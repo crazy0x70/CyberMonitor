@@ -1,0 +1,1271 @@
+package server
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"cyber_monitor/internal/metrics"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
+)
+
+const maxLogSize = 10 * 1024 * 1024
+
+type sizeLimitedWriter struct {
+	path    string
+	maxSize int64
+	mu      sync.Mutex
+}
+
+func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
+	if w == nil || w.path == "" || w.maxSize <= 0 {
+		return len(p), nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	dir := filepath.Dir(w.path)
+	if dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+
+	file, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return len(p), err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return len(p), err
+	}
+
+	if info.Size()+int64(len(p)) > w.maxSize {
+		if err := file.Truncate(0); err != nil {
+			return len(p), err
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return len(p), err
+		}
+	} else {
+		if _, err := file.Seek(0, io.SeekEnd); err != nil {
+			return len(p), err
+		}
+	}
+
+	_, err = file.Write(p)
+	if err != nil {
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+func setupLogger(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	logPath := filepath.Join(dataDir, "server.log")
+	writer := &sizeLimitedWriter{path: logPath, maxSize: maxLogSize}
+	log.SetOutput(io.MultiWriter(os.Stdout, writer))
+}
+
+const (
+	defaultAddr            = ":25012"
+	defaultTestIntervalSec = 5
+	defaultPersistInterval = 10 * time.Second
+)
+
+//go:embed web/*
+var webFS embed.FS
+
+type Config struct {
+	Addr       string
+	AdminUser  string
+	AdminPass  string
+	AdminPath  string
+	JWTSecret  string
+	AgentToken string
+	DataDir    string
+	Commit     string
+}
+
+type Store struct {
+	mu              sync.RWMutex
+	nodes           map[string]NodeState
+	profiles        map[string]*NodeProfile
+	settings        Settings
+	buildCommit     string
+	dataPath        string
+	lastPersist     time.Time
+	persistInterval time.Duration
+}
+
+type NodeState struct {
+	Stats     metrics.NodeStats `json:"stats"`
+	LastSeen  time.Time         `json:"last_seen"`
+	FirstSeen time.Time         `json:"first_seen"`
+}
+
+type NodeProfile struct {
+	Alias            string                      `json:"alias,omitempty"`
+	Group            string                      `json:"group,omitempty"`
+	Tags             []string                    `json:"tags,omitempty"`
+	Groups           []string                    `json:"groups,omitempty"`
+	Region           string                      `json:"region,omitempty"`
+	DiskType         string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps     int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt         int64                       `json:"expire_at,omitempty"`
+	AutoRenew        bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec  int                         `json:"test_interval_sec"`
+	Tests            []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections   []TestSelection             `json:"test_selections,omitempty"`
+	UpdatedAt        int64                       `json:"updated_at,omitempty"`
+}
+
+type TestSelection struct {
+	TestID      string `json:"test_id"`
+	IntervalSec int    `json:"interval_sec,omitempty"`
+}
+
+type AgentConfig struct {
+	Alias           string                      `json:"alias,omitempty"`
+	Group           string                      `json:"group,omitempty"`
+	TestIntervalSec int                         `json:"test_interval_sec"`
+	Tests           []metrics.NetworkTestConfig `json:"tests"`
+}
+
+type NodeView struct {
+	Stats            metrics.NodeStats           `json:"stats"`
+	LastSeen         int64                       `json:"last_seen"`
+	FirstSeen        int64                       `json:"first_seen,omitempty"`
+	Status           string                      `json:"status"`
+	Alias            string                      `json:"alias,omitempty"`
+	Group            string                      `json:"group,omitempty"`
+	Tags             []string                    `json:"tags,omitempty"`
+	Groups           []string                    `json:"groups,omitempty"`
+	Region           string                      `json:"region,omitempty"`
+	DiskType         string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps     int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt         int64                       `json:"expire_at,omitempty"`
+	AutoRenew        bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec  int                         `json:"test_interval_sec,omitempty"`
+	Tests            []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections   []TestSelection             `json:"test_selections,omitempty"`
+}
+
+type PublicSettings struct {
+	SiteTitle    string `json:"site_title,omitempty"`
+	SiteIcon     string `json:"site_icon,omitempty"`
+	HomeTitle    string `json:"home_title,omitempty"`
+	HomeSubtitle string `json:"home_subtitle,omitempty"`
+	Commit       string `json:"commit,omitempty"`
+}
+
+type Snapshot struct {
+	Type        string         `json:"type"`
+	GeneratedAt int64          `json:"generated_at"`
+	Nodes       []NodeView     `json:"nodes"`
+	Groups      []string       `json:"groups,omitempty"`
+	Settings    PublicSettings `json:"settings,omitempty"`
+}
+
+type Hub struct {
+	mu      sync.Mutex
+	clients map[*websocket.Conn]struct{}
+}
+
+func Run(ctx context.Context, cfg Config) error {
+	applyDefaults(&cfg)
+	setupLogger(cfg.DataDir)
+
+	dataPath := filepath.Join(cfg.DataDir, "state.json")
+	persisted, loaded, err := loadPersistedData(dataPath)
+	if err != nil {
+		log.Printf("读取持久化数据失败: %v", err)
+	}
+	tokenGenerated := !loaded || persisted.Settings.AuthToken == ""
+	defaultSettings := initSettings(cfg)
+	settings := defaultSettings
+	profiles := make(map[string]*NodeProfile)
+	nodes := make(map[string]NodeState)
+	if loaded {
+		settings = mergeSettings(persisted.Settings, defaultSettings)
+		profiles = persisted.Profiles
+		if persisted.Nodes != nil {
+			nodes = persisted.Nodes
+		}
+	}
+	if settings.AuthToken != "" {
+		cfg.JWTSecret = settings.AuthToken
+		cfg.AgentToken = settings.AuthToken
+	}
+	if err := savePersistedData(dataPath, PersistedData{
+		Settings: settings,
+		Profiles: profiles,
+		Nodes:    nodes,
+	}); err != nil {
+		log.Printf("写入持久化数据失败: %v", err)
+	}
+
+	commit := strings.TrimSpace(cfg.Commit)
+	if commit == "none" {
+		commit = ""
+	}
+	if len(commit) > 7 {
+		commit = commit[:7]
+	}
+
+	store := &Store{
+		nodes:           nodes,
+		profiles:        profiles,
+		settings:        settings,
+		buildCommit:     commit,
+		dataPath:        dataPath,
+		persistInterval: defaultPersistInterval,
+	}
+	hub := &Hub{clients: make(map[*websocket.Conn]struct{})}
+
+	mux := http.NewServeMux()
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return err
+	}
+
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		creds := store.Credentials()
+		if req.Username != creds.AdminUser || req.Password != creds.AdminPass {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		token, exp, err := generateToken(cfg.JWTSecret, req.Username, creds.TokenSalt)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token error"})
+			return
+		}
+		log.Printf("管理员登录: %s (%s)", req.Username, r.RemoteAddr)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"token":      token,
+			"expires_at": exp,
+		})
+	})
+
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		snapshot := storeSnapshot(store)
+		writeJSON(w, http.StatusOK, snapshot)
+	}))
+
+	mux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if cfg.AgentToken != "" {
+			token := r.Header.Get("X-AGENT-TOKEN")
+			if token != cfg.AgentToken {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+				return
+			}
+		}
+
+		var payload metrics.NodeStats
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if payload.NodeID == "" {
+			if payload.NodeName != "" {
+				payload.NodeID = payload.NodeName
+			} else if payload.Hostname != "" {
+				payload.NodeID = payload.Hostname
+			}
+		}
+		if payload.NodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+			return
+		}
+		if payload.NodeName == "" {
+			payload.NodeName = payload.NodeID
+		}
+		store.Update(payload)
+		log.Printf("Agent 上报: %s (%s)", payload.NodeID, r.RemoteAddr)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			snapshot := storeSnapshot(store)
+			writeJSON(w, http.StatusOK, snapshot)
+		case http.MethodDelete:
+			store.ClearNodes()
+			writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	}))
+
+	mux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		nodeID := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPatch:
+			var update NodeProfileUpdate
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+			profile := store.UpdateProfile(nodeID, update)
+			writeJSON(w, http.StatusOK, profile)
+		case http.MethodDelete:
+			deleted := store.DeleteNode(nodeID)
+			if !deleted {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	}))
+
+	mux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, store.SettingsView())
+		case http.MethodPatch, http.MethodPut:
+			var update SettingsUpdate
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+				return
+			}
+			view, err := store.UpdateSettings(update)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, view)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	}))
+
+	mux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if cfg.AgentToken != "" {
+			token := r.Header.Get("X-AGENT-TOKEN")
+			if token != cfg.AgentToken {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+				return
+			}
+		}
+		nodeID := r.URL.Query().Get("node_id")
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+			return
+		}
+		config := store.AgentConfig(nodeID)
+		writeJSON(w, http.StatusOK, config)
+	})
+
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		hub.Add(conn)
+
+		// 首次连接立即推送快照
+		snapshot := storeSnapshot(store)
+		payload, _ := json.Marshal(snapshot)
+		_ = conn.WriteMessage(websocket.TextMessage, payload)
+
+		go readLoop(conn, hub)
+	})
+
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(webRoot))))
+
+	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dashboard" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		adminPath := store.AdminPath()
+		if r.URL.Path == adminPath {
+			data, err := webFS.ReadFile("web/admin.html")
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin not found"})
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		}
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := webFS.ReadFile("web/index.html")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})
+
+	server := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snapshot := storeSnapshot(store)
+				payload, _ := json.Marshal(snapshot)
+				hub.Broadcast(payload)
+			}
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		_ = server.Shutdown(context.Background())
+	}()
+
+	log.Printf("管理后台路径: %s", store.AdminPath())
+	if !loaded {
+		log.Printf("初始管理员账号: %s", settings.AdminUser)
+		log.Printf("初始管理员密码: %s", settings.AdminPass)
+	}
+	if tokenGenerated {
+		log.Printf("初始 Agent Token: %s", cfg.AgentToken)
+	}
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func applyDefaults(cfg *Config) {
+	if cfg.Addr == "" {
+		cfg.Addr = defaultAddr
+	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = defaultDataDir
+	}
+	if cfg.JWTSecret == "" && cfg.AgentToken == "" {
+		token := generateBootstrapToken()
+		cfg.JWTSecret = token
+		cfg.AgentToken = token
+		return
+	}
+	if cfg.JWTSecret == "" {
+		cfg.JWTSecret = cfg.AgentToken
+	}
+	if cfg.AgentToken == "" {
+		cfg.AgentToken = cfg.JWTSecret
+	}
+	if cfg.JWTSecret != cfg.AgentToken {
+		cfg.AgentToken = cfg.JWTSecret
+	}
+}
+
+func generateBootstrapToken() string {
+	secret := randomToken(32)
+	claims := jwt.RegisteredClaims{
+		Subject:  "bootstrap",
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return randomToken(48)
+	}
+	return signed
+}
+
+func (s *Store) Update(stats metrics.NodeStats) {
+	var persist bool
+	var data PersistedData
+	s.mu.Lock()
+
+	now := time.Now()
+	prev := s.nodes[stats.NodeID]
+	firstSeen := prev.FirstSeen
+	if firstSeen.IsZero() {
+		firstSeen = now
+	}
+	s.nodes[stats.NodeID] = NodeState{
+		Stats:     stats,
+		LastSeen:  now,
+		FirstSeen: firstSeen,
+	}
+
+	profile := s.ensureProfileLocked(stats.NodeID)
+	if profile.TestIntervalSec == 0 {
+		profile.TestIntervalSec = defaultTestIntervalSec
+		persist = true
+	}
+	if profile.Alias == "" {
+		if stats.NodeAlias != "" {
+			profile.Alias = stats.NodeAlias
+		} else if stats.NodeName != "" {
+			profile.Alias = stats.NodeName
+		} else if stats.Hostname != "" {
+			profile.Alias = stats.Hostname
+		}
+		if profile.Alias != "" {
+			persist = true
+		}
+	}
+	if stats.NodeGroup != "" {
+		if profile.Group == "" {
+			profile.Group = stats.NodeGroup
+			persist = true
+		}
+		if len(profile.Groups) == 0 {
+			profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(stats.NodeGroup, nil))
+			group, tags := primaryGroupTagsFromSelections(profile.Groups)
+			if group != "" {
+				profile.Group = group
+			}
+			profile.Tags = tags
+			persist = true
+		}
+	}
+	if s.applyAutoRenewLocked(profile, now) {
+		persist = true
+	}
+	profile.UpdatedAt = now.Unix()
+
+	if s.shouldPersistLocked(now) {
+		persist = true
+	}
+	if persist {
+		data = s.snapshotPersistedLocked()
+	}
+	s.mu.Unlock()
+
+	if persist {
+		s.persist(data)
+	}
+}
+
+func storeSnapshot(s *Store) Snapshot {
+	nodes := s.Snapshot()
+	return Snapshot{
+		Type:        "snapshot",
+		GeneratedAt: time.Now().Unix(),
+		Nodes:       nodes,
+		Groups:      s.SettingsGroups(),
+		Settings:    s.PublicSettings(),
+	}
+}
+
+func (s *Store) Snapshot() []NodeView {
+	var persist bool
+	var data PersistedData
+	s.mu.Lock()
+
+	views := make([]NodeView, 0, len(s.nodes))
+	now := time.Now()
+	for _, node := range s.nodes {
+		profile := s.ensureProfileLocked(node.Stats.NodeID)
+		if s.applyAutoRenewLocked(profile, now) {
+			persist = true
+		}
+		status := "online"
+		if now.Sub(node.LastSeen) > 5*time.Second {
+			status = "offline"
+		}
+		group, tags := resolveProfileGroupTags(profile, node.Stats)
+		groups := normalizeGroupSelections(profile.Groups)
+		views = append(views, NodeView{
+			Stats:            node.Stats,
+			LastSeen:         node.LastSeen.Unix(),
+			FirstSeen:        node.FirstSeen.Unix(),
+			Status:           status,
+			Alias:            profile.Alias,
+			Group:            group,
+			Tags:             tags,
+			Groups:           groups,
+			Region:           profile.Region,
+			DiskType:         profile.DiskType,
+			NetSpeedMbps:     profile.NetSpeedMbps,
+			ExpireAt:         profile.ExpireAt,
+			AutoRenew:        profile.AutoRenew,
+			RenewIntervalSec: profile.RenewIntervalSec,
+			TestIntervalSec:  profile.TestIntervalSec,
+			Tests:            profile.Tests,
+			TestSelections:   profile.TestSelections,
+		})
+	}
+	sort.Slice(views, func(i, j int) bool {
+		leftGroup := views[i].Group
+		rightGroup := views[j].Group
+		if leftGroup == rightGroup {
+			return views[i].Alias < views[j].Alias
+		}
+		return leftGroup < rightGroup
+	})
+	if persist {
+		data = s.snapshotPersistedLocked()
+	}
+	s.mu.Unlock()
+
+	if persist {
+		s.persist(data)
+	}
+	return views
+}
+
+func resolveProfileGroupTags(profile *NodeProfile, stats metrics.NodeStats) (string, []string) {
+	selections := normalizeGroupSelections(profile.Groups)
+	if len(selections) == 0 {
+		selections = selectionsFromGroupTags(profile.Group, profile.Tags)
+	}
+	group, tags := primaryGroupTagsFromSelections(selections)
+	if group == "" && stats.NodeGroup != "" {
+		group = strings.TrimSpace(stats.NodeGroup)
+	}
+	return group, tags
+}
+
+func (s *Store) SettingsGroups() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.settings.GroupTree) > 0 {
+		return flattenGroupTree(s.settings.GroupTree)
+	}
+	groups := make([]string, len(s.settings.Groups))
+	copy(groups, s.settings.Groups)
+	return groups
+}
+
+func (h *Hub) Add(conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[conn] = struct{}{}
+}
+
+func (h *Hub) Remove(conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.clients, conn)
+	_ = conn.Close()
+}
+
+func (h *Hub) Broadcast(payload []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients {
+		if err := client.WriteMessage(websocket.TextMessage, payload); err != nil {
+			delete(h.clients, client)
+			_ = client.Close()
+		}
+	}
+}
+
+func readLoop(conn *websocket.Conn, hub *Hub) {
+	defer hub.Remove(conn)
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+type NodeProfileUpdate struct {
+	Alias            *string                      `json:"alias"`
+	Group            *string                      `json:"group"`
+	Tags             *[]string                    `json:"tags"`
+	Groups           *[]string                    `json:"groups"`
+	Region           *string                      `json:"region"`
+	DiskType         *string                      `json:"disk_type"`
+	NetSpeedMbps     *int                         `json:"net_speed_mbps"`
+	ExpireAt         *int64                       `json:"expire_at"`
+	AutoRenew        *bool                        `json:"auto_renew"`
+	RenewIntervalSec *int64                       `json:"renew_interval_sec"`
+	TestIntervalSec  *int                         `json:"test_interval_sec"`
+	Tests            *[]metrics.NetworkTestConfig `json:"tests"`
+	TestSelections   *[]TestSelection             `json:"test_selections"`
+}
+
+func (s *Store) AdminPath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings.AdminPath
+}
+
+func (s *Store) Credentials() Settings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings
+}
+
+func (s *Store) PublicSettings() PublicSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return PublicSettings{
+		SiteTitle:    s.settings.SiteTitle,
+		SiteIcon:     s.settings.SiteIcon,
+		HomeTitle:    s.settings.HomeTitle,
+		HomeSubtitle: s.settings.HomeSubtitle,
+		Commit:       s.buildCommit,
+	}
+}
+
+func (s *Store) SettingsView() SettingsView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return SettingsView{
+		AdminPath:    s.settings.AdminPath,
+		AdminUser:    s.settings.AdminUser,
+		AgentEndpoint: s.settings.AgentEndpoint,
+		AgentToken:   s.settings.AuthToken,
+		SiteTitle:    s.settings.SiteTitle,
+		SiteIcon:     s.settings.SiteIcon,
+		HomeTitle:    s.settings.HomeTitle,
+		HomeSubtitle: s.settings.HomeSubtitle,
+		Commit:       s.buildCommit,
+		Groups:       s.settings.Groups,
+		GroupTree:    s.settings.GroupTree,
+		TestCatalog:  s.settings.TestCatalog,
+	}
+}
+
+func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
+	var data PersistedData
+	var view SettingsView
+	s.mu.Lock()
+	if update.AdminPath != nil {
+		normalized, err := normalizeAdminPath(*update.AdminPath)
+		if err != nil {
+			s.mu.Unlock()
+			return SettingsView{}, err
+		}
+		s.settings.AdminPath = normalized
+	}
+	if update.AdminUser != nil {
+		user := strings.TrimSpace(*update.AdminUser)
+		if user == "" {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("admin_user invalid")
+		}
+		if user != s.settings.AdminUser {
+			s.settings.AdminUser = user
+			s.settings.TokenSalt = randomToken(adminTokenLength)
+		}
+	}
+	if update.AdminPass != nil {
+		pass := strings.TrimSpace(*update.AdminPass)
+		if pass == "" {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("admin_pass invalid")
+		}
+		if pass != s.settings.AdminPass {
+			s.settings.AdminPass = pass
+			s.settings.TokenSalt = randomToken(adminTokenLength)
+		}
+	}
+	if update.AgentEndpoint != nil {
+		s.settings.AgentEndpoint = strings.TrimSpace(*update.AgentEndpoint)
+	}
+	if update.SiteTitle != nil {
+		s.settings.SiteTitle = strings.TrimSpace(*update.SiteTitle)
+		if s.settings.SiteTitle == "" {
+			s.settings.SiteTitle = defaultSiteTitle
+		}
+	}
+	if update.SiteIcon != nil {
+		s.settings.SiteIcon = strings.TrimSpace(*update.SiteIcon)
+	}
+	if update.HomeTitle != nil {
+		s.settings.HomeTitle = strings.TrimSpace(*update.HomeTitle)
+		if s.settings.HomeTitle == "" {
+			s.settings.HomeTitle = defaultHomeTitle
+		}
+	}
+	if update.HomeSubtitle != nil {
+		s.settings.HomeSubtitle = strings.TrimSpace(*update.HomeSubtitle)
+		if s.settings.HomeSubtitle == "" {
+			s.settings.HomeSubtitle = defaultHomeSub
+		}
+	}
+	if update.Groups != nil {
+		s.settings.Groups = normalizeGroups(*update.Groups)
+		if len(s.settings.GroupTree) == 0 {
+			s.settings.GroupTree = buildGroupTree(s.settings.Groups)
+		}
+	}
+	if update.GroupTree != nil {
+		s.settings.GroupTree = normalizeGroupTree(*update.GroupTree)
+		s.settings.Groups = flattenGroupTree(s.settings.GroupTree)
+	}
+	if update.TestCatalog != nil {
+		catalog, err := normalizeTestCatalog(*update.TestCatalog)
+		if err != nil {
+			s.mu.Unlock()
+			return SettingsView{}, err
+		}
+		s.settings.TestCatalog = catalog
+	}
+	data = s.snapshotPersistedLocked()
+	view = SettingsView{
+		AdminPath:    s.settings.AdminPath,
+		AdminUser:    s.settings.AdminUser,
+		SiteTitle:    s.settings.SiteTitle,
+		SiteIcon:     s.settings.SiteIcon,
+		HomeTitle:    s.settings.HomeTitle,
+		HomeSubtitle: s.settings.HomeSubtitle,
+		Commit:       s.buildCommit,
+		Groups:       s.settings.Groups,
+		GroupTree:    s.settings.GroupTree,
+		TestCatalog:  s.settings.TestCatalog,
+	}
+	s.mu.Unlock()
+
+	s.persist(data)
+	return view, nil
+}
+
+func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
+	profile := s.profiles[nodeID]
+	if profile == nil {
+		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+		s.profiles[nodeID] = profile
+	}
+	if len(profile.Groups) == 0 {
+		if profile.Group != "" || len(profile.Tags) > 0 {
+			profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
+		}
+	}
+	if len(profile.Groups) > 0 && profile.Group == "" && len(profile.Tags) == 0 {
+		legacy := normalizeGroups(profile.Groups)
+		if len(legacy) > 0 {
+			profile.Groups = selectionsFromGroupTags(legacy[0], legacy[1:])
+		}
+	}
+	if len(profile.Groups) > 0 {
+		profile.Groups = normalizeGroupSelections(profile.Groups)
+		group, tags := primaryGroupTagsFromSelections(profile.Groups)
+		if group != "" {
+			profile.Group = group
+		}
+		profile.Tags = tags
+	}
+	return profile
+}
+
+func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfile {
+	var data PersistedData
+	s.mu.Lock()
+
+	profile := s.ensureProfileLocked(nodeID)
+	if update.Alias != nil {
+		profile.Alias = strings.TrimSpace(*update.Alias)
+	}
+	if update.Group != nil {
+		profile.Group = strings.TrimSpace(*update.Group)
+	}
+	if update.Tags != nil {
+		profile.Tags = normalizeGroups(*update.Tags)
+	}
+	if update.Groups != nil {
+		profile.Groups = normalizeGroupSelections(*update.Groups)
+		group, tags := primaryGroupTagsFromSelections(profile.Groups)
+		profile.Group = group
+		profile.Tags = tags
+	}
+	if update.Groups == nil && (update.Group != nil || update.Tags != nil) {
+		profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
+	} else if update.Groups == nil && len(profile.Groups) > 0 {
+		profile.Groups = normalizeGroupSelections(profile.Groups)
+	}
+	if update.Region != nil {
+		profile.Region = strings.ToUpper(strings.TrimSpace(*update.Region))
+	}
+	if update.DiskType != nil {
+		profile.DiskType = strings.TrimSpace(*update.DiskType)
+	}
+	if update.NetSpeedMbps != nil {
+		value := *update.NetSpeedMbps
+		if value < 0 {
+			value = 0
+		}
+		profile.NetSpeedMbps = value
+	}
+	if update.AutoRenew != nil {
+		profile.AutoRenew = *update.AutoRenew
+		if profile.AutoRenew && profile.ExpireAt > 0 && profile.RenewIntervalSec <= 0 {
+			renew := profile.ExpireAt - time.Now().Unix()
+			if renew > 0 {
+				profile.RenewIntervalSec = renew
+			}
+		}
+	}
+	if update.ExpireAt != nil {
+		expireAt := *update.ExpireAt
+		if expireAt < 0 {
+			expireAt = 0
+		}
+		profile.ExpireAt = expireAt
+		if profile.AutoRenew && expireAt > 0 {
+			if update.RenewIntervalSec != nil && *update.RenewIntervalSec > 0 {
+				profile.RenewIntervalSec = *update.RenewIntervalSec
+			} else {
+				renew := expireAt - time.Now().Unix()
+				if renew > 0 {
+					profile.RenewIntervalSec = renew
+				}
+			}
+		}
+	}
+	if update.RenewIntervalSec != nil && *update.RenewIntervalSec > 0 {
+		profile.RenewIntervalSec = *update.RenewIntervalSec
+	}
+	if update.TestIntervalSec != nil && *update.TestIntervalSec > 0 {
+		profile.TestIntervalSec = *update.TestIntervalSec
+	}
+	if update.Tests != nil {
+		profile.Tests = *update.Tests
+	}
+	if update.TestSelections != nil {
+		profile.TestSelections = s.normalizeSelectionsLocked(*update.TestSelections)
+	}
+	profile.UpdatedAt = time.Now().Unix()
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+	return *profile
+}
+
+func (s *Store) DeleteNode(nodeID string) bool {
+	var data PersistedData
+	s.mu.Lock()
+	_, exists := s.nodes[nodeID]
+	delete(s.nodes, nodeID)
+	delete(s.profiles, nodeID)
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+	return exists
+}
+
+func (s *Store) ClearNodes() {
+	var data PersistedData
+	s.mu.Lock()
+	s.nodes = make(map[string]NodeState)
+	s.profiles = make(map[string]*NodeProfile)
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+}
+
+func (s *Store) AgentConfig(nodeID string) AgentConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profile := s.ensureProfileLocked(nodeID)
+	tests := s.resolveTestsLocked(profile)
+	group, _ := primaryGroupTagsFromSelections(profile.Groups)
+	if group == "" {
+		group = strings.TrimSpace(profile.Group)
+	}
+	if tests == nil {
+		tests = []metrics.NetworkTestConfig{}
+	}
+	return AgentConfig{
+		Alias:           profile.Alias,
+		Group:           group,
+		TestIntervalSec: profile.TestIntervalSec,
+		Tests:           tests,
+	}
+}
+
+func (s *Store) snapshotPersistedLocked() PersistedData {
+	profiles := make(map[string]*NodeProfile, len(s.profiles))
+	for id, profile := range s.profiles {
+		if profile == nil {
+			continue
+		}
+		copyProfile := *profile
+		profiles[id] = &copyProfile
+	}
+	nodes := make(map[string]NodeState, len(s.nodes))
+	for id, node := range s.nodes {
+		nodes[id] = node
+	}
+	return PersistedData{
+		Settings: s.settings,
+		Profiles: profiles,
+		Nodes:    nodes,
+	}
+}
+
+func (s *Store) persist(data PersistedData) {
+	if s.dataPath == "" {
+		return
+	}
+	if err := savePersistedData(s.dataPath, data); err != nil {
+		log.Printf("持久化失败: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.lastPersist = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *Store) shouldPersistLocked(now time.Time) bool {
+	if s.persistInterval <= 0 {
+		return false
+	}
+	if s.lastPersist.IsZero() {
+		return true
+	}
+	return now.Sub(s.lastPersist) >= s.persistInterval
+}
+
+func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {
+	if profile == nil || !profile.AutoRenew {
+		return false
+	}
+	if profile.ExpireAt <= 0 || profile.RenewIntervalSec <= 0 {
+		return false
+	}
+	if now.Unix() < profile.ExpireAt {
+		return false
+	}
+	profile.ExpireAt = now.Unix() + profile.RenewIntervalSec
+	return true
+}
+
+func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
+	if len(profile.TestSelections) == 0 {
+		return profile.Tests
+	}
+	catalog := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
+	for _, item := range s.settings.TestCatalog {
+		catalog[item.ID] = item
+	}
+	results := make([]metrics.NetworkTestConfig, 0, len(profile.TestSelections))
+	for _, sel := range profile.TestSelections {
+		if sel.TestID == "" {
+			continue
+		}
+		item, ok := catalog[sel.TestID]
+		if !ok {
+			continue
+		}
+		interval := 0
+		if strings.ToLower(item.Type) == "tcp" {
+			if sel.IntervalSec == 0 {
+				interval = 0
+			} else if sel.IntervalSec > 0 {
+				interval = sel.IntervalSec
+			} else if item.IntervalSec > 0 {
+				interval = item.IntervalSec
+			} else if profile.TestIntervalSec > 0 {
+				interval = profile.TestIntervalSec
+			} else {
+				interval = defaultTestIntervalSec
+			}
+		}
+		results = append(results, metrics.NetworkTestConfig{
+			Name:        item.Name,
+			Type:        item.Type,
+			Host:        item.Host,
+			Port:        item.Port,
+			IntervalSec: interval,
+		})
+	}
+	return results
+}
+
+func (s *Store) normalizeSelectionsLocked(selections []TestSelection) []TestSelection {
+	if len(selections) == 0 {
+		return nil
+	}
+	valid := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
+	for _, item := range s.settings.TestCatalog {
+		if item.ID == "" {
+			continue
+		}
+		valid[item.ID] = item
+	}
+	seen := make(map[string]struct{})
+	result := make([]TestSelection, 0, len(selections))
+	for _, sel := range selections {
+		id := strings.TrimSpace(sel.TestID)
+		if id == "" {
+			continue
+		}
+		item, ok := valid[id]
+		if !ok {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		interval := sel.IntervalSec
+		if interval < 0 {
+			interval = 0
+		}
+		if strings.ToLower(item.Type) == "icmp" {
+			interval = 0
+		}
+		result = append(result, TestSelection{
+			TestID:      id,
+			IntervalSec: interval,
+		})
+	}
+	return result
+}
+
+func generateToken(secret, subject, tokenSalt string) (string, int64, error) {
+	exp := time.Now().Add(12 * time.Hour)
+	claims := jwt.RegisteredClaims{
+		Subject:   subject,
+		ID:        tokenSalt,
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(exp),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	str, err := token.SignedString([]byte(secret))
+	return str, exp.Unix(), err
+}
+
+func requireJWT(secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := validateJWTFromRequest(secret, r); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func requireAdminJWT(store *Store, secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := validateAdminJWT(store, secret, r); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func validateJWTFromRequest(secret string, r *http.Request) error {
+	token := extractToken(r)
+	if token == "" {
+		return errors.New("token required")
+	}
+	_, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return []byte(secret), nil
+	})
+	return err
+}
+
+func validateAdminJWT(store *Store, secret string, r *http.Request) error {
+	token := extractToken(r)
+	if token == "" {
+		return errors.New("token required")
+	}
+	claims := &jwt.RegisteredClaims{}
+	_, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return []byte(secret), nil
+	})
+	if err != nil {
+		return err
+	}
+	creds := store.Credentials()
+	if creds.AdminUser != "" && claims.Subject != creds.AdminUser {
+		return errors.New("token subject mismatch")
+	}
+	if creds.TokenSalt != "" && claims.ID != creds.TokenSalt {
+		return errors.New("token revoked")
+	}
+	return nil
+}
+
+func extractToken(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return parts[1]
+		}
+	}
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
+	}
+	return ""
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}

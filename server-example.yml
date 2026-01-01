@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  server:
+    image: ${CM_SERVER_IMAGE:-ghcr.io/crazy0x70/cyber-monitor-server:latest}
+    container_name: cyber-monitor-server
+    ports:
+      - "25012:25012"
+    volumes:
+      - ./data:/data

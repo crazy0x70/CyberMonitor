@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  cyber-monitor-agent:
+    image: ghcr.io/crazy0x70/cyber-monitor-agent:latest
+    container_name: cyber-monitor-agent
+    network_mode: "host"
+    environment:
+      CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
+      CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"
+    volumes:
+      - /:/host:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc:/host/etc:ro
+    restart: unless-stopped

@@ -1,0 +1,305 @@
+name: Build, Release and Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（例如 0.1.0）'
+        required: false
+        default: ''
+        type: string
+
+env:
+  GO_VERSION: '1.22'
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+concurrency:
+  group: "release-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      build_time: ${{ steps.version.outputs.build_time }}
+    steps:
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            if [ -z "$VERSION" ]; then
+              VERSION="0.0.0-${{ github.run_number }}"
+            fi
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          fi
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: amd64
+            output: cyber-monitor-server-linux-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: arm64
+            output: cyber-monitor-server-linux-arm64
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: arm
+            goarm: 7
+            output: cyber-monitor-server-linux-armv7
+          - name: server
+            cmd_path: ./cmd/server
+            os: darwin
+            arch: amd64
+            output: cyber-monitor-server-darwin-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: darwin
+            arch: arm64
+            output: cyber-monitor-server-darwin-arm64
+          - name: server
+            cmd_path: ./cmd/server
+            os: windows
+            arch: amd64
+            output: cyber-monitor-server-windows-amd64.exe
+          - name: server
+            cmd_path: ./cmd/server
+            os: freebsd
+            arch: amd64
+            output: cyber-monitor-server-freebsd-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: freebsd
+            arch: arm64
+            output: cyber-monitor-server-freebsd-arm64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: amd64
+            output: cyber-monitor-agent-linux-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: arm64
+            output: cyber-monitor-agent-linux-arm64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: arm
+            goarm: 7
+            output: cyber-monitor-agent-linux-armv7
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: darwin
+            arch: amd64
+            output: cyber-monitor-agent-darwin-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: darwin
+            arch: arm64
+            output: cyber-monitor-agent-darwin-arm64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: windows
+            arch: amd64
+            output: cyber-monitor-agent-windows-amd64.exe
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: freebsd
+            arch: amd64
+            output: cyber-monitor-agent-freebsd-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: freebsd
+            arch: arm64
+            output: cyber-monitor-agent-freebsd-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build ${{ matrix.output }}
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM=${{ matrix.goarm }}
+          fi
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o dist/${{ matrix.output }} \
+            ${{ matrix.cmd_path }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          retention-days: 30
+
+  build-web:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: 打包前端资源
+        run: |
+          tar -czf web-dist.tar.gz -C internal/server/web .
+          (cd internal/server/web && zip -r ../../../web-dist.zip .)
+
+      - name: Upload web archive (tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist-tar
+          path: web-dist.tar.gz
+          retention-days: 30
+
+      - name: Upload web archive (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist-zip
+          path: web-dist.zip
+          retention-days: 30
+
+  docker:
+    needs: version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      IMAGE_PREFIX: ghcr.io/crazy0x70/cyber-monitor
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: server
+            target: server
+          - name: agent
+            target: agent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}:${{ needs.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}:latest
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ needs.version.outputs.build_time }}
+            TARGET=${{ matrix.target }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  release:
+    needs: [version, build, build-web]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve changelog range
+        id: changelog
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          PREV=$(git tag --sort=version:refname | grep -v "^${TAG}$" | tail -1)
+          if [ -z "$PREV" ]; then
+            PREV="$TAG"
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          else
+            URL="https://github.com/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+          fi
+          echo "prev_tag=$PREV" >> $GITHUB_OUTPUT
+          echo "prev_version=${PREV#v}" >> $GITHUB_OUTPUT
+          echo "compare_url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name "cyber-monitor-*" -exec cp {} release/ \;
+          cp artifacts/web-dist.tar.gz release/ || true
+          cp artifacts/web-dist.zip release/ || true
+          find release -type f -name "cyber-monitor-*" ! -name "*.exe" -exec chmod +x {} \;
+          cd release
+          sha256sum * > checksums.txt
+          ls -la
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          body: |
+            Full Changelog: [${{ steps.changelog.outputs.prev_tag }}...${{ needs.version.outputs.tag }}](${{ steps.changelog.outputs.compare_url }})
+          files: |
+            release/*
+          draft: false
+          prerelease: false

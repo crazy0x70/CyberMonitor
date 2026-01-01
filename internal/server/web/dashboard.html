@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CyberMonitor</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <div class="bg-orb orb-c"></div>
+
+    <div id="app" class="app">
+      <header class="topbar">
+        <div>
+          <div class="brand">CyberMonitor</div>
+          <div class="subtitle">极简、多节点、实时服务器探针</div>
+        </div>
+        <div class="topbar-right">
+          <div class="status-pill" id="ws-status">
+            <span class="dot"></span>
+            <span class="label">连接中...</span>
+          </div>
+          <div class="meta">
+            <span id="node-count">0</span> 节点 · <span id="last-updated">--</span>
+          </div>
+        </div>
+      </header>
+
+      <section id="grid" class="grid"></section>
+
+      <div id="empty" class="empty">
+        <h2>等待节点接入</h2>
+        <p>请启动 Agent 并指向当前管理端地址。</p>
+      </div>
+    </div>
+
+    <div id="login-modal" class="modal hidden">
+      <div class="modal-card">
+        <h3>管理端登录</h3>
+        <p>请输入管理员账号以获取实时监控视图。</p>
+        <form id="login-form">
+          <label>
+            用户名
+            <input type="text" name="username" autocomplete="username" required />
+          </label>
+          <label>
+            密码
+            <input type="password" name="password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">登录</button>
+          <div id="login-error" class="error"></div>
+        </form>
+      </div>
+    </div>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
