@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -111,6 +113,7 @@ type Store struct {
 	dataPath        string
 	lastPersist     time.Time
 	persistInterval time.Duration
+	alerted         map[string]bool
 }
 
 type NodeState struct {
@@ -237,6 +240,7 @@ func Run(ctx context.Context, cfg Config) error {
 		buildCommit:     commit,
 		dataPath:        dataPath,
 		persistInterval: defaultPersistInterval,
+		alerted:         make(map[string]bool),
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]struct{})}
 
@@ -383,6 +387,33 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}))
 
+	mux.HandleFunc("/api/v1/admin/alerts/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req struct {
+			Webhook string `json:"webhook"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		webhook := strings.TrimSpace(req.Webhook)
+		if webhook == "" {
+			webhook = store.AlertWebhook()
+		}
+		if webhook == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhook 不能为空"})
+			return
+		}
+		if err := sendFeishuTest(webhook); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+
 	mux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -477,9 +508,14 @@ func Run(ctx context.Context, cfg Config) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				now := time.Now()
 				snapshot := storeSnapshot(store)
 				payload, _ := json.Marshal(snapshot)
 				hub.Broadcast(payload)
+				webhook, events := store.CollectOfflineAlerts(now)
+				if len(events) > 0 {
+					go sendFeishuAlert(webhook, events)
+				}
 			}
 		}
 	}()
@@ -606,6 +642,168 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	if persist {
 		s.persist(data)
 	}
+}
+
+type AlertEvent struct {
+	NodeID     string
+	Display    string
+	OS         string
+	LastSeen   int64
+	OfflineSec int64
+}
+
+func (s *Store) CollectOfflineAlerts(now time.Time) (string, []AlertEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	webhook := strings.TrimSpace(s.settings.AlertWebhook)
+	if webhook == "" || s.settings.AlertOfflineSec <= 0 {
+		return "", nil
+	}
+	alertAll := s.settings.AlertAll
+	selected := make(map[string]struct{})
+	if !alertAll {
+		for _, nodeID := range s.settings.AlertNodes {
+			value := strings.TrimSpace(nodeID)
+			if value == "" {
+				continue
+			}
+			selected[value] = struct{}{}
+		}
+	}
+
+	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
+	events := make([]AlertEvent, 0)
+	for nodeID, node := range s.nodes {
+		if !alertAll {
+			if _, ok := selected[nodeID]; !ok {
+				delete(s.alerted, nodeID)
+				continue
+			}
+		}
+		offlineFor := now.Sub(node.LastSeen)
+		if offlineFor < threshold {
+			delete(s.alerted, nodeID)
+			continue
+		}
+		if s.alerted[nodeID] {
+			continue
+		}
+		profile := s.ensureProfileLocked(nodeID)
+		stats := node.Stats
+		display := strings.TrimSpace(profile.Alias)
+		if display == "" {
+			display = strings.TrimSpace(stats.NodeName)
+		}
+		if display == "" {
+			display = nodeID
+		}
+		events = append(events, AlertEvent{
+			NodeID:     nodeID,
+			Display:    display,
+			OS:         stats.OS,
+			LastSeen:   node.LastSeen.Unix(),
+			OfflineSec: int64(offlineFor.Seconds()),
+		})
+		s.alerted[nodeID] = true
+	}
+
+	for nodeID := range s.alerted {
+		if _, ok := s.nodes[nodeID]; !ok {
+			delete(s.alerted, nodeID)
+		}
+	}
+
+	return webhook, events
+}
+
+func sendFeishuAlert(webhook string, events []AlertEvent) {
+	if webhook == "" || len(events) == 0 {
+		return
+	}
+	if err := sendFeishuText(webhook, buildAlertMessage(events)); err != nil {
+		log.Printf("告警发送失败: %v", err)
+	}
+}
+
+func sendFeishuTest(webhook string) error {
+	message := fmt.Sprintf("[CyberMonitor] 告警测试 %s", time.Now().Format("2006-01-02 15:04:05"))
+	return sendFeishuText(webhook, message)
+}
+
+func sendFeishuText(webhook, text string) error {
+	if webhook == "" || strings.TrimSpace(text) == "" {
+		return errors.New("webhook 或消息为空")
+	}
+	payload := map[string]any{
+		"msg_type": "text",
+		"content": map[string]string{
+			"text": text,
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("告警消息编码失败: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("告警请求创建失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("告警发送失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("webhook 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func buildAlertMessage(events []AlertEvent) string {
+	lines := []string{"[CyberMonitor] 服务器离线告警"}
+	for _, event := range events {
+		label := event.Display
+		if event.NodeID != "" && event.NodeID != event.Display {
+			label = fmt.Sprintf("%s (%s)", event.Display, event.NodeID)
+		}
+		lines = append(lines, fmt.Sprintf("- %s | %s | 离线 %s | 最后上报 %s",
+			label,
+			formatAlertValue(event.OS, "--"),
+			formatAlertDuration(event.OfflineSec),
+			time.Unix(event.LastSeen, 0).Format("2006-01-02 15:04:05"),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatAlertDuration(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%d秒", seconds)
+	}
+	minutes := seconds / 60
+	if minutes < 60 {
+		return fmt.Sprintf("%d分钟", minutes)
+	}
+	hours := minutes / 60
+	if hours < 24 {
+		return fmt.Sprintf("%d小时", hours)
+	}
+	days := hours / 24
+	return fmt.Sprintf("%d天", days)
+}
+
+func formatAlertValue(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(value)
 }
 
 func storeSnapshot(s *Store) Snapshot {
@@ -776,19 +974,29 @@ func (s *Store) SettingsView() SettingsView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return SettingsView{
-		AdminPath:    s.settings.AdminPath,
-		AdminUser:    s.settings.AdminUser,
-		AgentEndpoint: s.settings.AgentEndpoint,
-		AgentToken:   s.settings.AuthToken,
-		SiteTitle:    s.settings.SiteTitle,
-		SiteIcon:     s.settings.SiteIcon,
-		HomeTitle:    s.settings.HomeTitle,
-		HomeSubtitle: s.settings.HomeSubtitle,
-		Commit:       s.buildCommit,
-		Groups:       s.settings.Groups,
-		GroupTree:    s.settings.GroupTree,
-		TestCatalog:  s.settings.TestCatalog,
+		AdminPath:       s.settings.AdminPath,
+		AdminUser:       s.settings.AdminUser,
+		AgentEndpoint:   s.settings.AgentEndpoint,
+		AgentToken:      s.settings.AuthToken,
+		SiteTitle:       s.settings.SiteTitle,
+		SiteIcon:        s.settings.SiteIcon,
+		HomeTitle:       s.settings.HomeTitle,
+		HomeSubtitle:    s.settings.HomeSubtitle,
+		AlertWebhook:    s.settings.AlertWebhook,
+		AlertOfflineSec: s.settings.AlertOfflineSec,
+		AlertAll:        s.settings.AlertAll,
+		AlertNodes:      s.settings.AlertNodes,
+		Commit:          s.buildCommit,
+		Groups:          s.settings.Groups,
+		GroupTree:       s.settings.GroupTree,
+		TestCatalog:     s.settings.TestCatalog,
 	}
+}
+
+func (s *Store) AlertWebhook() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.settings.AlertWebhook)
 }
 
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
@@ -849,6 +1057,22 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 			s.settings.HomeSubtitle = defaultHomeSub
 		}
 	}
+	if update.AlertWebhook != nil {
+		s.settings.AlertWebhook = strings.TrimSpace(*update.AlertWebhook)
+	}
+	if update.AlertOfflineSec != nil {
+		offlineSec := *update.AlertOfflineSec
+		if offlineSec <= 0 {
+			offlineSec = defaultAlertOfflineSec
+		}
+		s.settings.AlertOfflineSec = offlineSec
+	}
+	if update.AlertAll != nil {
+		s.settings.AlertAll = *update.AlertAll
+	}
+	if update.AlertNodes != nil {
+		s.settings.AlertNodes = normalizeAlertNodes(*update.AlertNodes)
+	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
 		if len(s.settings.GroupTree) == 0 {
@@ -869,16 +1093,20 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	data = s.snapshotPersistedLocked()
 	view = SettingsView{
-		AdminPath:    s.settings.AdminPath,
-		AdminUser:    s.settings.AdminUser,
-		SiteTitle:    s.settings.SiteTitle,
-		SiteIcon:     s.settings.SiteIcon,
-		HomeTitle:    s.settings.HomeTitle,
-		HomeSubtitle: s.settings.HomeSubtitle,
-		Commit:       s.buildCommit,
-		Groups:       s.settings.Groups,
-		GroupTree:    s.settings.GroupTree,
-		TestCatalog:  s.settings.TestCatalog,
+		AdminPath:       s.settings.AdminPath,
+		AdminUser:       s.settings.AdminUser,
+		SiteTitle:       s.settings.SiteTitle,
+		SiteIcon:        s.settings.SiteIcon,
+		HomeTitle:       s.settings.HomeTitle,
+		HomeSubtitle:    s.settings.HomeSubtitle,
+		AlertWebhook:    s.settings.AlertWebhook,
+		AlertOfflineSec: s.settings.AlertOfflineSec,
+		AlertAll:        s.settings.AlertAll,
+		AlertNodes:      s.settings.AlertNodes,
+		Commit:          s.buildCommit,
+		Groups:          s.settings.Groups,
+		GroupTree:       s.settings.GroupTree,
+		TestCatalog:     s.settings.TestCatalog,
 	}
 	s.mu.Unlock()
 

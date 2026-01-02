@@ -85,6 +85,7 @@ type NodeStats struct {
 	Hostname     string              `json:"hostname"`
 	OS           string              `json:"os"`
 	Arch         string              `json:"arch"`
+	AgentVersion string              `json:"agent_version,omitempty"`
 	UptimeSec    uint64              `json:"uptime_sec"`
 	Timestamp    int64               `json:"timestamp"`
 	NetSpeedMbps float64             `json:"net_speed_mbps,omitempty"`
@@ -163,13 +164,13 @@ func (c *Collector) Collect() (NodeStats, error) {
 	netStat := sumNetCounters(netCounters, c.netIfaces)
 
 	hostInfo, _ := host.Info()
-	osLabel := runtime.GOOS
+	osLabel := normalizeOSLabel(runtime.GOOS, "")
 	hostname := ""
 	uptime := uint64(0)
 	processCount := 0
 	arch := detectArch()
 	if hostInfo != nil {
-		osLabel = hostInfo.Platform + " " + hostInfo.PlatformVersion
+		osLabel = normalizeOSLabel(hostInfo.Platform, hostInfo.PlatformVersion)
 		hostname = hostInfo.Hostname
 		uptime = hostInfo.Uptime
 		processCount = int(hostInfo.Procs)
@@ -179,6 +180,9 @@ func (c *Collector) Collect() (NodeStats, error) {
 	}
 	if hostOS := readHostOSRelease(c.hostRoot); hostOS != "" {
 		osLabel = hostOS
+	}
+	if osLabel != "" {
+		osLabel = normalizeOSLabel(osLabel, "")
 	}
 	if hostName := readHostHostname(c.hostRoot); hostName != "" {
 		hostname = hostName
@@ -195,13 +199,13 @@ func (c *Collector) Collect() (NodeStats, error) {
 
 	netSpeedMbps := collectNetSpeedMbps(c.netIfaces)
 	stats := NodeStats{
-		NodeID:    c.nodeID,
-		NodeName:  c.nodeName,
-		Hostname:  hostname,
-		OS:        osLabel,
-		Arch:      arch,
-		UptimeSec: uptime,
-		Timestamp: now.Unix(),
+		NodeID:       c.nodeID,
+		NodeName:     c.nodeName,
+		Hostname:     hostname,
+		OS:           osLabel,
+		Arch:         arch,
+		UptimeSec:    uptime,
+		Timestamp:    now.Unix(),
 		NetSpeedMbps: netSpeedMbps,
 		CPU: CPUInfo{
 			UsagePercent: usage,
@@ -217,7 +221,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 			Free:        valueOrZeroMem(memStat).Free,
 			UsedPercent: valueOrZeroMem(memStat).UsedPercent,
 		},
-		Disk: diskUsage,
+		Disk:     diskUsage,
 		DiskType: diskType,
 		DiskIO: DiskIO{
 			ReadBytes:  diskRead,
@@ -530,6 +534,24 @@ func normalizeArch(value string) string {
 	default:
 		return arch
 	}
+}
+
+func normalizeOSLabel(platform, version string) string {
+	name := strings.TrimSpace(platform)
+	if name == "" {
+		return ""
+	}
+	lower := strings.ToLower(name)
+	if lower == "darwin" || lower == "macos" || lower == "mac os" || lower == "osx" || lower == "os x" {
+		if strings.TrimSpace(version) != "" {
+			return "macOS " + strings.TrimSpace(version)
+		}
+		return "macOS"
+	}
+	if strings.TrimSpace(version) != "" && !strings.Contains(name, version) {
+		return name + " " + strings.TrimSpace(version)
+	}
+	return name
 }
 
 func detectArch() string {

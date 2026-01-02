@@ -23,6 +23,7 @@ type Config struct {
 	NodeAlias    string
 	NodeGroup    string
 	AgentToken   string
+	AgentVersion string
 	HostRoot     string
 	NetTests     []metrics.NetworkTestConfig
 	TestInterval time.Duration
@@ -66,6 +67,9 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		if sample.NodeName == "" {
 			sample.NodeName = sample.Hostname
+		}
+		if cfg.AgentVersion != "" {
+			sample.AgentVersion = cfg.AgentVersion
 		}
 		alias, group, tests, interval := runtimeCfg.Snapshot()
 		if alias != "" {

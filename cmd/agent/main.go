@@ -64,6 +64,7 @@ func main() {
 		NodeAlias:    *nodeAlias,
 		NodeGroup:    *nodeGroup,
 		AgentToken:   *agentToken,
+		AgentVersion: Version,
 		HostRoot:     *hostRoot,
 		NetTests:     agent.ParseNetTests(*netTestsRaw),
 		TestInterval: *testInterval,

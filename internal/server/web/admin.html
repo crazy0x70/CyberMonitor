@@ -46,6 +46,7 @@
           <button class="side-link" type="button" data-section="groups">分组管理</button>
           <button class="side-link" type="button" data-section="tests">探测设置</button>
           <button class="side-link" type="button" data-section="agents">服务器管理</button>
+          <button class="side-link" type="button" data-section="alerts">通知告警</button>
           <button class="side-link side-logout hidden" type="button" id="logout-link">退出登录</button>
         </aside>
 
@@ -157,6 +158,44 @@
             <div id="admin-empty" class="empty hidden">
               <h2>暂无节点</h2>
               <p>请先启动 Agent 并完成上报。</p>
+            </div>
+          </section>
+
+          <section class="panel hidden" data-section="alerts">
+            <div class="panel-head">
+              <div>
+                <h2>通知告警</h2>
+                <p class="panel-desc">配置飞书机器人 Webhook，服务器离线后自动推送提醒。</p>
+              </div>
+              <div class="panel-actions">
+                <button class="btn small" id="save-alerts-btn" type="button">保存</button>
+                <button class="btn ghost" id="test-alerts-btn" type="button">测试</button>
+                <div class="form-hint" id="alerts-hint"></div>
+              </div>
+            </div>
+            <div class="admin-grid">
+              <label class="field span-full">
+                <span>飞书 Webhook</span>
+                <input class="input" type="text" id="alert-webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+              </label>
+              <label class="field">
+                <span>离线时长(分钟)</span>
+                <input class="input" type="number" id="alert-offline-minutes" min="1" step="1" placeholder="默认 5" />
+              </label>
+              <div class="field">
+                <span>监测范围</span>
+                <div class="check-row">
+                  <label class="check">
+                    <input type="checkbox" id="alert-all" />
+                    <span>全部服务器</span>
+                  </label>
+                  <div class="form-hint">默认全选，取消后可单独勾选</div>
+                </div>
+              </div>
+              <div class="field span-full">
+                <span>监测服务器</span>
+                <div class="test-select-list" id="alert-node-list"></div>
+              </div>
             </div>
           </section>
         </main>

@@ -14,6 +14,13 @@ const siteTitleInput = document.getElementById("site-title");
 const siteIconInput = document.getElementById("site-icon-input");
 const homeTitleInput = document.getElementById("home-title");
 const homeSubtitleInput = document.getElementById("home-subtitle");
+const alertWebhookInput = document.getElementById("alert-webhook");
+const alertOfflineMinutesInput = document.getElementById("alert-offline-minutes");
+const alertAllToggle = document.getElementById("alert-all");
+const alertNodeList = document.getElementById("alert-node-list");
+const saveAlertsBtn = document.getElementById("save-alerts-btn");
+const testAlertsBtn = document.getElementById("test-alerts-btn");
+const alertsHint = document.getElementById("alerts-hint");
 const groupTree = document.getElementById("group-tree");
 const addGroupBtn = document.getElementById("add-group-btn");
 const saveGroupBtn = document.getElementById("save-group-btn");
@@ -46,7 +53,12 @@ const state = {
     testCatalog: [],
     agentEndpoint: "",
     agentToken: "",
+    alertWebhook: "",
+    alertOfflineSec: 0,
+    alertAll: true,
+    alertNodes: [],
   },
+  nodes: [],
 };
 
 function setView(loggedIn) {
@@ -146,6 +158,16 @@ function applySettingsView(data) {
   siteIconInput.value = data.site_icon || "";
   homeTitleInput.value = data.home_title || "";
   homeSubtitleInput.value = data.home_subtitle || "";
+  if (alertWebhookInput) {
+    alertWebhookInput.value = data.alert_webhook || "";
+  }
+  if (alertOfflineMinutesInput) {
+    const minutes = Math.round((data.alert_offline_sec || 0) / 60);
+    alertOfflineMinutesInput.value = minutes > 0 ? String(minutes) : "";
+  }
+  if (alertAllToggle) {
+    alertAllToggle.checked = data.alert_all !== false;
+  }
   updateAdminBrand(data);
   if (siteIconLink) {
     if (data.site_icon) {
@@ -157,6 +179,14 @@ function applySettingsView(data) {
   if (typeof data.agent_token === "string" && data.agent_token) {
     state.settings.agentToken = data.agent_token;
   }
+  if (typeof data.alert_webhook === "string") {
+    state.settings.alertWebhook = data.alert_webhook;
+  }
+  if (typeof data.alert_offline_sec === "number") {
+    state.settings.alertOfflineSec = data.alert_offline_sec;
+  }
+  state.settings.alertAll = data.alert_all !== false;
+  state.settings.alertNodes = Array.isArray(data.alert_nodes) ? data.alert_nodes : [];
   state.settings.groups = Array.isArray(data.groups) ? data.groups : [];
   state.settings.groupTree = Array.isArray(data.group_tree)
     ? data.group_tree
@@ -166,6 +196,7 @@ function applySettingsView(data) {
     : [];
   renderGroupTree(state.settings.groupTree);
   renderTestCatalog(state.settings.testCatalog);
+  renderAlertTargets();
   updateFooter(data.commit || "");
   updateInstallCommands();
 }
@@ -224,6 +255,65 @@ async function saveBaseSettings() {
   payload.home_title = homeTitle;
   payload.home_subtitle = homeSubtitle;
   return saveSettingsPayload(payload);
+}
+
+function collectAlertNodes() {
+  if (!alertNodeList) return [];
+  const nodes = [];
+  alertNodeList
+    .querySelectorAll("input[type=\"checkbox\"][data-node-id]:checked")
+    .forEach((input) => {
+      const value = (input.dataset.nodeId || "").trim();
+      if (value) nodes.push(value);
+    });
+  return nodes;
+}
+
+async function saveAlertSettings() {
+  if (!alertWebhookInput || !alertOfflineMinutesInput) return;
+  const payload = {};
+  const webhook = alertWebhookInput.value.trim();
+  let minutes = parseInt(alertOfflineMinutesInput.value, 10);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    minutes = 5;
+  }
+  const alertAll = alertAllToggle ? alertAllToggle.checked : true;
+  payload.alert_webhook = webhook;
+  payload.alert_offline_sec = minutes * 60;
+  payload.alert_all = alertAll;
+  if (!alertAll) {
+    const nodes = collectAlertNodes();
+    if (!nodes.length) {
+      throw new Error("请至少选择一台服务器");
+    }
+    payload.alert_nodes = nodes;
+  }
+  return saveSettingsPayload(payload);
+}
+
+async function testAlertSettings() {
+  if (!alertWebhookInput) return;
+  const webhook = alertWebhookInput.value.trim();
+  if (!webhook) {
+    throw new Error("请先填写飞书 Webhook");
+  }
+  const resp = await apiFetch("/api/v1/admin/alerts/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ webhook }),
+  });
+  if (!resp.ok) {
+    let message = `测试失败: ${resp.status}`;
+    try {
+      const data = await resp.json();
+      if (data && data.error) {
+        message = data.error;
+      }
+    } catch (error) {
+      // ignore
+    }
+    throw new Error(message);
+  }
 }
 
 function updateInstallCommands() {
@@ -310,7 +400,9 @@ async function loadNodes() {
     throw new Error(`加载失败: ${resp.status}`);
   }
   const data = await resp.json();
-  renderNodes(data.nodes || []);
+  state.nodes = Array.isArray(data.nodes) ? data.nodes : [];
+  renderNodes(state.nodes);
+  renderAlertTargets();
 }
 
 function renderNodes(nodes) {
@@ -323,6 +415,47 @@ function renderNodes(nodes) {
   nodes.forEach((node) => {
     nodeList.appendChild(createNodeCard(node));
   });
+}
+
+function renderAlertTargets() {
+  if (!alertNodeList) return;
+  alertNodeList.innerHTML = "";
+  const nodes = Array.isArray(state.nodes) ? state.nodes : [];
+  if (!nodes.length) {
+    alertNodeList.innerHTML = "<div class=\"form-hint\">暂无可监测的服务器</div>";
+    return;
+  }
+  const selectedAll = alertAllToggle ? alertAllToggle.checked : true;
+  const selected = new Set(state.settings.alertNodes || []);
+  const sorted = [...nodes].sort((a, b) => {
+    const left = resolveNodeDisplayName(a);
+    const right = resolveNodeDisplayName(b);
+    return left.localeCompare(right, "zh-Hans-CN");
+  });
+  sorted.forEach((node) => {
+    const stats = node.stats || {};
+    const nodeID = stats.node_id || stats.node_name || "";
+    if (!nodeID) return;
+    const row = document.createElement("div");
+    row.className = "check-row";
+    const checked = selectedAll || selected.has(nodeID);
+    const disabled = selectedAll;
+    row.innerHTML = `
+      <label class="check">
+        <input type="checkbox" data-node-id="${escapeHtml(nodeID)}" ${
+          checked ? "checked" : ""
+        } ${disabled ? "disabled" : ""} />
+        <span>${escapeHtml(resolveNodeDisplayName(node))}</span>
+      </label>
+    `;
+    alertNodeList.appendChild(row);
+  });
+}
+
+function resolveNodeDisplayName(node) {
+  const stats = node.stats || {};
+  const nodeID = stats.node_id || stats.node_name || "--";
+  return node.alias || stats.node_alias || nodeID;
 }
 
 function createNodeCard(node) {
@@ -340,6 +473,9 @@ function createNodeCard(node) {
     metaParts.push(escapeHtml(hostLabel));
   }
   metaParts.push(escapeHtml(stats.os || "--"));
+  if (stats.agent_version) {
+    metaParts.push(`Agent ${escapeHtml(stats.agent_version)}`);
+  }
   metaParts.push(status);
   metaParts.push(lastSeen);
   const metaText = metaParts.join(" · ");
@@ -1202,13 +1338,27 @@ function formatCatalogLabel(item) {
   return `${type} ${host}${port}`;
 }
 
+function normalizeUnixSeconds(timestamp) {
+  let value = Number(timestamp);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if (value > 1e14) {
+    value = Math.floor(value / 1000);
+  }
+  if (value > 1e12) {
+    value = Math.floor(value / 1000);
+  }
+  return Math.floor(value);
+}
+
 function formatLocalDateTime(timestamp) {
-  if (!timestamp) return "";
-  const date = new Date(timestamp * 1000);
+  const seconds = normalizeUnixSeconds(timestamp);
+  if (!seconds) return "";
+  const date = new Date(seconds * 1000);
   const pad = (num) => String(num).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
-    date.getDate()
-  )}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const year = String(date.getFullYear()).padStart(4, "0");
+  return `${year}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function normalizeExpireInput(value) {
@@ -1220,20 +1370,35 @@ function normalizeExpireInput(value) {
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(raw)) {
     return `${raw}:00`;
   }
-  return raw;
+  return raw.replace(/\.\d+$/, "");
 }
 
 function parseLocalDateTime(value) {
-  const match = String(value || "").match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/
-  );
-  if (!match) return 0;
-  const year = Number(match[1]);
-  const month = Number(match[2]) - 1;
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const [datePart, timePartRaw] = raw.split("T");
+  if (!datePart) return 0;
+  const dateBits = datePart.split("-");
+  if (dateBits.length !== 3) return 0;
+  if (dateBits[0].length !== 4) return 0;
+  const year = Number(dateBits[0]);
+  const month = Number(dateBits[1]) - 1;
+  const day = Number(dateBits[2]);
+  const timePart = (timePartRaw || "00:00:00").split(".")[0];
+  const timeBits = timePart.split(":");
+  const hour = Number(timeBits[0] || 0);
+  const minute = Number(timeBits[1] || 0);
+  const second = Number(timeBits[2] || 0);
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(minute) ||
+    !Number.isFinite(second)
+  ) {
+    return 0;
+  }
   const date = new Date(year, month, day, hour, minute, second);
   const timestamp = date.getTime();
   if (Number.isNaN(timestamp)) return 0;
@@ -1392,6 +1557,62 @@ saveSettingsBtn.addEventListener("click", async () => {
     settingsHint.classList.add("error");
   }
 });
+
+if (alertAllToggle) {
+  alertAllToggle.addEventListener("change", () => {
+    state.settings.alertAll = alertAllToggle.checked;
+    renderAlertTargets();
+  });
+}
+
+if (saveAlertsBtn) {
+  saveAlertsBtn.addEventListener("click", async () => {
+    const originalText = saveAlertsBtn.textContent;
+    saveAlertsBtn.textContent = "保存中...";
+    saveAlertsBtn.disabled = true;
+    if (alertsHint) {
+      alertsHint.textContent = "";
+      alertsHint.classList.remove("error");
+    }
+    try {
+      await saveAlertSettings();
+      flashButtonText(saveAlertsBtn, "已保存", 2000, originalText);
+    } catch (error) {
+      saveAlertsBtn.textContent = originalText;
+      saveAlertsBtn.disabled = false;
+      if (alertsHint) {
+        alertsHint.textContent = error.message;
+        alertsHint.classList.add("error");
+      }
+    }
+  });
+}
+
+if (testAlertsBtn) {
+  testAlertsBtn.addEventListener("click", async () => {
+    const originalText = testAlertsBtn.textContent;
+    testAlertsBtn.textContent = "测试中...";
+    testAlertsBtn.disabled = true;
+    if (alertsHint) {
+      alertsHint.textContent = "";
+      alertsHint.classList.remove("error");
+    }
+    try {
+      await testAlertSettings();
+      flashButtonText(testAlertsBtn, "测试成功", 2000, originalText);
+      if (alertsHint) {
+        alertsHint.textContent = "已发送测试消息，请检查飞书";
+      }
+    } catch (error) {
+      testAlertsBtn.textContent = originalText;
+      testAlertsBtn.disabled = false;
+      if (alertsHint) {
+        alertsHint.textContent = error.message;
+        alertsHint.classList.add("error");
+      }
+    }
+  });
+}
 
 saveGroupBtn.addEventListener("click", async () => {
   const originalText = saveGroupBtn.textContent;
