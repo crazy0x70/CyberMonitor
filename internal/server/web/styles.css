@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&family=JetBrains+Mono:wght@500;600&display=swap");
 
 :root {
   color-scheme: light;
@@ -9,6 +9,8 @@
   --accent-3: #ff8a3d;
   --text: #0f172a;
   --muted: #6b7280;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, monospace;
   --glass: rgba(255, 255, 255, 0.2);
   --glass-border: rgba(255, 255, 255, 0.4);
   --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
@@ -748,6 +750,7 @@ body {
   background: rgba(255, 255, 255, 0.7);
   border: 1px solid rgba(148, 163, 184, 0.25);
   overflow: hidden;
+  font-variant-numeric: tabular-nums;
 }
 
 .network-range {
@@ -764,7 +767,9 @@ body {
   color: #111827;
   padding: 4px 10px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
   cursor: pointer;
 }
 
@@ -829,11 +834,16 @@ body {
 
 .latency-chart-svg .latency-axis text {
   fill: var(--muted);
-  font-size: 8px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
 .latency-chart-svg .latency-lines path {
   filter: drop-shadow(0 4px 12px rgba(15, 23, 42, 0.1));
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .network-cards {
@@ -865,6 +875,12 @@ body {
   gap: 8px;
   font-size: 12px;
   color: var(--muted);
+}
+
+.network-card-stats span,
+.network-card-loss {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .network-card-stats span:nth-child(1) {
@@ -924,7 +940,9 @@ body {
 }
 
 .latency-tooltip-time {
-  font-size: 10px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.02em;
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 6px;
 }
@@ -938,7 +956,9 @@ body {
 }
 
 .latency-tooltip-row strong {
-  font-weight: 400;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 .latency-tooltip-dot {
