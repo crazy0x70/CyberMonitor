@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;600;700&family=Inter:wght@300;400;600;700&display=swap");
 
 :root {
   color-scheme: light;
@@ -9,7 +9,7 @@
   --accent-3: #ff8a3d;
   --text: #0f172a;
   --muted: #6b7280;
-  --font-base: "Inter", system-ui, sans-serif;
+  --font-base: "Open Sans", "Inter", system-ui, sans-serif;
   --glass: rgba(255, 255, 255, 0.2);
   --glass-border: rgba(255, 255, 255, 0.4);
   --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
@@ -762,6 +762,7 @@ svg text {
   background: rgba(255, 255, 255, 0.7);
   border: 1px solid rgba(148, 163, 184, 0.25);
   overflow: hidden;
+  font-weight: 300;
   font-variant-numeric: tabular-nums;
 }
 
@@ -780,7 +781,7 @@ svg text {
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 300;
   letter-spacing: 0.03em;
   cursor: pointer;
 }
@@ -814,7 +815,8 @@ svg text {
 }
 
 .legend-item.compact {
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 300;
 }
 
 .legend-dot {
@@ -825,18 +827,18 @@ svg text {
 }
 
 .legend-title {
-  font-weight: 400;
-  font-size: 10px;
+  font-weight: 300;
+  font-size: 9px;
   color: var(--text);
 }
 
 .network-canvas {
-  min-height: 200px;
+  min-height: 180px;
 }
 
 .network-canvas svg {
   width: 100%;
-  height: 200px;
+  height: 180px;
 }
 
 .latency-chart-svg .latency-grid line {
@@ -846,13 +848,13 @@ svg text {
 
 .latency-chart-svg .latency-axis text {
   fill: var(--muted);
-  font-size: 9px;
-  font-weight: 600;
+  font-size: 8px;
+  font-weight: 300;
   letter-spacing: 0.02em;
 }
 
 .latency-chart-svg .latency-lines path {
-  filter: drop-shadow(0 4px 12px rgba(15, 23, 42, 0.1));
+  filter: drop-shadow(0 2px 6px rgba(15, 23, 42, 0.08));
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -873,8 +875,8 @@ svg text {
 }
 
 .network-card-name {
-  font-weight: 400;
-  font-size: 13px;
+  font-weight: 300;
+  font-size: 12px;
   color: var(--text);
   margin-bottom: 8px;
   text-align: center;
@@ -884,7 +886,7 @@ svg text {
   display: flex;
   justify-content: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
 }
 
@@ -895,23 +897,23 @@ svg text {
 
 .network-card-stats span:nth-child(1) {
   color: #22c55e;
-  font-weight: 400;
+  font-weight: 300;
 }
 
 .network-card-stats span:nth-child(2) {
   color: var(--accent);
-  font-weight: 400;
+  font-weight: 300;
 }
 
 .network-card-stats span:nth-child(3) {
   color: #f97316;
-  font-weight: 400;
+  font-weight: 300;
 }
 
 .network-card-loss {
   margin-top: 6px;
   text-align: center;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
 }
 
@@ -937,7 +939,7 @@ svg text {
   border-radius: 12px;
   background: rgba(15, 23, 42, 0.86);
   color: #fff;
-  font-size: 11px;
+  font-size: 10px;
   box-shadow: 0 14px 32px rgba(15, 23, 42, 0.2);
   opacity: 0;
   pointer-events: none;
@@ -950,7 +952,7 @@ svg text {
 }
 
 .latency-tooltip-time {
-  font-size: 9px;
+  font-size: 8px;
   letter-spacing: 0.02em;
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 6px;
@@ -966,7 +968,7 @@ svg text {
 
 .latency-tooltip-row strong {
   font-variant-numeric: tabular-nums;
-  font-weight: 600;
+  font-weight: 300;
 }
 
 .latency-tooltip-dot {
@@ -976,7 +978,7 @@ svg text {
 }
 
 .latency-tooltip-name {
-  font-size: 11px;
+  font-size: 10px;
   color: rgba(255, 255, 255, 0.85);
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,6 +89,9 @@ const (
 	defaultAddr            = ":25012"
 	defaultTestIntervalSec = 5
 	defaultPersistInterval = 10 * time.Second
+	historyMaxAgeSec       = int64(60 * 60 * 24 * 365)
+	historyBasePoints      = 20000
+	historyMaxPoints       = 200000
 )
 
 //go:embed web/*
@@ -105,15 +109,19 @@ type Config struct {
 }
 
 type Store struct {
-	mu              sync.RWMutex
-	nodes           map[string]NodeState
-	profiles        map[string]*NodeProfile
-	settings        Settings
-	buildCommit     string
-	dataPath        string
-	lastPersist     time.Time
-	persistInterval time.Duration
-	alerted         map[string]bool
+	mu                 sync.RWMutex
+	nodes              map[string]NodeState
+	profiles           map[string]*NodeProfile
+	settings           Settings
+	buildCommit        string
+	dataPath           string
+	historyPath        string
+	lastPersist        time.Time
+	persistInterval    time.Duration
+	alerted            map[string]bool
+	testHistory        map[string]map[string]*TestHistoryEntry
+	historyDirty       bool
+	historyLastPersist time.Time
 }
 
 type NodeState struct {
@@ -180,11 +188,12 @@ type PublicSettings struct {
 }
 
 type Snapshot struct {
-	Type        string         `json:"type"`
-	GeneratedAt int64          `json:"generated_at"`
-	Nodes       []NodeView     `json:"nodes"`
-	Groups      []string       `json:"groups,omitempty"`
-	Settings    PublicSettings `json:"settings,omitempty"`
+	Type        string                                  `json:"type"`
+	GeneratedAt int64                                   `json:"generated_at"`
+	Nodes       []NodeView                              `json:"nodes"`
+	Groups      []string                                `json:"groups,omitempty"`
+	Settings    PublicSettings                          `json:"settings,omitempty"`
+	TestHistory map[string]map[string]*TestHistoryEntry `json:"test_history,omitempty"`
 }
 
 type Hub struct {
@@ -201,11 +210,20 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		log.Printf("读取持久化数据失败: %v", err)
 	}
+	historyPath := filepath.Join(cfg.DataDir, testHistoryFileName)
+	historyPayload, _, historyErr := loadTestHistoryData(historyPath)
+	if historyErr != nil {
+		log.Printf("读取探测历史失败: %v", historyErr)
+	}
 	tokenGenerated := !loaded || persisted.Settings.AuthToken == ""
 	defaultSettings := initSettings(cfg)
 	settings := defaultSettings
 	profiles := make(map[string]*NodeProfile)
 	nodes := make(map[string]NodeState)
+	testHistory := historyPayload.Nodes
+	if testHistory == nil {
+		testHistory = make(map[string]map[string]*TestHistoryEntry)
+	}
 	if loaded {
 		settings = mergeSettings(persisted.Settings, defaultSettings)
 		profiles = persisted.Profiles
@@ -239,8 +257,10 @@ func Run(ctx context.Context, cfg Config) error {
 		settings:        settings,
 		buildCommit:     commit,
 		dataPath:        dataPath,
+		historyPath:     historyPath,
 		persistInterval: defaultPersistInterval,
 		alerted:         make(map[string]bool),
+		testHistory:     testHistory,
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]struct{})}
 
@@ -285,7 +305,7 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	mux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		snapshot := storeSnapshot(store)
+		snapshot := storeSnapshot(store, true)
 		writeJSON(w, http.StatusOK, snapshot)
 	}))
 
@@ -329,7 +349,7 @@ func Run(ctx context.Context, cfg Config) error {
 	mux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			snapshot := storeSnapshot(store)
+			snapshot := storeSnapshot(store, true)
 			writeJSON(w, http.StatusOK, snapshot)
 		case http.MethodDelete:
 			store.ClearNodes()
@@ -381,6 +401,9 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			snapshot := storeSnapshot(store, false)
+			payload, _ := json.Marshal(snapshot)
+			hub.Broadcast(payload)
 			writeJSON(w, http.StatusOK, view)
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -448,7 +471,7 @@ func Run(ctx context.Context, cfg Config) error {
 		hub.Add(conn)
 
 		// 首次连接立即推送快照
-		snapshot := storeSnapshot(store)
+		snapshot := storeSnapshot(store, true)
 		payload, _ := json.Marshal(snapshot)
 		_ = conn.WriteMessage(websocket.TextMessage, payload)
 
@@ -510,7 +533,7 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			case <-ticker.C:
 				now := time.Now()
-				snapshot := storeSnapshot(store)
+				snapshot := storeSnapshot(store, false)
 				payload, _ := json.Marshal(snapshot)
 				hub.Broadcast(payload)
 				webhook, siteTitle, events := store.CollectOfflineAlerts(now)
@@ -581,6 +604,8 @@ func generateBootstrapToken() string {
 func (s *Store) Update(stats metrics.NodeStats) {
 	var persist bool
 	var data PersistedData
+	var historyPersist bool
+	var historyData TestHistoryData
 	s.mu.Lock()
 
 	now := time.Now()
@@ -632,8 +657,16 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	}
 	profile.UpdatedAt = now.Unix()
 
+	if s.updateTestHistoryLocked(stats, now) {
+		s.historyDirty = true
+	}
 	if s.shouldPersistLocked(now) {
 		persist = true
+	}
+	if s.historyDirty && s.shouldPersistHistoryLocked(now) {
+		historyPersist = true
+		historyData = s.snapshotTestHistoryLocked(now)
+		s.historyDirty = false
 	}
 	if persist {
 		data = s.snapshotPersistedLocked()
@@ -643,6 +676,171 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	if persist {
 		s.persist(data)
 	}
+	if historyPersist {
+		s.persistHistory(historyData)
+	}
+}
+
+func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) bool {
+	if len(stats.NetworkTests) == 0 {
+		return false
+	}
+	nodeID := strings.TrimSpace(stats.NodeID)
+	if nodeID == "" {
+		return false
+	}
+	if s.testHistory == nil {
+		s.testHistory = make(map[string]map[string]*TestHistoryEntry)
+	}
+	nodeHistory := s.testHistory[nodeID]
+	if nodeHistory == nil {
+		nodeHistory = make(map[string]*TestHistoryEntry)
+		s.testHistory[nodeID] = nodeHistory
+	}
+	nowSec := now.Unix()
+	changed := false
+	for _, test := range stats.NetworkTests {
+		key := buildTestHistoryKey(test)
+		if key == "" {
+			continue
+		}
+		entry := nodeHistory[key]
+		if entry == nil {
+			entry = &TestHistoryEntry{}
+			nodeHistory[key] = entry
+		}
+		normalizeHistoryEntry(entry)
+		checkedAt := test.CheckedAt
+		if checkedAt <= 0 {
+			checkedAt = nowSec
+		}
+		if entry.LastAt == 0 && len(entry.Times) > 0 {
+			entry.LastAt = entry.Times[len(entry.Times)-1]
+		}
+		if checkedAt <= entry.LastAt {
+			continue
+		}
+		if entry.LastAt > 0 {
+			interval := checkedAt - entry.LastAt
+			if interval > 0 {
+				if entry.MinIntervalSec == 0 || interval < entry.MinIntervalSec {
+					entry.MinIntervalSec = interval
+				}
+				if entry.AvgIntervalSec == 0 {
+					entry.AvgIntervalSec = float64(interval)
+				} else {
+					entry.AvgIntervalSec = entry.AvgIntervalSec*0.9 + float64(interval)*0.1
+				}
+			}
+		}
+		entry.Latency = append(entry.Latency, normalizeFloatPointer(test.LatencyMs))
+		entry.Loss = append(entry.Loss, normalizeFloatValue(test.PacketLoss))
+		entry.Times = append(entry.Times, checkedAt)
+		entry.LastAt = checkedAt
+		trimHistoryEntry(entry, nowSec)
+		changed = true
+	}
+	return changed
+}
+
+func buildTestHistoryKey(test metrics.NetworkTestResult) string {
+	kind := strings.ToLower(strings.TrimSpace(test.Type))
+	if kind == "" {
+		kind = "icmp"
+	}
+	host := strings.ToLower(strings.TrimSpace(test.Host))
+	name := strings.ToLower(strings.TrimSpace(test.Name))
+	if host == "" && name == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%d|%s", kind, host, test.Port, name)
+}
+
+func normalizeHistoryEntry(entry *TestHistoryEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.Times == nil {
+		entry.Times = []int64{}
+	}
+	count := len(entry.Times)
+	if entry.Latency == nil {
+		entry.Latency = make([]*float64, 0, count)
+	}
+	if entry.Loss == nil {
+		entry.Loss = make([]*float64, 0, count)
+	}
+	if count == 0 {
+		entry.Latency = entry.Latency[:0]
+		entry.Loss = entry.Loss[:0]
+		return
+	}
+	if len(entry.Latency) > count {
+		entry.Latency = entry.Latency[len(entry.Latency)-count:]
+	}
+	if len(entry.Loss) > count {
+		entry.Loss = entry.Loss[len(entry.Loss)-count:]
+	}
+	for len(entry.Latency) < count {
+		entry.Latency = append(entry.Latency, nil)
+	}
+	for len(entry.Loss) < count {
+		entry.Loss = append(entry.Loss, nil)
+	}
+}
+
+func trimHistoryEntry(entry *TestHistoryEntry, nowSec int64) {
+	if entry == nil {
+		return
+	}
+	normalizeHistoryEntry(entry)
+	cutoff := nowSec - historyMaxAgeSec
+	for len(entry.Times) > 0 && entry.Times[0] < cutoff {
+		entry.Times = entry.Times[1:]
+		if len(entry.Latency) > 0 {
+			entry.Latency = entry.Latency[1:]
+		}
+		if len(entry.Loss) > 0 {
+			entry.Loss = entry.Loss[1:]
+		}
+	}
+	interval := entry.MinIntervalSec
+	if interval <= 0 {
+		interval = int64(defaultTestIntervalSec)
+	}
+	maxPoints := int(historyMaxAgeSec/interval) + 10
+	if maxPoints < historyBasePoints {
+		maxPoints = historyBasePoints
+	}
+	if maxPoints > historyMaxPoints {
+		maxPoints = historyMaxPoints
+	}
+	if len(entry.Times) > maxPoints {
+		start := len(entry.Times) - maxPoints
+		entry.Times = entry.Times[start:]
+		entry.Latency = entry.Latency[start:]
+		entry.Loss = entry.Loss[start:]
+	}
+}
+
+func normalizeFloatPointer(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	v := *value
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil
+	}
+	clone := v
+	return &clone
+}
+
+func normalizeFloatValue(value float64) *float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	clone := value
+	return &clone
 }
 
 type AlertEvent struct {
@@ -812,15 +1010,57 @@ func normalizeSiteTitle(title string) string {
 	return value
 }
 
-func storeSnapshot(s *Store) Snapshot {
+func storeSnapshot(s *Store, withHistory bool) Snapshot {
 	nodes := s.Snapshot()
-	return Snapshot{
+	snapshot := Snapshot{
 		Type:        "snapshot",
 		GeneratedAt: time.Now().Unix(),
 		Nodes:       nodes,
 		Groups:      s.SettingsGroups(),
 		Settings:    s.PublicSettings(),
 	}
+	if withHistory {
+		snapshot.TestHistory = s.snapshotTestHistory()
+	}
+	return snapshot
+}
+
+func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneTestHistory(s.testHistory)
+}
+
+func cloneTestHistory(
+	source map[string]map[string]*TestHistoryEntry,
+) map[string]map[string]*TestHistoryEntry {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]map[string]*TestHistoryEntry, len(source))
+	for nodeID, tests := range source {
+		if tests == nil {
+			continue
+		}
+		copiedTests := make(map[string]*TestHistoryEntry, len(tests))
+		for key, entry := range tests {
+			if entry == nil {
+				continue
+			}
+			copiedTests[key] = &TestHistoryEntry{
+				Latency:        append([]*float64(nil), entry.Latency...),
+				Loss:           append([]*float64(nil), entry.Loss...),
+				Times:          append([]int64(nil), entry.Times...),
+				LastAt:         entry.LastAt,
+				MinIntervalSec: entry.MinIntervalSec,
+				AvgIntervalSec: entry.AvgIntervalSec,
+			}
+		}
+		if len(copiedTests) > 0 {
+			result[nodeID] = copiedTests
+		}
+	}
+	return result
 }
 
 func (s *Store) Snapshot() []NodeView {
@@ -1239,24 +1479,54 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfi
 
 func (s *Store) DeleteNode(nodeID string) bool {
 	var data PersistedData
+	var historyData TestHistoryData
+	var historyPersist bool
+	now := time.Now()
 	s.mu.Lock()
 	_, exists := s.nodes[nodeID]
 	delete(s.nodes, nodeID)
 	delete(s.profiles, nodeID)
+	if s.testHistory != nil {
+		if _, ok := s.testHistory[nodeID]; ok {
+			delete(s.testHistory, nodeID)
+			s.historyDirty = true
+		}
+	}
+	if s.historyDirty && s.shouldPersistHistoryLocked(now) {
+		historyPersist = true
+		historyData = s.snapshotTestHistoryLocked(now)
+		s.historyDirty = false
+	}
 	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
 	s.persist(data)
+	if historyPersist {
+		s.persistHistory(historyData)
+	}
 	return exists
 }
 
 func (s *Store) ClearNodes() {
 	var data PersistedData
+	var historyData TestHistoryData
+	var historyPersist bool
+	now := time.Now()
 	s.mu.Lock()
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
+	s.testHistory = make(map[string]map[string]*TestHistoryEntry)
+	s.historyDirty = true
+	if s.shouldPersistHistoryLocked(now) {
+		historyPersist = true
+		historyData = s.snapshotTestHistoryLocked(now)
+		s.historyDirty = false
+	}
 	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
 	s.persist(data)
+	if historyPersist {
+		s.persistHistory(historyData)
+	}
 }
 
 func (s *Store) AgentConfig(nodeID string) AgentConfig {
@@ -1299,6 +1569,14 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 	}
 }
 
+func (s *Store) snapshotTestHistoryLocked(now time.Time) TestHistoryData {
+	return TestHistoryData{
+		Version:   testHistoryVersion,
+		UpdatedAt: now.Unix(),
+		Nodes:     cloneTestHistory(s.testHistory),
+	}
+}
+
 func (s *Store) persist(data PersistedData) {
 	if s.dataPath == "" {
 		return
@@ -1312,6 +1590,19 @@ func (s *Store) persist(data PersistedData) {
 	s.mu.Unlock()
 }
 
+func (s *Store) persistHistory(data TestHistoryData) {
+	if s.historyPath == "" {
+		return
+	}
+	if err := saveTestHistoryData(s.historyPath, data); err != nil {
+		log.Printf("探测历史持久化失败: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.historyLastPersist = time.Now()
+	s.mu.Unlock()
+}
+
 func (s *Store) shouldPersistLocked(now time.Time) bool {
 	if s.persistInterval <= 0 {
 		return false
@@ -1320,6 +1611,16 @@ func (s *Store) shouldPersistLocked(now time.Time) bool {
 		return true
 	}
 	return now.Sub(s.lastPersist) >= s.persistInterval
+}
+
+func (s *Store) shouldPersistHistoryLocked(now time.Time) bool {
+	if s.persistInterval <= 0 {
+		return false
+	}
+	if s.historyLastPersist.IsZero() {
+		return true
+	}
+	return now.Sub(s.historyLastPersist) >= s.persistInterval
 }
 
 func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {

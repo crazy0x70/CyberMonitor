@@ -20,6 +20,8 @@ const (
 	defaultHomeTitle       = "CyberMonitor"
 	defaultHomeSub         = "主机监控"
 	defaultAlertOfflineSec = 300
+	testHistoryVersion     = 1
+	testHistoryFileName    = "test_history.json"
 )
 
 type Settings struct {
@@ -83,6 +85,21 @@ type PersistedData struct {
 	Settings Settings                `json:"settings"`
 	Profiles map[string]*NodeProfile `json:"profiles"`
 	Nodes    map[string]NodeState    `json:"nodes,omitempty"`
+}
+
+type TestHistoryEntry struct {
+	Latency        []*float64 `json:"latency"`
+	Loss           []*float64 `json:"loss"`
+	Times          []int64    `json:"times"`
+	LastAt         int64      `json:"last_at"`
+	MinIntervalSec int64      `json:"min_interval_sec,omitempty"`
+	AvgIntervalSec float64    `json:"avg_interval_sec,omitempty"`
+}
+
+type TestHistoryData struct {
+	Version   int                                     `json:"version"`
+	UpdatedAt int64                                   `json:"updated_at,omitempty"`
+	Nodes     map[string]map[string]*TestHistoryEntry `json:"nodes,omitempty"`
 }
 
 type ResetResult struct {
@@ -165,6 +182,39 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 }
 
 func savePersistedData(path string, payload PersistedData) error {
+	if err := ensureDataDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func loadTestHistoryData(path string) (TestHistoryData, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return TestHistoryData{Nodes: make(map[string]map[string]*TestHistoryEntry)}, false, nil
+		}
+		return TestHistoryData{}, false, err
+	}
+	var payload TestHistoryData
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return TestHistoryData{}, false, err
+	}
+	if payload.Nodes == nil {
+		payload.Nodes = make(map[string]map[string]*TestHistoryEntry)
+	}
+	return payload, true, nil
+}
+
+func saveTestHistoryData(path string, payload TestHistoryData) error {
 	if err := ensureDataDir(filepath.Dir(path)); err != nil {
 		return err
 	}

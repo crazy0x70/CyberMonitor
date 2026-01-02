@@ -84,6 +84,7 @@ function handleSnapshot(payload) {
   state.lastNodes = payload.nodes || [];
   state.settingsGroups = payload.groups || [];
   applyPublicSettings(payload.settings || {});
+  applyTestHistory(payload.test_history);
   if (lastUpdated) {
     lastUpdated.textContent = new Date(
       (payload.generated_at || 0) * 1000
@@ -165,6 +166,71 @@ function applyPublicSettings(settings) {
   }
 
   updateFooter(commit);
+}
+
+function applyTestHistory(history) {
+  if (!history || typeof history !== "object") return;
+  Object.entries(history).forEach(([nodeId, tests]) => {
+    if (!tests || typeof tests !== "object") return;
+    let map = state.testHistory.get(nodeId);
+    if (!map) {
+      map = new Map();
+      state.testHistory.set(nodeId, map);
+    }
+    Object.entries(tests).forEach(([key, entry]) => {
+      const normalized = normalizeTestHistoryEntry(entry);
+      if (!normalized) return;
+      const existing = map.get(key);
+      const incomingLast = normalized.lastAt || 0;
+      const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
+      if (!existing || incomingLast > existingLast) {
+        map.set(key, normalized);
+      }
+    });
+  });
+}
+
+function normalizeTestHistoryEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const times = Array.isArray(entry.times)
+    ? entry.times.map((value) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : 0;
+      })
+    : [];
+  const size = times.length;
+  const latency = normalizeTestHistorySeries(entry.latency, size);
+  const loss = normalizeTestHistorySeries(entry.loss, size);
+  const lastAt = Number(
+    entry.last_at ??
+      entry.lastAt ??
+      (size > 0 ? times[times.length - 1] : 0)
+  );
+  const minIntervalSec = Number(entry.min_interval_sec ?? entry.minIntervalSec ?? 0);
+  const avgIntervalSec = Number(entry.avg_interval_sec ?? entry.avgIntervalSec ?? 0);
+  return {
+    latency,
+    loss,
+    times,
+    lastAt: Number.isFinite(lastAt) ? lastAt : 0,
+    minIntervalSec: Number.isFinite(minIntervalSec) ? minIntervalSec : 0,
+    avgIntervalSec: Number.isFinite(avgIntervalSec) ? avgIntervalSec : 0,
+  };
+}
+
+function normalizeTestHistorySeries(series, size) {
+  const source = Array.isArray(series) ? series : [];
+  const normalized = [];
+  for (let i = 0; i < size; i += 1) {
+    const value = source[i];
+    if (value === null || value === undefined) {
+      normalized.push(null);
+      continue;
+    }
+    const number = Number(value);
+    normalized.push(Number.isFinite(number) ? number : null);
+  }
+  return normalized;
 }
 
 function updateFooter(commit) {
@@ -1420,7 +1486,7 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
       const path = buildLinePath(series, stepX, padding, plotHeight, maxValue);
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
-      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2.2" />`;
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.1" />`;
     })
     .join("");
 
