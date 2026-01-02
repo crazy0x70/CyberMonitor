@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&family=JetBrains+Mono:wght@500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap");
 
 :root {
   color-scheme: light;
@@ -9,8 +9,7 @@
   --accent-3: #ff8a3d;
   --text: #0f172a;
   --muted: #6b7280;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
-    Consolas, monospace;
+  --font-base: "Inter", system-ui, sans-serif;
   --glass: rgba(255, 255, 255, 0.2);
   --glass-border: rgba(255, 255, 255, 0.4);
   --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
@@ -20,13 +19,26 @@
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
-  font-family: "Open Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-base);
   color: var(--text);
   background: radial-gradient(120% 120% at 10% 0%, #ffffff 0%, var(--bg-1) 45%, var(--bg-2) 100%);
   min-height: 100vh;
   overflow-x: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+svg,
+svg text {
+  font-family: var(--font-base);
 }
 
 .bg-orb {
@@ -834,7 +846,6 @@ body {
 
 .latency-chart-svg .latency-axis text {
   fill: var(--muted);
-  font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -879,7 +890,6 @@ body {
 
 .network-card-stats span,
 .network-card-loss {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
 
@@ -940,7 +950,6 @@ body {
 }
 
 .latency-tooltip-time {
-  font-family: var(--font-mono);
   font-size: 9px;
   letter-spacing: 0.02em;
   color: rgba(255, 255, 255, 0.7);
@@ -956,7 +965,6 @@ body {
 }
 
 .latency-tooltip-row strong {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-weight: 600;
 }
