@@ -1448,6 +1448,19 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
+.input-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 140px;
+  align-items: center;
+}
+
+@media (max-width: 720px) {
+  .input-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .field-compact .input {
   max-width: 220px;
 }
@@ -1702,6 +1715,21 @@ body {
 .test-select-list {
   display: grid;
   gap: 8px;
+}
+
+#alert-node-list {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+#alert-node-list .alert-node-item {
+  display: flex;
+}
+
+#alert-node-list .check {
+  width: 100%;
+  justify-content: flex-start;
 }
 
 .test-select-row {

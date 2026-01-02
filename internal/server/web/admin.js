@@ -436,11 +436,11 @@ function renderAlertTargets() {
     const stats = node.stats || {};
     const nodeID = stats.node_id || stats.node_name || "";
     if (!nodeID) return;
-    const row = document.createElement("div");
-    row.className = "check-row";
+    const item = document.createElement("div");
+    item.className = "alert-node-item";
     const checked = selectedAll || selected.has(nodeID);
     const disabled = selectedAll;
-    row.innerHTML = `
+    item.innerHTML = `
       <label class="check">
         <input type="checkbox" data-node-id="${escapeHtml(nodeID)}" ${
           checked ? "checked" : ""
@@ -448,7 +448,7 @@ function renderAlertTargets() {
         <span>${escapeHtml(resolveNodeDisplayName(node))}</span>
       </label>
     `;
-    alertNodeList.appendChild(row);
+    alertNodeList.appendChild(item);
   });
 }
 
@@ -469,12 +469,12 @@ function createNodeCard(node) {
     : "--";
   const status = node.status === "offline" ? "离线" : "在线";
   const metaParts = [];
-  if (hostLabel && hostLabel !== displayName) {
-    metaParts.push(escapeHtml(hostLabel));
-  }
   metaParts.push(escapeHtml(stats.os || "--"));
   if (stats.agent_version) {
     metaParts.push(`Agent ${escapeHtml(stats.agent_version)}`);
+  }
+  if (hostLabel && hostLabel !== displayName) {
+    metaParts.push(escapeHtml(hostLabel));
   }
   metaParts.push(status);
   metaParts.push(lastSeen);
@@ -517,10 +517,13 @@ function createNodeCard(node) {
           </details>
         </label>
         <div class="field-row span-full">
-          <label class="field field-compact">
-            <span>到期时间</span>
-            <input class="input" type="datetime-local" step="1" data-field="expire" />
-          </label>
+        <label class="field field-compact">
+          <span>到期时间</span>
+          <div class="input-row">
+            <input class="input" type="date" data-field="expire-date" />
+            <input class="input" type="time" step="1" data-field="expire-time" />
+          </div>
+        </label>
           <label class="field field-compact">
             <span>自动续费</span>
             <select class="input" data-field="auto-renew">
@@ -557,8 +560,16 @@ function createNodeCard(node) {
   const diskTypeInput = card.querySelector('[data-field="disk-type"]');
   diskTypeInput.value = node.disk_type || "";
 
-  const expireInput = card.querySelector('[data-field="expire"]');
-  expireInput.value = formatLocalDateTime(node.expire_at || 0);
+  const expireDateInput = card.querySelector('[data-field="expire-date"]');
+  const expireTimeInput = card.querySelector('[data-field="expire-time"]');
+  const expireValue = formatLocalDateTime(node.expire_at || 0);
+  const [expireDate, expireTime] = expireValue.split("T");
+  if (expireDateInput) {
+    expireDateInput.value = expireDate || "";
+  }
+  if (expireTimeInput) {
+    expireTimeInput.value = expireTime || "";
+  }
 
   const autoRenewSelect = card.querySelector('[data-field="auto-renew"]');
   autoRenewSelect.value = resolveRenewPlan(node.auto_renew, node.renew_interval_sec);
@@ -1170,7 +1181,11 @@ async function saveNode(nodeID, card) {
   const region = card.querySelector('[data-field="region"]').value.trim().toUpperCase();
   const netSpeedRaw = card.querySelector('[data-field="net-speed"]').value;
   const diskTypeRaw = card.querySelector('[data-field="disk-type"]').value;
-  const expireRaw = card.querySelector('[data-field="expire"]').value;
+  const expireDateRaw =
+    card.querySelector('[data-field="expire-date"]')?.value || "";
+  const expireTimeRaw =
+    card.querySelector('[data-field="expire-time"]')?.value || "";
+  const expireRaw = combineExpireInput(expireDateRaw, expireTimeRaw);
   const renewPlan = card.querySelector('[data-field="auto-renew"]').value;
   const groups = collectGroupTags(card);
   const selections = collectSelections(card);
@@ -1371,6 +1386,14 @@ function normalizeExpireInput(value) {
     return `${raw}:00`;
   }
   return raw.replace(/\.\d+$/, "");
+}
+
+function combineExpireInput(dateValue, timeValue) {
+  const date = String(dateValue || "").trim();
+  if (!date) return "";
+  const time = String(timeValue || "").trim();
+  if (!time) return date;
+  return `${date}T${time}`;
 }
 
 function parseLocalDateTime(value) {

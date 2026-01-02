@@ -35,7 +35,7 @@ type Settings struct {
 	HomeSubtitle    string            `json:"home_subtitle,omitempty"`
 	AlertWebhook    string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll        bool              `json:"alert_all,omitempty"`
+	AlertAll        bool              `json:"alert_all"`
 	AlertNodes      []string          `json:"alert_nodes,omitempty"`
 	Groups          []string          `json:"groups,omitempty"`
 	GroupTree       []GroupNode       `json:"group_tree,omitempty"`
@@ -53,7 +53,7 @@ type SettingsView struct {
 	HomeSubtitle    string            `json:"home_subtitle,omitempty"`
 	AlertWebhook    string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll        bool              `json:"alert_all,omitempty"`
+	AlertAll        bool              `json:"alert_all"`
 	AlertNodes      []string          `json:"alert_nodes,omitempty"`
 	Commit          string            `json:"commit,omitempty"`
 	Groups          []string          `json:"groups,omitempty"`
