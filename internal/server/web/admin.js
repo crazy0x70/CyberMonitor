@@ -11,7 +11,7 @@ const adminUserInput = document.getElementById("admin-user");
 const adminPassInput = document.getElementById("admin-pass");
 const agentEndpointInput = document.getElementById("agent-endpoint");
 const siteTitleInput = document.getElementById("site-title");
-const siteIconInput = document.getElementById("site-icon");
+const siteIconInput = document.getElementById("site-icon-input");
 const homeTitleInput = document.getElementById("home-title");
 const homeSubtitleInput = document.getElementById("home-subtitle");
 const groupTree = document.getElementById("group-tree");
@@ -27,7 +27,8 @@ const settingsHint = document.getElementById("settings-hint");
 const sideLinks = document.querySelectorAll(".side-link[data-section]");
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
-const siteIcon = document.getElementById("site-icon");
+const siteIconLink = document.getElementById("site-icon");
+const brandTitle = document.querySelector(".brand-link");
 const installLinux = document.getElementById("install-linux");
 const installWindows = document.getElementById("install-windows");
 const installTabs = document.querySelectorAll("[data-install-tab]");
@@ -118,6 +119,16 @@ async function loadSettings() {
   applySettingsView(data);
 }
 
+function updateAdminBrand(settings) {
+  const siteTitle = (settings.site_title || "").trim();
+  const homeTitle = (settings.home_title || "").trim();
+  const resolvedTitle = homeTitle || siteTitle || "CyberMonitor";
+  if (brandTitle) {
+    brandTitle.textContent = resolvedTitle;
+  }
+  document.title = `${resolvedTitle} 管理后台`;
+}
+
 function applySettingsView(data) {
   adminPathInput.value = data.admin_path || "";
   adminUserInput.value = data.admin_user || "";
@@ -135,8 +146,13 @@ function applySettingsView(data) {
   siteIconInput.value = data.site_icon || "";
   homeTitleInput.value = data.home_title || "";
   homeSubtitleInput.value = data.home_subtitle || "";
-  if (siteIcon) {
-    siteIcon.setAttribute("href", data.site_icon || "");
+  updateAdminBrand(data);
+  if (siteIconLink) {
+    if (data.site_icon) {
+      siteIconLink.setAttribute("href", data.site_icon);
+    } else {
+      siteIconLink.removeAttribute("href");
+    }
   }
   if (typeof data.agent_token === "string" && data.agent_token) {
     state.settings.agentToken = data.agent_token;
@@ -1026,9 +1042,9 @@ async function saveNode(nodeID, card) {
   let expireAt = 0;
   const normalizedExpire = normalizeExpireInput(expireRaw);
   if (normalizedExpire) {
-    const parsed = Date.parse(normalizedExpire);
-    if (!Number.isNaN(parsed)) {
-      expireAt = Math.floor(parsed / 1000);
+    expireAt = parseLocalDateTime(normalizedExpire);
+    if (!expireAt) {
+      throw new Error("到期时间格式无效，请补全日期或时间");
     }
   }
 
@@ -1205,6 +1221,23 @@ function normalizeExpireInput(value) {
     return `${raw}:00`;
   }
   return raw;
+}
+
+function parseLocalDateTime(value) {
+  const match = String(value || "").match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/
+  );
+  if (!match) return 0;
+  const year = Number(match[1]);
+  const month = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const date = new Date(year, month, day, hour, minute, second);
+  const timestamp = date.getTime();
+  if (Number.isNaN(timestamp)) return 0;
+  return Math.floor(timestamp / 1000);
 }
 
 function planToSeconds(plan) {

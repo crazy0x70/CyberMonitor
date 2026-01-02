@@ -167,11 +167,15 @@ func (c *Collector) Collect() (NodeStats, error) {
 	hostname := ""
 	uptime := uint64(0)
 	processCount := 0
+	arch := detectArch()
 	if hostInfo != nil {
 		osLabel = hostInfo.Platform + " " + hostInfo.PlatformVersion
 		hostname = hostInfo.Hostname
 		uptime = hostInfo.Uptime
 		processCount = int(hostInfo.Procs)
+		if normalized := normalizeArch(hostInfo.KernelArch); normalized != "" {
+			arch = normalized
+		}
 	}
 	if hostOS := readHostOSRelease(c.hostRoot); hostOS != "" {
 		osLabel = hostOS
@@ -195,7 +199,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 		NodeName:  c.nodeName,
 		Hostname:  hostname,
 		OS:        osLabel,
-		Arch:      detectArch(),
+		Arch:      arch,
 		UptimeSec: uptime,
 		Timestamp: now.Unix(),
 		NetSpeedMbps: netSpeedMbps,
@@ -507,6 +511,25 @@ func readHostHostname(hostRoot string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func normalizeArch(value string) string {
+	arch := strings.ToLower(strings.TrimSpace(value))
+	if arch == "" {
+		return ""
+	}
+	switch arch {
+	case "x86_64", "x64", "amd64":
+		return "amd64"
+	case "i386", "i686", "x86":
+		return "386"
+	case "aarch64", "arm64":
+		return "arm64"
+	case "armv7l", "armv6l", "arm":
+		return "arm"
+	default:
+		return arch
+	}
 }
 
 func detectArch() string {
