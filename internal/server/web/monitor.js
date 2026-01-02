@@ -25,7 +25,7 @@ const state = {
   testHistory: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
-  testRangeMaxSec: rangeSeconds("24h"),
+  testRangeMaxSec: 60 * 60 * 24,
   renderMode: "flat",
   tagSections: new Map(),
 };
