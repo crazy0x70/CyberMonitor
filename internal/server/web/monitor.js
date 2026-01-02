@@ -25,6 +25,7 @@ const state = {
   testHistory: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
+  testRangeMaxSec: rangeSeconds("24h"),
   renderMode: "flat",
   tagSections: new Map(),
 };
@@ -1030,6 +1031,10 @@ function renderRangeTabs(fields, nodeId, active) {
     button.addEventListener("click", () => {
       if (item.key === active) return;
       state.testRange.set(nodeId, item.key);
+      const selectedRange = rangeSeconds(item.key);
+      if (Number.isFinite(selectedRange) && selectedRange > state.testRangeMaxSec) {
+        state.testRangeMaxSec = selectedRange;
+      }
       renderNetworkSection(fields, nodeId);
     });
     fields.testRange.appendChild(button);
@@ -1145,14 +1150,30 @@ function updateTestHistory(nodeId, tests) {
     state.testHistory.set(nodeId, new Map());
   }
   const map = state.testHistory.get(nodeId);
-  const maxPoints = 2000;
+  const baseMaxPoints = 20000;
+  const maxPointsCap = 200000;
   const maxAge = 60 * 60 * 24 * 365;
   tests.forEach((test) => {
     const key = testKey(test);
     if (!key) return;
-    const entry = map.get(key) || { latency: [], loss: [], times: [], lastAt: 0 };
+    const entry = map.get(key) || {
+      latency: [],
+      loss: [],
+      times: [],
+      lastAt: 0,
+      minIntervalSec: 0,
+    };
     const checkedAt = test.checked_at || 0;
     if (checkedAt > entry.lastAt) {
+      const intervalSec =
+        entry.lastAt > 0 && checkedAt > entry.lastAt
+          ? checkedAt - entry.lastAt
+          : 0;
+      if (intervalSec > 0) {
+        if (!entry.minIntervalSec || intervalSec < entry.minIntervalSec) {
+          entry.minIntervalSec = intervalSec;
+        }
+      }
       const value =
         test.latency_ms !== null && test.latency_ms !== undefined
           ? test.latency_ms
@@ -1174,6 +1195,13 @@ function updateTestHistory(nodeId, tests) {
         entry.latency.shift();
         entry.loss.shift();
       }
+      const interval = entry.minIntervalSec > 0 ? entry.minIntervalSec : 5;
+      const desiredPoints =
+        Math.ceil(state.testRangeMaxSec / interval) + 10;
+      const maxPoints = Math.min(
+        maxPointsCap,
+        Math.max(baseMaxPoints, desiredPoints)
+      );
       if (entry.latency.length > maxPoints) {
         entry.latency = entry.latency.slice(-maxPoints);
         entry.loss = entry.loss.slice(-maxPoints);

@@ -407,7 +407,8 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhook 不能为空"})
 			return
 		}
-		if err := sendFeishuTest(webhook); err != nil {
+		siteTitle := store.SiteTitle()
+		if err := sendFeishuTest(webhook, siteTitle); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
@@ -512,9 +513,9 @@ func Run(ctx context.Context, cfg Config) error {
 				snapshot := storeSnapshot(store)
 				payload, _ := json.Marshal(snapshot)
 				hub.Broadcast(payload)
-				webhook, events := store.CollectOfflineAlerts(now)
+				webhook, siteTitle, events := store.CollectOfflineAlerts(now)
 				if len(events) > 0 {
-					go sendFeishuAlert(webhook, events)
+					go sendFeishuAlert(webhook, siteTitle, events)
 				}
 			}
 		}
@@ -652,14 +653,15 @@ type AlertEvent struct {
 	OfflineSec int64
 }
 
-func (s *Store) CollectOfflineAlerts(now time.Time) (string, []AlertEvent) {
+func (s *Store) CollectOfflineAlerts(now time.Time) (string, string, []AlertEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	webhook := strings.TrimSpace(s.settings.AlertWebhook)
 	if webhook == "" || s.settings.AlertOfflineSec <= 0 {
-		return "", nil
+		return "", "", nil
 	}
+	siteTitle := normalizeSiteTitle(s.settings.SiteTitle)
 	alertAll := s.settings.AlertAll
 	selected := make(map[string]struct{})
 	if !alertAll {
@@ -714,20 +716,20 @@ func (s *Store) CollectOfflineAlerts(now time.Time) (string, []AlertEvent) {
 		}
 	}
 
-	return webhook, events
+	return webhook, siteTitle, events
 }
 
-func sendFeishuAlert(webhook string, events []AlertEvent) {
+func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) {
 	if webhook == "" || len(events) == 0 {
 		return
 	}
-	if err := sendFeishuText(webhook, buildAlertMessage(events)); err != nil {
+	if err := sendFeishuText(webhook, buildAlertMessage(siteTitle, events)); err != nil {
 		log.Printf("告警发送失败: %v", err)
 	}
 }
 
-func sendFeishuTest(webhook string) error {
-	message := fmt.Sprintf("[CyberMonitor] 告警测试 %s", time.Now().Format("2006-01-02 15:04:05"))
+func sendFeishuTest(webhook, siteTitle string) error {
+	message := fmt.Sprintf("【%s】告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
 	return sendFeishuText(webhook, message)
 }
 
@@ -763,20 +765,16 @@ func sendFeishuText(webhook, text string) error {
 	return nil
 }
 
-func buildAlertMessage(events []AlertEvent) string {
-	lines := []string{"[CyberMonitor] 服务器离线告警"}
+func buildAlertMessage(siteTitle string, events []AlertEvent) string {
+	lines := []string{fmt.Sprintf("【%s】服务器离线告警", normalizeSiteTitle(siteTitle)), "", "离线节点："}
 	for _, event := range events {
-		label := event.Display
-		if event.NodeID != "" && event.NodeID != event.Display {
-			label = fmt.Sprintf("%s (%s)", event.Display, event.NodeID)
+		label := strings.TrimSpace(event.Display)
+		if label == "" {
+			label = "未命名节点"
 		}
-		lines = append(lines, fmt.Sprintf("- %s | %s | 离线 %s | 最后上报 %s",
-			label,
-			formatAlertValue(event.OS, "--"),
-			formatAlertDuration(event.OfflineSec),
-			time.Unix(event.LastSeen, 0).Format("2006-01-02 15:04:05"),
-		))
+		lines = append(lines, fmt.Sprintf("• %s", label))
 	}
+	lines = append(lines, "", "请及时检查服务器状态。")
 	return strings.Join(lines, "\n")
 }
 
@@ -804,6 +802,14 @@ func formatAlertValue(value, fallback string) string {
 		return fallback
 	}
 	return strings.TrimSpace(value)
+}
+
+func normalizeSiteTitle(title string) string {
+	value := strings.TrimSpace(title)
+	if value == "" {
+		return defaultSiteTitle
+	}
+	return value
 }
 
 func storeSnapshot(s *Store) Snapshot {
@@ -997,6 +1003,12 @@ func (s *Store) AlertWebhook() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return strings.TrimSpace(s.settings.AlertWebhook)
+}
+
+func (s *Store) SiteTitle() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeSiteTitle(s.settings.SiteTitle)
 }
 
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
