@@ -203,6 +203,46 @@ function rangeSeconds(key) {
   return match ? match.seconds : RANGE_OPTIONS[1].seconds;
 }
 
+const TEST_RANGE_INTERVALS = {
+  "1h": 5,
+  "24h": 60 * 2,
+  "7d": 60 * 15,
+  "30d": 60 * 60,
+  "1y": 60 * 60 * 12,
+};
+
+function resolveTestRangeInterval(rangeKey, rangeSec) {
+  const base = TEST_RANGE_INTERVALS[rangeKey];
+  if (Number.isFinite(base) && base > 0) {
+    return base;
+  }
+  const derived = Math.round(rangeSec / 720);
+  return Math.max(5, derived || 5);
+}
+
+function buildTestGrid(rangeKey, rangeSec, nowSec, observedIntervalSec) {
+  const safeRangeSec =
+    Number.isFinite(rangeSec) && rangeSec > 0 ? rangeSec : 3600;
+  const baseInterval = resolveTestRangeInterval(rangeKey, safeRangeSec);
+  const observed =
+    Number.isFinite(observedIntervalSec) && observedIntervalSec > 0
+      ? observedIntervalSec
+      : 0;
+  const intervalSec = Math.max(baseInterval, observed);
+  const points = Math.max(2, Math.round(safeRangeSec / intervalSec));
+  const startSec = nowSec - safeRangeSec;
+  const times = Array.from({ length: points }, (_, index) => {
+    return startSec + index * intervalSec;
+  });
+  return {
+    points,
+    intervalSec,
+    startSec,
+    times,
+    rangeSec: safeRangeSec,
+  };
+}
+
 function collectGroupNames(nodes, settingsGroups) {
   const set = new Set();
   (settingsGroups || []).forEach((group) => set.add(group));
@@ -952,22 +992,44 @@ function renderNetworkSection(fields, nodeId) {
   const seriesList = [];
   const colors = [];
   const labels = [];
-  let timeSeries = [];
   const now = Math.floor(Date.now() / 1000);
   const rangeSec = rangeSeconds(activeRange);
+  const testEntries = [];
+  let observedIntervalSec = 0;
 
   tests.forEach((test, index) => {
     const key = testKey(test);
     const history = historyMap.get(key) || { latency: [], loss: [], times: [] };
     const color = testColor(key, index);
     const filtered = filterHistoryByRange(history, rangeSec, now);
-    if (filtered.latency.length > 0) {
-      seriesList.push(filtered.latency);
-      colors.push(color);
-      labels.push(formatTestName(test));
-      if (filtered.times.length > timeSeries.length) {
-        timeSeries = filtered.times;
-      }
+    const intervalHint =
+      history.avgIntervalSec || history.minIntervalSec || 0;
+    if (Number.isFinite(intervalHint) && intervalHint > observedIntervalSec) {
+      observedIntervalSec = intervalHint;
+    }
+    testEntries.push({
+      test,
+      history,
+      filtered,
+      color,
+      label: formatTestName(test),
+    });
+  });
+
+  const grid = buildTestGrid(
+    activeRange,
+    rangeSec,
+    now,
+    observedIntervalSec
+  );
+  const timeSeries = grid.times;
+
+  testEntries.forEach((entry) => {
+    const sampled = resampleHistoryForGrid(entry.history, grid);
+    if (hasSeriesData(sampled.latency)) {
+      seriesList.push(sampled.latency);
+      colors.push(entry.color);
+      labels.push(entry.label);
     }
 
     const legend = document.createElement("div");
@@ -975,11 +1037,11 @@ function renderNetworkSection(fields, nodeId) {
 
     const dot = document.createElement("span");
     dot.className = "legend-dot";
-    dot.style.background = color;
+    dot.style.background = entry.color;
 
     const label = document.createElement("span");
     label.className = "legend-title";
-    label.textContent = formatTestName(test);
+    label.textContent = entry.label;
 
     legend.appendChild(dot);
     legend.appendChild(label);
@@ -990,12 +1052,12 @@ function renderNetworkSection(fields, nodeId) {
 
     const cardName = document.createElement("div");
     cardName.className = "network-card-name";
-    cardName.textContent = formatTestName(test);
+    cardName.textContent = entry.label;
 
     const cardStats = document.createElement("div");
     cardStats.className = "network-card-stats";
-    const stats = summarizeLatency(filtered.latency);
-    const lossAvg = summarizeLoss(filtered.loss);
+    const stats = summarizeLatency(entry.filtered.latency);
+    const lossAvg = summarizeLoss(entry.filtered.loss);
     cardStats.innerHTML = `
       <span>${formatLatencyStat(stats.min)}</span>
       <span>${formatLatencyStat(stats.avg)}</span>
@@ -1061,6 +1123,43 @@ function filterHistoryByRange(history, rangeSec, nowSec) {
     filtered.loss.push(loss[i] ?? null);
   }
   return filtered;
+}
+
+function normalizeNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (Number.isFinite(value)) return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasSeriesData(series) {
+  return (
+    Array.isArray(series) &&
+    series.some((value) => value !== null && value !== undefined)
+  );
+}
+
+function resampleHistoryForGrid(history, grid) {
+  const latency = Array.from({ length: grid.points }, () => null);
+  const loss = Array.from({ length: grid.points }, () => null);
+  if (!history || !grid || !grid.points || !grid.intervalSec) {
+    return { latency, loss, times: grid.times || [] };
+  }
+  const times = Array.isArray(history.times) ? history.times : [];
+  const srcLatency = Array.isArray(history.latency) ? history.latency : [];
+  const srcLoss = Array.isArray(history.loss) ? history.loss : [];
+  const endSec = grid.startSec + grid.rangeSec;
+  for (let i = 0; i < times.length; i += 1) {
+    const ts = times[i];
+    if (!Number.isFinite(ts)) continue;
+    if (ts < grid.startSec || ts > endSec) continue;
+    let index = Math.round((ts - grid.startSec) / grid.intervalSec);
+    if (index < 0) index = 0;
+    if (index >= grid.points) index = grid.points - 1;
+    latency[index] = normalizeNumber(srcLatency[i]);
+    loss[index] = normalizeNumber(srcLoss[i]);
+  }
+  return { latency, loss, times: grid.times || [] };
 }
 
 function buildSummaryExtra(stats, tests) {
@@ -1162,6 +1261,7 @@ function updateTestHistory(nodeId, tests) {
       times: [],
       lastAt: 0,
       minIntervalSec: 0,
+      avgIntervalSec: 0,
     };
     const checkedAt = test.checked_at || 0;
     if (checkedAt > entry.lastAt) {
@@ -1172,6 +1272,11 @@ function updateTestHistory(nodeId, tests) {
       if (intervalSec > 0) {
         if (!entry.minIntervalSec || intervalSec < entry.minIntervalSec) {
           entry.minIntervalSec = intervalSec;
+        }
+        if (!entry.avgIntervalSec) {
+          entry.avgIntervalSec = intervalSec;
+        } else {
+          entry.avgIntervalSec = entry.avgIntervalSec * 0.9 + intervalSec * 0.1;
         }
       }
       const value =
