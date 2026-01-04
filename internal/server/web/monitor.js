@@ -1046,8 +1046,9 @@ function updateNetworkTests(fields, tests, nodeId) {
 }
 
 function renderNetworkSection(fields, nodeId) {
-  const tests = fields._tests || [];
   const historyMap = state.testHistory.get(nodeId) || new Map();
+  const baseTests = fields._tests || [];
+  const tests = baseTests.length > 0 ? baseTests : buildTestsFromHistory(historyMap);
   const activeRange = state.testRange.get(nodeId) || "1h";
   renderRangeTabs(fields, nodeId, activeRange);
 
@@ -1061,30 +1062,39 @@ function renderNetworkSection(fields, nodeId) {
   const rangeSec = rangeSeconds(activeRange);
   const testEntries = [];
   let observedIntervalSec = 0;
+  let latestHistoryAt = 0;
 
   tests.forEach((test, index) => {
     const key = testKey(test);
     const history = historyMap.get(key) || { latency: [], loss: [], times: [] };
     const color = testColor(key, index);
-    const filtered = filterHistoryByRange(history, rangeSec, now);
     const intervalHint =
       history.avgIntervalSec || history.minIntervalSec || 0;
     if (Number.isFinite(intervalHint) && intervalHint > observedIntervalSec) {
       observedIntervalSec = intervalHint;
     }
+    const historyLastAt = resolveHistoryLastAt(history);
+    if (historyLastAt > latestHistoryAt) {
+      latestHistoryAt = historyLastAt;
+    }
     testEntries.push({
       test,
       history,
-      filtered,
+      filtered: null,
       color,
       label: formatTestName(test),
     });
   });
 
+  const rangeEndSec = resolveRangeEndSec(now, latestHistoryAt, rangeSec);
+  testEntries.forEach((entry) => {
+    entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
+  });
+
   const grid = buildTestGrid(
     activeRange,
     rangeSec,
-    now,
+    rangeEndSec,
     observedIntervalSec
   );
   const timeSeries = grid.times;
@@ -1162,6 +1172,49 @@ function renderRangeTabs(fields, nodeId, active) {
     });
     fields.testRange.appendChild(button);
   });
+}
+
+function buildTestsFromHistory(historyMap) {
+  if (!historyMap || historyMap.size === 0) return [];
+  return Array.from(historyMap.keys())
+    .filter(Boolean)
+    .sort()
+    .map((key) => testFromHistoryKey(key))
+    .filter(Boolean);
+}
+
+function testFromHistoryKey(key) {
+  if (!key) return null;
+  const parts = String(key).split("|");
+  const type = (parts[0] || "icmp").toLowerCase();
+  const host = parts[1] || "";
+  const port = Number(parts[2]) || 0;
+  const name = parts.slice(3).join("|").trim();
+  const displayName =
+    name || (host ? (port ? `${host}:${port}` : host) : "");
+  return { type, host, port, name: displayName };
+}
+
+function resolveHistoryLastAt(history) {
+  if (!history) return 0;
+  const direct = Number(history.lastAt ?? history.last_at ?? 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  const times = Array.isArray(history.times) ? history.times : [];
+  if (!times.length) return 0;
+  const tail = Number(times[times.length - 1]);
+  return Number.isFinite(tail) ? tail : 0;
+}
+
+function resolveRangeEndSec(nowSec, latestHistorySec, rangeSec) {
+  const safeNow = Number.isFinite(nowSec)
+    ? nowSec
+    : Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(rangeSec) || rangeSec <= 0) return safeNow;
+  if (!Number.isFinite(latestHistorySec) || latestHistorySec <= 0) {
+    return safeNow;
+  }
+  if (latestHistorySec >= safeNow - rangeSec) return safeNow;
+  return latestHistorySec;
 }
 
 function filterHistoryByRange(history, rangeSec, nowSec) {
