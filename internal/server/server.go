@@ -89,9 +89,6 @@ const (
 	defaultAddr            = ":25012"
 	defaultTestIntervalSec = 5
 	defaultPersistInterval = 10 * time.Second
-	historyMaxAgeSec       = int64(60 * 60 * 24 * 365)
-	historyBasePoints      = 20000
-	historyMaxPoints       = 200000
 )
 
 //go:embed web/*
@@ -737,7 +734,7 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 		entry.Loss = append(entry.Loss, normalizeFloatValue(test.PacketLoss))
 		entry.Times = append(entry.Times, checkedAt)
 		entry.LastAt = checkedAt
-		trimHistoryEntry(entry, nowSec)
+		trimHistoryEntry(entry)
 		changed = true
 	}
 	return changed
@@ -789,38 +786,11 @@ func normalizeHistoryEntry(entry *TestHistoryEntry) {
 	}
 }
 
-func trimHistoryEntry(entry *TestHistoryEntry, nowSec int64) {
+func trimHistoryEntry(entry *TestHistoryEntry) {
 	if entry == nil {
 		return
 	}
 	normalizeHistoryEntry(entry)
-	cutoff := nowSec - historyMaxAgeSec
-	for len(entry.Times) > 0 && entry.Times[0] < cutoff {
-		entry.Times = entry.Times[1:]
-		if len(entry.Latency) > 0 {
-			entry.Latency = entry.Latency[1:]
-		}
-		if len(entry.Loss) > 0 {
-			entry.Loss = entry.Loss[1:]
-		}
-	}
-	interval := entry.MinIntervalSec
-	if interval <= 0 {
-		interval = int64(defaultTestIntervalSec)
-	}
-	maxPoints := int(historyMaxAgeSec/interval) + 10
-	if maxPoints < historyBasePoints {
-		maxPoints = historyBasePoints
-	}
-	if maxPoints > historyMaxPoints {
-		maxPoints = historyMaxPoints
-	}
-	if len(entry.Times) > maxPoints {
-		start := len(entry.Times) - maxPoints
-		entry.Times = entry.Times[start:]
-		entry.Latency = entry.Latency[start:]
-		entry.Loss = entry.Loss[start:]
-	}
 }
 
 func normalizeFloatPointer(value *float64) *float64 {

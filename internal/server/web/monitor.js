@@ -25,7 +25,6 @@ const state = {
   testHistory: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
-  testRangeMaxSec: 60 * 60 * 24,
   renderMode: "flat",
   tagSections: new Map(),
 };
@@ -1049,7 +1048,7 @@ function updateNetworkTests(fields, tests, nodeId) {
 function renderNetworkSection(fields, nodeId) {
   const tests = fields._tests || [];
   const historyMap = state.testHistory.get(nodeId) || new Map();
-  const activeRange = state.testRange.get(nodeId) || "24h";
+  const activeRange = state.testRange.get(nodeId) || "1h";
   renderRangeTabs(fields, nodeId, activeRange);
 
   fields.testLegend.innerHTML = "";
@@ -1159,10 +1158,6 @@ function renderRangeTabs(fields, nodeId, active) {
     button.addEventListener("click", () => {
       if (item.key === active) return;
       state.testRange.set(nodeId, item.key);
-      const selectedRange = rangeSeconds(item.key);
-      if (Number.isFinite(selectedRange) && selectedRange > state.testRangeMaxSec) {
-        state.testRangeMaxSec = selectedRange;
-      }
       renderNetworkSection(fields, nodeId);
     });
     fields.testRange.appendChild(button);
@@ -1315,9 +1310,6 @@ function updateTestHistory(nodeId, tests) {
     state.testHistory.set(nodeId, new Map());
   }
   const map = state.testHistory.get(nodeId);
-  const baseMaxPoints = 20000;
-  const maxPointsCap = 200000;
-  const maxAge = 60 * 60 * 24 * 365;
   tests.forEach((test) => {
     const key = testKey(test);
     if (!key) return;
@@ -1360,24 +1352,6 @@ function updateTestHistory(nodeId, tests) {
       entry.loss.push(loss);
       entry.times.push(checkedAt || Math.floor(Date.now() / 1000));
       entry.lastAt = checkedAt;
-      const cutoff = Math.floor(Date.now() / 1000) - maxAge;
-      while (entry.times.length > 0 && entry.times[0] < cutoff) {
-        entry.times.shift();
-        entry.latency.shift();
-        entry.loss.shift();
-      }
-      const interval = entry.minIntervalSec > 0 ? entry.minIntervalSec : 5;
-      const desiredPoints =
-        Math.ceil(state.testRangeMaxSec / interval) + 10;
-      const maxPoints = Math.min(
-        maxPointsCap,
-        Math.max(baseMaxPoints, desiredPoints)
-      );
-      if (entry.latency.length > maxPoints) {
-        entry.latency = entry.latency.slice(-maxPoints);
-        entry.loss = entry.loss.slice(-maxPoints);
-        entry.times = entry.times.slice(-maxPoints);
-      }
       map.set(key, entry);
     }
   });

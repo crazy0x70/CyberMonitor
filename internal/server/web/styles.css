@@ -1769,10 +1769,6 @@ svg text {
   align-items: center;
 }
 
-.test-select-row.icmp {
-  grid-template-columns: minmax(200px, 1fr);
-}
-
 .test-select-row .check {
   min-width: 200px;
 }
