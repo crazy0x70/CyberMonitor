@@ -195,7 +195,24 @@ type Snapshot struct {
 
 type Hub struct {
 	mu      sync.Mutex
-	clients map[*websocket.Conn]struct{}
+	clients map[*websocket.Conn]*hubClient
+}
+
+type hubClient struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (c *hubClient) writeMessage(messageType int, payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(messageType, payload)
+}
+
+func (c *hubClient) close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Close()
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -259,7 +276,7 @@ func Run(ctx context.Context, cfg Config) error {
 		alerted:         make(map[string]bool),
 		testHistory:     testHistory,
 	}
-	hub := &Hub{clients: make(map[*websocket.Conn]struct{})}
+	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
 
 	mux := http.NewServeMux()
 	webRoot, err := fs.Sub(webFS, "web")
@@ -465,12 +482,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return
 		}
-		hub.Add(conn)
+		client := hub.Add(conn)
 
 		// 首次连接立即推送快照
 		snapshot := storeSnapshot(store, true)
 		payload, _ := json.Marshal(snapshot)
-		_ = conn.WriteMessage(websocket.TextMessage, payload)
+		if client != nil {
+			if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
+				hub.Remove(conn)
+				return
+			}
+		}
 
 		go readLoop(conn, hub)
 	})
@@ -1113,28 +1135,56 @@ func (s *Store) SettingsGroups() []string {
 	return groups
 }
 
-func (h *Hub) Add(conn *websocket.Conn) {
+func (h *Hub) Add(conn *websocket.Conn) *hubClient {
+	client := &hubClient{conn: conn}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.clients[conn] = struct{}{}
+	h.clients[conn] = client
+	return client
 }
 
 func (h *Hub) Remove(conn *websocket.Conn) {
+	var client *hubClient
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	client = h.clients[conn]
 	delete(h.clients, conn)
+	h.mu.Unlock()
+	if client != nil {
+		_ = client.close()
+		return
+	}
 	_ = conn.Close()
 }
 
 func (h *Hub) Broadcast(payload []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for client := range h.clients {
-		if err := client.WriteMessage(websocket.TextMessage, payload); err != nil {
-			delete(h.clients, client)
-			_ = client.Close()
+	clients := h.snapshotClients()
+	for _, client := range clients {
+		if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
+			h.removeClient(client)
 		}
 	}
+}
+
+func (h *Hub) snapshotClients() []*hubClient {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients := make([]*hubClient, 0, len(h.clients))
+	for _, client := range h.clients {
+		if client != nil {
+			clients = append(clients, client)
+		}
+	}
+	return clients
+}
+
+func (h *Hub) removeClient(client *hubClient) {
+	if client == nil {
+		return
+	}
+	h.mu.Lock()
+	delete(h.clients, client.conn)
+	h.mu.Unlock()
+	_ = client.close()
 }
 
 func readLoop(conn *websocket.Conn, hub *Hub) {
