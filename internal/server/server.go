@@ -25,7 +25,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const maxLogSize = 10 * 1024 * 1024
+const (
+	maxLogSize               = 10 * 1024 * 1024
+	maxTestHistoryPoints     = 5000
+	testHistoryHotSeconds    = 60 * 60
+	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
+)
 
 type sizeLimitedWriter struct {
 	path    string
@@ -238,6 +243,15 @@ func Run(ctx context.Context, cfg Config) error {
 	if testHistory == nil {
 		testHistory = make(map[string]map[string]*TestHistoryEntry)
 	}
+	historyTrimmed := false
+	nowSec := time.Now().Unix()
+	for _, tests := range testHistory {
+		for _, entry := range tests {
+			if trimHistoryEntry(entry, nowSec) {
+				historyTrimmed = true
+			}
+		}
+	}
 	if loaded {
 		settings = mergeSettings(persisted.Settings, defaultSettings)
 		profiles = persisted.Profiles
@@ -275,6 +289,14 @@ func Run(ctx context.Context, cfg Config) error {
 		persistInterval: defaultPersistInterval,
 		alerted:         make(map[string]bool),
 		testHistory:     testHistory,
+	}
+	if historyTrimmed {
+		historyData := TestHistoryData{
+			Version:   testHistoryVersion,
+			UpdatedAt: time.Now().Unix(),
+			Nodes:     store.snapshotTestHistory(),
+		}
+		store.persistHistory(historyData)
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
 
@@ -756,7 +778,7 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 		entry.Loss = append(entry.Loss, normalizeFloatValue(test.PacketLoss))
 		entry.Times = append(entry.Times, checkedAt)
 		entry.LastAt = checkedAt
-		trimHistoryEntry(entry)
+		trimHistoryEntry(entry, nowSec)
 		changed = true
 	}
 	return changed
@@ -808,11 +830,98 @@ func normalizeHistoryEntry(entry *TestHistoryEntry) {
 	}
 }
 
-func trimHistoryEntry(entry *TestHistoryEntry) {
+func trimHistoryEntry(entry *TestHistoryEntry, nowSec int64) bool {
 	if entry == nil {
-		return
+		return false
 	}
 	normalizeHistoryEntry(entry)
+	if len(entry.Times) == 0 {
+		entry.LastAt = 0
+		return false
+	}
+	if nowSec <= 0 {
+		nowSec = entry.LastAt
+	}
+	if nowSec <= 0 {
+		nowSec = entry.Times[len(entry.Times)-1]
+	}
+
+	changed := false
+	cutoff := nowSec - testHistoryMaxAgeSeconds
+	if cutoff > 0 {
+		idx := sort.Search(len(entry.Times), func(i int) bool {
+			return entry.Times[i] >= cutoff
+		})
+		if idx > 0 {
+			entry.Times = entry.Times[idx:]
+			entry.Latency = entry.Latency[idx:]
+			entry.Loss = entry.Loss[idx:]
+			changed = true
+		}
+	}
+	if len(entry.Times) == 0 {
+		entry.Latency = entry.Latency[:0]
+		entry.Loss = entry.Loss[:0]
+		entry.LastAt = 0
+		return changed
+	}
+
+	total := len(entry.Times)
+	if total <= maxTestHistoryPoints {
+		if entry.LastAt == 0 {
+			entry.LastAt = entry.Times[len(entry.Times)-1]
+		}
+		return changed
+	}
+
+	hotCutoff := nowSec - testHistoryHotSeconds
+	hotIndex := sort.Search(total, func(i int) bool {
+		return entry.Times[i] >= hotCutoff
+	})
+	hotCount := total - hotIndex
+	if hotCount >= maxTestHistoryPoints {
+		start := total - maxTestHistoryPoints
+		entry.Times = entry.Times[start:]
+		entry.Latency = entry.Latency[start:]
+		entry.Loss = entry.Loss[start:]
+		entry.LastAt = entry.Times[len(entry.Times)-1]
+		return true
+	}
+
+	remaining := maxTestHistoryPoints - hotCount
+	olderCount := hotIndex
+	step := int(math.Ceil(float64(olderCount) / float64(remaining)))
+	if step < 1 {
+		step = 1
+	}
+	newLen := 0
+	if olderCount > 0 {
+		newLen = (olderCount-1)/step + 1
+	}
+	newTimes := make([]int64, 0, newLen+hotCount)
+	newLatency := make([]*float64, 0, newLen+hotCount)
+	newLoss := make([]*float64, 0, newLen+hotCount)
+	for i := 0; i < olderCount; i += step {
+		newTimes = append(newTimes, entry.Times[i])
+		newLatency = append(newLatency, entry.Latency[i])
+		newLoss = append(newLoss, entry.Loss[i])
+	}
+	if olderCount > 0 {
+		last := olderCount - 1
+		if len(newTimes) == 0 || newTimes[len(newTimes)-1] != entry.Times[last] {
+			newTimes = append(newTimes, entry.Times[last])
+			newLatency = append(newLatency, entry.Latency[last])
+			newLoss = append(newLoss, entry.Loss[last])
+		}
+	}
+	newTimes = append(newTimes, entry.Times[hotIndex:]...)
+	newLatency = append(newLatency, entry.Latency[hotIndex:]...)
+	newLoss = append(newLoss, entry.Loss[hotIndex:]...)
+	entry.Times = newTimes
+	entry.Latency = newLatency
+	entry.Loss = newLoss
+	entry.LastAt = entry.Times[len(entry.Times)-1]
+	return true
 }
 
 func normalizeFloatPointer(value *float64) *float64 {

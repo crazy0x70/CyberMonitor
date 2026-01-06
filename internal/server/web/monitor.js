@@ -27,7 +27,16 @@ const state = {
   testRange: new Map(),
   renderMode: "flat",
   tagSections: new Map(),
+  historyCacheTimer: null,
+  historyCacheLoading: false,
 };
+
+const HISTORY_CACHE_KEY = "cm_test_history_v1";
+const HISTORY_CACHE_VERSION = 1;
+const HISTORY_CACHE_MAX_POINTS = 5000;
+const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
+const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+const HISTORY_CACHE_SAVE_DELAY = 1500;
 
 function resetToAllGroups() {
   if (state.selectedGroup === "全部") {
@@ -84,6 +93,7 @@ function handleSnapshot(payload) {
   state.settingsGroups = payload.groups || [];
   applyPublicSettings(payload.settings || {});
   applyTestHistory(payload.test_history);
+  cleanupDetachedHistory(state.lastNodes);
   if (lastUpdated) {
     lastUpdated.textContent = new Date(
       (payload.generated_at || 0) * 1000
@@ -167,8 +177,189 @@ function applyPublicSettings(settings) {
   updateFooter(commit);
 }
 
+function loadTestHistoryCache() {
+  if (!window.localStorage) return;
+  try {
+    const raw = localStorage.getItem(HISTORY_CACHE_KEY);
+    if (!raw) return;
+    const payload = JSON.parse(raw);
+    if (!payload || typeof payload !== "object") return;
+    if (payload.version && payload.version !== HISTORY_CACHE_VERSION) return;
+    const nodes = payload.nodes;
+    if (!nodes || typeof nodes !== "object") return;
+    state.historyCacheLoading = true;
+    applyTestHistory(nodes);
+  } catch (error) {
+    return;
+  } finally {
+    state.historyCacheLoading = false;
+  }
+}
+
+function scheduleHistoryCacheSave() {
+  if (state.historyCacheLoading) return;
+  if (state.historyCacheTimer) return;
+  state.historyCacheTimer = setTimeout(() => {
+    state.historyCacheTimer = null;
+    persistHistoryCache();
+  }, HISTORY_CACHE_SAVE_DELAY);
+}
+
+function persistHistoryCache() {
+  if (!window.localStorage) return;
+  const nodes = {};
+  state.testHistory.forEach((tests, nodeId) => {
+    if (!tests || tests.size === 0) return;
+    const entries = {};
+    tests.forEach((entry, key) => {
+      if (!entry) return;
+      trimTestHistoryEntry(entry);
+      const serialized = serializeTestHistoryEntry(entry);
+      if (serialized) {
+        entries[key] = serialized;
+      }
+    });
+    if (Object.keys(entries).length > 0) {
+      nodes[nodeId] = entries;
+    }
+  });
+  const payload = {
+    version: HISTORY_CACHE_VERSION,
+    saved_at: Math.floor(Date.now() / 1000),
+    nodes,
+  };
+  try {
+    localStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify(payload));
+  } catch (error) {
+    return;
+  }
+}
+
+function serializeTestHistoryEntry(entry) {
+  if (!entry || !Array.isArray(entry.times)) return null;
+  const normalizeValue = (value) => {
+    if (value === null || value === undefined) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  return {
+    latency: Array.isArray(entry.latency)
+      ? entry.latency.map(normalizeValue)
+      : [],
+    loss: Array.isArray(entry.loss) ? entry.loss.map(normalizeValue) : [],
+    times: entry.times.slice(),
+    last_at: entry.lastAt || 0,
+    min_interval_sec: entry.minIntervalSec || 0,
+    avg_interval_sec: entry.avgIntervalSec || 0,
+  };
+}
+
+function trimTestHistoryEntry(entry) {
+  if (!entry || !Array.isArray(entry.times)) return entry;
+  let times = entry.times;
+  let latency = Array.isArray(entry.latency) ? entry.latency : [];
+  let loss = Array.isArray(entry.loss) ? entry.loss : [];
+  if (times.length === 0) return entry;
+
+  let nowSec = entry.lastAt || times[times.length - 1] || 0;
+  if (!nowSec) {
+    nowSec = Math.floor(Date.now() / 1000);
+  }
+  const cutoff = nowSec - HISTORY_CACHE_MAX_AGE_SECONDS;
+  if (cutoff > 0) {
+    let startIndex = 0;
+    while (startIndex < times.length && times[startIndex] < cutoff) {
+      startIndex += 1;
+    }
+    if (startIndex > 0) {
+      times = times.slice(startIndex);
+      latency = latency.slice(startIndex);
+      loss = loss.slice(startIndex);
+    }
+  }
+
+  const total = times.length;
+  if (total <= HISTORY_CACHE_MAX_POINTS) {
+    entry.times = times;
+    entry.latency = latency;
+    entry.loss = loss;
+    if (!entry.lastAt && total > 0) {
+      entry.lastAt = times[total - 1];
+    }
+    return entry;
+  }
+
+  const hotCutoff = nowSec - HISTORY_CACHE_HOT_SECONDS;
+  let hotIndex = 0;
+  while (hotIndex < total && times[hotIndex] < hotCutoff) {
+    hotIndex += 1;
+  }
+  const hotCount = total - hotIndex;
+  if (hotCount >= HISTORY_CACHE_MAX_POINTS) {
+    const start = total - HISTORY_CACHE_MAX_POINTS;
+    entry.times = times.slice(start);
+    entry.latency = latency.slice(start);
+    entry.loss = loss.slice(start);
+    entry.lastAt = entry.times[entry.times.length - 1];
+    return entry;
+  }
+
+  const remaining = HISTORY_CACHE_MAX_POINTS - hotCount;
+  const olderCount = hotIndex;
+  const step = Math.max(1, Math.ceil(olderCount / remaining));
+  const sampledTimes = [];
+  const sampledLatency = [];
+  const sampledLoss = [];
+  for (let i = 0; i < olderCount; i += step) {
+    sampledTimes.push(times[i]);
+    sampledLatency.push(latency[i] ?? null);
+    sampledLoss.push(loss[i] ?? null);
+  }
+  if (olderCount > 0) {
+    const lastOlder = olderCount - 1;
+    if (sampledTimes[sampledTimes.length - 1] !== times[lastOlder]) {
+      sampledTimes.push(times[lastOlder]);
+      sampledLatency.push(latency[lastOlder] ?? null);
+      sampledLoss.push(loss[lastOlder] ?? null);
+    }
+  }
+  entry.times = sampledTimes.concat(times.slice(hotIndex));
+  entry.latency = sampledLatency.concat(latency.slice(hotIndex));
+  entry.loss = sampledLoss.concat(loss.slice(hotIndex));
+  entry.lastAt = entry.times[entry.times.length - 1];
+  return entry;
+}
+
+function cleanupDetachedHistory(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) return;
+  const active = new Set();
+  nodes.forEach((node) => {
+    const id = resolveNodeId(node, "");
+    if (id) {
+      active.add(id);
+    }
+  });
+  let changed = false;
+  for (const id of state.testHistory.keys()) {
+    if (!active.has(id)) {
+      state.testHistory.delete(id);
+      changed = true;
+    }
+  }
+  for (const id of state.testRange.keys()) {
+    if (!active.has(id)) {
+      state.testRange.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) {
+    scheduleHistoryCacheSave();
+  }
+}
+
 function applyTestHistory(history) {
   if (!history || typeof history !== "object") return;
+  let updated = false;
   Object.entries(history).forEach(([nodeId, tests]) => {
     if (!tests || typeof tests !== "object") return;
     let map = state.testHistory.get(nodeId);
@@ -182,11 +373,23 @@ function applyTestHistory(history) {
       const existing = map.get(key);
       const incomingLast = normalized.lastAt || 0;
       const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
-      if (!existing || incomingLast > existingLast) {
+      const incomingSize = normalized.times.length;
+      const existingSize =
+        existing && Array.isArray(existing.times) ? existing.times.length : 0;
+      if (
+        !existing ||
+        incomingLast > existingLast ||
+        (incomingLast === existingLast && incomingSize > existingSize)
+      ) {
+        trimTestHistoryEntry(normalized);
         map.set(key, normalized);
+        updated = true;
       }
     });
   });
+  if (updated) {
+    scheduleHistoryCacheSave();
+  }
 }
 
 function normalizeTestHistoryEntry(entry) {
@@ -605,8 +808,6 @@ function cleanupInactive(activeIds) {
     if (!activeIds.has(id)) {
       card.remove();
       state.nodes.delete(id);
-      state.testHistory.delete(id);
-      state.testRange.delete(id);
     }
   }
 }
@@ -1363,6 +1564,7 @@ function updateTestHistory(nodeId, tests) {
     state.testHistory.set(nodeId, new Map());
   }
   const map = state.testHistory.get(nodeId);
+  let updated = false;
   tests.forEach((test) => {
     const key = testKey(test);
     if (!key) return;
@@ -1405,9 +1607,14 @@ function updateTestHistory(nodeId, tests) {
       entry.loss.push(loss);
       entry.times.push(checkedAt || Math.floor(Date.now() / 1000));
       entry.lastAt = checkedAt;
+      trimTestHistoryEntry(entry);
       map.set(key, entry);
+      updated = true;
     }
   });
+  if (updated) {
+    scheduleHistoryCacheSave();
+  }
 }
 
 function renderSparklineMulti(seriesList, colors, maxValueOverride) {
@@ -1963,4 +2170,5 @@ function aggregateDisk(list) {
 }
 
 updateFooter("");
+loadTestHistoryCache();
 connectWS();
