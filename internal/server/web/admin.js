@@ -60,7 +60,7 @@ const state = {
     alertAll: true,
     alertNodes: [],
     alertTelegramToken: "",
-    alertTelegramUserId: 0,
+    alertTelegramUserIds: [],
   },
   nodes: [],
 };
@@ -169,8 +169,13 @@ function applySettingsView(data) {
     alertTelegramTokenInput.value = data.alert_telegram_token || "";
   }
   if (alertTelegramUserIdInput) {
-    const userId = Number(data.alert_telegram_user_id || 0);
-    alertTelegramUserIdInput.value = userId > 0 ? String(userId) : "";
+    let userIds = Array.isArray(data.alert_telegram_user_ids)
+      ? data.alert_telegram_user_ids
+      : [];
+    if (!userIds.length && typeof data.alert_telegram_user_id === "number") {
+      userIds = data.alert_telegram_user_id > 0 ? [data.alert_telegram_user_id] : [];
+    }
+    alertTelegramUserIdInput.value = userIds.length ? userIds.join(",") : "";
   }
   if (alertOfflineMinutesInput) {
     const minutes = Math.round((data.alert_offline_sec || 0) / 60);
@@ -196,8 +201,10 @@ function applySettingsView(data) {
   if (typeof data.alert_telegram_token === "string") {
     state.settings.alertTelegramToken = data.alert_telegram_token;
   }
-  if (typeof data.alert_telegram_user_id === "number") {
-    state.settings.alertTelegramUserId = data.alert_telegram_user_id;
+  if (Array.isArray(data.alert_telegram_user_ids)) {
+    state.settings.alertTelegramUserIds = data.alert_telegram_user_ids;
+  } else if (typeof data.alert_telegram_user_id === "number") {
+    state.settings.alertTelegramUserIds = data.alert_telegram_user_id > 0 ? [data.alert_telegram_user_id] : [];
   }
   if (typeof data.alert_offline_sec === "number") {
     state.settings.alertOfflineSec = data.alert_offline_sec;
@@ -286,6 +293,15 @@ function collectAlertNodes() {
   return nodes;
 }
 
+function parseTelegramUserIds(raw) {
+  if (!raw) return [];
+  const values = raw
+    .split(/[,，\s]+/)
+    .map((item) => parseInt(item.trim(), 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return Array.from(new Set(values));
+}
+
 async function saveAlertSettings() {
   if (!alertWebhookInput || !alertOfflineMinutesInput) return;
   const payload = {};
@@ -296,9 +312,9 @@ async function saveAlertSettings() {
   const telegramUserIdRaw = alertTelegramUserIdInput
     ? alertTelegramUserIdInput.value.trim()
     : "";
-  let telegramUserId = telegramUserIdRaw ? parseInt(telegramUserIdRaw, 10) : 0;
+  const telegramUserIds = parseTelegramUserIds(telegramUserIdRaw);
   if (telegramToken || telegramUserIdRaw) {
-    if (!telegramToken || !telegramUserIdRaw || !Number.isFinite(telegramUserId) || telegramUserId <= 0) {
+    if (!telegramToken || telegramUserIds.length === 0) {
       throw new Error("Telegram Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
     }
   }
@@ -309,7 +325,7 @@ async function saveAlertSettings() {
   const alertAll = alertAllToggle ? alertAllToggle.checked : true;
   payload.alert_webhook = webhook;
   payload.alert_telegram_token = telegramToken;
-  payload.alert_telegram_user_id = Number.isFinite(telegramUserId) ? telegramUserId : 0;
+  payload.alert_telegram_user_ids = telegramUserIds;
   payload.alert_offline_sec = minutes * 60;
   payload.alert_all = alertAll;
   if (!alertAll) {
@@ -331,12 +347,12 @@ async function testAlertSettings() {
   const telegramUserIdRaw = alertTelegramUserIdInput
     ? alertTelegramUserIdInput.value.trim()
     : "";
-  const telegramUserId = telegramUserIdRaw ? parseInt(telegramUserIdRaw, 10) : 0;
+  const telegramUserIds = parseTelegramUserIds(telegramUserIdRaw);
   if (!webhook && !telegramToken) {
     throw new Error("请先填写飞书 Webhook 或 Telegram 配置");
   }
   if (telegramToken || telegramUserIdRaw) {
-    if (!telegramToken || !telegramUserIdRaw || !Number.isFinite(telegramUserId) || telegramUserId <= 0) {
+    if (!telegramToken || telegramUserIds.length === 0) {
       throw new Error("Telegram Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
     }
   }
@@ -346,7 +362,7 @@ async function testAlertSettings() {
     body: JSON.stringify({
       webhook,
       telegram_token: telegramToken,
-      telegram_user_id: Number.isFinite(telegramUserId) ? telegramUserId : 0,
+      telegram_user_ids: telegramUserIds,
     }),
   });
   if (!resp.ok) {

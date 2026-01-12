@@ -25,67 +25,69 @@ const (
 )
 
 type Settings struct {
-	AdminPath           string            `json:"admin_path"`
-	AdminUser           string            `json:"admin_user"`
-	AdminPass           string            `json:"admin_pass"`
-	AdminPassPlain      string            `json:"-"`
-	TokenSalt           string            `json:"token_salt,omitempty"`
-	AuthToken           string            `json:"auth_token,omitempty"`
-	AgentEndpoint       string            `json:"agent_endpoint,omitempty"`
-	SiteTitle           string            `json:"site_title,omitempty"`
-	SiteIcon            string            `json:"site_icon,omitempty"`
-	HomeTitle           string            `json:"home_title,omitempty"`
-	HomeSubtitle        string            `json:"home_subtitle,omitempty"`
-	AlertWebhook        string            `json:"alert_webhook,omitempty"`
-	AlertOfflineSec     int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll            bool              `json:"alert_all"`
-	AlertNodes          []string          `json:"alert_nodes,omitempty"`
-	AlertTelegramToken  string            `json:"alert_telegram_token,omitempty"`
-	AlertTelegramUserID int64             `json:"alert_telegram_user_id,omitempty"`
-	Groups              []string          `json:"groups,omitempty"`
-	GroupTree           []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog         []TestCatalogItem `json:"test_catalog,omitempty"`
+	AdminPath            string            `json:"admin_path"`
+	AdminUser            string            `json:"admin_user"`
+	AdminPass            string            `json:"admin_pass"`
+	AdminPassPlain       string            `json:"-"`
+	TokenSalt            string            `json:"token_salt,omitempty"`
+	AuthToken            string            `json:"auth_token,omitempty"`
+	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
+	SiteTitle            string            `json:"site_title,omitempty"`
+	SiteIcon             string            `json:"site_icon,omitempty"`
+	HomeTitle            string            `json:"home_title,omitempty"`
+	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
+	AlertWebhook         string            `json:"alert_webhook,omitempty"`
+	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
+	AlertAll             bool              `json:"alert_all"`
+	AlertNodes           []string          `json:"alert_nodes,omitempty"`
+	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
+	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
+	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
+	Groups               []string          `json:"groups,omitempty"`
+	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
 }
 
 type SettingsView struct {
-	AdminPath           string            `json:"admin_path"`
-	AdminUser           string            `json:"admin_user"`
-	AgentEndpoint       string            `json:"agent_endpoint,omitempty"`
-	AgentToken          string            `json:"agent_token,omitempty"`
-	SiteTitle           string            `json:"site_title,omitempty"`
-	SiteIcon            string            `json:"site_icon,omitempty"`
-	HomeTitle           string            `json:"home_title,omitempty"`
-	HomeSubtitle        string            `json:"home_subtitle,omitempty"`
-	AlertWebhook        string            `json:"alert_webhook,omitempty"`
-	AlertOfflineSec     int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll            bool              `json:"alert_all"`
-	AlertNodes          []string          `json:"alert_nodes,omitempty"`
-	AlertTelegramToken  string            `json:"alert_telegram_token,omitempty"`
-	AlertTelegramUserID int64             `json:"alert_telegram_user_id,omitempty"`
-	Commit              string            `json:"commit,omitempty"`
-	Groups              []string          `json:"groups,omitempty"`
-	GroupTree           []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog         []TestCatalogItem `json:"test_catalog,omitempty"`
+	AdminPath            string            `json:"admin_path"`
+	AdminUser            string            `json:"admin_user"`
+	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
+	AgentToken           string            `json:"agent_token,omitempty"`
+	SiteTitle            string            `json:"site_title,omitempty"`
+	SiteIcon             string            `json:"site_icon,omitempty"`
+	HomeTitle            string            `json:"home_title,omitempty"`
+	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
+	AlertWebhook         string            `json:"alert_webhook,omitempty"`
+	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
+	AlertAll             bool              `json:"alert_all"`
+	AlertNodes           []string          `json:"alert_nodes,omitempty"`
+	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
+	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
+	Commit               string            `json:"commit,omitempty"`
+	Groups               []string          `json:"groups,omitempty"`
+	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
 }
 
 type SettingsUpdate struct {
-	AdminPath           *string            `json:"admin_path"`
-	AdminUser           *string            `json:"admin_user"`
-	AdminPass           *string            `json:"admin_pass"`
-	AgentEndpoint       *string            `json:"agent_endpoint"`
-	SiteTitle           *string            `json:"site_title"`
-	SiteIcon            *string            `json:"site_icon"`
-	HomeTitle           *string            `json:"home_title"`
-	HomeSubtitle        *string            `json:"home_subtitle"`
-	AlertWebhook        *string            `json:"alert_webhook"`
-	AlertOfflineSec     *int64             `json:"alert_offline_sec"`
-	AlertAll            *bool              `json:"alert_all"`
-	AlertNodes          *[]string          `json:"alert_nodes"`
-	AlertTelegramToken  *string            `json:"alert_telegram_token"`
-	AlertTelegramUserID *int64             `json:"alert_telegram_user_id"`
-	Groups              *[]string          `json:"groups"`
-	GroupTree           *[]GroupNode       `json:"group_tree"`
-	TestCatalog         *[]TestCatalogItem `json:"test_catalog"`
+	AdminPath            *string            `json:"admin_path"`
+	AdminUser            *string            `json:"admin_user"`
+	AdminPass            *string            `json:"admin_pass"`
+	AgentEndpoint        *string            `json:"agent_endpoint"`
+	SiteTitle            *string            `json:"site_title"`
+	SiteIcon             *string            `json:"site_icon"`
+	HomeTitle            *string            `json:"home_title"`
+	HomeSubtitle         *string            `json:"home_subtitle"`
+	AlertWebhook         *string            `json:"alert_webhook"`
+	AlertOfflineSec      *int64             `json:"alert_offline_sec"`
+	AlertAll             *bool              `json:"alert_all"`
+	AlertNodes           *[]string          `json:"alert_nodes"`
+	AlertTelegramToken   *string            `json:"alert_telegram_token"`
+	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
+	AlertTelegramUserID  *int64             `json:"alert_telegram_user_id"`
+	Groups               *[]string          `json:"groups"`
+	GroupTree            *[]GroupNode       `json:"group_tree"`
+	TestCatalog          *[]TestCatalogItem `json:"test_catalog"`
 }
 
 type PersistedData struct {
@@ -259,26 +261,27 @@ func initSettings(cfg Config) Settings {
 	passHash, passPlain := buildAdminPassword(cfg.AdminPass)
 
 	return Settings{
-		AdminPath:           path,
-		AdminUser:           user,
-		AdminPass:           passHash,
-		AdminPassPlain:      passPlain,
-		TokenSalt:           randomToken(adminTokenLength),
-		AuthToken:           cfg.JWTSecret,
-		AgentEndpoint:       "",
-		SiteTitle:           defaultSiteTitle,
-		SiteIcon:            "",
-		HomeTitle:           defaultHomeTitle,
-		HomeSubtitle:        defaultHomeSub,
-		AlertWebhook:        "",
-		AlertOfflineSec:     defaultAlertOfflineSec,
-		AlertAll:            true,
-		AlertNodes:          []string{},
-		AlertTelegramToken:  "",
-		AlertTelegramUserID: 0,
-		Groups:              []string{},
-		GroupTree:           []GroupNode{},
-		TestCatalog:         []TestCatalogItem{},
+		AdminPath:            path,
+		AdminUser:            user,
+		AdminPass:            passHash,
+		AdminPassPlain:       passPlain,
+		TokenSalt:            randomToken(adminTokenLength),
+		AuthToken:            cfg.JWTSecret,
+		AgentEndpoint:        "",
+		SiteTitle:            defaultSiteTitle,
+		SiteIcon:             "",
+		HomeTitle:            defaultHomeTitle,
+		HomeSubtitle:         defaultHomeSub,
+		AlertWebhook:         "",
+		AlertOfflineSec:      defaultAlertOfflineSec,
+		AlertAll:             true,
+		AlertNodes:           []string{},
+		AlertTelegramToken:   "",
+		AlertTelegramUserIDs: []int64{},
+		AlertTelegramUserID:  0,
+		Groups:               []string{},
+		GroupTree:            []GroupNode{},
+		TestCatalog:          []TestCatalogItem{},
 	}
 }
 
@@ -342,9 +345,16 @@ func mergeSettings(existing, fallback Settings) Settings {
 	if existing.AlertTelegramToken == "" {
 		existing.AlertTelegramToken = fallback.AlertTelegramToken
 	}
-	if strings.TrimSpace(existing.AlertTelegramToken) == "" || existing.AlertTelegramUserID <= 0 {
+	if len(existing.AlertTelegramUserIDs) == 0 && existing.AlertTelegramUserID > 0 {
+		existing.AlertTelegramUserIDs = []int64{existing.AlertTelegramUserID}
+	}
+	existing.AlertTelegramUserID = 0
+	if len(existing.AlertTelegramUserIDs) > 0 {
+		existing.AlertTelegramUserIDs = normalizeTelegramUserIDs(existing.AlertTelegramUserIDs)
+	}
+	if strings.TrimSpace(existing.AlertTelegramToken) == "" || len(existing.AlertTelegramUserIDs) == 0 {
 		existing.AlertTelegramToken = ""
-		existing.AlertTelegramUserID = 0
+		existing.AlertTelegramUserIDs = []int64{}
 	}
 	if !existing.AlertAll && existing.AlertWebhook == "" && len(existing.AlertNodes) == 0 {
 		existing.AlertAll = fallback.AlertAll

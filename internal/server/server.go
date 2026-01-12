@@ -459,9 +459,10 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		var req struct {
-			Webhook        string `json:"webhook"`
-			TelegramToken  string `json:"telegram_token"`
-			TelegramUserID int64  `json:"telegram_user_id"`
+			Webhook         string  `json:"webhook"`
+			TelegramToken   string  `json:"telegram_token"`
+			TelegramUserIDs []int64 `json:"telegram_user_ids"`
+			TelegramUserID  int64   `json:"telegram_user_id"`
 		}
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -469,20 +470,23 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		webhook := strings.TrimSpace(req.Webhook)
 		telegramToken := strings.TrimSpace(req.TelegramToken)
-		telegramUserID := req.TelegramUserID
+		telegramUserIDs := normalizeTelegramUserIDs(req.TelegramUserIDs)
+		if len(telegramUserIDs) == 0 && req.TelegramUserID > 0 {
+			telegramUserIDs = []int64{req.TelegramUserID}
+		}
 		if webhook == "" {
 			webhook = store.AlertWebhook()
 		}
-		if telegramToken == "" || telegramUserID <= 0 {
-			cfgToken, cfgUserID := store.TelegramSettings()
+		if telegramToken == "" || len(telegramUserIDs) == 0 {
+			cfgToken, cfgUserIDs := store.TelegramSettings()
 			if telegramToken == "" {
 				telegramToken = cfgToken
 			}
-			if telegramUserID <= 0 {
-				telegramUserID = cfgUserID
+			if len(telegramUserIDs) == 0 {
+				telegramUserIDs = cfgUserIDs
 			}
 		}
-		if webhook == "" && (telegramToken == "" || telegramUserID <= 0) {
+		if webhook == "" && (telegramToken == "" || len(telegramUserIDs) == 0) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请先配置飞书或 Telegram 告警"})
 			return
 		}
@@ -493,10 +497,8 @@ func Run(ctx context.Context, cfg Config) error {
 				errs = append(errs, err.Error())
 			}
 		}
-		if telegramToken != "" && telegramUserID > 0 {
-			if err := sendTelegramTest(telegramToken, telegramUserID, siteTitle); err != nil {
-				errs = append(errs, err.Error())
-			}
+		if telegramToken != "" && len(telegramUserIDs) > 0 {
+			errs = append(errs, sendTelegramTest(telegramToken, telegramUserIDs, siteTitle)...)
 		}
 		if len(errs) > 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": strings.Join(errs, "; ")})
@@ -617,11 +619,11 @@ func Run(ctx context.Context, cfg Config) error {
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
 				if len(offlineEvents) > 0 {
 					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
-					go sendTelegramAlert(targets.TelegramToken, targets.TelegramUserID, targets.SiteTitle, offlineEvents)
+					go sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, offlineEvents)
 				}
 				if len(recoveredEvents) > 0 {
 					go sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, recoveredEvents)
-					go sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserID, targets.SiteTitle, recoveredEvents)
+					go sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, recoveredEvents)
 				}
 			}
 		}
@@ -1026,10 +1028,10 @@ type AlertEvent struct {
 }
 
 type AlertTargets struct {
-	FeishuWebhook  string
-	TelegramToken  string
-	TelegramUserID int64
-	SiteTitle      string
+	FeishuWebhook   string
+	TelegramToken   string
+	TelegramUserIDs []int64
+	SiteTitle       string
 }
 
 type alertState struct {
@@ -1041,14 +1043,14 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	defer s.mu.Unlock()
 
 	targets := AlertTargets{
-		FeishuWebhook:  strings.TrimSpace(s.settings.AlertWebhook),
-		TelegramToken:  strings.TrimSpace(s.settings.AlertTelegramToken),
-		TelegramUserID: s.settings.AlertTelegramUserID,
-		SiteTitle:      normalizeSiteTitle(s.settings.SiteTitle),
+		FeishuWebhook:   strings.TrimSpace(s.settings.AlertWebhook),
+		TelegramToken:   strings.TrimSpace(s.settings.AlertTelegramToken),
+		TelegramUserIDs: normalizeTelegramUserIDs(append([]int64(nil), s.settings.AlertTelegramUserIDs...)),
+		SiteTitle:       normalizeSiteTitle(s.settings.SiteTitle),
 	}
-	if targets.TelegramToken == "" || targets.TelegramUserID <= 0 {
+	if targets.TelegramToken == "" || len(targets.TelegramUserIDs) == 0 {
 		targets.TelegramToken = ""
-		targets.TelegramUserID = 0
+		targets.TelegramUserIDs = nil
 	}
 	if s.settings.AlertOfflineSec <= 0 || (targets.FeishuWebhook == "" && targets.TelegramToken == "") {
 		return AlertTargets{}, nil, nil
@@ -1241,6 +1243,22 @@ func formatAlertValue(value, fallback string) string {
 		return fallback
 	}
 	return strings.TrimSpace(value)
+}
+
+func normalizeTelegramUserIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{})
+	normalized := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized
 }
 
 func normalizeSiteTitle(title string) string {
@@ -1547,24 +1565,24 @@ func (s *Store) SettingsView() SettingsView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return SettingsView{
-		AdminPath:           s.settings.AdminPath,
-		AdminUser:           s.settings.AdminUser,
-		AgentEndpoint:       s.settings.AgentEndpoint,
-		AgentToken:          s.settings.AuthToken,
-		SiteTitle:           s.settings.SiteTitle,
-		SiteIcon:            s.settings.SiteIcon,
-		HomeTitle:           s.settings.HomeTitle,
-		HomeSubtitle:        s.settings.HomeSubtitle,
-		AlertWebhook:        s.settings.AlertWebhook,
-		AlertOfflineSec:     s.settings.AlertOfflineSec,
-		AlertAll:            s.settings.AlertAll,
-		AlertNodes:          s.settings.AlertNodes,
-		AlertTelegramToken:  s.settings.AlertTelegramToken,
-		AlertTelegramUserID: s.settings.AlertTelegramUserID,
-		Commit:              s.buildCommit,
-		Groups:              s.settings.Groups,
-		GroupTree:           s.settings.GroupTree,
-		TestCatalog:         s.settings.TestCatalog,
+		AdminPath:            s.settings.AdminPath,
+		AdminUser:            s.settings.AdminUser,
+		AgentEndpoint:        s.settings.AgentEndpoint,
+		AgentToken:           s.settings.AuthToken,
+		SiteTitle:            s.settings.SiteTitle,
+		SiteIcon:             s.settings.SiteIcon,
+		HomeTitle:            s.settings.HomeTitle,
+		HomeSubtitle:         s.settings.HomeSubtitle,
+		AlertWebhook:         s.settings.AlertWebhook,
+		AlertOfflineSec:      s.settings.AlertOfflineSec,
+		AlertAll:             s.settings.AlertAll,
+		AlertNodes:           s.settings.AlertNodes,
+		AlertTelegramToken:   s.settings.AlertTelegramToken,
+		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		Commit:               s.buildCommit,
+		Groups:               s.settings.Groups,
+		GroupTree:            s.settings.GroupTree,
+		TestCatalog:          s.settings.TestCatalog,
 	}
 }
 
@@ -1574,10 +1592,10 @@ func (s *Store) AlertWebhook() string {
 	return strings.TrimSpace(s.settings.AlertWebhook)
 }
 
-func (s *Store) TelegramSettings() (string, int64) {
+func (s *Store) TelegramSettings() (string, []int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return strings.TrimSpace(s.settings.AlertTelegramToken), s.settings.AlertTelegramUserID
+	return strings.TrimSpace(s.settings.AlertTelegramToken), append([]int64(nil), s.settings.AlertTelegramUserIDs...)
 }
 
 func (s *Store) SiteTitle() string {
@@ -1692,15 +1710,27 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AlertTelegramToken = value
 	}
-	if update.AlertTelegramUserID != nil {
-		value := *update.AlertTelegramUserID
-		if value < 0 {
-			value = 0
-		}
-		s.settings.AlertTelegramUserID = value
+	telegramIDsUpdated := false
+	var telegramUserIDs []int64
+	if update.AlertTelegramUserIDs != nil {
+		telegramUserIDs = normalizeTelegramUserIDs(*update.AlertTelegramUserIDs)
+		telegramIDsUpdated = true
 	}
-	if (s.settings.AlertTelegramToken != "" || s.settings.AlertTelegramUserID > 0) &&
-		(s.settings.AlertTelegramToken == "" || s.settings.AlertTelegramUserID <= 0) {
+	if update.AlertTelegramUserID != nil && update.AlertTelegramUserIDs == nil {
+		value := *update.AlertTelegramUserID
+		if value > 0 {
+			telegramUserIDs = []int64{value}
+		} else {
+			telegramUserIDs = []int64{}
+		}
+		telegramIDsUpdated = true
+	}
+	if telegramIDsUpdated {
+		s.settings.AlertTelegramUserIDs = telegramUserIDs
+	}
+	s.settings.AlertTelegramUserID = 0
+	if (s.settings.AlertTelegramToken != "" || len(s.settings.AlertTelegramUserIDs) > 0) &&
+		(s.settings.AlertTelegramToken == "" || len(s.settings.AlertTelegramUserIDs) == 0) {
 		s.mu.Unlock()
 		return SettingsView{}, errors.New("telegram token 与 telegram 用户 ID 需要同时配置")
 	}
@@ -1724,22 +1754,22 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	data = s.snapshotPersistedLocked()
 	view = SettingsView{
-		AdminPath:           s.settings.AdminPath,
-		AdminUser:           s.settings.AdminUser,
-		SiteTitle:           s.settings.SiteTitle,
-		SiteIcon:            s.settings.SiteIcon,
-		HomeTitle:           s.settings.HomeTitle,
-		HomeSubtitle:        s.settings.HomeSubtitle,
-		AlertWebhook:        s.settings.AlertWebhook,
-		AlertOfflineSec:     s.settings.AlertOfflineSec,
-		AlertAll:            s.settings.AlertAll,
-		AlertNodes:          s.settings.AlertNodes,
-		AlertTelegramToken:  s.settings.AlertTelegramToken,
-		AlertTelegramUserID: s.settings.AlertTelegramUserID,
-		Commit:              s.buildCommit,
-		Groups:              s.settings.Groups,
-		GroupTree:           s.settings.GroupTree,
-		TestCatalog:         s.settings.TestCatalog,
+		AdminPath:            s.settings.AdminPath,
+		AdminUser:            s.settings.AdminUser,
+		SiteTitle:            s.settings.SiteTitle,
+		SiteIcon:             s.settings.SiteIcon,
+		HomeTitle:            s.settings.HomeTitle,
+		HomeSubtitle:         s.settings.HomeSubtitle,
+		AlertWebhook:         s.settings.AlertWebhook,
+		AlertOfflineSec:      s.settings.AlertOfflineSec,
+		AlertAll:             s.settings.AlertAll,
+		AlertNodes:           s.settings.AlertNodes,
+		AlertTelegramToken:   s.settings.AlertTelegramToken,
+		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		Commit:               s.buildCommit,
+		Groups:               s.settings.Groups,
+		GroupTree:            s.settings.GroupTree,
+		TestCatalog:          s.settings.TestCatalog,
 	}
 	s.mu.Unlock()
 

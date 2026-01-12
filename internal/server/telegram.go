@@ -21,6 +21,11 @@ type telegramUpdateResponse struct {
 	Description string           `json:"description,omitempty"`
 }
 
+type telegramSendResponse struct {
+	Ok          bool   `json:"ok"`
+	Description string `json:"description,omitempty"`
+}
+
 type telegramUpdate struct {
 	UpdateID int64            `json:"update_id"`
 	Message  *telegramMessage `json:"message"`
@@ -48,7 +53,7 @@ func startTelegramBot(ctx context.Context, store *Store) {
 		client := &http.Client{Timeout: 12 * time.Second}
 		var offset int64
 		var lastToken string
-		var lastUserID int64
+		var lastUserKey string
 		for {
 			select {
 			case <-ctx.Done():
@@ -56,15 +61,22 @@ func startTelegramBot(ctx context.Context, store *Store) {
 			default:
 			}
 
-			token, userID := store.TelegramSettings()
-			if token == "" || userID <= 0 {
+			token, userIDs := store.TelegramSettings()
+			userIDs = normalizeTelegramUserIDs(userIDs)
+			if token == "" || len(userIDs) == 0 {
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			if token != lastToken || userID != lastUserID {
+			userKey := buildTelegramUserKey(userIDs)
+			if token != lastToken {
 				offset = 0
 				lastToken = token
-				lastUserID = userID
+				lastUserKey = userKey
+				if err := setTelegramCommands(token); err != nil {
+					log.Printf("Telegram 菜单设置失败: %v", err)
+				}
+			} else if userKey != lastUserKey {
+				lastUserKey = userKey
 			}
 
 			updates, err := fetchTelegramUpdates(client, token, offset)
@@ -73,6 +85,10 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				time.Sleep(2 * time.Second)
 				continue
 			}
+			allowed := make(map[int64]struct{}, len(userIDs))
+			for _, id := range userIDs {
+				allowed[id] = struct{}{}
+			}
 			for _, update := range updates {
 				if update.UpdateID >= offset {
 					offset = update.UpdateID + 1
@@ -80,7 +96,10 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				if update.Message == nil || update.Message.From == nil || update.Message.Chat == nil {
 					continue
 				}
-				if update.Message.From.ID != userID || update.Message.Chat.ID != userID {
+				if update.Message.Chat.Type != "" && update.Message.Chat.Type != "private" {
+					continue
+				}
+				if !isAllowedTelegramUser(allowed, update.Message.From.ID, update.Message.Chat.ID) {
 					continue
 				}
 				command := strings.TrimSpace(update.Message.Text)
@@ -91,7 +110,7 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				if reply == "" {
 					continue
 				}
-				if err := sendTelegramMessage(token, userID, reply); err != nil {
+				if err := sendTelegramMessage(token, update.Message.Chat.ID, reply); err != nil {
 					log.Printf("Telegram 回复失败: %v", err)
 				}
 			}
@@ -133,27 +152,43 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 	return payload.Result, nil
 }
 
-func sendTelegramAlert(token string, userID int64, siteTitle string, events []AlertEvent) {
-	if token == "" || userID <= 0 || len(events) == 0 {
+func sendTelegramAlert(token string, userIDs []int64, siteTitle string, events []AlertEvent) {
+	if token == "" || len(userIDs) == 0 || len(events) == 0 {
 		return
 	}
-	if err := sendTelegramMessage(token, userID, buildAlertMessage(siteTitle, events)); err != nil {
+	message := buildAlertMessage(siteTitle, events)
+	for _, err := range sendTelegramMessageToUsers(token, userIDs, message) {
 		log.Printf("Telegram 告警发送失败: %v", err)
 	}
 }
 
-func sendTelegramRecovery(token string, userID int64, siteTitle string, events []AlertEvent) {
-	if token == "" || userID <= 0 || len(events) == 0 {
+func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, events []AlertEvent) {
+	if token == "" || len(userIDs) == 0 || len(events) == 0 {
 		return
 	}
-	if err := sendTelegramMessage(token, userID, buildRecoveryMessage(siteTitle, events)); err != nil {
+	message := buildRecoveryMessage(siteTitle, events)
+	for _, err := range sendTelegramMessageToUsers(token, userIDs, message) {
 		log.Printf("Telegram 恢复通知发送失败: %v", err)
 	}
 }
 
-func sendTelegramTest(token string, userID int64, siteTitle string) error {
+func sendTelegramTest(token string, userIDs []int64, siteTitle string) []string {
 	message := fmt.Sprintf("【%s】Telegram 告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
-	return sendTelegramMessage(token, userID, message)
+	return sendTelegramMessageToUsers(token, userIDs, message)
+}
+
+func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []string {
+	ids := normalizeTelegramUserIDs(userIDs)
+	if token == "" || len(ids) == 0 || strings.TrimSpace(text) == "" {
+		return nil
+	}
+	var errs []string
+	for _, id := range ids {
+		if err := sendTelegramMessage(token, id, text); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	return errs
 }
 
 func sendTelegramMessage(token string, userID int64, text string) error {
@@ -190,7 +225,7 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("telegram 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	var result telegramUpdateResponse
+	var result telegramSendResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return fmt.Errorf("telegram 响应解析失败: %w", err)
 	}
@@ -206,6 +241,8 @@ func handleTelegramCommand(command string, store *Store) string {
 		return ""
 	}
 	switch parts[0] {
+	case "/start", "/help":
+		return buildTelegramHelp()
 	case "/cmall":
 		return buildTelegramAllStats(store)
 	case "/server":
@@ -216,8 +253,18 @@ func handleTelegramCommand(command string, store *Store) string {
 		}
 		return buildTelegramServerStatus(store, parts[1])
 	default:
-		return "支持命令：/cmall /server /status <服务器ID>"
+		return buildTelegramHelp()
 	}
+}
+
+func buildTelegramHelp() string {
+	return strings.Join([]string{
+		"已启用 CyberMonitor 告警机器人",
+		"可用命令：",
+		"/cmall 查看所有服务器统计",
+		"/server 查看服务器列表",
+		"/status <服务器ID> 查看服务器状态",
+	}, "\n")
 }
 
 func buildTelegramAllStats(store *Store) string {
@@ -257,20 +304,38 @@ func buildTelegramServerList(store *Store) string {
 	if len(nodes) == 0 {
 		return "暂无服务器数据"
 	}
-	sort.Slice(nodes, func(i, j int) bool {
-		if nodes[i].Status == nodes[j].Status {
-			return resolveTelegramDisplay(nodes[i]) < resolveTelegramDisplay(nodes[j])
-		}
-		return nodes[i].Status != "offline"
-	})
-	lines := []string{"服务器列表："}
+	online := make([]NodeView, 0)
+	offline := make([]NodeView, 0)
 	for _, node := range nodes {
-		display := resolveTelegramDisplay(node)
-		status := "在线"
 		if node.Status == "offline" {
-			status = "离线"
+			offline = append(offline, node)
+		} else {
+			online = append(online, node)
 		}
-		lines = append(lines, fmt.Sprintf("• %s %s（%s）", node.ServerID, display, status))
+	}
+	sort.Slice(online, func(i, j int) bool {
+		return resolveTelegramDisplay(online[i]) < resolveTelegramDisplay(online[j])
+	})
+	sort.Slice(offline, func(i, j int) bool {
+		return resolveTelegramDisplay(offline[i]) < resolveTelegramDisplay(offline[j])
+	})
+	lines := []string{"服务器列表：", "在线服务器："}
+	if len(online) == 0 {
+		lines = append(lines, "• 无")
+	} else {
+		for _, node := range online {
+			display := resolveTelegramDisplay(node)
+			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
+		}
+	}
+	lines = append(lines, "", "离线服务器：")
+	if len(offline) == 0 {
+		lines = append(lines, "• 无")
+	} else {
+		for _, node := range offline {
+			display := resolveTelegramDisplay(node)
+			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -293,6 +358,13 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 		lastSeen := formatTelegramTime(node.LastSeen)
 		firstSeen := formatTelegramTime(node.FirstSeen)
 		uptime := formatAlertDuration(int64(node.Stats.UptimeSec))
+		hostName := strings.TrimSpace(node.Stats.Hostname)
+		if hostName == "" {
+			hostName = strings.TrimSpace(node.Stats.NodeName)
+		}
+		if hostName == "" {
+			hostName = strings.TrimSpace(node.Stats.NodeID)
+		}
 		detail := []string{
 			"服务器状态",
 			fmt.Sprintf("ID: %s", node.ServerID),
@@ -304,7 +376,7 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 			fmt.Sprintf("运行时长: %s", uptime),
 			fmt.Sprintf("最后上报: %s", lastSeen),
 			fmt.Sprintf("首次上线: %s", firstSeen),
-			fmt.Sprintf("节点ID: %s", node.Stats.NodeID),
+			fmt.Sprintf("主机名: %s", hostName),
 		}
 		if node.Status == "offline" {
 			offlineFor := formatAlertDuration(int64(time.Since(time.Unix(node.LastSeen, 0)).Seconds()))
@@ -313,6 +385,70 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 		return strings.Join(detail, "\n")
 	}
 	return fmt.Sprintf("未找到服务器: %s", serverID)
+}
+
+func setTelegramCommands(token string) error {
+	if err := validateTelegramToken(token); err != nil {
+		return err
+	}
+	commands := []map[string]string{
+		{"command": "cmall", "description": "查看所有服务器统计"},
+		{"command": "server", "description": "查看服务器列表"},
+		{"command": "status", "description": "查看服务器状态 /status 服务器ID"},
+		{"command": "help", "description": "查看可用命令"},
+	}
+	payload := map[string]any{"commands": commands}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("telegram 菜单编码失败: %w", err)
+	}
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", token)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("telegram 菜单请求创建失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram 菜单设置失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("telegram 菜单响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var result telegramSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("telegram 菜单响应解析失败: %w", err)
+	}
+	if !result.Ok {
+		return errors.New(formatTelegramError(result.Description, "telegram 菜单设置失败"))
+	}
+	return nil
+}
+
+func buildTelegramUserKey(ids []int64) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	parts := make([]string, 0, len(sorted))
+	for _, id := range sorted {
+		parts = append(parts, fmt.Sprintf("%d", id))
+	}
+	return strings.Join(parts, ",")
+}
+
+func isAllowedTelegramUser(allowed map[int64]struct{}, fromID, chatID int64) bool {
+	if _, ok := allowed[fromID]; !ok {
+		return false
+	}
+	if _, ok := allowed[chatID]; !ok {
+		return false
+	}
+	return true
 }
 
 func resolveTelegramDisplay(node NodeView) string {

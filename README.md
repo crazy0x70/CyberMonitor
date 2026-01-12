@@ -15,6 +15,7 @@ docker run -d \
   -p 25012:25012 \
   -v "$(pwd)/data:/data" \
   --name cyber-monitor-server \
+  --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
 
@@ -27,6 +28,7 @@ docker logs cyber-monitor-server
 ```bash
 docker run -d \
   --name cyber-monitor-agent \
+  --restart=always \
   --network host \
   -e CM_SERVER_URL=http://<your_server_ip>:25012 \
   -e CM_AGENT_TOKEN=<your_token> \
@@ -104,3 +106,16 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 - `CM_NET_IFACE`：指定采集网卡（逗号分隔）
 - `CM_HOST_ROOT`：宿主机挂载根目录（容器部署时使用）
 - `CM_INTERVAL`：采样间隔
+
+## 通知告警
+
+管理后台「通知告警」支持飞书 Webhook 与 Telegram Bot。
+
+### Telegram 配置
+- 需要同时填写 `Bot Token` 与 `Telegram 用户 ID`（多个用户用逗号分隔）
+- 配置完成后可通过 Telegram 获取告警与服务器信息
+
+### Telegram 命令
+- `/cmall`：查看所有服务器统计
+- `/server`：查看服务器列表（在线/离线分组）
+- `/status <服务器ID>`：查看指定服务器状态
