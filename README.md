@@ -107,12 +107,6 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 - `CM_HOST_ROOT`：宿主机挂载根目录（容器部署时使用）
 - `CM_INTERVAL`：采样间隔
 
-## 管理后台
-
-- 服务器管理支持设置显示昵称、地域、硬盘/网速、分组标签、到期与续费信息
-- 离线告警在服务器管理内逐台配置，保存后下发到 Agent
-- 刷新按钮会提示刷新成功，便于确认加载状态
-
 ## 通知告警
 
 管理后台「通知告警」支持飞书 Webhook 与 Telegram Bot。
@@ -129,12 +123,6 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 - `/alarmson <服务器ID>`：开启该服务器告警
 - `/alarmsoff <服务器ID>`：关闭该服务器告警
 
-## 安全评估
-
-- 攻击树与审计结果：`docs/security-audit.md`
-
 ## 架构图
 
 ![系统架构图](images/architecture.png)
-
-源文件：`images/architecture.drawio`
