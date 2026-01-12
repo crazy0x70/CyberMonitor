@@ -1532,19 +1532,19 @@ svg text {
 }
 
 .ai-card {
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(241, 245, 249, 0.75));
   display: grid;
   gap: 12px;
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
   overflow: hidden;
   position: relative;
 }
 
 .ai-card[open] {
-  border-color: rgba(59, 130, 246, 0.4);
-  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
+  border-color: rgba(59, 130, 246, 0.45);
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.12);
   overflow: visible;
   z-index: 2;
 }
@@ -1612,17 +1612,45 @@ svg text {
   justify-content: flex-end;
   padding: 0 16px 16px;
   border-top: 1px solid rgba(148, 163, 184, 0.2);
-  background: rgba(248, 250, 252, 0.6);
+  background: rgba(248, 250, 252, 0.7);
+}
+
+.ai-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 0 16px;
+}
+
+.ai-hints .form-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin-bottom: 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ai-hints .form-hint.error {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.08);
 }
 
 .ai-compat-group {
   grid-column: 1 / -1;
-  border: 1px dashed rgba(148, 163, 184, 0.4);
-  border-radius: 16px;
+  border: 1px dashed rgba(148, 163, 184, 0.45);
+  border-radius: 18px;
   padding: 14px;
-  background: rgba(248, 250, 252, 0.7);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(241, 245, 249, 0.75));
   display: grid;
   gap: 12px;
+  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.06);
 }
 
 .ai-compat-head {
@@ -1654,13 +1682,13 @@ svg text {
 }
 
 .alert-card {
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 18px;
   padding: 14px 16px 16px;
-  background: rgba(255, 255, 255, 0.8);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(241, 245, 249, 0.75));
   display: grid;
   gap: 12px;
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
   align-content: start;
   align-items: start;
   justify-items: stretch;
@@ -2272,5 +2300,11 @@ svg text {
     flex-direction: column;
     align-items: flex-start;
     gap: 6px;
+  }
+}
+
+@media (max-width: 720px) {
+  .node-summary .summary-text {
+    display: none;
   }
 }

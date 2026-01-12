@@ -863,7 +863,7 @@ function createCard() {
         </div>
       </div>
       <div class="node-summary-metrics">
-        <div class="summary-metric">
+        <div class="summary-metric cpu">
           <div class="summary-inline">
             <span class="summary-label">CPU</span>
             <span class="summary-text" data-field="cpu-meta">--</span>
@@ -1972,12 +1972,22 @@ function formatLossValue(loss) {
 
 function formatCPUModel(cpu) {
   if (!cpu) return "--";
-  const model = (cpu.model || "").trim();
+  const model = stripCPUFrequency(cpu.model || "");
   const cores = cpu.cores || 0;
   const parts = [];
   if (model) parts.push(model);
   if (cores) parts.push(`${cores} 核`);
   return parts.length ? parts.join(" · ") : "--";
+}
+
+function stripCPUFrequency(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const atIndex = value.indexOf("@");
+  if (atIndex !== -1) {
+    return value.slice(0, atIndex).trim();
+  }
+  return value.replace(/\s*\d+(?:\.\d+)?\s*GHz$/i, "").trim();
 }
 
 function formatDiskType(node, stats) {

@@ -26,15 +26,15 @@ const alertsHint = document.getElementById("alerts-hint");
 const aiOpenAIKeyInput = document.getElementById("ai-openai-key");
 const aiOpenAIBaseInput = document.getElementById("ai-openai-base");
 const aiOpenAIModelInput = document.getElementById("ai-openai-model");
-const aiOpenAIModelSelect = document.getElementById("ai-openai-model-select");
+const aiOpenAIModelList = document.getElementById("ai-openai-models");
 const aiGeminiKeyInput = document.getElementById("ai-gemini-key");
 const aiGeminiBaseInput = document.getElementById("ai-gemini-base");
 const aiGeminiModelInput = document.getElementById("ai-gemini-model");
-const aiGeminiModelSelect = document.getElementById("ai-gemini-model-select");
+const aiGeminiModelList = document.getElementById("ai-gemini-models");
 const aiVolcKeyInput = document.getElementById("ai-volc-key");
 const aiVolcBaseInput = document.getElementById("ai-volc-base");
 const aiVolcModelInput = document.getElementById("ai-volc-model");
-const aiVolcModelSelect = document.getElementById("ai-volc-model-select");
+const aiVolcModelList = document.getElementById("ai-volc-models");
 const aiCompatList = document.getElementById("ai-compat-list");
 const aiCompatAddBtn = document.getElementById("ai-compat-add");
 const saveAiBtn = document.getElementById("save-ai-btn");
@@ -527,48 +527,29 @@ function resolveAIModelInput(provider, providerId = "") {
   return null;
 }
 
-function resolveAIModelSelect(provider, providerId = "") {
-  if (provider === "openai") return aiOpenAIModelSelect;
-  if (provider === "gemini") return aiGeminiModelSelect;
-  if (provider === "volcengine") return aiVolcModelSelect;
+function resolveAIModelList(provider, providerId = "") {
+  if (provider === "openai") return aiOpenAIModelList;
+  if (provider === "gemini") return aiGeminiModelList;
+  if (provider === "volcengine") return aiVolcModelList;
   if (provider === "openai_compatible" && providerId && aiCompatList) {
     const card = aiCompatList.querySelector(`[data-provider-id="${providerId}"]`);
-    return card ? card.querySelector('[data-field="compat-model-select"]') : null;
+    return card ? card.querySelector('[data-field="compat-models"]') : null;
   }
   return null;
 }
 
-function applyModelOptions(models, input, select) {
-  if (!select) return;
+function applyModelOptions(models, input, list) {
+  if (!list) return;
   const current = input ? input.value.trim() : "";
-  select.innerHTML = "";
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "选择模型";
-  select.appendChild(placeholder);
+  list.innerHTML = "";
   models.forEach((model) => {
     const option = document.createElement("option");
     option.value = model;
-    option.textContent = model;
-    select.appendChild(option);
+    list.appendChild(option);
   });
-  if (current && models.includes(current)) {
-    select.value = current;
-    return;
-  }
   if (!current && models.length > 0 && input) {
     input.value = models[0];
-    select.value = models[0];
   }
-}
-
-function bindModelSelect(select, input) {
-  if (!select || !input) return;
-  select.addEventListener("change", () => {
-    if (select.value) {
-      input.value = select.value;
-    }
-  });
 }
 
 async function testAIProvider(provider, providerId, button) {
@@ -717,6 +698,7 @@ function updateAlertAIProviderOptions(selectedValue) {
 
 function createCompatCard(item) {
   const id = item.id || createCompatID();
+  const listId = `compat-models-${id}`;
   const name = item.name || "未命名服务商";
   const baseURL = item.base_url || "";
   const card = document.createElement("details");
@@ -746,13 +728,9 @@ function createCompatCard(item) {
       </label>
       <label class="field">
         <span>模型</span>
-        <div class="input-row model-row">
-          <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" />
-          <select class="input" data-field="compat-model-select">
-            <option value="">选择模型</option>
-          </select>
-        </div>
-        <div class="form-hint">从下拉菜单选择会自动填入模型</div>
+        <input class="input" type="text" data-field="compat-model" list="${listId}" placeholder="gpt-4o-mini" />
+        <datalist data-field="compat-models" id="${listId}"></datalist>
+        <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
       </label>
     </div>
     <div class="ai-actions">
@@ -760,19 +738,19 @@ function createCompatCard(item) {
       <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai_compatible" data-provider-id="${id}">测试连接</button>
       <button class="btn danger tiny" type="button" data-action="ai-remove" data-provider="openai_compatible" data-provider-id="${id}">删除</button>
     </div>
-    <div class="form-hint" data-ai-hint="openai_compatible:${id}"></div>
-    <div class="form-hint" data-ai-models="openai_compatible:${id}"></div>
+    <div class="ai-hints">
+      <div class="form-hint" data-ai-hint="openai_compatible:${id}"></div>
+      <div class="form-hint" data-ai-models="openai_compatible:${id}"></div>
+    </div>
   `;
   const nameInput = card.querySelector('[data-field="compat-name"]');
   const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
   const baseInput = card.querySelector('[data-field="compat-base"]');
   const modelInput = card.querySelector('[data-field="compat-model"]');
-  const modelSelect = card.querySelector('[data-field="compat-model-select"]');
   if (nameInput) nameInput.value = item.name || "";
   if (apiKeyInput) apiKeyInput.value = item.api_key || "";
   if (baseInput) baseInput.value = item.base_url || "";
   if (modelInput) modelInput.value = item.model || "";
-  bindModelSelect(modelSelect, modelInput);
   const title = card.querySelector("h3");
   const subtitle = card.querySelector("p");
   if (nameInput && title) {
@@ -821,7 +799,7 @@ function removeCompatProvider(providerId) {
 async function fetchAIModels(provider, providerId, button) {
   const hint = resolveAIModelsHint(provider, providerId);
   const input = resolveAIModelInput(provider, providerId);
-  const select = resolveAIModelSelect(provider, providerId);
+  const list = resolveAIModelList(provider, providerId);
   if (hint) {
     hint.textContent = "";
     hint.classList.remove("error");
@@ -854,7 +832,7 @@ async function fetchAIModels(provider, providerId, button) {
     }
     const data = await resp.json();
     const models = Array.isArray(data.models) ? data.models : [];
-    applyModelOptions(models, input, select);
+    applyModelOptions(models, input, list);
     if (hint) {
       if (!models.length) {
         hint.textContent = "未返回可用模型";
@@ -982,9 +960,6 @@ installCodes.forEach((code) => {
   code.addEventListener("click", () => copyInstallCommand(code));
 });
 
-bindModelSelect(aiOpenAIModelSelect, aiOpenAIModelInput);
-bindModelSelect(aiGeminiModelSelect, aiGeminiModelInput);
-bindModelSelect(aiVolcModelSelect, aiVolcModelInput);
 
 async function saveGroupSettings() {
   const payload = {
