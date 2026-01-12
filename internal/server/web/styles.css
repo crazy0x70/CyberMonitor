@@ -1528,7 +1528,7 @@ svg text {
 .ai-grid {
   display: grid;
   gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: 1fr;
 }
 
 .ai-card {
@@ -1632,6 +1632,7 @@ svg text {
 .ai-compat-list {
   display: grid;
   gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
 .ai-empty {
@@ -1643,13 +1644,13 @@ svg text {
 .alert-grid {
   display: grid;
   gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
 .alert-card {
   border: 1px solid rgba(148, 163, 184, 0.3);
   border-radius: 16px;
-  padding: 16px;
+  padding: 14px 16px 16px;
   background: rgba(255, 255, 255, 0.8);
   display: grid;
   gap: 12px;
@@ -1661,6 +1662,8 @@ svg text {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
 }
 
 .alert-card-head h3 {
@@ -1677,6 +1680,7 @@ svg text {
 .alert-fields {
   display: grid;
   gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .admin-card-grid {

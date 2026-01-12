@@ -215,7 +215,7 @@
                   </div>
                 </div>
                 <div class="alert-fields">
-                  <label class="field">
+                  <label class="field span-full">
                     <span>指定 AI 提供商</span>
                     <select class="input" id="alert-ai-provider">
                       <option value="openai">OpenAI</option>
@@ -264,7 +264,8 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" />
+                    <input class="input" type="text" id="ai-openai-model" list="ai-openai-models" placeholder="gpt-5.2" />
+                    <datalist id="ai-openai-models"></datalist>
                   </label>
                 </div>
                 <div class="ai-actions">
@@ -294,7 +295,8 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" />
+                    <input class="input" type="text" id="ai-gemini-model" list="ai-gemini-models" placeholder="gemini-2.5-flash" />
+                    <datalist id="ai-gemini-models"></datalist>
                   </label>
                 </div>
                 <div class="ai-actions">
@@ -324,7 +326,8 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" />
+                    <input class="input" type="text" id="ai-volc-model" list="ai-volc-models" placeholder="doubao-seed-1-6-flash" />
+                    <datalist id="ai-volc-models"></datalist>
                   </label>
                 </div>
                 <div class="ai-actions">

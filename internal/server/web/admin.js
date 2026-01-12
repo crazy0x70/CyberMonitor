@@ -513,6 +513,40 @@ function resolveAIModelsHint(provider, providerId = "") {
   return document.querySelector(`[data-ai-models="${provider}"]`);
 }
 
+function resolveAIModelInput(provider, providerId = "") {
+  if (provider === "openai") return aiOpenAIModelInput;
+  if (provider === "gemini") return aiGeminiModelInput;
+  if (provider === "volcengine") return aiVolcModelInput;
+  if (provider === "openai_compatible" && providerId && aiCompatList) {
+    const card = aiCompatList.querySelector(`[data-provider-id="${providerId}"]`);
+    return card ? card.querySelector('[data-field="compat-model"]') : null;
+  }
+  return null;
+}
+
+function resolveAIModelsDatalist(provider, providerId = "") {
+  if (provider === "openai") return document.getElementById("ai-openai-models");
+  if (provider === "gemini") return document.getElementById("ai-gemini-models");
+  if (provider === "volcengine") return document.getElementById("ai-volc-models");
+  if (provider === "openai_compatible" && providerId && aiCompatList) {
+    return aiCompatList.querySelector(`#ai-compat-models-${providerId}`);
+  }
+  return null;
+}
+
+function applyModelOptions(models, input, datalist) {
+  if (!datalist) return;
+  datalist.innerHTML = "";
+  models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model;
+    datalist.appendChild(option);
+  });
+  if (input && !input.value && models.length > 0) {
+    input.value = models[0];
+  }
+}
+
 async function testAIProvider(provider, providerId, button) {
   const hint = resolveAIHint(provider, providerId);
   if (hint) {
@@ -688,7 +722,8 @@ function createCompatCard(item) {
       </label>
       <label class="field">
         <span>模型</span>
-        <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" />
+        <input class="input" type="text" data-field="compat-model" list="ai-compat-models-${id}" placeholder="gpt-4o-mini" />
+        <datalist id="ai-compat-models-${id}"></datalist>
       </label>
     </div>
     <div class="ai-actions">
@@ -754,6 +789,8 @@ function removeCompatProvider(providerId) {
 
 async function fetchAIModels(provider, providerId, button) {
   const hint = resolveAIModelsHint(provider, providerId);
+  const input = resolveAIModelInput(provider, providerId);
+  const datalist = resolveAIModelsDatalist(provider, providerId);
   if (hint) {
     hint.textContent = "";
     hint.classList.remove("error");
@@ -786,15 +823,12 @@ async function fetchAIModels(provider, providerId, button) {
     }
     const data = await resp.json();
     const models = Array.isArray(data.models) ? data.models : [];
+    applyModelOptions(models, input, datalist);
     if (hint) {
       if (!models.length) {
         hint.textContent = "未返回可用模型";
       } else {
-        const preview = models.slice(0, 8).join("、");
-        hint.textContent =
-          models.length > 8
-            ? `可用模型(${models.length}): ${preview} …`
-            : `可用模型(${models.length}): ${preview}`;
+        hint.textContent = `已更新模型列表（${models.length}）`;
       }
     }
   } catch (error) {
