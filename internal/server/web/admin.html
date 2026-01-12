@@ -264,8 +264,13 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-openai-model" list="ai-openai-models" placeholder="gpt-5.2" />
-                    <datalist id="ai-openai-models"></datalist>
+                    <div class="input-row model-row">
+                      <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" />
+                      <select class="input" id="ai-openai-model-select">
+                        <option value="">选择模型</option>
+                      </select>
+                    </div>
+                    <div class="form-hint">从下拉菜单选择会自动填入模型</div>
                   </label>
                 </div>
                 <div class="ai-actions">
@@ -295,8 +300,13 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-gemini-model" list="ai-gemini-models" placeholder="gemini-2.5-flash" />
-                    <datalist id="ai-gemini-models"></datalist>
+                    <div class="input-row model-row">
+                      <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" />
+                      <select class="input" id="ai-gemini-model-select">
+                        <option value="">选择模型</option>
+                      </select>
+                    </div>
+                    <div class="form-hint">从下拉菜单选择会自动填入模型</div>
                   </label>
                 </div>
                 <div class="ai-actions">
@@ -326,8 +336,13 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-volc-model" list="ai-volc-models" placeholder="doubao-seed-1-6-flash" />
-                    <datalist id="ai-volc-models"></datalist>
+                    <div class="input-row model-row">
+                      <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" />
+                      <select class="input" id="ai-volc-model-select">
+                        <option value="">选择模型</option>
+                      </select>
+                    </div>
+                    <div class="form-hint">从下拉菜单选择会自动填入模型</div>
                   </label>
                 </div>
                 <div class="ai-actions">

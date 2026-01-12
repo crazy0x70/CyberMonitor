@@ -1539,11 +1539,14 @@ svg text {
   gap: 12px;
   box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
   overflow: hidden;
+  position: relative;
 }
 
 .ai-card[open] {
   border-color: rgba(59, 130, 246, 0.4);
   box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
+  overflow: visible;
+  z-index: 2;
 }
 
 .ai-card-head {
@@ -1645,6 +1648,9 @@ svg text {
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+  justify-items: stretch;
+  justify-content: start;
 }
 
 .alert-card {
@@ -1655,6 +1661,10 @@ svg text {
   display: grid;
   gap: 12px;
   box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+  align-content: start;
+  align-items: start;
+  justify-items: stretch;
+  text-align: left;
 }
 
 .alert-card-head {
@@ -1723,6 +1733,10 @@ svg text {
   gap: 8px;
   grid-template-columns: minmax(0, 1fr) 140px;
   align-items: center;
+}
+
+.input-row.model-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 
 @media (max-width: 720px) {
