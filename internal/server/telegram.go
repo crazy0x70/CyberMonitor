@@ -240,7 +240,11 @@ func handleTelegramCommand(command string, store *Store) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	switch parts[0] {
+	cmd := parts[0]
+	if idx := strings.Index(cmd, "@"); idx > 0 {
+		cmd = cmd[:idx]
+	}
+	switch cmd {
 	case "/start", "/help":
 		return buildTelegramHelp()
 	case "/cmall":
@@ -256,6 +260,8 @@ func handleTelegramCommand(command string, store *Store) string {
 		return handleTelegramAlarmToggle(store, parts, true)
 	case "/alarmsoff":
 		return handleTelegramAlarmToggle(store, parts, false)
+	case "/ai":
+		return handleTelegramAICommand(command, store)
 	default:
 		return buildTelegramHelp()
 	}
@@ -270,7 +276,26 @@ func buildTelegramHelp() string {
 		"/status <服务器ID> 查看服务器状态",
 		"/alarmson <服务器ID> 开启告警",
 		"/alarmsoff <服务器ID> 关闭告警",
+		"/ai <问题> AI 运维查询",
 	}, "\n")
+}
+
+func handleTelegramAICommand(command string, store *Store) string {
+	parts := strings.Fields(command)
+	if len(parts) < 2 {
+		return "用法: /ai 你的问题"
+	}
+	query := strings.TrimSpace(strings.Join(parts[1:], " "))
+	if query == "" {
+		return "用法: /ai 你的问题"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	defer cancel()
+	answer, err := runAIQuery(ctx, store, query)
+	if err != nil {
+		return fmt.Sprintf("AI 查询失败: %s", err.Error())
+	}
+	return answer
 }
 
 func handleTelegramAlarmToggle(store *Store, parts []string, enabled bool) string {
@@ -431,6 +456,7 @@ func setTelegramCommands(token string) error {
 		{"command": "status", "description": "查看服务器状态 /status 服务器ID"},
 		{"command": "alarmson", "description": "开启告警 /alarmson 服务器ID"},
 		{"command": "alarmsoff", "description": "关闭告警 /alarmsoff 服务器ID"},
+		{"command": "ai", "description": "AI 运维 /ai 你的问题"},
 		{"command": "help", "description": "查看可用命令"},
 	}
 	payload := map[string]any{"commands": commands}

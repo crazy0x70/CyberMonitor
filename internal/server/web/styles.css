@@ -1518,6 +1518,91 @@ svg text {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
+.ai-top {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(220px, 1fr);
+  margin-bottom: 12px;
+}
+
+.ai-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.ai-card {
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.75);
+  display: grid;
+  gap: 12px;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+}
+
+.ai-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-card-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.ai-card-head p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ai-fields {
+  display: grid;
+  gap: 10px;
+}
+
+.alert-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.alert-card {
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 16px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.8);
+  display: grid;
+  gap: 12px;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+}
+
+.alert-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.alert-card-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.alert-card-head p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.alert-fields {
+  display: grid;
+  gap: 10px;
+}
+
 .admin-card-grid {
   display: grid;
   gap: 14px;

@@ -43,6 +43,7 @@ type Settings struct {
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
+	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
 	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
@@ -64,6 +65,7 @@ type SettingsView struct {
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
+	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Commit               string            `json:"commit,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
@@ -86,6 +88,7 @@ type SettingsUpdate struct {
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`
 	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
 	AlertTelegramUserID  *int64             `json:"alert_telegram_user_id"`
+	AISettings           *AISettings        `json:"ai_settings"`
 	Groups               *[]string          `json:"groups"`
 	GroupTree            *[]GroupNode       `json:"group_tree"`
 	TestCatalog          *[]TestCatalogItem `json:"test_catalog"`
@@ -280,6 +283,7 @@ func initSettings(cfg Config) Settings {
 		AlertTelegramToken:   "",
 		AlertTelegramUserIDs: []int64{},
 		AlertTelegramUserID:  0,
+		AISettings:           defaultAISettings(),
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
 		TestCatalog:          []TestCatalogItem{},
@@ -360,6 +364,7 @@ func mergeSettings(existing, fallback Settings) Settings {
 	if !existing.AlertAll && existing.AlertWebhook == "" && len(existing.AlertNodes) == 0 {
 		existing.AlertAll = fallback.AlertAll
 	}
+	existing.AISettings = mergeAISettings(existing.AISettings, fallback.AISettings)
 	if existing.Groups == nil {
 		existing.Groups = fallback.Groups
 	}

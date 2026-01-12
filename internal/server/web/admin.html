@@ -47,6 +47,7 @@
           <button class="side-link" type="button" data-section="tests">探测设置</button>
           <button class="side-link" type="button" data-section="agents">服务器管理</button>
           <button class="side-link" type="button" data-section="alerts">通知告警</button>
+          <button class="side-link" type="button" data-section="ai">API提供商</button>
           <button class="side-link side-logout hidden" type="button" id="logout-link">退出登录</button>
         </aside>
 
@@ -173,27 +174,188 @@
                 <div class="form-hint" id="alerts-hint"></div>
               </div>
             </div>
-            <div class="admin-grid">
-              <label class="field span-full">
-                <span>飞书 Webhook</span>
-                <input class="input" type="text" id="alert-webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
-              </label>
-              <label class="field span-full">
-                <span>Telegram Bot Token</span>
-                <input class="input" type="text" id="alert-telegram-token" placeholder="123456:ABC-DEF..." />
-                <div class="form-hint">启用 Telegram 告警需同时填写 Token 与用户 ID</div>
-              </label>
+            <div class="alert-grid">
+              <div class="alert-card">
+                <div class="alert-card-head">
+                  <div>
+                    <h3>告警通道</h3>
+                    <p>飞书与 Telegram 告警配置</p>
+                  </div>
+                </div>
+                <div class="alert-fields">
+                  <label class="field span-full">
+                    <span>飞书 Webhook</span>
+                    <input class="input" type="text" id="alert-webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+                  </label>
+                  <label class="field span-full">
+                    <span>Telegram Bot Token</span>
+                    <input class="input" type="text" id="alert-telegram-token" placeholder="123456:ABC-DEF..." />
+                    <div class="form-hint">启用 Telegram 告警需同时填写 Token 与用户 ID</div>
+                  </label>
+                  <label class="field">
+                    <span>Telegram 用户 ID（逗号分隔）</span>
+                    <input class="input" type="text" id="alert-telegram-user-id" placeholder="123456789,987654321" />
+                  </label>
+                  <label class="field">
+                    <span>离线时长(分钟)</span>
+                    <input class="input" type="number" id="alert-offline-minutes" min="1" step="1" placeholder="默认 5" />
+                  </label>
+                  <div class="field span-full">
+                    <span>监测说明</span>
+                    <div class="form-hint">离线告警开关请在「服务器管理」中按节点设置</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="alert-card">
+                <div class="alert-card-head">
+                  <div>
+                    <h3>AI 运维</h3>
+                    <p>Telegram /ai 使用指定提供商与 Prompt</p>
+                  </div>
+                </div>
+                <div class="alert-fields">
+                  <label class="field">
+                    <span>指定 AI 提供商</span>
+                    <select class="input" id="alert-ai-provider">
+                      <option value="openai">OpenAI</option>
+                      <option value="gemini">Gemini</option>
+                      <option value="volcengine">Volcengine</option>
+                      <option value="openai_compatible">OpenAI 兼容</option>
+                    </select>
+                  </label>
+                  <label class="field span-full">
+                    <span>Prompt</span>
+                    <textarea class="textarea" id="alert-ai-prompt" placeholder="例如：请重点关注网络流量、下载量与离线情况"></textarea>
+                    <div class="form-hint">该提示词会与系统提示合并，用于 /ai 查询</div>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel hidden" data-section="ai">
+            <div class="panel-head">
+              <div>
+                <h2>API提供商</h2>
+                <p class="panel-desc">配置 AI 提供商后，Telegram 可通过 /ai 命令进行智能运维查询。</p>
+              </div>
+              <div class="panel-actions">
+                <button class="btn small" id="save-ai-btn" type="button">保存</button>
+                <div class="form-hint" id="ai-hint"></div>
+              </div>
+            </div>
+            <div class="ai-top">
               <label class="field">
-                <span>Telegram 用户 ID（逗号分隔）</span>
-                <input class="input" type="text" id="alert-telegram-user-id" placeholder="123456789,987654321" />
+                <span>默认提供商</span>
+                <select class="input" id="ai-default-provider">
+                  <option value="openai">OpenAI</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="volcengine">Volcengine</option>
+                  <option value="openai_compatible">OpenAI 兼容</option>
+                </select>
               </label>
-              <label class="field">
-                <span>离线时长(分钟)</span>
-                <input class="input" type="number" id="alert-offline-minutes" min="1" step="1" placeholder="默认 5" />
-              </label>
-              <div class="field span-full">
-                <span>监测说明</span>
-                <div class="form-hint">离线告警开关请在「服务器管理」中按节点设置</div>
+              <div class="form-hint">/ai 默认使用该提供商，可随时切换。</div>
+            </div>
+            <div class="ai-grid">
+              <div class="ai-card" data-provider="openai">
+                <div class="ai-card-head">
+                  <div>
+                    <h3>OpenAI</h3>
+                    <p>官方接口，默认模型 gpt-5.2</p>
+                  </div>
+                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai">测试连接</button>
+                </div>
+                <div class="ai-fields">
+                  <label class="field">
+                    <span>API Key</span>
+                    <input class="input" type="password" id="ai-openai-key" autocomplete="new-password" placeholder="sk-..." />
+                  </label>
+                  <label class="field">
+                    <span>Base URL</span>
+                    <input class="input" type="text" id="ai-openai-base" placeholder="https://api.openai.com/v1" />
+                  </label>
+                  <label class="field">
+                    <span>模型</span>
+                    <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" />
+                  </label>
+                </div>
+                <div class="form-hint" data-ai-hint="openai"></div>
+              </div>
+
+              <div class="ai-card" data-provider="gemini">
+                <div class="ai-card-head">
+                  <div>
+                    <h3>Gemini</h3>
+                    <p>Google 生成式语言 API</p>
+                  </div>
+                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="gemini">测试连接</button>
+                </div>
+                <div class="ai-fields">
+                  <label class="field">
+                    <span>API Key</span>
+                    <input class="input" type="password" id="ai-gemini-key" autocomplete="new-password" placeholder="AIza..." />
+                  </label>
+                  <label class="field">
+                    <span>Base URL</span>
+                    <input class="input" type="text" id="ai-gemini-base" placeholder="https://generativelanguage.googleapis.com/v1beta" />
+                  </label>
+                  <label class="field">
+                    <span>模型</span>
+                    <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" />
+                  </label>
+                </div>
+                <div class="form-hint" data-ai-hint="gemini"></div>
+              </div>
+
+              <div class="ai-card" data-provider="volcengine">
+                <div class="ai-card-head">
+                  <div>
+                    <h3>Volcengine</h3>
+                    <p>豆包模型，默认 doubao-seed-1-6-flash</p>
+                  </div>
+                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="volcengine">测试连接</button>
+                </div>
+                <div class="ai-fields">
+                  <label class="field">
+                    <span>API Key</span>
+                    <input class="input" type="password" id="ai-volc-key" autocomplete="new-password" placeholder="volc-..." />
+                  </label>
+                  <label class="field">
+                    <span>Base URL</span>
+                    <input class="input" type="text" id="ai-volc-base" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
+                  </label>
+                  <label class="field">
+                    <span>模型</span>
+                    <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" />
+                  </label>
+                </div>
+                <div class="form-hint" data-ai-hint="volcengine"></div>
+              </div>
+
+              <div class="ai-card" data-provider="openai_compatible">
+                <div class="ai-card-head">
+                  <div>
+                    <h3>OpenAI 兼容</h3>
+                    <p>适配任意 OpenAI 接口兼容服务</p>
+                  </div>
+                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai_compatible">测试连接</button>
+                </div>
+                <div class="ai-fields">
+                  <label class="field">
+                    <span>API Key</span>
+                    <input class="input" type="password" id="ai-compat-key" autocomplete="new-password" placeholder="自定义 Key" />
+                  </label>
+                  <label class="field">
+                    <span>Base URL</span>
+                    <input class="input" type="text" id="ai-compat-base" placeholder="https://api.example.com/v1" />
+                  </label>
+                  <label class="field">
+                    <span>模型</span>
+                    <input class="input" type="text" id="ai-compat-model" placeholder="自定义模型" />
+                  </label>
+                </div>
+                <div class="form-hint" data-ai-hint="openai_compatible"></div>
               </div>
             </div>
           </section>

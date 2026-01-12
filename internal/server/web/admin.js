@@ -18,9 +18,27 @@ const alertWebhookInput = document.getElementById("alert-webhook");
 const alertTelegramTokenInput = document.getElementById("alert-telegram-token");
 const alertTelegramUserIdInput = document.getElementById("alert-telegram-user-id");
 const alertOfflineMinutesInput = document.getElementById("alert-offline-minutes");
+const alertAIProviderSelect = document.getElementById("alert-ai-provider");
+const alertAIPromptInput = document.getElementById("alert-ai-prompt");
 const saveAlertsBtn = document.getElementById("save-alerts-btn");
 const testAlertsBtn = document.getElementById("test-alerts-btn");
 const alertsHint = document.getElementById("alerts-hint");
+const aiDefaultProviderSelect = document.getElementById("ai-default-provider");
+const aiOpenAIKeyInput = document.getElementById("ai-openai-key");
+const aiOpenAIBaseInput = document.getElementById("ai-openai-base");
+const aiOpenAIModelInput = document.getElementById("ai-openai-model");
+const aiGeminiKeyInput = document.getElementById("ai-gemini-key");
+const aiGeminiBaseInput = document.getElementById("ai-gemini-base");
+const aiGeminiModelInput = document.getElementById("ai-gemini-model");
+const aiVolcKeyInput = document.getElementById("ai-volc-key");
+const aiVolcBaseInput = document.getElementById("ai-volc-base");
+const aiVolcModelInput = document.getElementById("ai-volc-model");
+const aiCompatKeyInput = document.getElementById("ai-compat-key");
+const aiCompatBaseInput = document.getElementById("ai-compat-base");
+const aiCompatModelInput = document.getElementById("ai-compat-model");
+const saveAiBtn = document.getElementById("save-ai-btn");
+const aiHint = document.getElementById("ai-hint");
+const aiTestButtons = document.querySelectorAll('[data-action="ai-test"]');
 const groupTree = document.getElementById("group-tree");
 const addGroupBtn = document.getElementById("add-group-btn");
 const saveGroupBtn = document.getElementById("save-group-btn");
@@ -58,6 +76,15 @@ const state = {
     alertOfflineSec: 0,
     alertTelegramToken: "",
     alertTelegramUserIds: [],
+    aiSettings: {
+      defaultProvider: "openai",
+      commandProvider: "",
+      prompt: "",
+      openai: { apiKey: "", baseURL: "", model: "" },
+      gemini: { apiKey: "", baseURL: "", model: "" },
+      volcengine: { apiKey: "", baseURL: "", model: "" },
+      openaiCompatible: { apiKey: "", baseURL: "", model: "" },
+    },
   },
   nodes: [],
 };
@@ -185,6 +212,43 @@ function applySettingsView(data) {
     const minutes = Math.round((data.alert_offline_sec || 0) / 60);
     alertOfflineMinutesInput.value = minutes > 0 ? String(minutes) : "";
   }
+  const aiSettings = data.ai_settings || {};
+  const defaultProvider = ["openai", "gemini", "volcengine", "openai_compatible"].includes(
+    aiSettings.default_provider
+  )
+    ? aiSettings.default_provider
+    : "openai";
+  const commandProvider = ["openai", "gemini", "volcengine", "openai_compatible"].includes(
+    aiSettings.command_provider
+  )
+    ? aiSettings.command_provider
+    : "";
+  const prompt = typeof aiSettings.prompt === "string" ? aiSettings.prompt : "";
+  if (aiDefaultProviderSelect) {
+    aiDefaultProviderSelect.value = defaultProvider;
+  }
+  if (alertAIProviderSelect) {
+    alertAIProviderSelect.value = commandProvider || defaultProvider;
+  }
+  if (alertAIPromptInput) {
+    alertAIPromptInput.value = prompt;
+  }
+  const openai = aiSettings.openai || {};
+  if (aiOpenAIKeyInput) aiOpenAIKeyInput.value = openai.api_key || "";
+  if (aiOpenAIBaseInput) aiOpenAIBaseInput.value = openai.base_url || "";
+  if (aiOpenAIModelInput) aiOpenAIModelInput.value = openai.model || "";
+  const gemini = aiSettings.gemini || {};
+  if (aiGeminiKeyInput) aiGeminiKeyInput.value = gemini.api_key || "";
+  if (aiGeminiBaseInput) aiGeminiBaseInput.value = gemini.base_url || "";
+  if (aiGeminiModelInput) aiGeminiModelInput.value = gemini.model || "";
+  const volcengine = aiSettings.volcengine || {};
+  if (aiVolcKeyInput) aiVolcKeyInput.value = volcengine.api_key || "";
+  if (aiVolcBaseInput) aiVolcBaseInput.value = volcengine.base_url || "";
+  if (aiVolcModelInput) aiVolcModelInput.value = volcengine.model || "";
+  const compat = aiSettings.openai_compatible || {};
+  if (aiCompatKeyInput) aiCompatKeyInput.value = compat.api_key || "";
+  if (aiCompatBaseInput) aiCompatBaseInput.value = compat.base_url || "";
+  if (aiCompatModelInput) aiCompatModelInput.value = compat.model || "";
   updateAdminBrand(data);
   if (siteIconLink) {
     if (data.site_icon) {
@@ -210,6 +274,31 @@ function applySettingsView(data) {
   if (typeof data.alert_offline_sec === "number") {
     state.settings.alertOfflineSec = data.alert_offline_sec;
   }
+  state.settings.aiSettings = {
+    defaultProvider,
+    commandProvider,
+    prompt,
+    openai: {
+      apiKey: openai.api_key || "",
+      baseURL: openai.base_url || "",
+      model: openai.model || "",
+    },
+    gemini: {
+      apiKey: gemini.api_key || "",
+      baseURL: gemini.base_url || "",
+      model: gemini.model || "",
+    },
+    volcengine: {
+      apiKey: volcengine.api_key || "",
+      baseURL: volcengine.base_url || "",
+      model: volcengine.model || "",
+    },
+    openaiCompatible: {
+      apiKey: compat.api_key || "",
+      baseURL: compat.base_url || "",
+      model: compat.model || "",
+    },
+  };
   state.settings.groups = Array.isArray(data.groups) ? data.groups : [];
   state.settings.groupTree = Array.isArray(data.group_tree)
     ? data.group_tree
@@ -312,6 +401,7 @@ async function saveAlertSettings() {
   payload.alert_telegram_token = telegramToken;
   payload.alert_telegram_user_ids = telegramUserIds;
   payload.alert_offline_sec = minutes * 60;
+  payload.ai_settings = collectAISettings();
   return saveSettingsPayload(payload);
 }
 
@@ -353,6 +443,111 @@ async function testAlertSettings() {
       // ignore
     }
     throw new Error(message);
+  }
+}
+
+function collectAIProviderConfig(provider) {
+  switch (provider) {
+    case "openai":
+      return {
+        api_key: aiOpenAIKeyInput ? aiOpenAIKeyInput.value.trim() : "",
+        base_url: aiOpenAIBaseInput ? aiOpenAIBaseInput.value.trim() : "",
+        model: aiOpenAIModelInput ? aiOpenAIModelInput.value.trim() : "",
+      };
+    case "gemini":
+      return {
+        api_key: aiGeminiKeyInput ? aiGeminiKeyInput.value.trim() : "",
+        base_url: aiGeminiBaseInput ? aiGeminiBaseInput.value.trim() : "",
+        model: aiGeminiModelInput ? aiGeminiModelInput.value.trim() : "",
+      };
+    case "volcengine":
+      return {
+        api_key: aiVolcKeyInput ? aiVolcKeyInput.value.trim() : "",
+        base_url: aiVolcBaseInput ? aiVolcBaseInput.value.trim() : "",
+        model: aiVolcModelInput ? aiVolcModelInput.value.trim() : "",
+      };
+    case "openai_compatible":
+      return {
+        api_key: aiCompatKeyInput ? aiCompatKeyInput.value.trim() : "",
+        base_url: aiCompatBaseInput ? aiCompatBaseInput.value.trim() : "",
+        model: aiCompatModelInput ? aiCompatModelInput.value.trim() : "",
+      };
+    default:
+      return { api_key: "", base_url: "", model: "" };
+  }
+}
+
+function collectAISettings() {
+  const provider = aiDefaultProviderSelect ? aiDefaultProviderSelect.value : "openai";
+  const commandProvider = alertAIProviderSelect ? alertAIProviderSelect.value : "";
+  const prompt = alertAIPromptInput ? alertAIPromptInput.value.trim() : "";
+  return {
+    default_provider: provider || "openai",
+    command_provider: commandProvider || "",
+    prompt,
+    openai: collectAIProviderConfig("openai"),
+    gemini: collectAIProviderConfig("gemini"),
+    volcengine: collectAIProviderConfig("volcengine"),
+    openai_compatible: collectAIProviderConfig("openai_compatible"),
+  };
+}
+
+async function saveAISettings() {
+  const payload = {
+    ai_settings: collectAISettings(),
+  };
+  return saveSettingsPayload(payload);
+}
+
+function resolveAIHint(provider) {
+  return document.querySelector(`[data-ai-hint="${provider}"]`);
+}
+
+async function testAIProvider(provider, button) {
+  const hint = resolveAIHint(provider);
+  if (hint) {
+    hint.textContent = "";
+    hint.classList.remove("error");
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "测试中...";
+  }
+  const payload = {
+    provider,
+    config: collectAIProviderConfig(provider),
+  };
+  try {
+    const resp = await apiFetch("/api/v1/admin/ai/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      let message = `测试失败: ${resp.status}`;
+      try {
+        const data = await resp.json();
+        if (data && data.error) {
+          message = data.error;
+        }
+      } catch (error) {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    if (hint) {
+      hint.textContent = "连接成功";
+    }
+  } catch (error) {
+    if (hint) {
+      hint.textContent = error.message;
+      hint.classList.add("error");
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "测试连接";
+    }
   }
 }
 
@@ -1731,6 +1926,39 @@ if (testAlertsBtn) {
         alertsHint.classList.add("error");
       }
     }
+  });
+}
+
+if (saveAiBtn) {
+  saveAiBtn.addEventListener("click", async () => {
+    const originalText = saveAiBtn.textContent;
+    saveAiBtn.textContent = "保存中...";
+    saveAiBtn.disabled = true;
+    if (aiHint) {
+      aiHint.textContent = "";
+      aiHint.classList.remove("error");
+    }
+    try {
+      await saveAISettings();
+      flashButtonText(saveAiBtn, "已保存", 2000, originalText);
+    } catch (error) {
+      saveAiBtn.textContent = originalText;
+      saveAiBtn.disabled = false;
+      if (aiHint) {
+        aiHint.textContent = error.message;
+        aiHint.classList.add("error");
+      }
+    }
+  });
+}
+
+if (aiTestButtons) {
+  aiTestButtons.forEach((button) => {
+    button.addEventListener("click", async () => {
+      const provider = button.dataset.provider || "";
+      if (!provider) return;
+      await testAIProvider(provider, button);
+    });
   });
 }
 

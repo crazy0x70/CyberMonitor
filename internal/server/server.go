@@ -509,6 +509,38 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
 
+	mux.HandleFunc("/api/v1/admin/ai/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req struct {
+			Provider string           `json:"provider"`
+			Config   AIProviderConfig `json:"config"`
+		}
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(req.Provider) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
+			return
+		}
+		settings := store.AISettings()
+		selection, err := resolveAIProviderConfigWithOverride(settings, req.Provider, req.Config)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
+		defer cancel()
+		if err := testAIProvider(ctx, selection.Provider, selection.Config); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+
 	mux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -1591,6 +1623,7 @@ func (s *Store) SettingsView() SettingsView {
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
+		AISettings:           s.settings.AISettings,
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
 		GroupTree:            s.settings.GroupTree,
@@ -1746,6 +1779,14 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.mu.Unlock()
 		return SettingsView{}, errors.New("telegram token 与 telegram 用户 ID 需要同时配置")
 	}
+	if update.AISettings != nil {
+		normalized := normalizeAISettings(*update.AISettings)
+		if err := validateAISettings(normalized); err != nil {
+			s.mu.Unlock()
+			return SettingsView{}, err
+		}
+		s.settings.AISettings = normalized
+	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
 		if len(s.settings.GroupTree) == 0 {
@@ -1779,6 +1820,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
+		AISettings:           s.settings.AISettings,
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
 		GroupTree:            s.settings.GroupTree,
