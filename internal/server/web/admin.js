@@ -411,6 +411,7 @@ function syncAlertToggles(nodes) {
     if (!nodeID) return;
     const card = cardMap.get(nodeID);
     if (!card) return;
+    if (card.dataset.alertDirty === "true") return;
     const checkbox = card.querySelector('[data-field="alert-enabled"]');
     if (!checkbox) return;
     checkbox.checked = node.alert_enabled !== false;
@@ -517,6 +518,7 @@ function createNodeCard(node) {
     ? new Date(node.last_seen * 1000).toLocaleString()
     : "--";
   const status = node.status === "offline" ? "离线" : "在线";
+  const statusClass = node.status === "offline" ? "offline" : "online";
   const metaParts = [];
   metaParts.push(escapeHtml(stats.os || "--"));
   if (stats.agent_version) {
@@ -525,7 +527,6 @@ function createNodeCard(node) {
   if (hostLabel && hostLabel !== displayName) {
     metaParts.push(escapeHtml(hostLabel));
   }
-  metaParts.push(status);
   metaParts.push(lastSeen);
   const metaText = metaParts.join(" · ");
 
@@ -540,57 +541,74 @@ function createNodeCard(node) {
           ${metaText}
         </div>
       </div>
+      <div class="admin-status ${statusClass}">
+        <span class="dot"></span>
+        ${status}
+      </div>
     </summary>
     <div class="admin-body">
-      <div class="admin-grid">
-        <label class="field">
-          <span>显示昵称</span>
-          <input class="input" type="text" data-field="alias" placeholder="例如：杭州节点" />
-        </label>
-        <label class="field">
-          <span>离线告警</span>
-          <label class="check">
-            <input type="checkbox" data-field="alert-enabled" />
-            <span>启用</span>
-          </label>
-        </label>
-        <label class="field">
-          <span>国家/地区</span>
-          <input class="input" type="text" data-field="region" placeholder="如 CN / HK / US" />
-        </label>
-        <label class="field">
-          <span>网速(Mbps)</span>
-          <input class="input" type="number" min="0" step="1" data-field="net-speed" placeholder="例如 1000" />
-        </label>
-        <label class="field">
-          <span>硬盘类型</span>
-          <input class="input" type="text" data-field="disk-type" placeholder="如 SSD / HDD / NVMe" />
-        </label>
-        <label class="field">
-          <span>分组与标签</span>
-          <details class="multi-select" data-field="group-tags">
-            <summary class="select-summary" data-field="group-tags-summary">未选择</summary>
-            <div class="select-panel" data-field="group-tags-panel"></div>
-          </details>
-        </label>
-        <div class="field-row span-full">
-        <label class="field field-compact">
-          <span>到期时间</span>
-          <div class="input-row">
-            <input class="input" type="date" data-field="expire-date" />
-            <input class="input" type="time" step="1" data-field="expire-time" />
+      <div class="admin-card-grid">
+        <div class="admin-block">
+          <div class="block-title">基础信息</div>
+          <div class="block-grid">
+            <label class="field">
+              <span>显示昵称</span>
+              <input class="input" type="text" data-field="alias" placeholder="例如：杭州节点" />
+            </label>
+            <label class="field">
+              <span>国家/地区</span>
+              <input class="input" type="text" data-field="region" placeholder="如 CN / HK / US" />
+            </label>
+            <label class="field">
+              <span>硬盘类型</span>
+              <input class="input" type="text" data-field="disk-type" placeholder="如 SSD / HDD / NVMe" />
+            </label>
+            <label class="field">
+              <span>网速(Mbps)</span>
+              <input class="input" type="number" min="0" step="1" data-field="net-speed" placeholder="例如 1000" />
+            </label>
           </div>
-        </label>
-          <label class="field field-compact">
-            <span>自动续费</span>
-            <select class="input" data-field="auto-renew">
-              <option value="none">none</option>
-              <option value="month">每月</option>
-              <option value="quarter">每季</option>
-              <option value="half">每半年</option>
-              <option value="year">每年</option>
-            </select>
-          </label>
+        </div>
+        <div class="admin-block">
+          <div class="block-title">告警与分组</div>
+          <div class="block-grid">
+            <label class="field">
+              <span>离线告警</span>
+              <label class="toggle">
+                <input type="checkbox" data-field="alert-enabled" />
+                <span class="toggle-text">启用</span>
+              </label>
+            </label>
+            <label class="field">
+              <span>分组与标签</span>
+              <details class="multi-select" data-field="group-tags">
+                <summary class="select-summary" data-field="group-tags-summary">未选择</summary>
+                <div class="select-panel" data-field="group-tags-panel"></div>
+              </details>
+            </label>
+          </div>
+        </div>
+        <div class="admin-block span-full">
+          <div class="block-title">到期与续费</div>
+          <div class="block-grid">
+            <label class="field field-compact">
+              <span>到期时间</span>
+              <div class="input-row">
+                <input class="input" type="date" data-field="expire-date" />
+                <input class="input" type="time" step="1" data-field="expire-time" />
+              </div>
+            </label>
+            <label class="field field-compact">
+              <span>自动续费</span>
+              <select class="input" data-field="auto-renew">
+                <option value="none">none</option>
+                <option value="month">每月</option>
+                <option value="quarter">每季</option>
+                <option value="half">每半年</option>
+                <option value="year">每年</option>
+              </select>
+            </label>
+          </div>
         </div>
       </div>
       <div class="test-config">
@@ -611,6 +629,9 @@ function createNodeCard(node) {
   const alertEnabledInput = card.querySelector('[data-field="alert-enabled"]');
   if (alertEnabledInput) {
     alertEnabledInput.checked = node.alert_enabled !== false;
+    alertEnabledInput.addEventListener("change", () => {
+      card.dataset.alertDirty = "true";
+    });
   }
 
   const regionInput = card.querySelector('[data-field="region"]');
@@ -1307,6 +1328,7 @@ async function saveNode(nodeID, card) {
   if (!resp.ok) {
     throw new Error(`保存失败: ${resp.status}`);
   }
+  card.dataset.alertDirty = "";
 }
 
 function collectGroupTags(card) {
@@ -1632,10 +1654,18 @@ loginForm.addEventListener("submit", async (event) => {
   }
 });
 
-refreshBtn.addEventListener("click", () => {
-  loadNodes().catch((error) => {
+refreshBtn.addEventListener("click", async () => {
+  const originalText = refreshBtn.textContent || "刷新";
+  refreshBtn.textContent = "刷新中...";
+  refreshBtn.disabled = true;
+  try {
+    await loadNodes();
+    flashButtonText(refreshBtn, "刷新成功", 1600, originalText);
+  } catch (error) {
+    refreshBtn.textContent = originalText;
+    refreshBtn.disabled = false;
     alert(error.message);
-  });
+  }
 });
 
 saveSettingsBtn.addEventListener("click", async () => {
