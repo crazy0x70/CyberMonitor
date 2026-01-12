@@ -18,8 +18,6 @@ const alertWebhookInput = document.getElementById("alert-webhook");
 const alertTelegramTokenInput = document.getElementById("alert-telegram-token");
 const alertTelegramUserIdInput = document.getElementById("alert-telegram-user-id");
 const alertOfflineMinutesInput = document.getElementById("alert-offline-minutes");
-const alertAllToggle = document.getElementById("alert-all");
-const alertNodeList = document.getElementById("alert-node-list");
 const saveAlertsBtn = document.getElementById("save-alerts-btn");
 const testAlertsBtn = document.getElementById("test-alerts-btn");
 const alertsHint = document.getElementById("alerts-hint");
@@ -45,6 +43,7 @@ const installPanes = document.querySelectorAll("[data-install-pane]");
 const installCodes = document.querySelectorAll(".install-code");
 
 const TOKEN_KEY = "cm_admin_token";
+const DEFAULT_TCP_INTERVAL = 5;
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
@@ -57,13 +56,13 @@ const state = {
     agentToken: "",
     alertWebhook: "",
     alertOfflineSec: 0,
-    alertAll: true,
-    alertNodes: [],
     alertTelegramToken: "",
     alertTelegramUserIds: [],
   },
   nodes: [],
 };
+
+let adminSocket = null;
 
 function setView(loggedIn) {
   if (loggedIn) {
@@ -73,6 +72,10 @@ function setView(loggedIn) {
   } else {
     loginPanel.classList.remove("hidden");
     adminShell.classList.add("hidden");
+    if (adminSocket) {
+      adminSocket.close();
+      adminSocket = null;
+    }
   }
   if (logoutLink) {
     logoutLink.classList.toggle("hidden", !loggedIn);
@@ -123,6 +126,7 @@ async function login(username, password) {
   setView(true);
   await loadSettings();
   await loadNodes();
+  connectAdminSocket();
 }
 
 async function loadSettings() {
@@ -181,9 +185,6 @@ function applySettingsView(data) {
     const minutes = Math.round((data.alert_offline_sec || 0) / 60);
     alertOfflineMinutesInput.value = minutes > 0 ? String(minutes) : "";
   }
-  if (alertAllToggle) {
-    alertAllToggle.checked = data.alert_all !== false;
-  }
   updateAdminBrand(data);
   if (siteIconLink) {
     if (data.site_icon) {
@@ -209,8 +210,6 @@ function applySettingsView(data) {
   if (typeof data.alert_offline_sec === "number") {
     state.settings.alertOfflineSec = data.alert_offline_sec;
   }
-  state.settings.alertAll = data.alert_all !== false;
-  state.settings.alertNodes = Array.isArray(data.alert_nodes) ? data.alert_nodes : [];
   state.settings.groups = Array.isArray(data.groups) ? data.groups : [];
   state.settings.groupTree = Array.isArray(data.group_tree)
     ? data.group_tree
@@ -220,7 +219,6 @@ function applySettingsView(data) {
     : [];
   renderGroupTree(state.settings.groupTree);
   renderTestCatalog(state.settings.testCatalog);
-  renderAlertTargets();
   updateFooter(data.commit || "");
   updateInstallCommands();
 }
@@ -281,18 +279,6 @@ async function saveBaseSettings() {
   return saveSettingsPayload(payload);
 }
 
-function collectAlertNodes() {
-  if (!alertNodeList) return [];
-  const nodes = [];
-  alertNodeList
-    .querySelectorAll("input[type=\"checkbox\"][data-node-id]:checked")
-    .forEach((input) => {
-      const value = (input.dataset.nodeId || "").trim();
-      if (value) nodes.push(value);
-    });
-  return nodes;
-}
-
 function parseTelegramUserIds(raw) {
   if (!raw) return [];
   const values = raw
@@ -322,19 +308,10 @@ async function saveAlertSettings() {
   if (!Number.isFinite(minutes) || minutes <= 0) {
     minutes = 5;
   }
-  const alertAll = alertAllToggle ? alertAllToggle.checked : true;
   payload.alert_webhook = webhook;
   payload.alert_telegram_token = telegramToken;
   payload.alert_telegram_user_ids = telegramUserIds;
   payload.alert_offline_sec = minutes * 60;
-  payload.alert_all = alertAll;
-  if (!alertAll) {
-    const nodes = collectAlertNodes();
-    if (!nodes.length) {
-      throw new Error("请至少选择一台服务器");
-    }
-    payload.alert_nodes = nodes;
-  }
   return saveSettingsPayload(payload);
 }
 
@@ -394,6 +371,50 @@ function updateInstallCommands() {
     const safeToken = escapePwsh(token);
     installWindows.textContent = `powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile "$env:TEMP\\agent.ps1"; & "$env:TEMP\\agent.ps1" -ServerUrl "${safeEndpoint}" -AgentToken "${safeToken}"'`;
   }
+}
+
+function connectAdminSocket() {
+  if (!state.token || adminSocket) return;
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const url = `${protocol}://${window.location.host}/ws?token=${encodeURIComponent(
+    state.token
+  )}`;
+  adminSocket = new WebSocket(url);
+  adminSocket.addEventListener("message", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (!payload || !Array.isArray(payload.nodes)) return;
+      state.nodes = payload.nodes;
+      syncAlertToggles(payload.nodes);
+    } catch (error) {
+      // ignore
+    }
+  });
+  adminSocket.addEventListener("close", () => {
+    adminSocket = null;
+  });
+}
+
+function syncAlertToggles(nodes) {
+  if (!nodeList || !Array.isArray(nodes)) return;
+  const cards = nodeList.querySelectorAll(".admin-card[data-node-id]");
+  const cardMap = new Map();
+  cards.forEach((card) => {
+    const nodeId = card.dataset.nodeId;
+    if (nodeId) {
+      cardMap.set(nodeId, card);
+    }
+  });
+  nodes.forEach((node) => {
+    const stats = node.stats || {};
+    const nodeID = stats.node_id || stats.node_name || "";
+    if (!nodeID) return;
+    const card = cardMap.get(nodeID);
+    if (!card) return;
+    const checkbox = card.querySelector('[data-field="alert-enabled"]');
+    if (!checkbox) return;
+    checkbox.checked = node.alert_enabled !== false;
+  });
 }
 
 installTabs.forEach((tab) => {
@@ -465,7 +486,6 @@ async function loadNodes() {
   const data = await resp.json();
   state.nodes = Array.isArray(data.nodes) ? data.nodes : [];
   renderNodes(state.nodes);
-  renderAlertTargets();
 }
 
 function renderNodes(nodes) {
@@ -480,40 +500,6 @@ function renderNodes(nodes) {
   });
 }
 
-function renderAlertTargets() {
-  if (!alertNodeList) return;
-  alertNodeList.innerHTML = "";
-  const nodes = Array.isArray(state.nodes) ? state.nodes : [];
-  if (!nodes.length) {
-    alertNodeList.innerHTML = "<div class=\"form-hint\">暂无可监测的服务器</div>";
-    return;
-  }
-  const selectedAll = alertAllToggle ? alertAllToggle.checked : true;
-  const selected = new Set(state.settings.alertNodes || []);
-  const sorted = [...nodes].sort((a, b) => {
-    const left = resolveNodeDisplayName(a);
-    const right = resolveNodeDisplayName(b);
-    return left.localeCompare(right, "zh-Hans-CN");
-  });
-  sorted.forEach((node) => {
-    const stats = node.stats || {};
-    const nodeID = stats.node_id || stats.node_name || "";
-    if (!nodeID) return;
-    const item = document.createElement("div");
-    item.className = "alert-node-item";
-    const checked = selectedAll || selected.has(nodeID);
-    const disabled = selectedAll;
-    item.innerHTML = `
-      <label class="check">
-        <input type="checkbox" data-node-id="${escapeHtml(nodeID)}" ${
-          checked ? "checked" : ""
-        } ${disabled ? "disabled" : ""} />
-        <span>${escapeHtml(resolveNodeDisplayName(node))}</span>
-      </label>
-    `;
-    alertNodeList.appendChild(item);
-  });
-}
 
 function resolveNodeDisplayName(node) {
   const stats = node.stats || {};
@@ -545,6 +531,7 @@ function createNodeCard(node) {
 
   const card = document.createElement("details");
   card.className = "admin-card";
+  card.dataset.nodeId = nodeID;
   card.innerHTML = `
     <summary class="admin-head">
       <div class="admin-title">
@@ -559,6 +546,13 @@ function createNodeCard(node) {
         <label class="field">
           <span>显示昵称</span>
           <input class="input" type="text" data-field="alias" placeholder="例如：杭州节点" />
+        </label>
+        <label class="field">
+          <span>离线告警</span>
+          <label class="check">
+            <input type="checkbox" data-field="alert-enabled" />
+            <span>启用</span>
+          </label>
         </label>
         <label class="field">
           <span>国家/地区</span>
@@ -613,6 +607,11 @@ function createNodeCard(node) {
 
   const aliasInput = card.querySelector('[data-field="alias"]');
   aliasInput.value = node.alias || stats.node_alias || "";
+
+  const alertEnabledInput = card.querySelector('[data-field="alert-enabled"]');
+  if (alertEnabledInput) {
+    alertEnabledInput.checked = node.alert_enabled !== false;
+  }
 
   const regionInput = card.querySelector('[data-field="region"]');
   regionInput.value = node.region || "";
@@ -1028,7 +1027,7 @@ function renderTestSelections(container, selections) {
   }
   state.settings.testCatalog.forEach((item) => {
     const isTCP = (item.type || "icmp").toLowerCase() === "tcp";
-    const defaultInterval = parseInterval(item.interval_sec, 0);
+    const defaultInterval = parseInterval(item.interval_sec, DEFAULT_TCP_INTERVAL);
     const row = document.createElement("div");
     row.className = "test-select-row";
     if (!isTCP) {
@@ -1056,7 +1055,7 @@ function renderTestSelections(container, selections) {
       intervalInput.type = "number";
       intervalInput.min = "0";
       intervalInput.max = "3600";
-      intervalInput.placeholder = "0 表示持续";
+      intervalInput.placeholder = `默认 ${DEFAULT_TCP_INTERVAL} 秒`;
       intervalInput.value =
         selectedInterval !== undefined ? selectedInterval : defaultInterval;
       intervalInput.disabled = !checkbox.checked;
@@ -1087,7 +1086,10 @@ function buildSelectionMap(node) {
   state.settings.testCatalog.forEach((item) => {
     if (!item || !item.id) return;
     const type = (item.type || "icmp").toLowerCase();
-    const interval = type === "tcp" ? parseInterval(item.interval_sec, 0) : 0;
+    const interval =
+      type === "tcp"
+        ? parseInterval(item.interval_sec, DEFAULT_TCP_INTERVAL)
+        : 0;
     catalogMeta.set(item.id, { type, interval });
   });
   if (Array.isArray(node.test_selections)) {
@@ -1095,7 +1097,7 @@ function buildSelectionMap(node) {
       if (sel && sel.test_id) {
         const meta = catalogMeta.get(sel.test_id);
         const isTCP = meta && meta.type === "tcp";
-        const fallback = meta ? meta.interval : 0;
+        const fallback = meta ? meta.interval : DEFAULT_TCP_INTERVAL;
         selections.set(
           sel.test_id,
           isTCP ? resolveInterval(sel.interval_sec, fallback) : 0
@@ -1116,7 +1118,10 @@ function buildSelectionMap(node) {
       if (id && !selections.has(id)) {
         const meta = catalogMeta.get(id);
         const isTCP = meta && meta.type === "tcp";
-        selections.set(id, isTCP ? resolveInterval(meta.interval, 0) : 0);
+        selections.set(
+          id,
+          isTCP ? resolveInterval(meta.interval, DEFAULT_TCP_INTERVAL) : 0
+        );
       }
     });
   }
@@ -1252,6 +1257,8 @@ async function saveNode(nodeID, card) {
   const renewPlan = card.querySelector('[data-field="auto-renew"]').value;
   const groups = collectGroupTags(card);
   const selections = collectSelections(card);
+  const alertEnabledInput = card.querySelector('[data-field="alert-enabled"]');
+  const alertEnabled = alertEnabledInput ? alertEnabledInput.checked : true;
 
   let expireAt = 0;
   const normalizedExpire = normalizeExpireInput(expireRaw);
@@ -1281,6 +1288,7 @@ async function saveNode(nodeID, card) {
     disk_type: diskType,
     net_speed_mbps: netSpeedMbps,
     auto_renew: autoRenew,
+    alert_enabled: alertEnabled,
     groups,
     test_selections: selections,
   };
@@ -1326,7 +1334,10 @@ function collectSelections(card) {
       return;
     }
     const isTCP = (row.dataset.type || "icmp") === "tcp";
-    const fallbackInterval = parseInterval(row.dataset.defaultInterval, 0);
+    const fallbackInterval = parseInterval(
+      row.dataset.defaultInterval,
+      DEFAULT_TCP_INTERVAL
+    );
     let interval = 0;
     if (isTCP) {
       const intervalInput = row.querySelector('input[type="number"]');
@@ -1390,7 +1401,7 @@ function parsePositiveNumber(value, fallback) {
 
 function parseInterval(value, fallback) {
   if (value === 0 || value === "0") {
-    return 0;
+    return fallback;
   }
   const num = parseInt(value, 10);
   if (Number.isFinite(num) && num > 0) {
@@ -1400,10 +1411,10 @@ function parseInterval(value, fallback) {
 }
 
 function resolveInterval(value, fallback) {
-  if (value === 0) return 0;
+  if (value === 0) return fallback;
   const num = parseInt(value, 10);
   if (Number.isFinite(num)) {
-    if (num === 0) return 0;
+    if (num === 0) return fallback;
     if (num > 0) return num;
   }
   return fallback;
@@ -1644,13 +1655,6 @@ saveSettingsBtn.addEventListener("click", async () => {
   }
 });
 
-if (alertAllToggle) {
-  alertAllToggle.addEventListener("change", () => {
-    state.settings.alertAll = alertAllToggle.checked;
-    renderAlertTargets();
-  });
-}
-
 if (saveAlertsBtn) {
   saveAlertsBtn.addEventListener("click", async () => {
     const originalText = saveAlertsBtn.textContent;
@@ -1687,7 +1691,7 @@ if (testAlertsBtn) {
       await testAlertSettings();
       flashButtonText(testAlertsBtn, "测试成功", 2000, originalText);
       if (alertsHint) {
-        alertsHint.textContent = "已发送测试消息，请检查飞书";
+        alertsHint.textContent = "已发送测试消息，请检查飞书或 Telegram";
       }
     } catch (error) {
       testAlertsBtn.textContent = originalText;
@@ -1762,8 +1766,12 @@ sideLinks.forEach((link) => {
 updateFooter("");
 setView(Boolean(state.token));
 if (state.token) {
-  Promise.all([loadSettings(), loadNodes()]).catch((error) => {
-    loginError.textContent = error.message;
-    setView(false);
-  });
+  Promise.all([loadSettings(), loadNodes()])
+    .then(() => {
+      connectAdminSocket();
+    })
+    .catch((error) => {
+      loginError.textContent = error.message;
+      setView(false);
+    });
 }

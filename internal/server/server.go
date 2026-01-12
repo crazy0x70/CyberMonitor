@@ -138,6 +138,7 @@ type NodeState struct {
 
 type NodeProfile struct {
 	ServerID         string                      `json:"server_id,omitempty"`
+	AlertEnabled     *bool                       `json:"alert_enabled,omitempty"`
 	Alias            string                      `json:"alias,omitempty"`
 	Group            string                      `json:"group,omitempty"`
 	Tags             []string                    `json:"tags,omitempty"`
@@ -172,6 +173,7 @@ type NodeView struct {
 	FirstSeen        int64                       `json:"first_seen,omitempty"`
 	Status           string                      `json:"status"`
 	ServerID         string                      `json:"server_id,omitempty"`
+	AlertEnabled     bool                        `json:"alert_enabled"`
 	Alias            string                      `json:"alias,omitempty"`
 	Group            string                      `json:"group,omitempty"`
 	Tags             []string                    `json:"tags,omitempty"`
@@ -1055,33 +1057,19 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	if s.settings.AlertOfflineSec <= 0 || (targets.FeishuWebhook == "" && targets.TelegramToken == "") {
 		return AlertTargets{}, nil, nil
 	}
-	alertAll := s.settings.AlertAll
-	selected := make(map[string]struct{})
-	if !alertAll {
-		for _, nodeID := range s.settings.AlertNodes {
-			value := strings.TrimSpace(nodeID)
-			if value == "" {
-				continue
-			}
-			selected[value] = struct{}{}
-		}
-	}
-
 	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
 	offlineEvents := make([]AlertEvent, 0)
 	recoveredEvents := make([]AlertEvent, 0)
 	for nodeID, node := range s.nodes {
 		state, wasAlerted := s.alerted[nodeID]
-		if !alertAll {
-			if _, ok := selected[nodeID]; !ok {
-				delete(s.alerted, nodeID)
-				continue
-			}
+		profile := s.ensureProfileLocked(nodeID)
+		if !isAlertEnabled(profile) {
+			delete(s.alerted, nodeID)
+			continue
 		}
 		offlineFor := now.Sub(node.LastSeen)
 		if offlineFor < threshold {
 			if wasAlerted {
-				profile := s.ensureProfileLocked(nodeID)
 				stats := node.Stats
 				display := resolveAlertDisplay(profile, stats, nodeID)
 				offlineSec := int64(now.Sub(state.OfflineAt).Seconds())
@@ -1102,7 +1090,6 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		if wasAlerted {
 			continue
 		}
-		profile := s.ensureProfileLocked(nodeID)
 		stats := node.Stats
 		display := resolveAlertDisplay(profile, stats, nodeID)
 		offlineEvents = append(offlineEvents, AlertEvent{
@@ -1245,6 +1232,20 @@ func formatAlertValue(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
+func boolPointer(value bool) *bool {
+	return &value
+}
+
+func isAlertEnabled(profile *NodeProfile) bool {
+	if profile == nil {
+		return true
+	}
+	if profile.AlertEnabled == nil {
+		return true
+	}
+	return *profile.AlertEnabled
+}
+
 func normalizeTelegramUserIDs(ids []int64) []int64 {
 	seen := make(map[int64]struct{})
 	normalized := make([]int64, 0, len(ids))
@@ -1259,6 +1260,14 @@ func normalizeTelegramUserIDs(ids []int64) []int64 {
 		normalized = append(normalized, id)
 	}
 	return normalized
+}
+
+func firstTelegramUserID(ids []int64) int64 {
+	normalized := normalizeTelegramUserIDs(ids)
+	if len(normalized) == 0 {
+		return 0
+	}
+	return normalized[0]
 }
 
 func normalizeSiteTitle(title string) string {
@@ -1346,6 +1355,7 @@ func (s *Store) Snapshot() []NodeView {
 			FirstSeen:        node.FirstSeen.Unix(),
 			Status:           status,
 			ServerID:         profile.ServerID,
+			AlertEnabled:     isAlertEnabled(profile),
 			Alias:            profile.Alias,
 			Group:            group,
 			Tags:             tags,
@@ -1503,6 +1513,7 @@ type NodeProfileUpdate struct {
 	TestIntervalSec  *int                         `json:"test_interval_sec"`
 	Tests            *[]metrics.NetworkTestConfig `json:"tests"`
 	TestSelections   *[]TestSelection             `json:"test_selections"`
+	AlertEnabled     *bool                        `json:"alert_enabled"`
 }
 
 func (s *Store) AdminPath() string {
@@ -1579,6 +1590,7 @@ func (s *Store) SettingsView() SettingsView {
 		AlertNodes:           s.settings.AlertNodes,
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
 		GroupTree:            s.settings.GroupTree,
@@ -1766,6 +1778,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AlertNodes:           s.settings.AlertNodes,
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
 		GroupTree:            s.settings.GroupTree,
@@ -1782,6 +1795,9 @@ func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
 	if profile == nil {
 		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
 		s.profiles[nodeID] = profile
+	}
+	if profile.AlertEnabled == nil {
+		profile.AlertEnabled = boolPointer(true)
 	}
 	if len(profile.Groups) == 0 {
 		if profile.Group != "" || len(profile.Tags) > 0 {
@@ -1867,6 +1883,9 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 		if profile == nil {
 			profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
 			profiles[nodeID] = profile
+		}
+		if profile.AlertEnabled == nil {
+			profile.AlertEnabled = boolPointer(true)
 		}
 		id := strings.TrimSpace(profile.ServerID)
 		if id == "" || containsKey(used, id) {
@@ -1961,11 +1980,54 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfi
 	if update.TestSelections != nil {
 		profile.TestSelections = s.normalizeSelectionsLocked(*update.TestSelections)
 	}
+	if update.AlertEnabled != nil {
+		value := *update.AlertEnabled
+		profile.AlertEnabled = &value
+	}
 	profile.UpdatedAt = time.Now().Unix()
 	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
 	s.persist(data)
 	return *profile
+}
+
+func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (string, string, bool) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return "", "", false
+	}
+	var data PersistedData
+	var nodeID string
+	var display string
+	s.mu.Lock()
+	for id, profile := range s.profiles {
+		if profile == nil {
+			continue
+		}
+		if strings.TrimSpace(profile.ServerID) != serverID {
+			continue
+		}
+		nodeID = id
+		profile = s.ensureProfileLocked(nodeID)
+		value := enabled
+		profile.AlertEnabled = &value
+		if !enabled {
+			delete(s.alerted, nodeID)
+		}
+		if node, ok := s.nodes[nodeID]; ok {
+			display = resolveAlertDisplay(profile, node.Stats, nodeID)
+		} else {
+			display = resolveAlertDisplay(profile, metrics.NodeStats{}, nodeID)
+		}
+		data = s.snapshotPersistedLocked()
+		break
+	}
+	s.mu.Unlock()
+	if nodeID == "" {
+		return "", "", false
+	}
+	s.persist(data)
+	return nodeID, display, true
 }
 
 func (s *Store) DeleteNode(nodeID string) bool {
@@ -2147,9 +2209,7 @@ func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestCo
 		}
 		interval := 0
 		if strings.ToLower(item.Type) == "tcp" {
-			if sel.IntervalSec == 0 {
-				interval = 0
-			} else if sel.IntervalSec > 0 {
+			if sel.IntervalSec > 0 {
 				interval = sel.IntervalSec
 			} else if item.IntervalSec > 0 {
 				interval = item.IntervalSec

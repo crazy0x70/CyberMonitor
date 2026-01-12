@@ -252,6 +252,10 @@ func handleTelegramCommand(command string, store *Store) string {
 			return "用法: /status 服务器ID"
 		}
 		return buildTelegramServerStatus(store, parts[1])
+	case "/alarmson":
+		return handleTelegramAlarmToggle(store, parts, true)
+	case "/alarmsoff":
+		return handleTelegramAlarmToggle(store, parts, false)
 	default:
 		return buildTelegramHelp()
 	}
@@ -264,7 +268,37 @@ func buildTelegramHelp() string {
 		"/cmall 查看所有服务器统计",
 		"/server 查看服务器列表",
 		"/status <服务器ID> 查看服务器状态",
+		"/alarmson <服务器ID> 开启告警",
+		"/alarmsoff <服务器ID> 关闭告警",
 	}, "\n")
+}
+
+func handleTelegramAlarmToggle(store *Store, parts []string, enabled bool) string {
+	if len(parts) < 2 {
+		if enabled {
+			return "用法: /alarmson 服务器ID"
+		}
+		return "用法: /alarmsoff 服务器ID"
+	}
+	serverID := strings.TrimSpace(parts[1])
+	if serverID == "" {
+		if enabled {
+			return "用法: /alarmson 服务器ID"
+		}
+		return "用法: /alarmsoff 服务器ID"
+	}
+	_, display, ok := store.UpdateAlertEnabledByServerID(serverID, enabled)
+	if !ok {
+		return fmt.Sprintf("未找到服务器: %s", serverID)
+	}
+	action := "已开启"
+	if !enabled {
+		action = "已关闭"
+	}
+	if strings.TrimSpace(display) == "" {
+		display = serverID
+	}
+	return fmt.Sprintf("%s告警：%s （%s）", action, display, serverID)
 }
 
 func buildTelegramAllStats(store *Store) string {
@@ -395,6 +429,8 @@ func setTelegramCommands(token string) error {
 		{"command": "cmall", "description": "查看所有服务器统计"},
 		{"command": "server", "description": "查看服务器列表"},
 		{"command": "status", "description": "查看服务器状态 /status 服务器ID"},
+		{"command": "alarmson", "description": "开启告警 /alarmson 服务器ID"},
+		{"command": "alarmsoff", "description": "关闭告警 /alarmsoff 服务器ID"},
 		{"command": "help", "description": "查看可用命令"},
 	}
 	payload := map[string]any{"commands": commands}

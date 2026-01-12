@@ -114,8 +114,15 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 ### Telegram 配置
 - 需要同时填写 `Bot Token` 与 `Telegram 用户 ID`（多个用户用逗号分隔）
 - 配置完成后可通过 Telegram 获取告警与服务器信息
+- 离线告警开关请在「服务器管理」为每台服务器单独设置
 
 ### Telegram 命令
 - `/cmall`：查看所有服务器统计
 - `/server`：查看服务器列表（在线/离线分组）
 - `/status <服务器ID>`：查看指定服务器状态
+- `/alarmson <服务器ID>`：开启该服务器告警
+- `/alarmsoff <服务器ID>`：关闭该服务器告警
+
+## 架构图
+
+![系统架构图](images/architecture.png)

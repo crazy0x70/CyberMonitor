@@ -63,6 +63,7 @@ type SettingsView struct {
 	AlertNodes           []string          `json:"alert_nodes,omitempty"`
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
+	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
 	Commit               string            `json:"commit,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
