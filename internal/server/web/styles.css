@@ -1528,17 +1528,22 @@ svg text {
 .ai-grid {
   display: grid;
   gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
 }
 
 .ai-card {
   border: 1px solid rgba(148, 163, 184, 0.3);
   border-radius: 16px;
-  padding: 14px;
-  background: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.82);
   display: grid;
   gap: 12px;
   box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+  overflow: hidden;
+}
+
+.ai-card[open] {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 16px 30px rgba(15, 23, 42, 0.12);
 }
 
 .ai-card-head {
@@ -1546,6 +1551,38 @@ svg text {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding: 14px 16px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ai-card-head::-webkit-details-marker {
+  display: none;
+}
+
+.ai-card-head::marker {
+  content: "";
+}
+
+.ai-card-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(248, 250, 252, 0.9);
+  white-space: nowrap;
+}
+
+.ai-card-toggle::after {
+  content: "展开设置";
+}
+
+.ai-card[open] .ai-card-toggle::after {
+  content: "收起设置";
 }
 
 .ai-card-head h3 {
@@ -1562,6 +1599,45 @@ svg text {
 .ai-fields {
   display: grid;
   gap: 10px;
+  padding: 0 16px 12px;
+}
+
+.ai-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 0 16px 16px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(248, 250, 252, 0.6);
+}
+
+.ai-compat-group {
+  grid-column: 1 / -1;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(248, 250, 252, 0.7);
+  display: grid;
+  gap: 12px;
+}
+
+.ai-compat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-compat-list {
+  display: grid;
+  gap: 12px;
+}
+
+.ai-empty {
+  font-size: 13px;
+  color: var(--muted);
+  padding: 8px 2px;
 }
 
 .alert-grid {

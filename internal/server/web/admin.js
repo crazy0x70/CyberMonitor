@@ -23,7 +23,6 @@ const alertAIPromptInput = document.getElementById("alert-ai-prompt");
 const saveAlertsBtn = document.getElementById("save-alerts-btn");
 const testAlertsBtn = document.getElementById("test-alerts-btn");
 const alertsHint = document.getElementById("alerts-hint");
-const aiDefaultProviderSelect = document.getElementById("ai-default-provider");
 const aiOpenAIKeyInput = document.getElementById("ai-openai-key");
 const aiOpenAIBaseInput = document.getElementById("ai-openai-base");
 const aiOpenAIModelInput = document.getElementById("ai-openai-model");
@@ -33,12 +32,10 @@ const aiGeminiModelInput = document.getElementById("ai-gemini-model");
 const aiVolcKeyInput = document.getElementById("ai-volc-key");
 const aiVolcBaseInput = document.getElementById("ai-volc-base");
 const aiVolcModelInput = document.getElementById("ai-volc-model");
-const aiCompatKeyInput = document.getElementById("ai-compat-key");
-const aiCompatBaseInput = document.getElementById("ai-compat-base");
-const aiCompatModelInput = document.getElementById("ai-compat-model");
+const aiCompatList = document.getElementById("ai-compat-list");
+const aiCompatAddBtn = document.getElementById("ai-compat-add");
 const saveAiBtn = document.getElementById("save-ai-btn");
 const aiHint = document.getElementById("ai-hint");
-const aiTestButtons = document.querySelectorAll('[data-action="ai-test"]');
 const groupTree = document.getElementById("group-tree");
 const addGroupBtn = document.getElementById("add-group-btn");
 const saveGroupBtn = document.getElementById("save-group-btn");
@@ -80,6 +77,7 @@ const state = {
       defaultProvider: "openai",
       commandProvider: "",
       prompt: "",
+      openaiCompatibles: [],
       openai: { apiKey: "", baseURL: "", model: "" },
       gemini: { apiKey: "", baseURL: "", model: "" },
       volcengine: { apiKey: "", baseURL: "", model: "" },
@@ -213,23 +211,9 @@ function applySettingsView(data) {
     alertOfflineMinutesInput.value = minutes > 0 ? String(minutes) : "";
   }
   const aiSettings = data.ai_settings || {};
-  const defaultProvider = ["openai", "gemini", "volcengine", "openai_compatible"].includes(
-    aiSettings.default_provider
-  )
-    ? aiSettings.default_provider
-    : "openai";
-  const commandProvider = ["openai", "gemini", "volcengine", "openai_compatible"].includes(
-    aiSettings.command_provider
-  )
-    ? aiSettings.command_provider
-    : "";
+  const defaultProvider = normalizeAIProviderValue(aiSettings.default_provider) || "openai";
+  const commandProvider = normalizeAIProviderValue(aiSettings.command_provider);
   const prompt = typeof aiSettings.prompt === "string" ? aiSettings.prompt : "";
-  if (aiDefaultProviderSelect) {
-    aiDefaultProviderSelect.value = defaultProvider;
-  }
-  if (alertAIProviderSelect) {
-    alertAIProviderSelect.value = commandProvider || defaultProvider;
-  }
   if (alertAIPromptInput) {
     alertAIPromptInput.value = prompt;
   }
@@ -245,10 +229,9 @@ function applySettingsView(data) {
   if (aiVolcKeyInput) aiVolcKeyInput.value = volcengine.api_key || "";
   if (aiVolcBaseInput) aiVolcBaseInput.value = volcengine.base_url || "";
   if (aiVolcModelInput) aiVolcModelInput.value = volcengine.model || "";
-  const compat = aiSettings.openai_compatible || {};
-  if (aiCompatKeyInput) aiCompatKeyInput.value = compat.api_key || "";
-  if (aiCompatBaseInput) aiCompatBaseInput.value = compat.base_url || "";
-  if (aiCompatModelInput) aiCompatModelInput.value = compat.model || "";
+  const compatList = Array.isArray(aiSettings.openai_compatibles)
+    ? aiSettings.openai_compatibles
+    : [];
   updateAdminBrand(data);
   if (siteIconLink) {
     if (data.site_icon) {
@@ -278,6 +261,7 @@ function applySettingsView(data) {
     defaultProvider,
     commandProvider,
     prompt,
+    openaiCompatibles: compatList,
     openai: {
       apiKey: openai.api_key || "",
       baseURL: openai.base_url || "",
@@ -293,12 +277,10 @@ function applySettingsView(data) {
       baseURL: volcengine.base_url || "",
       model: volcengine.model || "",
     },
-    openaiCompatible: {
-      apiKey: compat.api_key || "",
-      baseURL: compat.base_url || "",
-      model: compat.model || "",
-    },
+    openaiCompatible: {},
   };
+  renderAICompatibles(state.settings.aiSettings.openaiCompatibles);
+  updateAlertAIProviderOptions(commandProvider || defaultProvider);
   state.settings.groups = Array.isArray(data.groups) ? data.groups : [];
   state.settings.groupTree = Array.isArray(data.group_tree)
     ? data.group_tree
@@ -446,7 +428,7 @@ async function testAlertSettings() {
   }
 }
 
-function collectAIProviderConfig(provider) {
+function collectAIProviderConfig(provider, providerId = "") {
   switch (provider) {
     case "openai":
       return {
@@ -467,18 +449,36 @@ function collectAIProviderConfig(provider) {
         model: aiVolcModelInput ? aiVolcModelInput.value.trim() : "",
       };
     case "openai_compatible":
-      return {
-        api_key: aiCompatKeyInput ? aiCompatKeyInput.value.trim() : "",
-        base_url: aiCompatBaseInput ? aiCompatBaseInput.value.trim() : "",
-        model: aiCompatModelInput ? aiCompatModelInput.value.trim() : "",
-      };
+      return collectCompatConfig(providerId);
     default:
       return { api_key: "", base_url: "", model: "" };
   }
 }
 
+function normalizeAIProviderValue(value) {
+  if (!value) return "";
+  const raw = String(value).trim();
+  if (!raw) return "";
+  if (raw.startsWith("openai_compatible:")) {
+    const id = raw.slice("openai_compatible:".length).trim();
+    return id ? `openai_compatible:${id}` : "openai_compatible";
+  }
+  const normalized = raw.toLowerCase();
+  if (normalized === "openai" || normalized === "open_ai") return "openai";
+  if (normalized === "gemini") return "gemini";
+  if (normalized === "volcengine" || normalized === "volc" || normalized === "ark") return "volcengine";
+  if (
+    normalized === "openai_compatible" ||
+    normalized === "openai-compatible" ||
+    normalized === "openai_compat"
+  ) {
+    return "openai_compatible";
+  }
+  return "";
+}
+
 function collectAISettings() {
-  const provider = aiDefaultProviderSelect ? aiDefaultProviderSelect.value : "openai";
+  const provider = state.settings.aiSettings.defaultProvider || "openai";
   const commandProvider = alertAIProviderSelect ? alertAIProviderSelect.value : "";
   const prompt = alertAIPromptInput ? alertAIPromptInput.value.trim() : "";
   return {
@@ -488,7 +488,7 @@ function collectAISettings() {
     openai: collectAIProviderConfig("openai"),
     gemini: collectAIProviderConfig("gemini"),
     volcengine: collectAIProviderConfig("volcengine"),
-    openai_compatible: collectAIProviderConfig("openai_compatible"),
+    openai_compatibles: collectAICompatibles(),
   };
 }
 
@@ -499,12 +499,22 @@ async function saveAISettings() {
   return saveSettingsPayload(payload);
 }
 
-function resolveAIHint(provider) {
+function resolveAIHint(provider, providerId = "") {
+  if (provider === "openai_compatible" && providerId) {
+    return document.querySelector(`[data-ai-hint="openai_compatible:${providerId}"]`);
+  }
   return document.querySelector(`[data-ai-hint="${provider}"]`);
 }
 
-async function testAIProvider(provider, button) {
-  const hint = resolveAIHint(provider);
+function resolveAIModelsHint(provider, providerId = "") {
+  if (provider === "openai_compatible" && providerId) {
+    return document.querySelector(`[data-ai-models="openai_compatible:${providerId}"]`);
+  }
+  return document.querySelector(`[data-ai-models="${provider}"]`);
+}
+
+async function testAIProvider(provider, providerId, button) {
+  const hint = resolveAIHint(provider, providerId);
   if (hint) {
     hint.textContent = "";
     hint.classList.remove("error");
@@ -515,7 +525,7 @@ async function testAIProvider(provider, button) {
   }
   const payload = {
     provider,
-    config: collectAIProviderConfig(provider),
+    config: collectAIProviderConfig(provider, providerId),
   };
   try {
     const resp = await apiFetch("/api/v1/admin/ai/test", {
@@ -551,6 +561,254 @@ async function testAIProvider(provider, button) {
   }
 }
 
+function createCompatID() {
+  return `compat-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCompatCards() {
+  if (!aiCompatList) return [];
+  return Array.from(aiCompatList.querySelectorAll(".ai-compat-card"));
+}
+
+function collectCompatConfig(providerId) {
+  if (!aiCompatList) return { api_key: "", base_url: "", model: "" };
+  const card = aiCompatList.querySelector(`[data-provider-id="${providerId}"]`);
+  if (!card) return { api_key: "", base_url: "", model: "" };
+  const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
+  const baseInput = card.querySelector('[data-field="compat-base"]');
+  const modelInput = card.querySelector('[data-field="compat-model"]');
+  return {
+    api_key: apiKeyInput ? apiKeyInput.value.trim() : "",
+    base_url: baseInput ? baseInput.value.trim() : "",
+    model: modelInput ? modelInput.value.trim() : "",
+  };
+}
+
+function collectAICompatibles() {
+  const cards = getCompatCards();
+  const items = [];
+  cards.forEach((card) => {
+    const id = card.dataset.providerId || createCompatID();
+    const nameInput = card.querySelector('[data-field="compat-name"]');
+    const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
+    const baseInput = card.querySelector('[data-field="compat-base"]');
+    const modelInput = card.querySelector('[data-field="compat-model"]');
+    const name = nameInput ? nameInput.value.trim() : "";
+    const apiKey = apiKeyInput ? apiKeyInput.value.trim() : "";
+    const baseURL = baseInput ? baseInput.value.trim() : "";
+    const model = modelInput ? modelInput.value.trim() : "";
+    if (!name && !apiKey && !baseURL && !model) {
+      return;
+    }
+    items.push({
+      id,
+      name,
+      api_key: apiKey,
+      base_url: baseURL,
+      model,
+    });
+  });
+  return items;
+}
+
+function currentCompatibles() {
+  if (aiCompatList) {
+    return collectAICompatibles();
+  }
+  return Array.isArray(state.settings.aiSettings.openaiCompatibles)
+    ? state.settings.aiSettings.openaiCompatibles
+    : [];
+}
+
+function updateAlertAIProviderOptions(selectedValue) {
+  if (!alertAIProviderSelect) return;
+  const normalized = normalizeAIProviderValue(selectedValue);
+  const options = [
+    { value: "openai", label: "OpenAI" },
+    { value: "gemini", label: "Gemini" },
+    { value: "volcengine", label: "Volcengine" },
+  ];
+  currentCompatibles().forEach((item) => {
+    const id = item.id || "";
+    const name = item.name || "未命名服务商";
+    if (!id) return;
+    options.push({
+      value: `openai_compatible:${id}`,
+      label: `${name}（OpenAI 兼容）`,
+    });
+  });
+  alertAIProviderSelect.innerHTML = "";
+  options.forEach((option) => {
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    alertAIProviderSelect.appendChild(element);
+  });
+  let target = normalized;
+  if (target === "openai_compatible") {
+    const compat = options.find((item) => item.value.startsWith("openai_compatible:"));
+    target = compat ? compat.value : "";
+  }
+  if (!options.some((item) => item.value === target)) {
+    target = options[0] ? options[0].value : "";
+  }
+  if (target) {
+    alertAIProviderSelect.value = target;
+  }
+}
+
+function createCompatCard(item) {
+  const id = item.id || createCompatID();
+  const name = item.name || "未命名服务商";
+  const baseURL = item.base_url || "";
+  const card = document.createElement("details");
+  card.className = "ai-card ai-compat-card";
+  card.dataset.provider = "openai_compatible";
+  card.dataset.providerId = id;
+  card.innerHTML = `
+    <summary class="ai-card-head">
+      <div>
+        <h3>${escapeHtml(name)}</h3>
+        <p>${baseURL ? escapeHtml(baseURL) : "OpenAI 兼容接口"}</p>
+      </div>
+      <span class="ai-card-toggle" aria-hidden="true"></span>
+    </summary>
+    <div class="ai-fields">
+      <label class="field">
+        <span>名称</span>
+        <input class="input" type="text" data-field="compat-name" placeholder="如：SiliconFlow" />
+      </label>
+      <label class="field">
+        <span>API Key</span>
+        <input class="input" type="password" data-field="compat-api-key" autocomplete="new-password" placeholder="sk-..." />
+      </label>
+      <label class="field">
+        <span>Base URL</span>
+        <input class="input" type="text" data-field="compat-base" placeholder="https://api.xxx.com/v1" />
+      </label>
+      <label class="field">
+        <span>模型</span>
+        <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" />
+      </label>
+    </div>
+    <div class="ai-actions">
+      <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="openai_compatible" data-provider-id="${id}">获取可用模型</button>
+      <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai_compatible" data-provider-id="${id}">测试连接</button>
+      <button class="btn danger tiny" type="button" data-action="ai-remove" data-provider="openai_compatible" data-provider-id="${id}">删除</button>
+    </div>
+    <div class="form-hint" data-ai-hint="openai_compatible:${id}"></div>
+    <div class="form-hint" data-ai-models="openai_compatible:${id}"></div>
+  `;
+  const nameInput = card.querySelector('[data-field="compat-name"]');
+  const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
+  const baseInput = card.querySelector('[data-field="compat-base"]');
+  const modelInput = card.querySelector('[data-field="compat-model"]');
+  if (nameInput) nameInput.value = item.name || "";
+  if (apiKeyInput) apiKeyInput.value = item.api_key || "";
+  if (baseInput) baseInput.value = item.base_url || "";
+  if (modelInput) modelInput.value = item.model || "";
+  const title = card.querySelector("h3");
+  const subtitle = card.querySelector("p");
+  if (nameInput && title) {
+    nameInput.addEventListener("input", () => {
+      const value = nameInput.value.trim() || "未命名服务商";
+      title.textContent = value;
+      updateAlertAIProviderOptions(alertAIProviderSelect ? alertAIProviderSelect.value : "");
+    });
+  }
+  if (baseInput && subtitle) {
+    baseInput.addEventListener("input", () => {
+      subtitle.textContent = baseInput.value.trim() || "OpenAI 兼容接口";
+    });
+  }
+  return card;
+}
+
+function renderAICompatibles(items) {
+  if (!aiCompatList) return;
+  aiCompatList.innerHTML = "";
+  const normalized = Array.isArray(items) ? items : [];
+  if (!normalized.length) {
+    const empty = document.createElement("div");
+    empty.className = "ai-empty";
+    empty.textContent = "暂无兼容服务商，请点击“添加服务商”";
+    aiCompatList.appendChild(empty);
+    return;
+  }
+  normalized.forEach((item) => {
+    aiCompatList.appendChild(createCompatCard(item));
+  });
+}
+
+function removeCompatProvider(providerId) {
+  if (!aiCompatList) return;
+  const card = aiCompatList.querySelector(`[data-provider-id="${providerId}"]`);
+  if (card) {
+    card.remove();
+  }
+  if (!aiCompatList.children.length) {
+    renderAICompatibles([]);
+  }
+  updateAlertAIProviderOptions(alertAIProviderSelect ? alertAIProviderSelect.value : "");
+}
+
+async function fetchAIModels(provider, providerId, button) {
+  const hint = resolveAIModelsHint(provider, providerId);
+  if (hint) {
+    hint.textContent = "";
+    hint.classList.remove("error");
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "获取中...";
+  }
+  const payload = {
+    provider,
+    config: collectAIProviderConfig(provider, providerId),
+  };
+  try {
+    const resp = await apiFetch("/api/v1/admin/ai/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      let message = `获取失败: ${resp.status}`;
+      try {
+        const data = await resp.json();
+        if (data && data.error) {
+          message = data.error;
+        }
+      } catch (error) {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    const data = await resp.json();
+    const models = Array.isArray(data.models) ? data.models : [];
+    if (hint) {
+      if (!models.length) {
+        hint.textContent = "未返回可用模型";
+      } else {
+        const preview = models.slice(0, 8).join("、");
+        hint.textContent =
+          models.length > 8
+            ? `可用模型(${models.length}): ${preview} …`
+            : `可用模型(${models.length}): ${preview}`;
+      }
+    }
+  } catch (error) {
+    if (hint) {
+      hint.textContent = error.message;
+      hint.classList.add("error");
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "获取可用模型";
+    }
+  }
+}
 function updateInstallCommands() {
   const endpoint =
     (agentEndpointInput && agentEndpointInput.value.trim()) ||
@@ -1952,15 +2210,44 @@ if (saveAiBtn) {
   });
 }
 
-if (aiTestButtons) {
-  aiTestButtons.forEach((button) => {
-    button.addEventListener("click", async () => {
-      const provider = button.dataset.provider || "";
-      if (!provider) return;
-      await testAIProvider(provider, button);
-    });
+if (aiCompatAddBtn) {
+  aiCompatAddBtn.addEventListener("click", () => {
+    const current = collectAICompatibles();
+    const item = {
+      id: createCompatID(),
+      name: "新服务商",
+      api_key: "",
+      base_url: "",
+      model: "",
+    };
+    renderAICompatibles(current.concat(item));
+    updateAlertAIProviderOptions(alertAIProviderSelect ? alertAIProviderSelect.value : "");
   });
 }
+
+document.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const actionBtn = target.closest("button[data-action]");
+  if (!actionBtn) return;
+  const action = actionBtn.dataset.action || "";
+  if (action !== "ai-test" && action !== "ai-models" && action !== "ai-remove") {
+    return;
+  }
+  const provider = actionBtn.dataset.provider || "";
+  const providerId = actionBtn.dataset.providerId || "";
+  if (action === "ai-test") {
+    await testAIProvider(provider, providerId, actionBtn);
+    return;
+  }
+  if (action === "ai-models") {
+    await fetchAIModels(provider, providerId, actionBtn);
+    return;
+  }
+  if (action === "ai-remove") {
+    removeCompatProvider(providerId);
+  }
+});
 
 saveGroupBtn.addEventListener("click", async () => {
   const originalText = saveGroupBtn.textContent;

@@ -541,6 +541,39 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
 
+	mux.HandleFunc("/api/v1/admin/ai/models", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req struct {
+			Provider string           `json:"provider"`
+			Config   AIProviderConfig `json:"config"`
+		}
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(req.Provider) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
+			return
+		}
+		settings := store.AISettings()
+		selection, err := resolveAIProviderConfigWithOverride(settings, req.Provider, req.Config)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
+		defer cancel()
+		models, err := listAIModels(ctx, selection.Provider, selection.Config)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+	}))
+
 	mux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})

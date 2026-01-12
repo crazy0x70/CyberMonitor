@@ -38,13 +38,20 @@ type AIProviderConfig struct {
 }
 
 type AISettings struct {
-	DefaultProvider  string           `json:"default_provider,omitempty"`
-	CommandProvider  string           `json:"command_provider,omitempty"`
-	Prompt           string           `json:"prompt,omitempty"`
-	OpenAI           AIProviderConfig `json:"openai,omitempty"`
-	Gemini           AIProviderConfig `json:"gemini,omitempty"`
-	Volcengine       AIProviderConfig `json:"volcengine,omitempty"`
-	OpenAICompatible AIProviderConfig `json:"openai_compatible,omitempty"`
+	DefaultProvider   string              `json:"default_provider,omitempty"`
+	CommandProvider   string              `json:"command_provider,omitempty"`
+	Prompt            string              `json:"prompt,omitempty"`
+	OpenAI            AIProviderConfig    `json:"openai,omitempty"`
+	Gemini            AIProviderConfig    `json:"gemini,omitempty"`
+	Volcengine        AIProviderConfig    `json:"volcengine,omitempty"`
+	OpenAICompatible  AIProviderConfig    `json:"openai_compatible,omitempty"`
+	OpenAICompatibles []AIProviderProfile `json:"openai_compatibles,omitempty"`
+}
+
+type AIProviderProfile struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	AIProviderConfig
 }
 
 type aiProviderSelection struct {
@@ -59,23 +66,26 @@ type aiSnapshot struct {
 }
 
 type aiServerSummary struct {
-	ServerID      string  `json:"server_id"`
-	DisplayName   string  `json:"display_name"`
-	Hostname      string  `json:"hostname,omitempty"`
-	Status        string  `json:"status"`
-	OS            string  `json:"os,omitempty"`
-	Arch          string  `json:"arch,omitempty"`
-	CPUUsage      float64 `json:"cpu_usage_percent"`
-	MemUsage      float64 `json:"mem_usage_percent"`
-	DiskUsed      float64 `json:"disk_used_percent,omitempty"`
-	NetRecvBytes  uint64  `json:"net_recv_bytes"`
-	NetSendBytes  uint64  `json:"net_send_bytes"`
-	RxBytesPerSec float64 `json:"rx_bytes_per_sec"`
-	TxBytesPerSec float64 `json:"tx_bytes_per_sec"`
-	UptimeSec     uint64  `json:"uptime_sec"`
-	LastSeen      int64   `json:"last_seen"`
-	FirstSeen     int64   `json:"first_seen"`
-	AlertEnabled  bool    `json:"alert_enabled"`
+	ServerID      string   `json:"server_id"`
+	DisplayName   string   `json:"display_name"`
+	Hostname      string   `json:"hostname,omitempty"`
+	Status        string   `json:"status"`
+	Group         string   `json:"group,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	Groups        []string `json:"groups,omitempty"`
+	OS            string   `json:"os,omitempty"`
+	Arch          string   `json:"arch,omitempty"`
+	CPUUsage      float64  `json:"cpu_usage_percent"`
+	MemUsage      float64  `json:"mem_usage_percent"`
+	DiskUsed      float64  `json:"disk_used_percent,omitempty"`
+	NetRecvBytes  uint64   `json:"net_recv_bytes"`
+	NetSendBytes  uint64   `json:"net_send_bytes"`
+	RxBytesPerSec float64  `json:"rx_bytes_per_sec"`
+	TxBytesPerSec float64  `json:"tx_bytes_per_sec"`
+	UptimeSec     uint64   `json:"uptime_sec"`
+	LastSeen      int64    `json:"last_seen"`
+	FirstSeen     int64    `json:"first_seen"`
+	AlertEnabled  bool     `json:"alert_enabled"`
 }
 
 type openAIChatResponse struct {
@@ -102,6 +112,24 @@ type geminiResponse struct {
 	} `json:"error,omitempty"`
 }
 
+type openAIModelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type geminiModelsResponse struct {
+	Models []struct {
+		Name string `json:"name"`
+	} `json:"models"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
 func defaultAISettings() AISettings {
 	return AISettings{
 		DefaultProvider: aiProviderOpenAI,
@@ -119,7 +147,8 @@ func defaultAISettings() AISettings {
 			BaseURL: defaultVolcengineBaseURL,
 			Model:   defaultVolcengineModel,
 		},
-		OpenAICompatible: AIProviderConfig{},
+		OpenAICompatible:  AIProviderConfig{},
+		OpenAICompatibles: []AIProviderProfile{},
 	}
 }
 
@@ -139,6 +168,10 @@ func mergeAISettings(existing, fallback AISettings) AISettings {
 	existing.Gemini = mergeAIProviderConfig(existing.Gemini, fallback.Gemini)
 	existing.Volcengine = mergeAIProviderConfig(existing.Volcengine, fallback.Volcengine)
 	existing.OpenAICompatible = mergeAIProviderConfig(existing.OpenAICompatible, fallback.OpenAICompatible)
+	if len(existing.OpenAICompatibles) == 0 {
+		existing.OpenAICompatibles = fallback.OpenAICompatibles
+	}
+	existing.OpenAICompatibles = normalizeAICompatibles(existing.OpenAICompatibles)
 	return existing
 }
 
@@ -160,12 +193,22 @@ func normalizeAISettings(settings AISettings) AISettings {
 	if settings.DefaultProvider == "" {
 		settings.DefaultProvider = aiProviderOpenAI
 	}
-	settings.CommandProvider = normalizeAIProviderName(settings.CommandProvider)
+	settings.CommandProvider = normalizeAIProviderSelector(settings.CommandProvider)
 	settings.Prompt = normalizeAIPrompt(settings.Prompt)
 	settings.OpenAI = normalizeAIProviderConfig(settings.OpenAI)
 	settings.Gemini = normalizeAIProviderConfig(settings.Gemini)
 	settings.Volcengine = normalizeAIProviderConfig(settings.Volcengine)
 	settings.OpenAICompatible = normalizeAIProviderConfig(settings.OpenAICompatible)
+	settings.OpenAICompatibles = normalizeAICompatibles(settings.OpenAICompatibles)
+	if len(settings.OpenAICompatibles) == 0 && hasLegacyCompat(settings.OpenAICompatible) {
+		settings.OpenAICompatibles = normalizeAICompatibles([]AIProviderProfile{
+			{
+				ID:               "compat-legacy",
+				Name:             "OpenAI 兼容",
+				AIProviderConfig: settings.OpenAICompatible,
+			},
+		})
+	}
 	return settings
 }
 
@@ -182,6 +225,47 @@ func normalizeAIProviderName(value string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeAIProviderSelector(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, aiProviderOpenAICompatible+":") {
+		id := strings.TrimSpace(strings.TrimPrefix(trimmed, aiProviderOpenAICompatible+":"))
+		if id == "" {
+			return aiProviderOpenAICompatible
+		}
+		return fmt.Sprintf("%s:%s", aiProviderOpenAICompatible, id)
+	}
+	return normalizeAIProviderName(trimmed)
+}
+
+func normalizeAICompatibles(items []AIProviderProfile) []AIProviderProfile {
+	seen := make(map[string]struct{})
+	normalized := make([]AIProviderProfile, 0, len(items))
+	for _, item := range items {
+		item.ID = strings.TrimSpace(item.ID)
+		item.Name = strings.TrimSpace(item.Name)
+		item.AIProviderConfig = normalizeAIProviderConfig(item.AIProviderConfig)
+		if item.Name == "" && item.APIKey == "" && item.BaseURL == "" && item.Model == "" {
+			continue
+		}
+		if item.ID == "" {
+			item.ID = randomToken(8)
+		}
+		if _, ok := seen[item.ID]; ok {
+			item.ID = randomToken(8)
+		}
+		seen[item.ID] = struct{}{}
+		normalized = append(normalized, item)
+	}
+	return normalized
+}
+
+func hasLegacyCompat(cfg AIProviderConfig) bool {
+	return strings.TrimSpace(cfg.APIKey) != "" || strings.TrimSpace(cfg.BaseURL) != "" || strings.TrimSpace(cfg.Model) != ""
 }
 
 func normalizeAIProviderConfig(cfg AIProviderConfig) AIProviderConfig {
@@ -217,8 +301,24 @@ func validateAISettings(settings AISettings) error {
 			return err
 		}
 	}
+	if err := validateAICompatibles(settings.OpenAICompatibles); err != nil {
+		return err
+	}
 	if err := validateAIPrompt(settings.Prompt); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateAICompatibles(items []AIProviderProfile) error {
+	for _, item := range items {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			return errors.New("OpenAI 兼容服务商名称不能为空")
+		}
+		if err := validateAIBaseURL(item.BaseURL); err != nil {
+			return fmt.Errorf("OpenAI 兼容服务商 %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -281,6 +381,76 @@ func selectAIProviderConfig(settings AISettings, provider string) (aiProviderSel
 	default:
 		return aiProviderSelection{}, errors.New("AI 提供商无效")
 	}
+}
+
+func resolveAIProviderConfigBySelector(settings AISettings, selector string) (aiProviderSelection, error) {
+	selector = normalizeAIProviderSelector(selector)
+	if selector == "" {
+		selector = settings.DefaultProvider
+	}
+	provider, providerID := parseAIProviderSelector(selector)
+	if provider == aiProviderOpenAICompatible {
+		if providerID != "" {
+			if selection, ok := findAICompatibleProvider(settings, providerID); ok {
+				return resolveAICompatibleSelection(selection)
+			}
+			return aiProviderSelection{}, errors.New("未找到指定的兼容服务商")
+		}
+		if len(settings.OpenAICompatibles) > 0 {
+			return resolveAICompatibleSelection(settings.OpenAICompatibles[0])
+		}
+		if hasLegacyCompat(settings.OpenAICompatible) {
+			return resolveAICompatibleSelection(AIProviderProfile{
+				ID:               "compat-legacy",
+				Name:             "OpenAI 兼容",
+				AIProviderConfig: settings.OpenAICompatible,
+			})
+		}
+		return aiProviderSelection{}, errors.New("未配置 OpenAI 兼容服务商")
+	}
+	return resolveAIProviderConfig(settings, provider)
+}
+
+func parseAIProviderSelector(selector string) (string, string) {
+	if strings.HasPrefix(selector, aiProviderOpenAICompatible+":") {
+		return aiProviderOpenAICompatible, strings.TrimSpace(strings.TrimPrefix(selector, aiProviderOpenAICompatible+":"))
+	}
+	return normalizeAIProviderName(selector), ""
+}
+
+func findAICompatibleProvider(settings AISettings, providerID string) (AIProviderProfile, bool) {
+	for _, item := range settings.OpenAICompatibles {
+		if item.ID == providerID {
+			return item, true
+		}
+	}
+	return AIProviderProfile{}, false
+}
+
+func resolveAICompatibleSelection(provider AIProviderProfile) (aiProviderSelection, error) {
+	label := strings.TrimSpace(provider.Name)
+	if label == "" {
+		label = "OpenAI 兼容提供商"
+	}
+	selection := aiProviderSelection{
+		Provider: aiProviderOpenAICompatible,
+		Label:    label,
+		Config:   provider.AIProviderConfig,
+	}
+	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
+	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
+		return aiProviderSelection{}, err
+	}
+	if selection.Config.APIKey == "" {
+		return aiProviderSelection{}, fmt.Errorf("%s API Key 未配置", selection.Label)
+	}
+	if selection.Config.BaseURL == "" {
+		return aiProviderSelection{}, errors.New("OpenAI 兼容服务商需填写 Base URL")
+	}
+	if selection.Config.Model == "" {
+		return aiProviderSelection{}, errors.New("OpenAI 兼容服务商需填写模型")
+	}
+	return selection, nil
 }
 
 func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSelection, error) {
@@ -352,11 +522,7 @@ func runAIQuery(ctx context.Context, store *Store, question string) (string, err
 	if provider == "" {
 		provider = settings.DefaultProvider
 	}
-	provider = normalizeAIProviderName(provider)
-	if provider == "" {
-		provider = aiProviderOpenAI
-	}
-	selection, err := resolveAIProviderConfig(settings, provider)
+	selection, err := resolveAIProviderConfigBySelector(settings, provider)
 	if err != nil {
 		return "", err
 	}
@@ -377,6 +543,111 @@ func testAIProvider(ctx context.Context, provider string, config AIProviderConfi
 	userPrompt := defaultAITestPrompt
 	_, err := callAIProvider(ctx, provider, config, systemPrompt, userPrompt)
 	return err
+}
+
+func listAIModels(ctx context.Context, provider string, config AIProviderConfig) ([]string, error) {
+	switch provider {
+	case aiProviderGemini:
+		return listGeminiModels(ctx, config)
+	case aiProviderOpenAI, aiProviderVolcengine, aiProviderOpenAICompatible:
+		return listOpenAIModels(ctx, config)
+	default:
+		return nil, errors.New("AI 提供商无效")
+	}
+}
+
+func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, error) {
+	if config.APIKey == "" {
+		return nil, errors.New("API Key 不能为空")
+	}
+	baseURL := strings.TrimRight(config.BaseURL, "/")
+	if baseURL == "" {
+		return nil, errors.New("Base URL 不能为空")
+	}
+	endpoint := fmt.Sprintf("%s/models", baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", config.APIKey))
+	client := &http.Client{Timeout: 18 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AI 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parsed openAIModelsResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("AI 响应解析失败: %w", err)
+	}
+	if parsed.Error != nil {
+		return nil, errors.New(parsed.Error.Message)
+	}
+	seen := make(map[string]struct{})
+	models := make([]string, 0, len(parsed.Data))
+	for _, item := range parsed.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, id)
+	}
+	return models, nil
+}
+
+func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, error) {
+	if config.APIKey == "" {
+		return nil, errors.New("API Key 不能为空")
+	}
+	baseURL := strings.TrimRight(config.BaseURL, "/")
+	if baseURL == "" {
+		return nil, errors.New("Base URL 不能为空")
+	}
+	endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, url.QueryEscape(config.APIKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 18 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AI 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parsed geminiModelsResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("AI 响应解析失败: %w", err)
+	}
+	if parsed.Error != nil {
+		return nil, errors.New(parsed.Error.Message)
+	}
+	seen := make(map[string]struct{})
+	models := make([]string, 0, len(parsed.Models))
+	for _, item := range parsed.Models {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			continue
+		}
+		name = strings.TrimPrefix(name, "models/")
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		models = append(models, name)
+	}
+	return models, nil
 }
 
 func buildAISystemPrompt(custom string) string {
@@ -420,11 +691,17 @@ func buildAISnapshot(store *Store) aiSnapshot {
 		if hostName == "" {
 			hostName = strings.TrimSpace(stats.NodeID)
 		}
+		group := strings.TrimSpace(node.Group)
+		tags := append([]string{}, node.Tags...)
+		groups := append([]string{}, node.Groups...)
 		servers = append(servers, aiServerSummary{
 			ServerID:      node.ServerID,
 			DisplayName:   name,
 			Hostname:      hostName,
 			Status:        node.Status,
+			Group:         group,
+			Tags:          tags,
+			Groups:        groups,
 			OS:            stats.OS,
 			Arch:          stats.Arch,
 			CPUUsage:      stats.CPU.UsagePercent,

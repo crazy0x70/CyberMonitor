@@ -112,13 +112,13 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 - 服务器管理支持设置显示昵称、地域、硬盘/网速、分组标签、到期与续费信息
 - 离线告警在服务器管理内逐台配置，保存后下发到 Agent
 - 刷新按钮会提示刷新成功，便于确认加载状态
-- 「API提供商」用于配置 AI 运维能力（OpenAI / Gemini / Volcengine / OpenAI 兼容）
+- 「API提供商」用于配置 AI 运维能力，支持 OpenAI / Gemini / Volcengine 以及多个 OpenAI 兼容服务商
+- API 提供商卡片点击展开设置，可测试连接并获取可用模型列表
 
 ## AI 运维
 
-- 在「API提供商」配置 API Key、Base URL 与模型，支持测试连接
-- 默认提供商用于 Telegram `/ai` 命令
-- `/ai` 会基于当前服务器状态生成运维回答
+- 在「API提供商」配置 API Key、Base URL 与模型，可测试连接并获取可用模型
+- `/ai` 会基于当前服务器状态与分组标签生成运维回答
 - 通知告警中可指定 /ai 使用的提供商与 Prompt
 
 ## 通知告警
