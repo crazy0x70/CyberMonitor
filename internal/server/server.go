@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -30,6 +33,7 @@ const (
 	maxTestHistoryPoints     = 5000
 	testHistoryHotSeconds    = 60 * 60
 	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
+	maxJSONBodySize          = 4 * 1024 * 1024
 )
 
 type sizeLimitedWriter struct {
@@ -120,7 +124,7 @@ type Store struct {
 	historyPath        string
 	lastPersist        time.Time
 	persistInterval    time.Duration
-	alerted            map[string]bool
+	alerted            map[string]alertState
 	testHistory        map[string]map[string]*TestHistoryEntry
 	historyDirty       bool
 	historyLastPersist time.Time
@@ -133,6 +137,7 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
+	ServerID         string                      `json:"server_id,omitempty"`
 	Alias            string                      `json:"alias,omitempty"`
 	Group            string                      `json:"group,omitempty"`
 	Tags             []string                    `json:"tags,omitempty"`
@@ -166,6 +171,7 @@ type NodeView struct {
 	LastSeen         int64                       `json:"last_seen"`
 	FirstSeen        int64                       `json:"first_seen,omitempty"`
 	Status           string                      `json:"status"`
+	ServerID         string                      `json:"server_id,omitempty"`
 	Alias            string                      `json:"alias,omitempty"`
 	Group            string                      `json:"group,omitempty"`
 	Tags             []string                    `json:"tags,omitempty"`
@@ -259,6 +265,7 @@ func Run(ctx context.Context, cfg Config) error {
 			nodes = persisted.Nodes
 		}
 	}
+	ensureServerIDsForProfiles(profiles, nodes)
 	if settings.AuthToken != "" {
 		cfg.JWTSecret = settings.AuthToken
 		cfg.AgentToken = settings.AuthToken
@@ -287,7 +294,7 @@ func Run(ctx context.Context, cfg Config) error {
 		dataPath:        dataPath,
 		historyPath:     historyPath,
 		persistInterval: defaultPersistInterval,
-		alerted:         make(map[string]bool),
+		alerted:         make(map[string]alertState),
 		testHistory:     testHistory,
 	}
 	if historyTrimmed {
@@ -315,12 +322,12 @@ func Run(ctx context.Context, cfg Config) error {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
 		creds := store.Credentials()
-		if req.Username != creds.AdminUser || req.Password != creds.AdminPass {
+		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 			return
 		}
@@ -359,7 +366,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 
 		var payload metrics.NodeStats
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := decodeJSON(w, r, &payload); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
@@ -404,7 +411,7 @@ func Run(ctx context.Context, cfg Config) error {
 		switch r.Method {
 		case http.MethodPut, http.MethodPatch:
 			var update NodeProfileUpdate
-			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			if err := decodeJSON(w, r, &update); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 				return
 			}
@@ -428,7 +435,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusOK, store.SettingsView())
 		case http.MethodPatch, http.MethodPut:
 			var update SettingsUpdate
-			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			if err := decodeJSON(w, r, &update); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 				return
 			}
@@ -452,23 +459,47 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		var req struct {
-			Webhook string `json:"webhook"`
+			Webhook        string `json:"webhook"`
+			TelegramToken  string `json:"telegram_token"`
+			TelegramUserID int64  `json:"telegram_user_id"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
 		webhook := strings.TrimSpace(req.Webhook)
+		telegramToken := strings.TrimSpace(req.TelegramToken)
+		telegramUserID := req.TelegramUserID
 		if webhook == "" {
 			webhook = store.AlertWebhook()
 		}
-		if webhook == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhook 不能为空"})
+		if telegramToken == "" || telegramUserID <= 0 {
+			cfgToken, cfgUserID := store.TelegramSettings()
+			if telegramToken == "" {
+				telegramToken = cfgToken
+			}
+			if telegramUserID <= 0 {
+				telegramUserID = cfgUserID
+			}
+		}
+		if webhook == "" && (telegramToken == "" || telegramUserID <= 0) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请先配置飞书或 Telegram 告警"})
 			return
 		}
 		siteTitle := store.SiteTitle()
-		if err := sendFeishuTest(webhook, siteTitle); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		var errs []string
+		if webhook != "" {
+			if err := sendFeishuTest(webhook, siteTitle); err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+		if telegramToken != "" && telegramUserID > 0 {
+			if err := sendTelegramTest(telegramToken, telegramUserID, siteTitle); err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+		if len(errs) > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": strings.Join(errs, "; ")})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -496,10 +527,16 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: isAllowedOrigin,
 	}
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		if extractToken(r) != "" {
+			if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -558,7 +595,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           withSecurityHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -577,13 +614,20 @@ func Run(ctx context.Context, cfg Config) error {
 				snapshot := storeSnapshot(store, false)
 				payload, _ := json.Marshal(snapshot)
 				hub.Broadcast(payload)
-				webhook, siteTitle, events := store.CollectOfflineAlerts(now)
-				if len(events) > 0 {
-					go sendFeishuAlert(webhook, siteTitle, events)
+				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
+				if len(offlineEvents) > 0 {
+					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
+					go sendTelegramAlert(targets.TelegramToken, targets.TelegramUserID, targets.SiteTitle, offlineEvents)
+				}
+				if len(recoveredEvents) > 0 {
+					go sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, recoveredEvents)
+					go sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserID, targets.SiteTitle, recoveredEvents)
 				}
 			}
 		}
 	}()
+
+	startTelegramBot(ctx, store)
 
 	go func() {
 		<-ctx.Done()
@@ -593,7 +637,11 @@ func Run(ctx context.Context, cfg Config) error {
 	log.Printf("管理后台路径: %s", store.AdminPath())
 	if !loaded {
 		log.Printf("初始管理员账号: %s", settings.AdminUser)
-		log.Printf("初始管理员密码: %s", settings.AdminPass)
+		if settings.AdminPassPlain != "" {
+			log.Printf("初始管理员密码: %s", settings.AdminPassPlain)
+		} else {
+			log.Printf("初始管理员密码: 已设置")
+		}
 	}
 	if tokenGenerated {
 		log.Printf("初始 Agent Token: %s", cfg.AgentToken)
@@ -626,6 +674,28 @@ func applyDefaults(cfg *Config) {
 	if cfg.JWTSecret != cfg.AgentToken {
 		cfg.AgentToken = cfg.JWTSecret
 	}
+}
+
+func isBcryptHash(value string) bool {
+	return strings.HasPrefix(value, "$2a$") || strings.HasPrefix(value, "$2b$") || strings.HasPrefix(value, "$2y$")
+}
+
+func hashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+func verifyPassword(password, stored string) bool {
+	if stored == "" || password == "" {
+		return false
+	}
+	if isBcryptHash(stored) {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) == nil
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(password)) == 1
 }
 
 func generateBootstrapToken() string {
@@ -662,6 +732,9 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	}
 
 	profile := s.ensureProfileLocked(stats.NodeID)
+	if s.ensureServerIDLocked(stats.NodeID, profile) {
+		persist = true
+	}
 	if profile.TestIntervalSec == 0 {
 		profile.TestIntervalSec = defaultTestIntervalSec
 		persist = true
@@ -952,15 +1025,34 @@ type AlertEvent struct {
 	OfflineSec int64
 }
 
-func (s *Store) CollectOfflineAlerts(now time.Time) (string, string, []AlertEvent) {
+type AlertTargets struct {
+	FeishuWebhook  string
+	TelegramToken  string
+	TelegramUserID int64
+	SiteTitle      string
+}
+
+type alertState struct {
+	OfflineAt time.Time
+}
+
+func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	webhook := strings.TrimSpace(s.settings.AlertWebhook)
-	if webhook == "" || s.settings.AlertOfflineSec <= 0 {
-		return "", "", nil
+	targets := AlertTargets{
+		FeishuWebhook:  strings.TrimSpace(s.settings.AlertWebhook),
+		TelegramToken:  strings.TrimSpace(s.settings.AlertTelegramToken),
+		TelegramUserID: s.settings.AlertTelegramUserID,
+		SiteTitle:      normalizeSiteTitle(s.settings.SiteTitle),
 	}
-	siteTitle := normalizeSiteTitle(s.settings.SiteTitle)
+	if targets.TelegramToken == "" || targets.TelegramUserID <= 0 {
+		targets.TelegramToken = ""
+		targets.TelegramUserID = 0
+	}
+	if s.settings.AlertOfflineSec <= 0 || (targets.FeishuWebhook == "" && targets.TelegramToken == "") {
+		return AlertTargets{}, nil, nil
+	}
 	alertAll := s.settings.AlertAll
 	selected := make(map[string]struct{})
 	if !alertAll {
@@ -974,8 +1066,10 @@ func (s *Store) CollectOfflineAlerts(now time.Time) (string, string, []AlertEven
 	}
 
 	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
-	events := make([]AlertEvent, 0)
+	offlineEvents := make([]AlertEvent, 0)
+	recoveredEvents := make([]AlertEvent, 0)
 	for nodeID, node := range s.nodes {
+		state, wasAlerted := s.alerted[nodeID]
 		if !alertAll {
 			if _, ok := selected[nodeID]; !ok {
 				delete(s.alerted, nodeID)
@@ -984,29 +1078,39 @@ func (s *Store) CollectOfflineAlerts(now time.Time) (string, string, []AlertEven
 		}
 		offlineFor := now.Sub(node.LastSeen)
 		if offlineFor < threshold {
-			delete(s.alerted, nodeID)
+			if wasAlerted {
+				profile := s.ensureProfileLocked(nodeID)
+				stats := node.Stats
+				display := resolveAlertDisplay(profile, stats, nodeID)
+				offlineSec := int64(now.Sub(state.OfflineAt).Seconds())
+				if state.OfflineAt.IsZero() {
+					offlineSec = 0
+				}
+				recoveredEvents = append(recoveredEvents, AlertEvent{
+					NodeID:     nodeID,
+					Display:    display,
+					OS:         stats.OS,
+					LastSeen:   node.LastSeen.Unix(),
+					OfflineSec: offlineSec,
+				})
+				delete(s.alerted, nodeID)
+			}
 			continue
 		}
-		if s.alerted[nodeID] {
+		if wasAlerted {
 			continue
 		}
 		profile := s.ensureProfileLocked(nodeID)
 		stats := node.Stats
-		display := strings.TrimSpace(profile.Alias)
-		if display == "" {
-			display = strings.TrimSpace(stats.NodeName)
-		}
-		if display == "" {
-			display = nodeID
-		}
-		events = append(events, AlertEvent{
+		display := resolveAlertDisplay(profile, stats, nodeID)
+		offlineEvents = append(offlineEvents, AlertEvent{
 			NodeID:     nodeID,
 			Display:    display,
 			OS:         stats.OS,
 			LastSeen:   node.LastSeen.Unix(),
 			OfflineSec: int64(offlineFor.Seconds()),
 		})
-		s.alerted[nodeID] = true
+		s.alerted[nodeID] = alertState{OfflineAt: node.LastSeen}
 	}
 
 	for nodeID := range s.alerted {
@@ -1015,7 +1119,18 @@ func (s *Store) CollectOfflineAlerts(now time.Time) (string, string, []AlertEven
 		}
 	}
 
-	return webhook, siteTitle, events
+	return targets, offlineEvents, recoveredEvents
+}
+
+func resolveAlertDisplay(profile *NodeProfile, stats metrics.NodeStats, nodeID string) string {
+	display := strings.TrimSpace(profile.Alias)
+	if display == "" {
+		display = strings.TrimSpace(stats.NodeName)
+	}
+	if display == "" {
+		display = nodeID
+	}
+	return display
 }
 
 func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) {
@@ -1027,14 +1142,27 @@ func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) {
 	}
 }
 
+func sendFeishuRecovery(webhook, siteTitle string, events []AlertEvent) {
+	if webhook == "" || len(events) == 0 {
+		return
+	}
+	if err := sendFeishuText(webhook, buildRecoveryMessage(siteTitle, events)); err != nil {
+		log.Printf("恢复通知发送失败: %v", err)
+	}
+}
+
 func sendFeishuTest(webhook, siteTitle string) error {
 	message := fmt.Sprintf("【%s】告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
 	return sendFeishuText(webhook, message)
 }
 
 func sendFeishuText(webhook, text string) error {
+	webhook = strings.TrimSpace(webhook)
 	if webhook == "" || strings.TrimSpace(text) == "" {
 		return errors.New("webhook 或消息为空")
+	}
+	if err := validateWebhookURL(webhook); err != nil {
+		return err
 	}
 	payload := map[string]any{
 		"msg_type": "text",
@@ -1067,13 +1195,25 @@ func sendFeishuText(webhook, text string) error {
 func buildAlertMessage(siteTitle string, events []AlertEvent) string {
 	lines := []string{fmt.Sprintf("【%s】服务器离线告警", normalizeSiteTitle(siteTitle)), "", "离线节点："}
 	for _, event := range events {
-		label := strings.TrimSpace(event.Display)
-		if label == "" {
-			label = "未命名节点"
+		label := formatAlertValue(event.Display, "未命名节点")
+		detail := ""
+		if event.OfflineSec > 0 {
+			detail = fmt.Sprintf("（离线 %s）", formatAlertDuration(event.OfflineSec))
 		}
-		lines = append(lines, fmt.Sprintf("• %s", label))
+		lines = append(lines, fmt.Sprintf("• %s%s", label, detail))
 	}
 	lines = append(lines, "", "请及时检查服务器状态。")
+	return strings.Join(lines, "\n")
+}
+
+func buildRecoveryMessage(siteTitle string, events []AlertEvent) string {
+	lines := []string{fmt.Sprintf("【%s】服务器恢复在线", normalizeSiteTitle(siteTitle)), "", "已恢复节点："}
+	for _, event := range events {
+		label := formatAlertValue(event.Display, "未命名节点")
+		detail := fmt.Sprintf("（离线 %s）", formatAlertDuration(event.OfflineSec))
+		lines = append(lines, fmt.Sprintf("• %s%s", label, detail))
+	}
+	lines = append(lines, "", "服务已恢复。")
 	return strings.Join(lines, "\n")
 }
 
@@ -1187,6 +1327,7 @@ func (s *Store) Snapshot() []NodeView {
 			LastSeen:         node.LastSeen.Unix(),
 			FirstSeen:        node.FirstSeen.Unix(),
 			Status:           status,
+			ServerID:         profile.ServerID,
 			Alias:            profile.Alias,
 			Group:            group,
 			Tags:             tags,
@@ -1305,6 +1446,31 @@ func readLoop(conn *websocket.Conn, hub *Hub) {
 	}
 }
 
+func isAllowedOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		next.ServeHTTP(w, r)
+	})
+}
+
 type NodeProfileUpdate struct {
 	Alias            *string                      `json:"alias"`
 	Group            *string                      `json:"group"`
@@ -1333,6 +1499,38 @@ func (s *Store) Credentials() Settings {
 	return s.settings
 }
 
+func (s *Store) VerifyAdminPassword(password string) bool {
+	s.mu.RLock()
+	stored := s.settings.AdminPass
+	s.mu.RUnlock()
+	if stored == "" {
+		return false
+	}
+	if !verifyPassword(password, stored) {
+		return false
+	}
+	if !isBcryptHash(stored) {
+		s.upgradeAdminPasswordHash(password, stored)
+	}
+	return true
+}
+
+func (s *Store) upgradeAdminPasswordHash(password, stored string) {
+	hash, err := hashPassword(password)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.settings.AdminPass != stored {
+		s.mu.Unlock()
+		return
+	}
+	s.settings.AdminPass = hash
+	data := s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+}
+
 func (s *Store) PublicSettings() PublicSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1349,22 +1547,24 @@ func (s *Store) SettingsView() SettingsView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return SettingsView{
-		AdminPath:       s.settings.AdminPath,
-		AdminUser:       s.settings.AdminUser,
-		AgentEndpoint:   s.settings.AgentEndpoint,
-		AgentToken:      s.settings.AuthToken,
-		SiteTitle:       s.settings.SiteTitle,
-		SiteIcon:        s.settings.SiteIcon,
-		HomeTitle:       s.settings.HomeTitle,
-		HomeSubtitle:    s.settings.HomeSubtitle,
-		AlertWebhook:    s.settings.AlertWebhook,
-		AlertOfflineSec: s.settings.AlertOfflineSec,
-		AlertAll:        s.settings.AlertAll,
-		AlertNodes:      s.settings.AlertNodes,
-		Commit:          s.buildCommit,
-		Groups:          s.settings.Groups,
-		GroupTree:       s.settings.GroupTree,
-		TestCatalog:     s.settings.TestCatalog,
+		AdminPath:           s.settings.AdminPath,
+		AdminUser:           s.settings.AdminUser,
+		AgentEndpoint:       s.settings.AgentEndpoint,
+		AgentToken:          s.settings.AuthToken,
+		SiteTitle:           s.settings.SiteTitle,
+		SiteIcon:            s.settings.SiteIcon,
+		HomeTitle:           s.settings.HomeTitle,
+		HomeSubtitle:        s.settings.HomeSubtitle,
+		AlertWebhook:        s.settings.AlertWebhook,
+		AlertOfflineSec:     s.settings.AlertOfflineSec,
+		AlertAll:            s.settings.AlertAll,
+		AlertNodes:          s.settings.AlertNodes,
+		AlertTelegramToken:  s.settings.AlertTelegramToken,
+		AlertTelegramUserID: s.settings.AlertTelegramUserID,
+		Commit:              s.buildCommit,
+		Groups:              s.settings.Groups,
+		GroupTree:           s.settings.GroupTree,
+		TestCatalog:         s.settings.TestCatalog,
 	}
 }
 
@@ -1372,6 +1572,12 @@ func (s *Store) AlertWebhook() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return strings.TrimSpace(s.settings.AlertWebhook)
+}
+
+func (s *Store) TelegramSettings() (string, int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.settings.AlertTelegramToken), s.settings.AlertTelegramUserID
 }
 
 func (s *Store) SiteTitle() string {
@@ -1409,10 +1615,25 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 			s.mu.Unlock()
 			return SettingsView{}, errors.New("admin_pass invalid")
 		}
-		if pass != s.settings.AdminPass {
-			s.settings.AdminPass = pass
+		if verifyPassword(pass, s.settings.AdminPass) {
+			if !isBcryptHash(s.settings.AdminPass) {
+				hash, err := hashPassword(pass)
+				if err != nil {
+					s.mu.Unlock()
+					return SettingsView{}, errors.New("admin_pass hash failed")
+				}
+				s.settings.AdminPass = hash
+			}
+		} else {
+			hash, err := hashPassword(pass)
+			if err != nil {
+				s.mu.Unlock()
+				return SettingsView{}, errors.New("admin_pass hash failed")
+			}
+			s.settings.AdminPass = hash
 			s.settings.TokenSalt = randomToken(adminTokenLength)
 		}
+		s.settings.AdminPassPlain = ""
 	}
 	if update.AgentEndpoint != nil {
 		s.settings.AgentEndpoint = strings.TrimSpace(*update.AgentEndpoint)
@@ -1439,7 +1660,14 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 	}
 	if update.AlertWebhook != nil {
-		s.settings.AlertWebhook = strings.TrimSpace(*update.AlertWebhook)
+		value := strings.TrimSpace(*update.AlertWebhook)
+		if value != "" {
+			if err := validateWebhookURL(value); err != nil {
+				s.mu.Unlock()
+				return SettingsView{}, err
+			}
+		}
+		s.settings.AlertWebhook = value
 	}
 	if update.AlertOfflineSec != nil {
 		offlineSec := *update.AlertOfflineSec
@@ -1453,6 +1681,28 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.AlertNodes != nil {
 		s.settings.AlertNodes = normalizeAlertNodes(*update.AlertNodes)
+	}
+	if update.AlertTelegramToken != nil {
+		value := strings.TrimSpace(*update.AlertTelegramToken)
+		if value != "" {
+			if err := validateTelegramToken(value); err != nil {
+				s.mu.Unlock()
+				return SettingsView{}, err
+			}
+		}
+		s.settings.AlertTelegramToken = value
+	}
+	if update.AlertTelegramUserID != nil {
+		value := *update.AlertTelegramUserID
+		if value < 0 {
+			value = 0
+		}
+		s.settings.AlertTelegramUserID = value
+	}
+	if (s.settings.AlertTelegramToken != "" || s.settings.AlertTelegramUserID > 0) &&
+		(s.settings.AlertTelegramToken == "" || s.settings.AlertTelegramUserID <= 0) {
+		s.mu.Unlock()
+		return SettingsView{}, errors.New("telegram token 与 telegram 用户 ID 需要同时配置")
 	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
@@ -1474,20 +1724,22 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	data = s.snapshotPersistedLocked()
 	view = SettingsView{
-		AdminPath:       s.settings.AdminPath,
-		AdminUser:       s.settings.AdminUser,
-		SiteTitle:       s.settings.SiteTitle,
-		SiteIcon:        s.settings.SiteIcon,
-		HomeTitle:       s.settings.HomeTitle,
-		HomeSubtitle:    s.settings.HomeSubtitle,
-		AlertWebhook:    s.settings.AlertWebhook,
-		AlertOfflineSec: s.settings.AlertOfflineSec,
-		AlertAll:        s.settings.AlertAll,
-		AlertNodes:      s.settings.AlertNodes,
-		Commit:          s.buildCommit,
-		Groups:          s.settings.Groups,
-		GroupTree:       s.settings.GroupTree,
-		TestCatalog:     s.settings.TestCatalog,
+		AdminPath:           s.settings.AdminPath,
+		AdminUser:           s.settings.AdminUser,
+		SiteTitle:           s.settings.SiteTitle,
+		SiteIcon:            s.settings.SiteIcon,
+		HomeTitle:           s.settings.HomeTitle,
+		HomeSubtitle:        s.settings.HomeSubtitle,
+		AlertWebhook:        s.settings.AlertWebhook,
+		AlertOfflineSec:     s.settings.AlertOfflineSec,
+		AlertAll:            s.settings.AlertAll,
+		AlertNodes:          s.settings.AlertNodes,
+		AlertTelegramToken:  s.settings.AlertTelegramToken,
+		AlertTelegramUserID: s.settings.AlertTelegramUserID,
+		Commit:              s.buildCommit,
+		Groups:              s.settings.Groups,
+		GroupTree:           s.settings.GroupTree,
+		TestCatalog:         s.settings.TestCatalog,
 	}
 	s.mu.Unlock()
 
@@ -1521,6 +1773,86 @@ func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
 		profile.Tags = tags
 	}
 	return profile
+}
+
+func (s *Store) ensureServerIDLocked(nodeID string, profile *NodeProfile) bool {
+	if profile == nil {
+		return false
+	}
+	original := strings.TrimSpace(profile.ServerID)
+	if original == "" || s.isServerIDDuplicateLocked(nodeID, original) {
+		profile.ServerID = s.generateServerIDLocked()
+		return true
+	}
+	return false
+}
+
+func (s *Store) generateServerIDLocked() string {
+	for {
+		id := randomToken(10)
+		if !s.isServerIDUsedLocked(id) {
+			return id
+		}
+	}
+}
+
+func (s *Store) isServerIDUsedLocked(id string) bool {
+	if id == "" {
+		return true
+	}
+	for _, profile := range s.profiles {
+		if profile != nil && strings.TrimSpace(profile.ServerID) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) isServerIDDuplicateLocked(nodeID, id string) bool {
+	if id == "" {
+		return false
+	}
+	for key, profile := range s.profiles {
+		if key == nodeID || profile == nil {
+			continue
+		}
+		if strings.TrimSpace(profile.ServerID) == id {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[string]NodeState) {
+	if profiles == nil {
+		return
+	}
+	for nodeID := range nodes {
+		if profiles[nodeID] == nil {
+			profiles[nodeID] = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+		}
+	}
+	used := make(map[string]struct{})
+	for nodeID, profile := range profiles {
+		if profile == nil {
+			profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+			profiles[nodeID] = profile
+		}
+		id := strings.TrimSpace(profile.ServerID)
+		if id == "" || containsKey(used, id) {
+			id = randomToken(10)
+			for containsKey(used, id) {
+				id = randomToken(10)
+			}
+			profile.ServerID = id
+		}
+		used[id] = struct{}{}
+	}
+}
+
+func containsKey(seen map[string]struct{}, key string) bool {
+	_, ok := seen[key]
+	return ok
 }
 
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfile {
@@ -1932,6 +2264,29 @@ func extractToken(r *http.Request) string {
 		return token
 	}
 	return ""
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
+	decoder := json.NewDecoder(r.Body)
+	return decoder.Decode(target)
+}
+
+func validateWebhookURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("webhook 不能为空")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("webhook 无效")
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return errors.New("webhook 协议无效")
+	}
+	if parsed.Host == "" {
+		return errors.New("webhook 无效")
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

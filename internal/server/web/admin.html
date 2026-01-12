@@ -165,7 +165,7 @@
             <div class="panel-head">
               <div>
                 <h2>通知告警</h2>
-                <p class="panel-desc">配置飞书机器人 Webhook，服务器离线后自动推送提醒。</p>
+                <p class="panel-desc">配置飞书或 Telegram 机器人，服务器离线后自动推送提醒。</p>
               </div>
               <div class="panel-actions">
                 <button class="btn small" id="save-alerts-btn" type="button">保存</button>
@@ -177,6 +177,15 @@
               <label class="field span-full">
                 <span>飞书 Webhook</span>
                 <input class="input" type="text" id="alert-webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+              </label>
+              <label class="field span-full">
+                <span>Telegram Bot Token</span>
+                <input class="input" type="text" id="alert-telegram-token" placeholder="123456:ABC-DEF..." />
+                <div class="form-hint">启用 Telegram 告警需同时填写 Token 与用户 ID</div>
+              </label>
+              <label class="field">
+                <span>Telegram 用户 ID</span>
+                <input class="input" type="text" id="alert-telegram-user-id" placeholder="123456789" />
               </label>
               <label class="field">
                 <span>离线时长(分钟)</span>

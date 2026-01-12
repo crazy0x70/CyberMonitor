@@ -233,10 +233,16 @@ svg text {
   border: 1px solid rgba(148, 163, 184, 0.35);
   box-shadow: var(--shadow);
   backdrop-filter: blur(16px);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .stat-card.clickable {
   cursor: pointer;
+}
+
+.stat-card.clickable:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.14);
 }
 
 .stat-label {
@@ -296,6 +302,11 @@ svg text {
   font-size: 13px;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.group-tab:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
 }
 
 .group-tab.active {
@@ -383,10 +394,16 @@ svg text {
   overflow: hidden;
   backdrop-filter: blur(18px);
   box-shadow: var(--shadow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
 }
 
 .node-card.animate {
   animation: rise 0.8s ease both;
+}
+
+.node-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 52px rgba(15, 23, 42, 0.16);
 }
 
 .node-card[open] {

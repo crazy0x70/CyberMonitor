@@ -15,6 +15,8 @@ const siteIconInput = document.getElementById("site-icon-input");
 const homeTitleInput = document.getElementById("home-title");
 const homeSubtitleInput = document.getElementById("home-subtitle");
 const alertWebhookInput = document.getElementById("alert-webhook");
+const alertTelegramTokenInput = document.getElementById("alert-telegram-token");
+const alertTelegramUserIdInput = document.getElementById("alert-telegram-user-id");
 const alertOfflineMinutesInput = document.getElementById("alert-offline-minutes");
 const alertAllToggle = document.getElementById("alert-all");
 const alertNodeList = document.getElementById("alert-node-list");
@@ -57,6 +59,8 @@ const state = {
     alertOfflineSec: 0,
     alertAll: true,
     alertNodes: [],
+    alertTelegramToken: "",
+    alertTelegramUserId: 0,
   },
   nodes: [],
 };
@@ -161,6 +165,13 @@ function applySettingsView(data) {
   if (alertWebhookInput) {
     alertWebhookInput.value = data.alert_webhook || "";
   }
+  if (alertTelegramTokenInput) {
+    alertTelegramTokenInput.value = data.alert_telegram_token || "";
+  }
+  if (alertTelegramUserIdInput) {
+    const userId = Number(data.alert_telegram_user_id || 0);
+    alertTelegramUserIdInput.value = userId > 0 ? String(userId) : "";
+  }
   if (alertOfflineMinutesInput) {
     const minutes = Math.round((data.alert_offline_sec || 0) / 60);
     alertOfflineMinutesInput.value = minutes > 0 ? String(minutes) : "";
@@ -181,6 +192,12 @@ function applySettingsView(data) {
   }
   if (typeof data.alert_webhook === "string") {
     state.settings.alertWebhook = data.alert_webhook;
+  }
+  if (typeof data.alert_telegram_token === "string") {
+    state.settings.alertTelegramToken = data.alert_telegram_token;
+  }
+  if (typeof data.alert_telegram_user_id === "number") {
+    state.settings.alertTelegramUserId = data.alert_telegram_user_id;
   }
   if (typeof data.alert_offline_sec === "number") {
     state.settings.alertOfflineSec = data.alert_offline_sec;
@@ -273,12 +290,26 @@ async function saveAlertSettings() {
   if (!alertWebhookInput || !alertOfflineMinutesInput) return;
   const payload = {};
   const webhook = alertWebhookInput.value.trim();
+  const telegramToken = alertTelegramTokenInput
+    ? alertTelegramTokenInput.value.trim()
+    : "";
+  const telegramUserIdRaw = alertTelegramUserIdInput
+    ? alertTelegramUserIdInput.value.trim()
+    : "";
+  let telegramUserId = telegramUserIdRaw ? parseInt(telegramUserIdRaw, 10) : 0;
+  if (telegramToken || telegramUserIdRaw) {
+    if (!telegramToken || !telegramUserIdRaw || !Number.isFinite(telegramUserId) || telegramUserId <= 0) {
+      throw new Error("Telegram Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
+    }
+  }
   let minutes = parseInt(alertOfflineMinutesInput.value, 10);
   if (!Number.isFinite(minutes) || minutes <= 0) {
     minutes = 5;
   }
   const alertAll = alertAllToggle ? alertAllToggle.checked : true;
   payload.alert_webhook = webhook;
+  payload.alert_telegram_token = telegramToken;
+  payload.alert_telegram_user_id = Number.isFinite(telegramUserId) ? telegramUserId : 0;
   payload.alert_offline_sec = minutes * 60;
   payload.alert_all = alertAll;
   if (!alertAll) {
@@ -294,13 +325,29 @@ async function saveAlertSettings() {
 async function testAlertSettings() {
   if (!alertWebhookInput) return;
   const webhook = alertWebhookInput.value.trim();
-  if (!webhook) {
-    throw new Error("请先填写飞书 Webhook");
+  const telegramToken = alertTelegramTokenInput
+    ? alertTelegramTokenInput.value.trim()
+    : "";
+  const telegramUserIdRaw = alertTelegramUserIdInput
+    ? alertTelegramUserIdInput.value.trim()
+    : "";
+  const telegramUserId = telegramUserIdRaw ? parseInt(telegramUserIdRaw, 10) : 0;
+  if (!webhook && !telegramToken) {
+    throw new Error("请先填写飞书 Webhook 或 Telegram 配置");
+  }
+  if (telegramToken || telegramUserIdRaw) {
+    if (!telegramToken || !telegramUserIdRaw || !Number.isFinite(telegramUserId) || telegramUserId <= 0) {
+      throw new Error("Telegram Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
+    }
   }
   const resp = await apiFetch("/api/v1/admin/alerts/test", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ webhook }),
+    body: JSON.stringify({
+      webhook,
+      telegram_token: telegramToken,
+      telegram_user_id: Number.isFinite(telegramUserId) ? telegramUserId : 0,
+    }),
   });
   if (!resp.ok) {
     let message = `测试失败: ${resp.status}`;
