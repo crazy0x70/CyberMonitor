@@ -1164,7 +1164,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			LastSeen:   node.LastSeen.Unix(),
 			OfflineSec: int64(offlineFor.Seconds()),
 		})
-		s.alerted[nodeID] = alertState{OfflineAt: node.LastSeen}
+		s.alerted[nodeID] = alertState{OfflineAt: now}
 	}
 
 	for nodeID := range s.alerted {
