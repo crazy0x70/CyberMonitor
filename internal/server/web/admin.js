@@ -26,15 +26,15 @@ const alertsHint = document.getElementById("alerts-hint");
 const aiOpenAIKeyInput = document.getElementById("ai-openai-key");
 const aiOpenAIBaseInput = document.getElementById("ai-openai-base");
 const aiOpenAIModelInput = document.getElementById("ai-openai-model");
-const aiOpenAIModelList = document.getElementById("ai-openai-models");
+const aiOpenAIModelDropdown = document.querySelector('[data-model-dropdown="openai"]');
 const aiGeminiKeyInput = document.getElementById("ai-gemini-key");
 const aiGeminiBaseInput = document.getElementById("ai-gemini-base");
 const aiGeminiModelInput = document.getElementById("ai-gemini-model");
-const aiGeminiModelList = document.getElementById("ai-gemini-models");
+const aiGeminiModelDropdown = document.querySelector('[data-model-dropdown="gemini"]');
 const aiVolcKeyInput = document.getElementById("ai-volc-key");
 const aiVolcBaseInput = document.getElementById("ai-volc-base");
 const aiVolcModelInput = document.getElementById("ai-volc-model");
-const aiVolcModelList = document.getElementById("ai-volc-models");
+const aiVolcModelDropdown = document.querySelector('[data-model-dropdown="volcengine"]');
 const aiCompatList = document.getElementById("ai-compat-list");
 const aiCompatAddBtn = document.getElementById("ai-compat-add");
 const saveAiBtn = document.getElementById("save-ai-btn");
@@ -62,6 +62,7 @@ const installCodes = document.querySelectorAll(".install-code");
 
 const TOKEN_KEY = "cm_admin_token";
 const DEFAULT_TCP_INTERVAL = 5;
+const MODEL_CACHE_KEY = "cm_ai_models_cache";
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
@@ -116,6 +117,30 @@ function setToken(token) {
     localStorage.setItem(TOKEN_KEY, token);
   } else {
     localStorage.removeItem(TOKEN_KEY);
+  }
+}
+
+function loadModelCache() {
+  try {
+    const raw = localStorage.getItem(MODEL_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+  } catch (error) {
+    // ignore
+  }
+  return {};
+}
+
+const modelCache = loadModelCache();
+
+function saveModelCache() {
+  try {
+    localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify(modelCache));
+  } catch (error) {
+    // ignore
   }
 }
 
@@ -283,6 +308,7 @@ function applySettingsView(data) {
     openaiCompatible: {},
   };
   renderAICompatibles(state.settings.aiSettings.openaiCompatibles);
+  hydrateModelPickers();
   updateAlertAIProviderOptions(commandProvider || defaultProvider);
   state.settings.groups = Array.isArray(data.groups) ? data.groups : [];
   state.settings.groupTree = Array.isArray(data.group_tree)
@@ -527,10 +553,10 @@ function resolveAIModelInput(provider, providerId = "") {
   return null;
 }
 
-function resolveAIModelList(provider, providerId = "") {
-  if (provider === "openai") return aiOpenAIModelList;
-  if (provider === "gemini") return aiGeminiModelList;
-  if (provider === "volcengine") return aiVolcModelList;
+function resolveAIModelDropdown(provider, providerId = "") {
+  if (provider === "openai") return aiOpenAIModelDropdown;
+  if (provider === "gemini") return aiGeminiModelDropdown;
+  if (provider === "volcengine") return aiVolcModelDropdown;
   if (provider === "openai_compatible" && providerId && aiCompatList) {
     const card = aiCompatList.querySelector(`[data-provider-id="${providerId}"]`);
     return card ? card.querySelector('[data-field="compat-models"]') : null;
@@ -538,17 +564,118 @@ function resolveAIModelList(provider, providerId = "") {
   return null;
 }
 
-function applyModelOptions(models, input, list) {
-  if (!list) return;
-  const current = input ? input.value.trim() : "";
-  list.innerHTML = "";
-  models.forEach((model) => {
-    const option = document.createElement("option");
-    option.value = model;
-    list.appendChild(option);
+function resolveModelCacheKey(provider, providerId = "") {
+  if (provider === "openai_compatible") {
+    return providerId ? `${provider}:${providerId}` : provider;
+  }
+  return provider;
+}
+
+function normalizeModelList(models) {
+  return Array.from(
+    new Set(
+      (Array.isArray(models) ? models : [])
+        .map((item) => String(item || "").trim())
+        .filter((item) => item)
+    )
+  );
+}
+
+function getCachedModels(provider, providerId = "") {
+  const key = resolveModelCacheKey(provider, providerId);
+  const list = modelCache[key];
+  return Array.isArray(list) ? list : [];
+}
+
+function setCachedModels(provider, providerId, models) {
+  const key = resolveModelCacheKey(provider, providerId);
+  modelCache[key] = normalizeModelList(models);
+  saveModelCache();
+}
+
+function renderModelDropdown(models, dropdown, input) {
+  if (!dropdown) return;
+  dropdown.innerHTML = "";
+  const normalized = normalizeModelList(models);
+  if (!normalized.length) {
+    const empty = document.createElement("div");
+    empty.className = "model-dropdown-empty";
+    empty.textContent = "暂无模型列表";
+    dropdown.appendChild(empty);
+    return;
+  }
+  normalized.forEach((model) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "model-option";
+    option.dataset.model = model;
+    option.textContent = model;
+    dropdown.appendChild(option);
   });
-  if (!current && models.length > 0 && input) {
-    input.value = models[0];
+  if (input && !input.value && normalized.length > 0) {
+    input.value = normalized[0];
+  }
+}
+
+function applyModelOptions(models, input, dropdown, provider, providerId) {
+  const normalized = normalizeModelList(models);
+  renderModelDropdown(normalized, dropdown, input);
+  if (provider) {
+    setCachedModels(provider, providerId, normalized);
+  }
+}
+
+function bindModelPicker(input, dropdown) {
+  if (!input || !dropdown) return;
+  if (input.dataset.modelBound === "1") return;
+  input.dataset.modelBound = "1";
+  const wrapper = input.closest(".model-picker");
+  if (!wrapper) return;
+  const openPanel = () => {
+    if (dropdown.children.length > 0) {
+      wrapper.classList.add("open");
+    }
+  };
+  const closePanel = () => {
+    wrapper.classList.remove("open");
+  };
+  input.addEventListener("focus", openPanel);
+  input.addEventListener("click", openPanel);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closePanel();
+    }
+  });
+  dropdown.addEventListener("click", (event) => {
+    const option = event.target.closest(".model-option");
+    if (!option) return;
+    input.value = option.dataset.model || option.textContent;
+    closePanel();
+  });
+  document.addEventListener("click", (event) => {
+    if (!wrapper.contains(event.target)) {
+      closePanel();
+    }
+  });
+}
+
+function hydrateModelPickers() {
+  renderModelDropdown(getCachedModels("openai"), aiOpenAIModelDropdown, aiOpenAIModelInput);
+  bindModelPicker(aiOpenAIModelInput, aiOpenAIModelDropdown);
+  renderModelDropdown(getCachedModels("gemini"), aiGeminiModelDropdown, aiGeminiModelInput);
+  bindModelPicker(aiGeminiModelInput, aiGeminiModelDropdown);
+  renderModelDropdown(getCachedModels("volcengine"), aiVolcModelDropdown, aiVolcModelInput);
+  bindModelPicker(aiVolcModelInput, aiVolcModelDropdown);
+  if (aiCompatList) {
+    const cards = aiCompatList.querySelectorAll('[data-provider="openai_compatible"]');
+    cards.forEach((card) => {
+      const providerId = card.dataset.providerId;
+      if (!providerId) return;
+      const dropdown = card.querySelector('[data-field="compat-models"]');
+      const input = card.querySelector('[data-field="compat-model"]');
+      renderModelDropdown(getCachedModels("openai_compatible", providerId), dropdown, input);
+      bindModelPicker(input, dropdown);
+    });
   }
 }
 
@@ -558,7 +685,11 @@ async function testAIProvider(provider, providerId, button) {
     hint.textContent = "";
     hint.classList.remove("error");
   }
+  const defaultText = button ? button.dataset.defaultText || "测试连接" : "";
   if (button) {
+    button.dataset.defaultText = defaultText;
+    button.classList.remove("success", "error");
+    button.removeAttribute("title");
     button.disabled = true;
     button.textContent = "测试中...";
   }
@@ -585,17 +716,27 @@ async function testAIProvider(provider, providerId, button) {
       throw new Error(message);
     }
     if (hint) {
-      hint.textContent = "连接成功";
+      hint.textContent = "";
+      hint.classList.remove("error");
+    }
+    if (button) {
+      button.textContent = "连接成功";
+      button.classList.add("success");
     }
   } catch (error) {
     if (hint) {
-      hint.textContent = error.message;
-      hint.classList.add("error");
+      hint.textContent = "";
+      hint.classList.remove("error");
+    }
+    if (button) {
+      const message = error && error.message ? error.message : "连接失败";
+      button.textContent = message;
+      button.title = message;
+      button.classList.add("error");
     }
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = "测试连接";
     }
   }
 }
@@ -728,8 +869,10 @@ function createCompatCard(item) {
       </label>
       <label class="field">
         <span>模型</span>
-        <input class="input" type="text" data-field="compat-model" list="${listId}" placeholder="gpt-4o-mini" />
-        <datalist data-field="compat-models" id="${listId}"></datalist>
+        <div class="model-picker" data-model-picker="openai_compatible">
+          <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" autocomplete="off" />
+          <div class="model-dropdown" data-field="compat-models" id="${listId}"></div>
+        </div>
         <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
       </label>
     </div>
@@ -747,10 +890,13 @@ function createCompatCard(item) {
   const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
   const baseInput = card.querySelector('[data-field="compat-base"]');
   const modelInput = card.querySelector('[data-field="compat-model"]');
+  const modelDropdown = card.querySelector('[data-field="compat-models"]');
   if (nameInput) nameInput.value = item.name || "";
   if (apiKeyInput) apiKeyInput.value = item.api_key || "";
   if (baseInput) baseInput.value = item.base_url || "";
   if (modelInput) modelInput.value = item.model || "";
+  renderModelDropdown(getCachedModels("openai_compatible", id), modelDropdown, modelInput);
+  bindModelPicker(modelInput, modelDropdown);
   const title = card.querySelector("h3");
   const subtitle = card.querySelector("p");
   if (nameInput && title) {
@@ -799,12 +945,16 @@ function removeCompatProvider(providerId) {
 async function fetchAIModels(provider, providerId, button) {
   const hint = resolveAIModelsHint(provider, providerId);
   const input = resolveAIModelInput(provider, providerId);
-  const list = resolveAIModelList(provider, providerId);
+  const dropdown = resolveAIModelDropdown(provider, providerId);
   if (hint) {
     hint.textContent = "";
     hint.classList.remove("error");
   }
+  const defaultText = button ? button.dataset.defaultText || "获取可用模型" : "";
   if (button) {
+    button.dataset.defaultText = defaultText;
+    button.classList.remove("success", "error");
+    button.removeAttribute("title");
     button.disabled = true;
     button.textContent = "获取中...";
   }
@@ -832,23 +982,34 @@ async function fetchAIModels(provider, providerId, button) {
     }
     const data = await resp.json();
     const models = Array.isArray(data.models) ? data.models : [];
-    applyModelOptions(models, input, list);
+    applyModelOptions(models, input, dropdown, provider, providerId);
     if (hint) {
+      hint.textContent = "";
+      hint.classList.remove("error");
+    }
+    if (button) {
       if (!models.length) {
-        hint.textContent = "未返回可用模型";
+        button.textContent = "未返回模型";
+        button.classList.add("error");
       } else {
-        hint.textContent = `已更新模型列表（${models.length}）`;
+        button.textContent = "获取成功";
+        button.classList.add("success");
       }
     }
   } catch (error) {
     if (hint) {
-      hint.textContent = error.message;
-      hint.classList.add("error");
+      hint.textContent = "";
+      hint.classList.remove("error");
+    }
+    if (button) {
+      const message = error && error.message ? error.message : "获取失败";
+      button.textContent = message;
+      button.title = message;
+      button.classList.add("error");
     }
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = "获取可用模型";
     }
   }
 }

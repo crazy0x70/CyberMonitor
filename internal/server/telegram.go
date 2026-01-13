@@ -289,6 +289,11 @@ func handleTelegramAICommand(command string, store *Store) string {
 	if query == "" {
 		return "用法: /ai 你的问题"
 	}
+	if enabled, serverID, message, ok := parseAIAlertToggle(query, store); ok {
+		return toggleAlertForServer(store, serverID, enabled)
+	} else if message != "" {
+		return message
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 	defer cancel()
 	answer, err := runAIQuery(ctx, store, query)
@@ -312,6 +317,10 @@ func handleTelegramAlarmToggle(store *Store, parts []string, enabled bool) strin
 		}
 		return "用法: /alarmsoff 服务器ID"
 	}
+	return toggleAlertForServer(store, serverID, enabled)
+}
+
+func toggleAlertForServer(store *Store, serverID string, enabled bool) string {
 	_, display, ok := store.UpdateAlertEnabledByServerID(serverID, enabled)
 	if !ok {
 		return fmt.Sprintf("未找到服务器: %s", serverID)
@@ -324,6 +333,61 @@ func handleTelegramAlarmToggle(store *Store, parts []string, enabled bool) strin
 		display = serverID
 	}
 	return fmt.Sprintf("%s告警：%s （%s）", action, display, serverID)
+}
+
+func parseAIAlertToggle(query string, store *Store) (bool, string, string, bool) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false, "", "", false
+	}
+	enableKeywords := []string{"开启告警", "打开告警", "启用告警", "恢复告警", "开告警"}
+	disableKeywords := []string{"关闭告警", "禁用告警", "停用告警", "关掉告警", "关告警", "关停告警"}
+	enabled := false
+	recognized := false
+	for _, word := range enableKeywords {
+		if strings.Contains(query, word) {
+			enabled = true
+			recognized = true
+			break
+		}
+	}
+	if !recognized {
+		for _, word := range disableKeywords {
+			if strings.Contains(query, word) {
+				enabled = false
+				recognized = true
+				break
+			}
+		}
+	}
+	if !recognized {
+		return false, "", "", false
+	}
+	nodes := store.Snapshot()
+	for _, node := range nodes {
+		if node.ServerID != "" && strings.Contains(query, node.ServerID) {
+			return enabled, node.ServerID, "", true
+		}
+	}
+	matched := make([]string, 0, 1)
+	for _, node := range nodes {
+		display := resolveNodeDisplayNameForAI(node)
+		if display == "" || display == "未命名节点" {
+			continue
+		}
+		if strings.Contains(query, display) {
+			if node.ServerID != "" {
+				matched = append(matched, node.ServerID)
+			}
+		}
+	}
+	if len(matched) == 1 {
+		return enabled, matched[0], "", true
+	}
+	if len(matched) > 1 {
+		return false, "", "匹配到多个服务器，请使用服务器ID 进行操作", false
+	}
+	return false, "", "未识别服务器ID，请使用 /alarmson 或 /alarmsoff 服务器ID", false
 }
 
 func buildTelegramAllStats(store *Store) string {

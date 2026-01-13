@@ -264,8 +264,10 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" list="ai-openai-models" />
-                    <datalist id="ai-openai-models"></datalist>
+                    <div class="model-picker" data-model-picker="openai">
+                      <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" autocomplete="off" />
+                      <div class="model-dropdown" data-model-dropdown="openai"></div>
+                    </div>
                     <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
                   </label>
                 </div>
@@ -298,8 +300,10 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" list="ai-gemini-models" />
-                    <datalist id="ai-gemini-models"></datalist>
+                    <div class="model-picker" data-model-picker="gemini">
+                      <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" autocomplete="off" />
+                      <div class="model-dropdown" data-model-dropdown="gemini"></div>
+                    </div>
                     <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
                   </label>
                 </div>
@@ -332,8 +336,10 @@
                   </label>
                   <label class="field">
                     <span>模型</span>
-                    <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" list="ai-volc-models" />
-                    <datalist id="ai-volc-models"></datalist>
+                    <div class="model-picker" data-model-picker="volcengine">
+                      <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" autocomplete="off" />
+                      <div class="model-dropdown" data-model-dropdown="volcengine"></div>
+                    </div>
                     <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
                   </label>
                 </div>
