@@ -14,6 +14,9 @@ const siteTitleInput = document.getElementById("site-title");
 const siteIconInput = document.getElementById("site-icon-input");
 const homeTitleInput = document.getElementById("home-title");
 const homeSubtitleInput = document.getElementById("home-subtitle");
+const loginFailLimitInput = document.getElementById("login-fail-limit");
+const loginFailWindowInput = document.getElementById("login-fail-window");
+const loginLockMinutesInput = document.getElementById("login-lock-minutes");
 const alertWebhookInput = document.getElementById("alert-webhook");
 const alertTelegramTokenInput = document.getElementById("alert-telegram-token");
 const alertTelegramUserIdInput = document.getElementById("alert-telegram-user-id");
@@ -73,6 +76,9 @@ const state = {
     testCatalog: [],
     agentEndpoint: "",
     agentToken: "",
+    loginFailLimit: 0,
+    loginFailWindowSec: 0,
+    loginLockSec: 0,
     alertWebhook: "",
     alertOfflineSec: 0,
     alertTelegramToken: "",
@@ -169,7 +175,16 @@ async function login(username, password) {
     body: JSON.stringify({ username, password }),
   });
   if (!resp.ok) {
-    throw new Error("用户名或密码错误");
+    let message = "用户名或密码错误";
+    try {
+      const data = await resp.json();
+      if (data && data.error) {
+        message = data.error;
+      }
+    } catch (error) {
+      // ignore
+    }
+    throw new Error(message);
   }
   const data = await resp.json();
   if (!data.token) {
@@ -219,6 +234,24 @@ function applySettingsView(data) {
   siteIconInput.value = data.site_icon || "";
   homeTitleInput.value = data.home_title || "";
   homeSubtitleInput.value = data.home_subtitle || "";
+  if (loginFailLimitInput) {
+    const limit = typeof data.login_fail_limit === "number" ? data.login_fail_limit : 0;
+    loginFailLimitInput.value = String(limit < 0 ? 0 : limit);
+    state.settings.loginFailLimit = limit;
+  }
+  if (loginFailWindowInput) {
+    const windowSec =
+      typeof data.login_fail_window_sec === "number" ? data.login_fail_window_sec : 0;
+    const minutes = Math.round(windowSec / 60);
+    loginFailWindowInput.value = minutes > 0 ? String(minutes) : "";
+    state.settings.loginFailWindowSec = windowSec;
+  }
+  if (loginLockMinutesInput) {
+    const lockSec = typeof data.login_lock_sec === "number" ? data.login_lock_sec : 0;
+    const minutes = Math.round(lockSec / 60);
+    loginLockMinutesInput.value = minutes > 0 ? String(minutes) : "";
+    state.settings.loginLockSec = lockSec;
+  }
   if (alertWebhookInput) {
     alertWebhookInput.value = data.alert_webhook || "";
   }
@@ -367,6 +400,9 @@ async function saveBaseSettings() {
   const siteIcon = siteIconInput.value.trim();
   const homeTitle = homeTitleInput.value.trim();
   const homeSubtitle = homeSubtitleInput.value.trim();
+  const failLimit = loginFailLimitInput ? loginFailLimitInput.value.trim() : "";
+  const failWindow = loginFailWindowInput ? loginFailWindowInput.value.trim() : "";
+  const lockMinutes = loginLockMinutesInput ? loginLockMinutesInput.value.trim() : "";
 
   if (path) payload.admin_path = path;
   if (user && user !== state.settings.adminUser) payload.admin_user = user;
@@ -376,6 +412,24 @@ async function saveBaseSettings() {
   payload.site_icon = siteIcon;
   payload.home_title = homeTitle;
   payload.home_subtitle = homeSubtitle;
+  if (failLimit !== "") {
+    const value = parseInt(failLimit, 10);
+    if (!Number.isNaN(value)) {
+      payload.login_fail_limit = value;
+    }
+  }
+  if (failWindow !== "") {
+    const value = parseInt(failWindow, 10);
+    if (!Number.isNaN(value)) {
+      payload.login_fail_window_sec = Math.max(value, 0) * 60;
+    }
+  }
+  if (lockMinutes !== "") {
+    const value = parseInt(lockMinutes, 10);
+    if (!Number.isNaN(value)) {
+      payload.login_lock_sec = Math.max(value, 0) * 60;
+    }
+  }
   return saveSettingsPayload(payload);
 }
 

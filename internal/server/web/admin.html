@@ -21,23 +21,42 @@
       </header>
 
       <section id="login-panel" class="panel login-panel">
-        <div class="panel-head centered">
-          <div>
+        <div class="login-shell">
+          <div class="login-intro">
+            <span class="login-badge">CyberMonitor Admin Console</span>
             <h2>管理员登录</h2>
+            <p class="login-subtitle">进入核心配置区，管理节点、告警与 API 提供商。</p>
+            <div class="login-feature-list">
+              <div class="login-feature">
+                <strong>节点拓扑</strong>
+                <span>统一管理分组与探测策略</span>
+              </div>
+              <div class="login-feature">
+                <strong>告警策略</strong>
+                <span>精准通知与离线恢复追踪</span>
+              </div>
+              <div class="login-feature">
+                <strong>控制中枢</strong>
+                <span>集中管理配置与安全入口</span>
+              </div>
+            </div>
+            <div class="login-note">请使用管理员账号登录，谨慎操作。</div>
+          </div>
+          <div class="login-card">
+            <form id="login-form" class="form-grid login-form">
+              <label class="field">
+                <span>用户名</span>
+                <input class="input" type="text" name="username" autocomplete="username" required />
+              </label>
+              <label class="field">
+                <span>密码</span>
+                <input class="input" type="password" name="password" autocomplete="current-password" required />
+              </label>
+              <button class="btn" type="submit">登录</button>
+              <div id="login-error" class="form-hint error"></div>
+            </form>
           </div>
         </div>
-        <form id="login-form" class="form-grid">
-          <label class="field">
-            <span>用户名</span>
-            <input class="input" type="text" name="username" autocomplete="username" required />
-          </label>
-          <label class="field">
-            <span>密码</span>
-            <input class="input" type="password" name="password" autocomplete="current-password" required />
-          </label>
-          <button class="btn" type="submit">登录</button>
-          <div id="login-error" class="form-hint error"></div>
-        </form>
       </section>
 
       <section id="admin-shell" class="admin-shell hidden">
@@ -63,39 +82,84 @@
                 <div class="form-hint" id="settings-hint"></div>
               </div>
             </div>
-            <div class="admin-grid">
-              <label class="field">
-                <span>后台路径</span>
-                <input class="input" type="text" id="admin-path" placeholder="/随机路径" />
-              </label>
-              <label class="field">
-                <span>管理员账号</span>
-                <input class="input" type="text" id="admin-user" placeholder="admin" />
-              </label>
-              <label class="field">
-                <span>新密码</span>
-                <input class="input" type="password" id="admin-pass" placeholder="留空不修改" />
-              </label>
-              <label class="field">
-                <span>Agent 对接地址</span>
-                <input class="input" type="text" id="agent-endpoint" placeholder="https://agent.example.com" />
-              </label>
-              <label class="field">
-                <span>站点 Title</span>
-                <input class="input" type="text" id="site-title" placeholder="浏览器标题" />
-              </label>
-              <label class="field">
-                <span>站点 Icon</span>
-                <input class="input" type="text" id="site-icon-input" placeholder="图标 URL 或路径" />
-              </label>
-              <label class="field">
-                <span>首页标题</span>
-                <input class="input" type="text" id="home-title" placeholder="首页主标题" />
-              </label>
-              <label class="field">
-                <span>首页副标题</span>
-                <input class="input" type="text" id="home-subtitle" placeholder="首页副标题" />
-              </label>
+            <div class="settings-grid">
+              <div class="settings-card">
+                <div class="settings-card-head">
+                  <h3>账号与入口</h3>
+                  <p class="panel-desc">管理后台入口与管理员信息，密码留空则不修改。</p>
+                </div>
+                <div class="settings-fields">
+                  <label class="field">
+                    <span>后台路径</span>
+                    <input class="input" type="text" id="admin-path" placeholder="/随机路径" />
+                  </label>
+                  <label class="field">
+                    <span>管理员账号</span>
+                    <input class="input" type="text" id="admin-user" placeholder="admin" />
+                  </label>
+                  <label class="field">
+                    <span>新密码</span>
+                    <input class="input" type="password" id="admin-pass" placeholder="留空不修改" />
+                  </label>
+                </div>
+              </div>
+              <div class="settings-card">
+                <div class="settings-card-head">
+                  <h3>登录保护</h3>
+                  <p class="panel-desc">限制异常尝试并降低爆破风险。</p>
+                </div>
+                <div class="settings-fields">
+                  <label class="field">
+                    <span>失败次数上限</span>
+                    <input class="input" type="number" min="0" step="1" id="login-fail-limit" placeholder="5" />
+                    <div class="form-hint">设置为 0 表示不限制。</div>
+                  </label>
+                  <label class="field">
+                    <span>统计窗口(分钟)</span>
+                    <input class="input" type="number" min="1" step="1" id="login-fail-window" placeholder="15" />
+                  </label>
+                  <label class="field">
+                    <span>锁定时长(分钟)</span>
+                    <input class="input" type="number" min="1" step="1" id="login-lock-minutes" placeholder="15" />
+                  </label>
+                </div>
+              </div>
+              <div class="settings-card">
+                <div class="settings-card-head">
+                  <h3>Agent 接入</h3>
+                  <p class="panel-desc">控制 Agent 上报的服务地址。</p>
+                </div>
+                <div class="settings-fields">
+                  <label class="field">
+                    <span>Agent 对接地址</span>
+                    <input class="input" type="text" id="agent-endpoint" placeholder="https://agent.example.com" />
+                  </label>
+                </div>
+              </div>
+              <div class="settings-card">
+                <div class="settings-card-head">
+                  <h3>站点展示</h3>
+                  <p class="panel-desc">前台与浏览器展示文案。</p>
+                </div>
+                <div class="settings-fields">
+                  <label class="field">
+                    <span>站点 Title</span>
+                    <input class="input" type="text" id="site-title" placeholder="浏览器标题" />
+                  </label>
+                  <label class="field">
+                    <span>站点 Icon</span>
+                    <input class="input" type="text" id="site-icon-input" placeholder="图标 URL 或路径" />
+                  </label>
+                  <label class="field">
+                    <span>首页标题</span>
+                    <input class="input" type="text" id="home-title" placeholder="首页主标题" />
+                  </label>
+                  <label class="field">
+                    <span>首页副标题</span>
+                    <input class="input" type="text" id="home-subtitle" placeholder="首页副标题" />
+                  </label>
+                </div>
+              </div>
             </div>
           </section>
 

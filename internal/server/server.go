@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -126,6 +127,7 @@ type Store struct {
 	persistInterval    time.Duration
 	alerted            map[string]alertState
 	testHistory        map[string]map[string]*TestHistoryEntry
+	loginAttempts      map[string]*loginAttempt
 	historyDirty       bool
 	historyLastPersist time.Time
 }
@@ -216,6 +218,13 @@ type hubClient struct {
 	mu   sync.Mutex
 }
 
+type loginAttempt struct {
+	failCount   int
+	firstAt     time.Time
+	lastAt      time.Time
+	lockedUntil time.Time
+}
+
 func (c *hubClient) writeMessage(messageType int, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -298,6 +307,7 @@ func Run(ctx context.Context, cfg Config) error {
 		persistInterval: defaultPersistInterval,
 		alerted:         make(map[string]alertState),
 		testHistory:     testHistory,
+		loginAttempts:   make(map[string]*loginAttempt),
 	}
 	if historyTrimmed {
 		historyData := TestHistoryData{
@@ -328,11 +338,23 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		req.Username = strings.TrimSpace(req.Username)
+		now := time.Now()
 		creds := store.Credentials()
+		attemptKey := loginAttemptKey(req.Username, r.RemoteAddr)
+		if allowed, retryAfter := store.allowLoginAttempt(attemptKey, now); !allowed {
+			writeLoginRateLimit(w, retryAfter)
+			return
+		}
 		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
+			if locked, retryAfter := store.recordLoginFailure(attemptKey, now); locked {
+				writeLoginRateLimit(w, retryAfter)
+				return
+			}
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 			return
 		}
+		store.clearLoginAttempts(attemptKey)
 		token, exp, err := generateToken(cfg.JWTSecret, req.Username, creds.TokenSalt)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token error"})
@@ -1616,6 +1638,132 @@ func (s *Store) VerifyAdminPassword(password string) bool {
 	return true
 }
 
+func (s *Store) loginPolicy() (int, time.Duration, time.Duration) {
+	s.mu.RLock()
+	limit := s.settings.LoginFailLimit
+	windowSec := s.settings.LoginFailWindowSec
+	lockSec := s.settings.LoginLockSec
+	s.mu.RUnlock()
+	if limit == 0 {
+		limit = defaultLoginFailLimit
+	}
+	if limit < 0 {
+		return 0, 0, 0
+	}
+	if windowSec <= 0 {
+		windowSec = defaultLoginFailWindow
+	}
+	if lockSec <= 0 {
+		lockSec = defaultLoginLockSec
+	}
+	return limit, time.Duration(windowSec) * time.Second, time.Duration(lockSec) * time.Second
+}
+
+func loginAttemptKey(username, remoteAddr string) string {
+	user := strings.TrimSpace(username)
+	if user == "" {
+		user = "unknown"
+	}
+	host := strings.TrimSpace(remoteAddr)
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		host = parsed
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s|%s", user, host)
+}
+
+func (s *Store) allowLoginAttempt(key string, now time.Time) (bool, time.Duration) {
+	limit, window, lock := s.loginPolicy()
+	if limit <= 0 {
+		return true, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt := s.loginAttempts[key]
+	if attempt == nil {
+		s.pruneLoginAttemptsLocked(now, window, lock)
+		return true, 0
+	}
+	if !attempt.lockedUntil.IsZero() && now.Before(attempt.lockedUntil) {
+		return false, attempt.lockedUntil.Sub(now)
+	}
+	if window > 0 && !attempt.firstAt.IsZero() && now.Sub(attempt.firstAt) > window {
+		delete(s.loginAttempts, key)
+		s.pruneLoginAttemptsLocked(now, window, lock)
+		return true, 0
+	}
+	s.pruneLoginAttemptsLocked(now, window, lock)
+	return true, 0
+}
+
+func (s *Store) recordLoginFailure(key string, now time.Time) (bool, time.Duration) {
+	limit, window, lock := s.loginPolicy()
+	if limit <= 0 {
+		return false, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	attempt := s.loginAttempts[key]
+	if attempt == nil {
+		attempt = &loginAttempt{firstAt: now}
+		s.loginAttempts[key] = attempt
+	}
+	if !attempt.lockedUntil.IsZero() && now.Before(attempt.lockedUntil) {
+		return true, attempt.lockedUntil.Sub(now)
+	}
+	if window > 0 && !attempt.firstAt.IsZero() && now.Sub(attempt.firstAt) > window {
+		attempt.failCount = 0
+		attempt.firstAt = now
+	}
+	if attempt.firstAt.IsZero() {
+		attempt.firstAt = now
+	}
+	attempt.failCount++
+	attempt.lastAt = now
+	if attempt.failCount >= limit {
+		attempt.lockedUntil = now.Add(lock)
+		s.pruneLoginAttemptsLocked(now, window, lock)
+		return true, lock
+	}
+	s.pruneLoginAttemptsLocked(now, window, lock)
+	return false, 0
+}
+
+func (s *Store) clearLoginAttempts(key string) {
+	s.mu.Lock()
+	delete(s.loginAttempts, key)
+	s.mu.Unlock()
+}
+
+func (s *Store) pruneLoginAttemptsLocked(now time.Time, window, lock time.Duration) {
+	if len(s.loginAttempts) == 0 {
+		return
+	}
+	retain := window + lock
+	if retain <= 0 {
+		retain = 30 * time.Minute
+	}
+	cutoff := now.Add(-retain)
+	for key, attempt := range s.loginAttempts {
+		if attempt == nil {
+			delete(s.loginAttempts, key)
+			continue
+		}
+		last := attempt.lastAt
+		if last.IsZero() {
+			last = attempt.firstAt
+		}
+		if !attempt.lockedUntil.IsZero() && attempt.lockedUntil.After(last) {
+			last = attempt.lockedUntil
+		}
+		if last.Before(cutoff) {
+			delete(s.loginAttempts, key)
+		}
+	}
+}
+
 func (s *Store) upgradeAdminPasswordHash(password, stored string) {
 	hash, err := hashPassword(password)
 	if err != nil {
@@ -1647,6 +1795,10 @@ func (s *Store) PublicSettings() PublicSettings {
 func (s *Store) SettingsView() SettingsView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	loginFailLimit := s.settings.LoginFailLimit
+	if loginFailLimit < 0 {
+		loginFailLimit = 0
+	}
 	return SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
@@ -1663,6 +1815,9 @@ func (s *Store) SettingsView() SettingsView {
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
+		LoginFailLimit:       loginFailLimit,
+		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
+		LoginLockSec:         s.settings.LoginLockSec,
 		AISettings:           s.settings.AISettings,
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
@@ -1819,6 +1974,40 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.mu.Unlock()
 		return SettingsView{}, errors.New("telegram token 与 telegram 用户 ID 需要同时配置")
 	}
+	if update.LoginFailLimit != nil {
+		limit := *update.LoginFailLimit
+		if limit < -1 {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("login_fail_limit invalid")
+		}
+		if limit == 0 {
+			s.settings.LoginFailLimit = -1
+		} else {
+			s.settings.LoginFailLimit = limit
+		}
+	}
+	if update.LoginFailWindowSec != nil {
+		windowSec := *update.LoginFailWindowSec
+		if windowSec < 0 {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("login_fail_window_sec invalid")
+		}
+		if windowSec == 0 {
+			windowSec = defaultLoginFailWindow
+		}
+		s.settings.LoginFailWindowSec = windowSec
+	}
+	if update.LoginLockSec != nil {
+		lockSec := *update.LoginLockSec
+		if lockSec < 0 {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("login_lock_sec invalid")
+		}
+		if lockSec == 0 {
+			lockSec = defaultLoginLockSec
+		}
+		s.settings.LoginLockSec = lockSec
+	}
 	if update.AISettings != nil {
 		normalized := normalizeAISettings(*update.AISettings)
 		if err := validateAISettings(normalized); err != nil {
@@ -1846,6 +2035,10 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.settings.TestCatalog = catalog
 	}
 	data = s.snapshotPersistedLocked()
+	loginFailLimit := s.settings.LoginFailLimit
+	if loginFailLimit < 0 {
+		loginFailLimit = 0
+	}
 	view = SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
@@ -1860,6 +2053,9 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
+		LoginFailLimit:       loginFailLimit,
+		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
+		LoginLockSec:         s.settings.LoginLockSec,
 		AISettings:           s.settings.AISettings,
 		Commit:               s.buildCommit,
 		Groups:               s.settings.Groups,
@@ -2465,4 +2661,15 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeLoginRateLimit(w http.ResponseWriter, retryAfter time.Duration) {
+	seconds := int(math.Ceil(retryAfter.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
+	writeJSON(w, http.StatusTooManyRequests, map[string]string{
+		"error": fmt.Sprintf("尝试次数过多，请在 %d 秒后重试", seconds),
+	})
 }

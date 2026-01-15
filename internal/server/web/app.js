@@ -42,7 +42,16 @@ async function login(username, password) {
     body: JSON.stringify({ username, password }),
   });
   if (!resp.ok) {
-    throw new Error("用户名或密码错误");
+    let message = "用户名或密码错误";
+    try {
+      const data = await resp.json();
+      if (data && data.error) {
+        message = data.error;
+      }
+    } catch (error) {
+      // ignore
+    }
+    throw new Error(message);
   }
   const data = await resp.json();
   if (!data.token) {

@@ -20,6 +20,9 @@ const (
 	defaultHomeTitle       = "CyberMonitor"
 	defaultHomeSub         = "主机监控"
 	defaultAlertOfflineSec = 300
+	defaultLoginFailLimit  = 5
+	defaultLoginFailWindow = 15 * 60
+	defaultLoginLockSec    = 15 * 60
 	testHistoryVersion     = 1
 	testHistoryFileName    = "test_history.json"
 )
@@ -43,6 +46,9 @@ type Settings struct {
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
+	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
 	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
@@ -65,6 +71,9 @@ type SettingsView struct {
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
+	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
 	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Commit               string            `json:"commit,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
@@ -88,6 +97,9 @@ type SettingsUpdate struct {
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`
 	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
 	AlertTelegramUserID  *int64             `json:"alert_telegram_user_id"`
+	LoginFailLimit       *int               `json:"login_fail_limit"`
+	LoginFailWindowSec   *int64             `json:"login_fail_window_sec"`
+	LoginLockSec         *int64             `json:"login_lock_sec"`
 	AISettings           *AISettings        `json:"ai_settings"`
 	Groups               *[]string          `json:"groups"`
 	GroupTree            *[]GroupNode       `json:"group_tree"`
@@ -283,6 +295,9 @@ func initSettings(cfg Config) Settings {
 		AlertTelegramToken:   "",
 		AlertTelegramUserIDs: []int64{},
 		AlertTelegramUserID:  0,
+		LoginFailLimit:       defaultLoginFailLimit,
+		LoginFailWindowSec:   defaultLoginFailWindow,
+		LoginLockSec:         defaultLoginLockSec,
 		AISettings:           defaultAISettings(),
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
@@ -360,6 +375,15 @@ func mergeSettings(existing, fallback Settings) Settings {
 	if strings.TrimSpace(existing.AlertTelegramToken) == "" || len(existing.AlertTelegramUserIDs) == 0 {
 		existing.AlertTelegramToken = ""
 		existing.AlertTelegramUserIDs = []int64{}
+	}
+	if existing.LoginFailLimit == 0 {
+		existing.LoginFailLimit = fallback.LoginFailLimit
+	}
+	if existing.LoginFailWindowSec <= 0 {
+		existing.LoginFailWindowSec = fallback.LoginFailWindowSec
+	}
+	if existing.LoginLockSec <= 0 {
+		existing.LoginLockSec = fallback.LoginLockSec
 	}
 	if !existing.AlertAll && existing.AlertWebhook == "" && len(existing.AlertNodes) == 0 {
 		existing.AlertAll = fallback.AlertAll
