@@ -4,6 +4,14 @@ services:
     image: ${CM_SERVER_IMAGE:-ghcr.io/crazy0x70/cyber-monitor-server:latest}
     container_name: cyber-monitor-server
     ports:
+      # 管理后台端口（Admin API / Agent 上报 / 管理后台页面）
       - "25012:25012"
+      # 展示页端口（Public API / Public WS / 前台展示页）
+      # 如不需要分离，可不暴露此端口，并保持 CM_PUBLIC_LISTEN 为空。
+      - "25013:25013"
+    environment:
+      # 可选：启用“硬隔离”模式后，展示页与管理后台分别监听不同端口。
+      # 例如：CM_PUBLIC_LISTEN=:25013
+      - CM_PUBLIC_LISTEN=
     volumes:
       - ./data:/data

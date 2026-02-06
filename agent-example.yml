@@ -5,6 +5,9 @@ services:
     image: ghcr.io/crazy0x70/cyber-monitor-agent:latest
     container_name: cyber-monitor-agent
     network_mode: "host"
+    cap_add:
+      # 兜底：某些环境可能不支持镜像内 setcap，此时需要显式开启 NET_RAW 才能执行 ping。
+      - NET_RAW
     environment:
       CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
       CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"

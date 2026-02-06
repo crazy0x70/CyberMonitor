@@ -13,6 +13,52 @@
   --glass: rgba(255, 255, 255, 0.2);
   --glass-border: rgba(255, 255, 255, 0.4);
   --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+
+  --page-bg: radial-gradient(120% 120% at 10% 0%, #ffffff 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+  --panel-bg: rgba(255, 255, 255, 0.7);
+  --panel-border: rgba(148, 163, 184, 0.35);
+  --card-bg: rgba(255, 255, 255, 0.65);
+  --input-bg: rgba(255, 255, 255, 0.9);
+  --control-bg: rgba(255, 255, 255, 0.6);
+  --control-border: rgba(148, 163, 184, 0.4);
+  --tab-bg: #fff;
+  --tab-border: #e2e8f0;
+  --tab-text: #111827;
+  --meter-bg: rgba(15, 23, 42, 0.08);
+  --chart-bg: rgba(15, 23, 42, 0.04);
+  --legend-bg: rgba(15, 23, 42, 0.05);
+  --legend-border: rgba(148, 163, 184, 0.2);
+  --test-item-bg: rgba(15, 23, 42, 0.06);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-1: #0b1220;
+  --bg-2: #0f172a;
+  --accent: #3b82f6;
+  --accent-2: #22d3ee;
+  --accent-3: #fb7185;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --glass: rgba(15, 23, 42, 0.55);
+  --glass-border: rgba(148, 163, 184, 0.22);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+
+  --page-bg: radial-gradient(120% 120% at 10% 0%, #0b1020 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+  --panel-bg: rgba(15, 23, 42, 0.7);
+  --panel-border: rgba(148, 163, 184, 0.18);
+  --card-bg: rgba(15, 23, 42, 0.7);
+  --input-bg: rgba(15, 23, 42, 0.82);
+  --control-bg: rgba(15, 23, 42, 0.55);
+  --control-border: rgba(148, 163, 184, 0.22);
+  --tab-bg: rgba(15, 23, 42, 0.7);
+  --tab-border: rgba(148, 163, 184, 0.22);
+  --tab-text: var(--text);
+  --meter-bg: rgba(148, 163, 184, 0.18);
+  --chart-bg: rgba(148, 163, 184, 0.08);
+  --legend-bg: rgba(148, 163, 184, 0.08);
+  --legend-border: rgba(148, 163, 184, 0.18);
+  --test-item-bg: rgba(148, 163, 184, 0.08);
 }
 
 * {
@@ -24,7 +70,7 @@ body {
   margin: 0;
   font-family: var(--font-base);
   color: var(--text);
-  background: radial-gradient(120% 120% at 10% 0%, #ffffff 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+  background: var(--page-bg);
   min-height: 100vh;
   overflow-x: hidden;
 }
@@ -108,9 +154,9 @@ svg text {
 }
 
 .btn.ghost {
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--control-bg);
   color: var(--text);
-  border: 1px solid rgba(148, 163, 184, 0.4);
+  border: 1px solid var(--control-border);
   box-shadow: none;
 }
 
@@ -174,10 +220,10 @@ svg text {
 }
 
 .feature-card {
-  background: rgba(255, 255, 255, 0.55);
+  background: var(--control-bg);
   border-radius: 16px;
   padding: 16px;
-  border: 1px solid rgba(148, 163, 184, 0.35);
+  border: 1px solid var(--panel-border);
   box-shadow: 0 16px 30px rgba(15, 23, 42, 0.08);
 }
 
@@ -218,6 +264,53 @@ svg text {
   gap: 12px;
 }
 
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.theme-toggle:hover {
+  transform: translateY(-1px);
+}
+
+.theme-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  background: rgba(31, 93, 255, 0.15);
+  color: var(--text);
+}
+
+.theme-label {
+  font-size: 13px;
+}
+
+@media (max-width: 480px) {
+  .theme-toggle {
+    padding: 8px 10px;
+    gap: 0;
+  }
+
+  .theme-label {
+    display: none;
+  }
+}
+
 .stats-grid {
   display: grid;
   gap: 14px;
@@ -227,10 +320,10 @@ svg text {
 }
 
 .stat-card {
-  background: rgba(255, 255, 255, 0.65);
+  background: var(--card-bg);
   border-radius: 18px;
   padding: 16px 18px;
-  border: 1px solid rgba(148, 163, 184, 0.35);
+  border: 1px solid var(--panel-border);
   box-shadow: var(--shadow);
   backdrop-filter: blur(16px);
   transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -294,9 +387,9 @@ svg text {
 }
 
 .group-tab {
-  border: 1px solid #e2e8f0;
-  background: #fff;
-  color: #111827;
+  border: 1px solid var(--tab-border);
+  background: var(--tab-bg);
+  color: var(--tab-text);
   padding: 6px 14px;
   border-radius: 999px;
   font-size: 13px;
@@ -594,8 +687,8 @@ svg text {
   gap: 12px 14px;
   padding: 14px 16px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.65);
-  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: var(--card-bg);
+  border: 1px solid var(--panel-border);
   font-size: 12px;
   color: var(--muted);
 }
@@ -698,8 +791,8 @@ svg text {
   margin-bottom: 0;
   padding: 12px 14px;
   border-radius: 16px;
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid var(--panel-border);
+  background: var(--panel-bg);
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
 }
 
@@ -713,7 +806,7 @@ svg text {
 
 .meter {
   height: 8px;
-  background: rgba(15, 23, 42, 0.08);
+  background: var(--meter-bg);
   border-radius: 999px;
   overflow: hidden;
 }
@@ -743,7 +836,7 @@ svg text {
 
 .metric-chart {
   margin-top: 8px;
-  background: rgba(15, 23, 42, 0.04);
+  background: var(--chart-bg);
   border-radius: 12px;
   padding: 6px 8px;
 }
@@ -776,8 +869,8 @@ svg text {
   position: relative;
   border-radius: 18px;
   padding: 52px 18px 16px;
-  background: rgba(255, 255, 255, 0.7);
-  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
   overflow: hidden;
   font-weight: 300;
   font-variant-numeric: tabular-nums;
@@ -792,9 +885,9 @@ svg text {
 }
 
 .range-btn {
-  border: 1px solid #e2e8f0;
-  background: #fff;
-  color: #111827;
+  border: 1px solid var(--tab-border);
+  background: var(--tab-bg);
+  color: var(--tab-text);
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 10px;
@@ -827,8 +920,8 @@ svg text {
   gap: 6px;
   padding: 4px 10px;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.05);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: var(--legend-bg);
+  border: 1px solid var(--legend-border);
 }
 
 .legend-item.compact {
@@ -1013,7 +1106,7 @@ svg text {
   gap: 6px;
   padding: 6px 10px;
   border-radius: 10px;
-  background: rgba(15, 23, 42, 0.06);
+  background: var(--test-item-bg);
   font-size: 12px;
 }
 
@@ -1127,7 +1220,7 @@ svg text {
 
 .modal-card {
   width: min(420px, 90vw);
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--input-bg);
   border-radius: 18px;
   padding: 24px;
   box-shadow: var(--shadow);
@@ -1175,10 +1268,10 @@ svg text {
 }
 
 .panel {
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--panel-bg);
   border-radius: 20px;
   padding: 20px;
-  border: 1px solid rgba(148, 163, 184, 0.35);
+  border: 1px solid var(--panel-border);
   box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
   backdrop-filter: blur(16px);
   margin-bottom: 24px;

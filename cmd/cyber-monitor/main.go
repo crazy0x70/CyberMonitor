@@ -29,6 +29,7 @@ func main() {
 	mode := flag.String("mode", envOrDefault("CM_MODE", DefaultMode), "server 或 agent")
 
 	listen := flag.String("listen", envOrDefault("CM_LISTEN", ":25012"), "管理端监听地址")
+	publicListen := flag.String("public-listen", envOrDefault("CM_PUBLIC_LISTEN", ""), "展示页监听地址(可选，留空则与管理端一致)")
 	adminUser := flag.String("admin-user", envOrDefault("CM_ADMIN_USER", ""), "管理端用户名")
 	adminPass := flag.String("admin-pass", envOrDefault("CM_ADMIN_PASS", ""), "管理端密码")
 	adminPath := flag.String("admin-path", envOrDefault("CM_ADMIN_PATH", ""), "管理后台路径")
@@ -64,6 +65,7 @@ func main() {
 	}
 
 	*listen = normalizeListen(*listen)
+	*publicListen = normalizeListen(*publicListen)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -71,6 +73,7 @@ func main() {
 	case "server":
 		cfg := server.Config{
 			Addr:       *listen,
+			PublicAddr: *publicListen,
 			AdminUser:  *adminUser,
 			AdminPass:  *adminPass,
 			AdminPath:  *adminPath,

@@ -106,6 +106,7 @@ var webFS embed.FS
 
 type Config struct {
 	Addr       string
+	PublicAddr string
 	AdminUser  string
 	AdminPass  string
 	AdminPath  string
@@ -318,14 +319,20 @@ func Run(ctx context.Context, cfg Config) error {
 		store.persistHistory(historyData)
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
+	splitMode := strings.TrimSpace(cfg.PublicAddr) != "" && cfg.PublicAddr != cfg.Addr
 
-	mux := http.NewServeMux()
 	webRoot, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return err
 	}
 
-	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+	publicMux := http.NewServeMux()
+	adminMux := publicMux
+	if splitMode {
+		adminMux = http.NewServeMux()
+	}
+
+	adminMux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -367,12 +374,17 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	})
 
-	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	}
+	publicMux.HandleFunc("/api/v1/health", healthHandler)
+	if splitMode {
+		adminMux.HandleFunc("/api/v1/health", healthHandler)
+	}
 
-	mux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
+	publicMux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
+			w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -383,17 +395,18 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
+		w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		snapshot := storeSnapshot(store, false)
 		writeJSON(w, http.StatusOK, snapshot)
 	})
 
-	mux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		snapshot := storeSnapshot(store, true)
 		writeJSON(w, http.StatusOK, snapshot)
 	}))
 
-	mux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -430,7 +443,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	mux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			snapshot := storeSnapshot(store, true)
@@ -443,7 +456,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}))
 
-	mux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		nodeID := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
 		if nodeID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
@@ -470,7 +483,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}))
 
-	mux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, store.SettingsView())
@@ -494,7 +507,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}))
 
-	mux.HandleFunc("/api/v1/admin/alerts/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/alerts/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -548,7 +561,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
 
-	mux.HandleFunc("/api/v1/admin/ai/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/ai/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -580,7 +593,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
 
-	mux.HandleFunc("/api/v1/admin/ai/models", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/admin/ai/models", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -613,7 +626,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]any{"models": models})
 	}))
 
-	mux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
+	adminMux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -638,39 +651,72 @@ func Run(ctx context.Context, cfg Config) error {
 		CheckOrigin: isAllowedOrigin,
 	}
 
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		if extractToken(r) != "" {
-			if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	type wsAuthMode int
+	const (
+		wsAuthOptional wsAuthMode = iota
+		wsAuthRequired
+		wsAuthForbidden
+	)
+
+	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			token := extractToken(r)
+			switch mode {
+			case wsAuthRequired:
+				if token == "" {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+			case wsAuthForbidden:
+				if token != "" {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+			}
+			if token != "" {
+				if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+			}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
 				return
 			}
-		}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		client := hub.Add(conn)
+			client := hub.Add(conn)
 
-		// 首次连接立即推送快照
-		snapshot := storeSnapshot(store, true)
-		payload, _ := json.Marshal(snapshot)
-		if client != nil {
-			if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
-				hub.Remove(conn)
-				return
+			// 首次连接立即推送快照
+			snapshot := storeSnapshot(store, true)
+			payload, _ := json.Marshal(snapshot)
+			if client != nil {
+				if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
+					hub.Remove(conn)
+					return
+				}
 			}
-		}
 
-		go readLoop(conn, hub)
-	})
+			go readLoop(conn, hub)
+		}
+	}
+
+	if splitMode {
+		publicMux.HandleFunc("/ws", wsHandler(wsAuthForbidden))
+		adminMux.HandleFunc("/ws", wsHandler(wsAuthRequired))
+	} else {
+		publicMux.HandleFunc("/ws", wsHandler(wsAuthOptional))
+	}
 
 	assetsRoot, err := fs.Sub(webRoot, "assets")
 	if err != nil {
 		return err
 	}
-	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot))))
+	assetsHandler := http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot)))
+	publicMux.Handle("/assets/", assetsHandler)
+	if splitMode {
+		adminMux.Handle("/assets/", assetsHandler)
+	}
 
-	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+	publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/dashboard" {
 			http.NotFound(w, r)
 			return
@@ -678,9 +724,13 @@ func Run(ctx context.Context, cfg Config) error {
 		http.Redirect(w, r, "/", http.StatusFound)
 	})
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		adminPath := store.AdminPath()
-		if r.URL.Path == adminPath {
+	if splitMode {
+		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			adminPath := store.AdminPath()
+			if r.URL.Path != adminPath {
+				http.NotFound(w, r)
+				return
+			}
 			data, err := webFS.ReadFile("web/admin.html")
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin not found"})
@@ -689,29 +739,70 @@ func Run(ctx context.Context, cfg Config) error {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(data)
-			return
-		}
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		data, err := webFS.ReadFile("web/index.html")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-	})
+		})
 
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           withSecurityHeaders(mux),
+		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			data, err := webFS.ReadFile("web/index.html")
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		})
+	} else {
+		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			adminPath := store.AdminPath()
+			if r.URL.Path == adminPath {
+				data, err := webFS.ReadFile("web/admin.html")
+				if err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin not found"})
+					return
+				}
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			data, err := webFS.ReadFile("web/index.html")
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+		})
+	}
+
+	publicServer := &http.Server{
+		Addr:              cfg.PublicAddr,
+		Handler:           withSecurityHeaders(publicMux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+
+	adminServer := &http.Server{}
+	if splitMode {
+		adminServer = &http.Server{
+			Addr:              cfg.Addr,
+			Handler:           withSecurityHeaders(adminMux),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 	}
 
 	go func() {
@@ -743,10 +834,17 @@ func Run(ctx context.Context, cfg Config) error {
 
 	go func() {
 		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
+		_ = publicServer.Shutdown(context.Background())
+		if splitMode {
+			_ = adminServer.Shutdown(context.Background())
+		}
 	}()
 
 	log.Printf("管理后台路径: %s", store.AdminPath())
+	if splitMode {
+		log.Printf("展示页监听: %s", cfg.PublicAddr)
+		log.Printf("管理后台监听: %s", cfg.Addr)
+	}
 	if !loaded {
 		log.Printf("初始管理员账号: %s", settings.AdminUser)
 		if settings.AdminPassPlain != "" {
@@ -758,7 +856,24 @@ func Run(ctx context.Context, cfg Config) error {
 	if tokenGenerated {
 		log.Printf("初始 Agent Token: %s", cfg.AgentToken)
 	}
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if splitMode {
+		adminErr := make(chan error, 1)
+		go func() {
+			if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				adminErr <- err
+				return
+			}
+			adminErr <- nil
+		}()
+		if err := publicServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		if err := <-adminErr; err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := publicServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -767,6 +882,9 @@ func Run(ctx context.Context, cfg Config) error {
 func applyDefaults(cfg *Config) {
 	if cfg.Addr == "" {
 		cfg.Addr = defaultAddr
+	}
+	if cfg.PublicAddr == "" {
+		cfg.PublicAddr = cfg.Addr
 	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = defaultDataDir
@@ -1583,13 +1701,13 @@ func readLoop(conn *websocket.Conn, hub *Hub) {
 }
 
 func isAllowedOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
 	// 管理端 WebSocket（携带 token）保持同源校验，避免跨站点复用管理权限。
 	// 展示页 WebSocket（不携带 token）允许跨域，用于前后端分离部署。
 	if extractToken(r) == "" {
-		return true
-	}
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
 		return true
 	}
 	parsed, err := url.Parse(origin)

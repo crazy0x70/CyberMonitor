@@ -94,6 +94,59 @@ HTTPS 示例（推荐）：
 - 如果静态站点使用 `https://`，浏览器会阻止连接 `ws://`（混合内容），请使用 `wss://`。
 - `config.json` 不存在时会自动回退到同域模式（使用当前页面域名连接后端）。
 
+## 深色模式
+
+右上角提供主题切换按钮，支持三种模式：
+
+- 自动（默认）：跟随系统外观
+- 浅色
+- 深色
+
+点击按钮会在三种模式间循环切换，设置会保存在浏览器本地存储中，前台与管理后台共用同一套主题设置。
+
+## 硬隔离（可选）：管理后台与展示页端口分离
+
+默认情况下管理后台与展示页复用同一端口（例如 `:25012`）。
+
+如果你希望更进一步“硬隔离”，可以让管理后台与展示页分别监听不同端口：
+
+- 管理后台端口：Admin API、Agent 上报、管理后台页面
+- 展示页端口：Public API、Public WebSocket、前台展示页
+
+启用方式（Server）：
+
+- CLI：`--public-listen :25013`
+- 环境变量：`CM_PUBLIC_LISTEN=:25013`
+
+启用后行为变化：
+
+- 展示端口只提供：`/`、`/assets/*`、`/ws`（仅 Public，无 token）、`/api/v1/public/snapshot`、`/api/v1/health`
+- 管理端口只提供：管理后台页面、Admin API、Agent 上报、`/ws`（仅 Admin，必须带 token）
+
+Docker 部署示例（端口映射）：
+
+- 管理端口：`25012:25012`
+- 展示端口：`25013:25013`
+
+展示页的 `config.json` 也需要相应指向展示端口，例如：
+
+```json
+{
+  "socket": "wss://example.com:25013/ws",
+  "apiURL": "https://example.com:25013"
+}
+```
+
+## Agent 容器网络测试权限
+
+如果你在 Agent 容器内执行 `ping` 看到类似错误：
+
+```
+ping: permission denied (are you root?)
+```
+
+请在容器运行时为 Agent 增加 `NET_RAW` 能力（docker-compose 示例见 `agent-example.yml`）。
+
 ## Systemd 一键脚本
 
 适用于使用 systemd 的发行版（需 root），脚本会自动创建 `/opt/CyberMonitor/`。
@@ -149,6 +202,7 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 
 ### Server
 - `CM_LISTEN`：监听地址，默认 `25012`
+- `CM_PUBLIC_LISTEN`：展示页监听地址（可选，留空则与 CM_LISTEN 一致）
 - `CM_DATA_DIR`：数据目录，默认 `/opt/CyberMonitor/data`
 
 ### Agent
