@@ -101,7 +101,7 @@ const (
 	defaultPersistInterval = 10 * time.Second
 )
 
-//go:embed web/*
+//go:embed web/* web/assets/*
 var webFS embed.FS
 
 type Config struct {
@@ -369,6 +369,23 @@ func Run(ctx context.Context, cfg Config) error {
 
 	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		snapshot := storeSnapshot(store, false)
+		writeJSON(w, http.StatusOK, snapshot)
 	})
 
 	mux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
@@ -647,7 +664,11 @@ func Run(ctx context.Context, cfg Config) error {
 		go readLoop(conn, hub)
 	})
 
-	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(webRoot))))
+	assetsRoot, err := fs.Sub(webRoot, "assets")
+	if err != nil {
+		return err
+	}
+	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot))))
 
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/dashboard" {
@@ -1562,6 +1583,11 @@ func readLoop(conn *websocket.Conn, hub *Hub) {
 }
 
 func isAllowedOrigin(r *http.Request) bool {
+	// 管理端 WebSocket（携带 token）保持同源校验，避免跨站点复用管理权限。
+	// 展示页 WebSocket（不携带 token）允许跨域，用于前后端分离部署。
+	if extractToken(r) == "" {
+		return true
+	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return true

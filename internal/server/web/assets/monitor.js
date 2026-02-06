@@ -14,6 +14,13 @@ const siteIcon = document.getElementById("site-icon");
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
 
+const CONFIG_PATH = "/config.json";
+
+const remoteConfig = {
+  socketURL: "",
+  apiBase: "",
+};
+
 const state = {
   ws: null,
   nodes: new Map(),
@@ -55,8 +62,7 @@ function setStatusFilter(mode) {
 }
 
 function connectWS() {
-  const protocol = location.protocol === "https:" ? "wss" : "ws";
-  const wsUrl = `${protocol}://${location.host}/ws`;
+  const wsUrl = resolveSocketURL();
   const ws = new WebSocket(wsUrl);
   state.ws = ws;
 
@@ -80,6 +86,67 @@ function connectWS() {
   };
 }
 
+function resolveSocketURL() {
+  if (remoteConfig.socketURL) {
+    return remoteConfig.socketURL;
+  }
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${location.host}/ws`;
+}
+
+function resolveAPIBase() {
+  if (remoteConfig.apiBase) {
+    return remoteConfig.apiBase;
+  }
+  return location.origin;
+}
+
+function normalizeAPIBase(value) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  return raw.replace(/\/+$/, "");
+}
+
+function normalizeSocketURL(value) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  return raw;
+}
+
+async function loadRemoteConfig() {
+  try {
+    const resp = await fetch(CONFIG_PATH, { cache: "no-store" });
+    if (!resp.ok) {
+      return;
+    }
+    const data = await resp.json();
+    if (!data || typeof data !== "object") return;
+    remoteConfig.socketURL = normalizeSocketURL(data.socket);
+    remoteConfig.apiBase = normalizeAPIBase(data.apiURL);
+  } catch (error) {
+    return;
+  }
+}
+
+async function fetchPublicSnapshot() {
+  const base = resolveAPIBase();
+  if (!base) return;
+  try {
+    const resp = await fetch(`${base}/api/v1/public/snapshot`, {
+      cache: "no-store",
+    });
+    if (!resp.ok) {
+      return;
+    }
+    const payload = await resp.json();
+    if (payload && payload.type === "snapshot") {
+      handleSnapshot(payload);
+    }
+  } catch (error) {
+    return;
+  }
+}
+
 function scheduleReconnect() {
   if (state.reconnectTimer) return;
   state.reconnectTimer = setTimeout(() => {
@@ -89,6 +156,9 @@ function scheduleReconnect() {
 }
 
 function handleSnapshot(payload) {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
   state.lastNodes = payload.nodes || [];
   state.settingsGroups = payload.groups || [];
   applyPublicSettings(payload.settings || {});
@@ -2181,4 +2251,9 @@ function aggregateDisk(list) {
 
 updateFooter("");
 loadTestHistoryCache();
-connectWS();
+
+loadRemoteConfig().finally(() => {
+  fetchPublicSnapshot().finally(() => {
+    connectWS();
+  });
+});

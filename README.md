@@ -43,6 +43,57 @@ docker run -d \
 - 监控首页：`http://<server-host>:25012/`
 - 管理后台：`http://<server-host>:25012/<admin_path>`
 
+## 前后端分离部署（Cloudflare Pages / 静态站点）
+
+默认情况下 CyberMonitor 以前后端一体化方式运行（展示页与管理后台都由 Server 提供）。
+
+如果你希望将**展示页**部署到 Cloudflare Pages 等静态站点，可使用“前后端分离模式”：
+
+### 1) 准备前端静态文件
+
+将以下目录/文件复制到你的静态站点根目录（例如 Cloudflare Pages 项目根目录）：
+
+- `internal/server/web/index.html`
+- `internal/server/web/assets/`（目录）
+- `config.json`（你需要新增，见下方示例）
+
+提示：以上 `web/` 目录内的文件仅用于给静态站点托管（例如 Cloudflare Pages）复制使用，
+无需移动或改名。Server 仍会从自身内嵌资源（embed）提供这些页面。
+
+说明：分离模式下只部署展示页，不部署 `admin.html`，因此用户无法通过前端域名访问管理后台。
+
+### 2) 创建 config.json
+
+HTTP 示例：
+
+```json
+{
+  "socket": "ws://127.0.0.1:56789/ws",
+  "apiURL": "http://127.0.0.1:56789"
+}
+```
+
+HTTPS 示例（推荐）：
+
+```json
+{
+  "socket": "wss://127.0.0.1:56789/ws",
+  "apiURL": "https://127.0.0.1:56789"
+}
+```
+
+也可以直接参考项目内示例文件：`examples/config.example.json`
+
+字段说明：
+
+- `socket`：展示页使用的 WebSocket 地址（请包含 `/ws` 路径）
+- `apiURL`：展示页拉取快照的 API Base URL（不需要包含 `/api/...` 路径）
+
+### 3) 常见问题
+
+- 如果静态站点使用 `https://`，浏览器会阻止连接 `ws://`（混合内容），请使用 `wss://`。
+- `config.json` 不存在时会自动回退到同域模式（使用当前页面域名连接后端）。
+
 ## Systemd 一键脚本
 
 适用于使用 systemd 的发行版（需 root），脚本会自动创建 `/opt/CyberMonitor/`。
