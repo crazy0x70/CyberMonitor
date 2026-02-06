@@ -24,7 +24,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "输出版本信息")
 	resetPassword := flag.Bool("reset-password", false, "重置管理员密码")
 	listen := flag.String("listen", envOrDefault("CM_LISTEN", ":25012"), "管理端监听地址")
-	publicListen := flag.String("public-listen", envOrDefault("CM_PUBLIC_LISTEN", ""), "展示页监听地址(可选，留空则与管理端一致)")
+	publicListen := flag.String("public-listen", envOrDefault("CM_PUBLIC_LISTEN", ""), "展示页监听端口(可选，直接填写端口号；留空则与管理端一致)")
 	adminUser := flag.String("admin-user", envOrDefault("CM_ADMIN_USER", ""), "管理端用户名")
 	adminPass := flag.String("admin-pass", envOrDefault("CM_ADMIN_PASS", ""), "管理端密码")
 	adminPath := flag.String("admin-path", envOrDefault("CM_ADMIN_PATH", ""), "管理后台路径")

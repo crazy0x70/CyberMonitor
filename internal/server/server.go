@@ -406,7 +406,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, snapshot)
 	}))
 
-	adminMux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
+	publicMux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -486,7 +486,11 @@ func Run(ctx context.Context, cfg Config) error {
 	adminMux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, store.SettingsView())
+			view := store.SettingsView()
+			if splitMode {
+				view.AgentEndpoint = cfg.PublicAddr
+			}
+			writeJSON(w, http.StatusOK, view)
 		case http.MethodPatch, http.MethodPut:
 			var update SettingsUpdate
 			if err := decodeJSON(w, r, &update); err != nil {
@@ -497,6 +501,9 @@ func Run(ctx context.Context, cfg Config) error {
 			if err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
+			}
+			if splitMode {
+				view.AgentEndpoint = cfg.PublicAddr
 			}
 			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
@@ -626,7 +633,7 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, map[string]any{"models": models})
 	}))
 
-	adminMux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
+	publicMux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -1946,7 +1953,7 @@ func (s *Store) SettingsView() SettingsView {
 	return SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
-		AgentEndpoint:        s.settings.AgentEndpoint,
+		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AuthToken,
 		SiteTitle:            s.settings.SiteTitle,
 		SiteIcon:             s.settings.SiteIcon,

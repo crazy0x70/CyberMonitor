@@ -115,13 +115,15 @@ HTTPS 示例（推荐）：
 
 启用方式（Server）：
 
-- CLI：`--public-listen :25013`
-- 环境变量：`CM_PUBLIC_LISTEN=:25013`
+- CLI：`--public-listen 25013`
+- 环境变量：`CM_PUBLIC_LISTEN=25013`
 
 启用后行为变化：
 
 - 展示端口只提供：`/`、`/assets/*`、`/ws`（仅 Public，无 token）、`/api/v1/public/snapshot`、`/api/v1/health`
-- 管理端口只提供：管理后台页面、Admin API、Agent 上报、`/ws`（仅 Admin，必须带 token）
+- 管理端口只提供：管理后台页面、Admin API、`/ws`（仅 Admin，必须带 token）
+
+注意：硬隔离模式下 Agent 上报与配置下发接口会放在**展示端口**（与前台一致），以便将管理后台端口完全隐藏在内网。
 
 Docker 部署示例（端口映射）：
 
