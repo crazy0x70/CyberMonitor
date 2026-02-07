@@ -17,14 +17,13 @@ const footerCommit = document.getElementById("footer-commit");
 const CONFIG_PATH = "/config.json";
 
 const remoteConfig = {
-  socketURL: "",
-  apiBase: "",
+  targets: [],
 };
 
 const state = {
-  ws: null,
+  wsConnections: new Map(),
   nodes: new Map(),
-  reconnectTimer: null,
+  reconnectTimers: new Map(),
   selectedGroup: "全部",
   statusFilter: "all",
   lastNodes: [],
@@ -36,6 +35,7 @@ const state = {
   tagSections: new Map(),
   historyCacheTimer: null,
   historyCacheLoading: false,
+  sourceSnapshots: new Map(),
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
@@ -62,12 +62,26 @@ function setStatusFilter(mode) {
 }
 
 function connectWS() {
-  const wsUrl = resolveSocketURL();
-  const ws = new WebSocket(wsUrl);
-  state.ws = ws;
+  const targets = resolveTargets();
+  targets.forEach((target) => {
+    connectWSForTarget(target);
+  });
+}
+
+function connectWSForTarget(target) {
+  if (!target || !target.socketURL) {
+    return;
+  }
+  if (state.wsConnections.has(target.key)) {
+    return;
+  }
+
+  const ws = new WebSocket(target.socketURL);
+  state.wsConnections.set(target.key, ws);
 
   ws.onclose = () => {
-    scheduleReconnect();
+    state.wsConnections.delete(target.key);
+    scheduleReconnect(target);
   };
 
   ws.onerror = () => {
@@ -78,7 +92,7 @@ function connectWS() {
     try {
       const payload = JSON.parse(event.data);
       if (payload.type === "snapshot") {
-        handleSnapshot(payload);
+        handleSnapshot(payload, target.key);
       }
     } catch (error) {
       console.error(error);
@@ -86,19 +100,16 @@ function connectWS() {
   };
 }
 
-function resolveSocketURL() {
-  if (remoteConfig.socketURL) {
-    return remoteConfig.socketURL;
+function resolveTargets() {
+  if (Array.isArray(remoteConfig.targets) && remoteConfig.targets.length > 0) {
+    return remoteConfig.targets;
   }
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${location.host}/ws`;
-}
-
-function resolveAPIBase() {
-  if (remoteConfig.apiBase) {
-    return remoteConfig.apiBase;
-  }
-  return location.origin;
+  return [{
+    key: "default",
+    socketURL: `${protocol}://${location.host}/ws`,
+    apiBase: location.origin,
+  }];
 }
 
 function normalizeAPIBase(value) {
@@ -113,6 +124,46 @@ function normalizeSocketURL(value) {
   return raw;
 }
 
+function pickConfigEntry(entry, key = "") {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  const socketURL = normalizeSocketURL(entry.socket);
+  const apiBase = normalizeAPIBase(entry.apiURL);
+  if (!socketURL || !apiBase) {
+    return null;
+  }
+  return {
+    key: key || "default",
+    socketURL,
+    apiBase,
+  };
+}
+
+function pickConfigTargets(data) {
+  if (!data || typeof data !== "object") {
+    return [];
+  }
+
+  const targets = [];
+  const direct = pickConfigEntry(data, "default");
+  if (direct) {
+    targets.push(direct);
+  }
+
+  for (const key of Object.keys(data)) {
+    const entry = pickConfigEntry(data[key], key);
+    if (!entry) {
+      continue;
+    }
+    if (!targets.some((item) => item.socketURL === entry.socketURL && item.apiBase === entry.apiBase)) {
+      targets.push(entry);
+    }
+  }
+
+  return targets;
+}
+
 async function loadRemoteConfig() {
   try {
     const resp = await fetch(CONFIG_PATH, { cache: "no-store" });
@@ -120,54 +171,108 @@ async function loadRemoteConfig() {
       return;
     }
     const data = await resp.json();
-    if (!data || typeof data !== "object") return;
-    remoteConfig.socketURL = normalizeSocketURL(data.socket);
-    remoteConfig.apiBase = normalizeAPIBase(data.apiURL);
+    const targets = pickConfigTargets(data);
+    if (!targets.length) return;
+    remoteConfig.targets = targets;
   } catch (error) {
     return;
   }
 }
 
 async function fetchPublicSnapshot() {
-  const base = resolveAPIBase();
-  if (!base) return;
-  try {
-    const resp = await fetch(`${base}/api/v1/public/snapshot`, {
-      cache: "no-store",
-    });
-    if (!resp.ok) {
-      return;
-    }
-    const payload = await resp.json();
-    if (payload && payload.type === "snapshot") {
-      handleSnapshot(payload);
-    }
-  } catch (error) {
-    return;
-  }
+  const targets = resolveTargets();
+  await Promise.all(
+    targets.map(async (target) => {
+      const base = target.apiBase;
+      if (!base) return;
+      try {
+        const resp = await fetch(`${base}/api/v1/public/snapshot`, {
+          cache: "no-store",
+        });
+        if (!resp.ok) {
+          return;
+        }
+        const payload = await resp.json();
+        if (payload && payload.type === "snapshot") {
+          handleSnapshot(payload, target.key);
+        }
+      } catch (error) {
+        return;
+      }
+    })
+  );
 }
 
-function scheduleReconnect() {
-  if (state.reconnectTimer) return;
-  state.reconnectTimer = setTimeout(() => {
-    state.reconnectTimer = null;
-    connectWS();
+function scheduleReconnect(target) {
+  if (!target || !target.key) return;
+  if (state.reconnectTimers.has(target.key)) return;
+  const timer = setTimeout(() => {
+    state.reconnectTimers.delete(target.key);
+    connectWSForTarget(target);
   }, 2000);
+  state.reconnectTimers.set(target.key, timer);
 }
 
-function handleSnapshot(payload) {
+function mergeByNodeID(nodesBySource) {
+  const merged = new Map();
+  nodesBySource.forEach((sourceNodes) => {
+    (sourceNodes || []).forEach((node) => {
+      const nodeID = resolveNodeId(node, "").trim();
+      if (!nodeID) return;
+      const existing = merged.get(nodeID);
+      if (!existing) {
+        merged.set(nodeID, node);
+        return;
+      }
+      const existingLastSeen = existing.last_seen || 0;
+      const currentLastSeen = node.last_seen || 0;
+      if (currentLastSeen >= existingLastSeen) {
+        merged.set(nodeID, node);
+      }
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function mergeGroups(groupsBySource) {
+  const unique = new Set();
+  groupsBySource.forEach((groups) => {
+    (groups || []).forEach((item) => {
+      const name = String(item || "").trim();
+      if (name) unique.add(name);
+    });
+  });
+  return Array.from(unique);
+}
+
+function handleSnapshot(payload, sourceKey = "default") {
   if (!payload || typeof payload !== "object") {
     return;
   }
-  state.lastNodes = payload.nodes || [];
-  state.settingsGroups = payload.groups || [];
-  applyPublicSettings(payload.settings || {});
+
+  state.sourceSnapshots.set(sourceKey, payload);
+
+  const snapshots = Array.from(state.sourceSnapshots.values());
+  const mergedNodes = mergeByNodeID(snapshots.map((item) => item.nodes || []));
+  const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
+
+  state.lastNodes = mergedNodes;
+  state.settingsGroups = mergedGroups;
+
+  const latestSnapshot = snapshots
+    .slice()
+    .sort((a, b) => (b.generated_at || 0) - (a.generated_at || 0))[0];
+
+  if (latestSnapshot) {
+    applyPublicSettings(latestSnapshot.settings || {});
+  }
+
   applyTestHistory(payload.test_history);
   cleanupDetachedHistory(state.lastNodes);
+
   if (lastUpdated) {
-    lastUpdated.textContent = new Date(
-      (payload.generated_at || 0) * 1000
-    ).toLocaleTimeString();
+    const ts = latestSnapshot ? (latestSnapshot.generated_at || 0) : 0;
+    lastUpdated.textContent = ts ? new Date(ts * 1000).toLocaleTimeString() : "--";
   }
   render();
 }

@@ -487,7 +487,7 @@ func Run(ctx context.Context, cfg Config) error {
 		switch r.Method {
 		case http.MethodGet:
 			view := store.SettingsView()
-			if splitMode {
+			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
 			writeJSON(w, http.StatusOK, view)
@@ -502,7 +502,7 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
-			if splitMode {
+			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
 			snapshot := storeSnapshot(store, false)
@@ -718,18 +718,21 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	assetsHandler := http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot)))
-	publicMux.Handle("/assets/", assetsHandler)
 	if splitMode {
 		adminMux.Handle("/assets/", assetsHandler)
+	} else {
+		publicMux.Handle("/assets/", assetsHandler)
 	}
 
-	publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/dashboard" {
-			http.NotFound(w, r)
-			return
-		}
-		http.Redirect(w, r, "/", http.StatusFound)
-	})
+	if !splitMode {
+		publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/dashboard" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, "/", http.StatusFound)
+		})
+	}
 
 	if splitMode {
 		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -749,18 +752,7 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" {
-				http.NotFound(w, r)
-				return
-			}
-			data, err := webFS.ReadFile("web/index.html")
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
-				return
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
+			http.NotFound(w, r)
 		})
 	} else {
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -872,6 +864,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			adminErr <- nil
 		}()
+
 		if err := publicServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}

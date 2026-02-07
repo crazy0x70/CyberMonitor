@@ -57,8 +57,8 @@ docker run -d \
 - `internal/server/web/assets/`（目录）
 - `config.json`（你需要新增，见下方示例）
 
-提示：以上 `web/` 目录内的文件仅用于给静态站点托管（例如 Cloudflare Pages）复制使用，
-无需移动或改名。Server 仍会从自身内嵌资源（embed）提供这些页面。
+提示：以上 `web/` 目录内的文件仅用于复制到静态站点托管（例如 Cloudflare Pages）。
+默认一体化模式下 Server 也会通过 embed 提供这些页面；如果启用“硬隔离”（`CM_PUBLIC_LISTEN`），展示接口端口将不再提供页面，仅提供 API/WS。
 
 说明：分离模式下只部署展示页，不部署 `admin.html`，因此用户无法通过前端域名访问管理后台。
 
@@ -82,7 +82,35 @@ HTTPS 示例（推荐）：
 }
 ```
 
-也可以直接参考项目内示例文件：`examples/config.example.json`
+也可以直接参考项目内示例文件：`examples/config.example.json`。
+
+`config.json` 支持两种格式：
+
+1) 单组地址（推荐默认）：
+
+```json
+{
+  "socket": "wss://example.com:25013/ws",
+  "apiURL": "https://example.com:25013"
+}
+```
+
+2) 多组地址（多 CDN 入口）：
+
+```json
+{
+  "cloudflare": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  },
+  "edgeone": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  }
+}
+```
+
+前端会并行连接所有合法配置并合并节点数据，不会只选其中一组。
 
 字段说明：
 
@@ -98,20 +126,19 @@ HTTPS 示例（推荐）：
 
 右上角提供主题切换按钮，支持三种模式：
 
-- 自动（默认）：跟随系统外观
-- 浅色
-- 深色
+- 默认：自动（跟随系统外观）
+- 手动：浅色 / 深色
 
-点击按钮会在三种模式间循环切换，设置会保存在浏览器本地存储中，前台与管理后台共用同一套主题设置。
+点击按钮会在浅色与深色间切换；默认不保存时为自动模式。设置会保存在浏览器本地存储中，前台与管理后台共用同一套主题设置。
 
-## 硬隔离（可选）：管理后台与展示页端口分离
+## 硬隔离（可选）：管理后台与展示接口端口分离
 
 默认情况下管理后台与展示页复用同一端口（例如 `:25012`）。
 
-如果你希望更进一步“硬隔离”，可以让管理后台与展示页分别监听不同端口：
+如果你希望更进一步“硬隔离”，可以让管理后台与展示接口分别监听不同端口：
 
-- 管理后台端口：Admin API、Agent 上报、管理后台页面
-- 展示页端口：Public API、Public WebSocket、前台展示页
+- 管理后台端口：Admin API、管理后台页面
+- 展示接口端口：Agent 上报、Public API、Public WebSocket
 
 启用方式（Server）：
 
@@ -120,22 +147,40 @@ HTTPS 示例（推荐）：
 
 启用后行为变化：
 
-- 展示端口只提供：`/`、`/assets/*`、`/ws`（仅 Public，无 token）、`/api/v1/public/snapshot`、`/api/v1/health`
+- 展示接口端口只提供：`/api/v1/ingest`、`/api/v1/agent/config`、`/api/v1/public/snapshot`、`/api/v1/health`、`/ws`（仅 Public，无 token）
+- 展示接口端口不提供页面：`/`、`/dashboard`、`/assets/*` 都不可访问
 - 管理端口只提供：管理后台页面、Admin API、`/ws`（仅 Admin，必须带 token）
 
-注意：硬隔离模式下 Agent 上报与配置下发接口会放在**展示端口**（与前台一致），以便将管理后台端口完全隐藏在内网。
+这样可以把前端页面完全托管在 Cloudflare Pages / EdgeOne 等 CDN 静态服务上，后端仅暴露数据接口。
+
+![前后端分离部署架构图](images/architecture-separated.svg)
 
 Docker 部署示例（端口映射）：
 
 - 管理端口：`25012:25012`
-- 展示端口：`25013:25013`
+- 展示接口端口：`25013:25013`
 
-展示页的 `config.json` 也需要相应指向展示端口，例如：
+前端静态站点的 `config.json` 指向展示接口端口，例如：
 
 ```json
 {
   "socket": "wss://example.com:25013/ws",
   "apiURL": "https://example.com:25013"
+}
+```
+
+当同一个静态站点经由多个 CDN 域名/入口时，也可写成多组配置（程序会并行连接并合并展示数据）：
+
+```json
+{
+  "cloudflare": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  },
+  "edgeone": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  }
 }
 ```
 
@@ -247,4 +292,4 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 
 ## 架构图
 
-![系统架构图](images/architecture.png)
+![直接部署架构图](images/architecture-direct.svg)

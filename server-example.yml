@@ -9,7 +9,7 @@ services:
     ports:
       # 管理后台端口（Admin API / Agent 上报 / 管理后台页面）
       - "25012:25012"
-      # 展示页端口（Public API / Public WS / 前台展示页）
+      # 展示接口端口（Agent 上报 / Public API / Public WS）
       # 如不需要分离，可不暴露此端口，并保持 CM_PUBLIC_LISTEN 为空。
       - "25013:25013"
     environment:

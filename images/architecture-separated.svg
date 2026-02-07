@@ -1,0 +1,130 @@
+<svg width="1500" height="900" viewBox="0 0 1500 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 30px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 16px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #334155; }
+      .h { font: 700 20px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .t { font: 600 18px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .p { font: 400 14px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #334155; }
+      .s { font: 400 13px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #475569; }
+      .mono { font: 500 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; fill: #334155; }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155" />
+    </marker>
+
+    <marker id="arrow-soft" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1500" height="900" fill="#f8fafc" />
+  <text x="750" y="54" text-anchor="middle" class="title">前后端分离部署架构（多数据源并行合并）</text>
+  <text x="750" y="84" text-anchor="middle" class="subtitle">展示页托管在 CDN 静态站点；展示接口端口仅提供 API / WebSocket / Agent 上报，不提供任何页面资源</text>
+
+  <!-- 左侧：静态站点 / 浏览器 / Agent / 管理员 -->
+  <rect x="60" y="110" width="420" height="150" rx="16" fill="#eef2ff" stroke="#6366f1" stroke-width="2" />
+  <text x="80" y="145" class="h">CDN 静态站点</text>
+  <text x="80" y="172" class="p">Cloudflare Pages / EdgeOne Pages</text>
+  <text x="80" y="198" class="mono">index.html · assets/ · config.json</text>
+  <text x="80" y="224" class="s">只负责前端展示页托管</text>
+
+  <rect x="60" y="285" width="420" height="220" rx="16" fill="#dcfce7" stroke="#22c55e" stroke-width="2" />
+  <text x="80" y="320" class="h">用户浏览器</text>
+  <text x="80" y="347" class="p">从 CDN 加载展示页（前端）</text>
+  <text x="80" y="374" class="p">读取 config.json 多组 socket/apiURL</text>
+  <text x="80" y="401" class="p">并行订阅多个数据源（WS + Snapshot）</text>
+  <text x="80" y="428" class="p">按 node_id 合并节点，取 last_seen 更新值</text>
+
+  <rect x="60" y="545" width="420" height="150" rx="16" fill="#ecfeff" stroke="#06b6d4" stroke-width="2" />
+  <text x="80" y="580" class="h">Agent（多地域）</text>
+  <text x="80" y="607" class="p">定时采集 metrics + network tests</text>
+  <text x="80" y="634" class="p">上报 /api/v1/ingest，拉取 /api/v1/agent/config</text>
+  <text x="80" y="661" class="s">Agent 指向最近/对应的数据源</text>
+
+  <rect x="60" y="725" width="420" height="120" rx="16" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
+  <text x="80" y="760" class="h">管理员（内网）</text>
+  <text x="80" y="787" class="p">直接访问管理端口（CM_LISTEN）</text>
+  <text x="80" y="814" class="s">前端展示页域名无法跳转进入管理后台</text>
+
+  <!-- 右侧：两个数据源（可扩展） -->
+  <rect x="560" y="120" width="420" height="250" rx="16" fill="#f1f5f9" stroke="#64748b" stroke-width="2" />
+  <text x="580" y="154" class="h">数据源 A（Server 实例 / 区域 A）</text>
+
+  <rect x="580" y="176" width="380" height="94" rx="12" fill="#ffffff" stroke="#0284c7" stroke-width="2" />
+  <text x="600" y="206" class="t">展示接口端口（CM_PUBLIC_LISTEN）</text>
+  <text x="600" y="232" class="p">/api/v1/public/snapshot · /ws（Public）</text>
+  <text x="600" y="254" class="p">/api/v1/ingest · /api/v1/agent/config</text>
+
+  <rect x="580" y="284" width="380" height="70" rx="12" fill="#ffffff" stroke="#7c3aed" stroke-width="2" />
+  <text x="600" y="312" class="t">管理端口（CM_LISTEN）</text>
+  <text x="600" y="336" class="p">Admin UI / Admin API / WS（token）</text>
+
+  <rect x="1020" y="145" width="200" height="90" rx="14" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
+  <text x="1120" y="178" text-anchor="middle" class="t">State</text>
+  <text x="1120" y="204" text-anchor="middle" class="p">state.json</text>
+
+  <rect x="1240" y="145" width="200" height="90" rx="14" fill="#fef2f2" stroke="#ef4444" stroke-width="2" />
+  <text x="1340" y="178" text-anchor="middle" class="t">通知通道</text>
+  <text x="1340" y="204" text-anchor="middle" class="p">Feishu / Telegram</text>
+
+
+  <rect x="560" y="430" width="420" height="250" rx="16" fill="#f1f5f9" stroke="#64748b" stroke-width="2" />
+  <text x="580" y="464" class="h">数据源 B（Server 实例 / 区域 B）</text>
+
+  <rect x="580" y="486" width="380" height="94" rx="12" fill="#ffffff" stroke="#0284c7" stroke-width="2" />
+  <text x="600" y="516" class="t">展示接口端口（CM_PUBLIC_LISTEN）</text>
+  <text x="600" y="542" class="p">/api/v1/public/snapshot · /ws（Public）</text>
+  <text x="600" y="564" class="p">/api/v1/ingest · /api/v1/agent/config</text>
+
+  <rect x="580" y="594" width="380" height="70" rx="12" fill="#ffffff" stroke="#7c3aed" stroke-width="2" />
+  <text x="600" y="622" class="t">管理端口（CM_LISTEN）</text>
+  <text x="600" y="646" class="p">Admin UI / Admin API / WS（token）</text>
+
+  <rect x="1020" y="455" width="200" height="90" rx="14" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
+  <text x="1120" y="488" text-anchor="middle" class="t">State</text>
+  <text x="1120" y="514" text-anchor="middle" class="p">state.json</text>
+
+  <rect x="1240" y="455" width="200" height="90" rx="14" fill="#fef2f2" stroke="#ef4444" stroke-width="2" />
+  <text x="1340" y="488" text-anchor="middle" class="t">通知通道</text>
+  <text x="1340" y="514" text-anchor="middle" class="p">Feishu / Telegram</text>
+
+  <!-- 连线：静态站点 -> 浏览器 -->
+  <path d="M270 260 L270 285" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="286" y="276" class="s">加载页面</text>
+
+  <!-- 浏览器 -> 数据源A/B（避免穿过卡片，用折线走空白区域） -->
+  <path d="M480 340 L520 340 L520 205 L560 205" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="528" y="220" class="s">WS + Snapshot</text>
+
+  <path d="M480 430 L520 430 L520 520 L560 520" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="528" y="510" class="s">WS + Snapshot</text>
+
+  <!-- Agent -> 数据源A/B -->
+  <path d="M480 635 L520 635 L520 250 L560 250" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="528" y="266" class="s">POST ingest</text>
+
+  <path d="M480 600 L560 600" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="495" y="588" class="s">POST ingest</text>
+
+  <!-- 管理员（内网） -> 管理端口（虚线） -->
+  <path d="M480 780 L520 780 L520 320 L560 320" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow-soft)" class="dash" />
+  <text x="528" y="340" class="s">仅内网访问</text>
+
+  <path d="M480 815 L520 815 L520 630 L560 630" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow-soft)" class="dash" />
+  <text x="528" y="650" class="s">仅内网访问</text>
+
+  <!-- 数据源 -> State / 通知 -->
+  <path d="M980 205 L1020 190" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <path d="M1220 190 L1240 190" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+
+  <path d="M980 520 L1020 500" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <path d="M1220 500 L1240 500" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+
+  <text x="1050" y="130" class="s">持久化</text>
+  <text x="1280" y="130" class="s">告警推送</text>
+
+  <text x="60" y="875" class="s">提示：config.json 多组配置会并行接入并合并展示数据，避免单数据源不全。</text>
+</svg>

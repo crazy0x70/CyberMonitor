@@ -1,0 +1,76 @@
+<svg width="1200" height="700" viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 30px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 16px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #334155; }
+      .h { font: 700 20px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .t { font: 600 18px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #0f172a; }
+      .p { font: 400 14px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #334155; }
+      .s { font: 400 13px system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; fill: #475569; }
+      .mono { font: 500 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; fill: #334155; }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="700" fill="#f8fafc" />
+  <text x="600" y="54" text-anchor="middle" class="title">直接部署架构（一体化）</text>
+  <text x="600" y="84" text-anchor="middle" class="subtitle">Server 同一端口同时提供展示页、管理后台、API 与 WebSocket</text>
+
+  <!-- Agents -->
+  <rect x="60" y="280" width="240" height="140" rx="16" fill="#ecfeff" stroke="#06b6d4" stroke-width="2" />
+  <text x="80" y="316" class="h">Agents</text>
+  <text x="80" y="344" class="p">采集 metrics + tests</text>
+  <text x="80" y="372" class="p">POST /api/v1/ingest</text>
+  <text x="80" y="398" class="p">GET /api/v1/agent/config</text>
+
+  <!-- Server -->
+  <rect x="360" y="190" width="360" height="320" rx="18" fill="#f1f5f9" stroke="#64748b" stroke-width="2" />
+  <text x="380" y="226" class="h">CyberMonitor Server</text>
+  <text x="380" y="254" class="mono">CM_LISTEN（默认 :25012）</text>
+
+  <rect x="380" y="280" width="320" height="90" rx="12" fill="#ffffff" stroke="#22c55e" stroke-width="2" />
+  <text x="400" y="310" class="t">展示页（/）</text>
+  <text x="400" y="334" class="p">assets/ · WebSocket · Snapshot</text>
+
+  <rect x="380" y="388" width="320" height="90" rx="12" fill="#ffffff" stroke="#7c3aed" stroke-width="2" />
+  <text x="400" y="418" class="t">管理后台（/admin_path）</text>
+  <text x="400" y="442" class="p">Admin API · Admin WS（token）</text>
+
+  <!-- Browsers -->
+  <rect x="800" y="170" width="320" height="150" rx="16" fill="#dcfce7" stroke="#22c55e" stroke-width="2" />
+  <text x="820" y="206" class="h">访客浏览器</text>
+  <text x="820" y="234" class="p">访问 /（展示页）</text>
+  <text x="820" y="262" class="p">WS + Snapshot</text>
+
+  <rect x="800" y="350" width="320" height="150" rx="16" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
+  <text x="820" y="386" class="h">管理员浏览器</text>
+  <text x="820" y="414" class="p">访问 /admin_path</text>
+  <text x="820" y="442" class="p">Admin API + Admin WS</text>
+
+  <!-- State & Bots -->
+  <rect x="360" y="540" width="170" height="110" rx="14" fill="#fff7ed" stroke="#f97316" stroke-width="2" />
+  <text x="445" y="576" text-anchor="middle" class="t">State</text>
+  <text x="445" y="604" text-anchor="middle" class="p">state.json</text>
+
+  <rect x="550" y="540" width="170" height="110" rx="14" fill="#fef2f2" stroke="#ef4444" stroke-width="2" />
+  <text x="635" y="576" text-anchor="middle" class="t">通知通道</text>
+  <text x="635" y="604" text-anchor="middle" class="p">Feishu / Telegram</text>
+
+  <!-- Arrows (orthogonal, no crossing cards) -->
+  <path d="M300 350 L360 350" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="312" y="338" class="s">上报</text>
+
+  <path d="M800 245 L740 245 L740 305 L720 305" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="740" y="232" class="s">展示访问</text>
+
+  <path d="M800 425 L740 425 L740 438 L720 438" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <text x="740" y="412" class="s">管理访问</text>
+
+  <path d="M540 510 L445 540" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+  <path d="M600 510 L635 540" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+
+</svg>

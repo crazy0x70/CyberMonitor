@@ -6,44 +6,28 @@ function getSystemTheme() {
     : "light";
 }
 
-function resolveTheme(mode) {
-  if (mode === "light" || mode === "dark") {
-    return mode;
-  }
-  return getSystemTheme();
-}
-
 function applyTheme(mode) {
-  const theme = resolveTheme(mode);
-  document.documentElement.setAttribute("data-theme", theme);
-  return theme;
+  const resolved = mode === "dark" ? "dark" : mode === "light" ? "light" : getSystemTheme();
+  document.documentElement.setAttribute("data-theme", resolved);
+  return resolved;
 }
 
-function updateThemeToggle(mode, appliedTheme) {
-  const label = document.getElementById("theme-label");
+function updateThemeToggle(mode, resolvedTheme) {
   const icon = document.getElementById("theme-icon");
   const btn = document.getElementById("theme-toggle");
-  if (!label || !icon || !btn) return;
+  if (!icon || !btn) return;
 
-  if (mode === "light") {
-    label.textContent = "浅色";
-    icon.textContent = "☀";
-  } else if (mode === "dark") {
-    label.textContent = "深色";
-    icon.textContent = "☾";
-  } else {
-    label.textContent = "自动";
-    icon.textContent = "A";
-  }
+  const isDark = resolvedTheme === "dark";
+  icon.textContent = isDark ? "🌙" : "🌞";
   btn.setAttribute("data-theme-mode", mode);
-  btn.setAttribute("title", `当前：${label.textContent}（显示：${appliedTheme}）`);
+  btn.removeAttribute("title");
 }
 
 function loadThemeMode() {
   try {
     const raw = localStorage.getItem(THEME_STORAGE_KEY);
     const mode = (raw || "").trim();
-    if (mode === "light" || mode === "dark" || mode === "auto") {
+    if (mode === "light" || mode === "dark") {
       return mode;
     }
   } catch (error) {
@@ -54,16 +38,18 @@ function loadThemeMode() {
 
 function saveThemeMode(mode) {
   try {
-    localStorage.setItem(THEME_STORAGE_KEY, mode);
+    if (mode === "light" || mode === "dark") {
+      localStorage.setItem(THEME_STORAGE_KEY, mode);
+    } else {
+      localStorage.removeItem(THEME_STORAGE_KEY);
+    }
   } catch (error) {
     // ignore
   }
 }
 
 function nextThemeMode(mode) {
-  if (mode === "auto") return "light";
-  if (mode === "light") return "dark";
-  return "auto";
+  return mode === "dark" ? "light" : "dark";
 }
 
 function setupThemeToggle() {
@@ -71,8 +57,8 @@ function setupThemeToggle() {
   if (!btn) return;
 
   let mode = loadThemeMode();
-  let applied = applyTheme(mode);
-  updateThemeToggle(mode, applied);
+  let resolved = applyTheme(mode);
+  updateThemeToggle(mode, resolved);
 
   const media = window.matchMedia
     ? window.matchMedia("(prefers-color-scheme: dark)")
@@ -81,24 +67,23 @@ function setupThemeToggle() {
   if (media && typeof media.addEventListener === "function") {
     media.addEventListener("change", () => {
       if (mode !== "auto") return;
-      applied = applyTheme(mode);
-      updateThemeToggle(mode, applied);
+      resolved = applyTheme(mode);
+      updateThemeToggle(mode, resolved);
     });
   } else if (media && typeof media.addListener === "function") {
     media.addListener(() => {
       if (mode !== "auto") return;
-      applied = applyTheme(mode);
-      updateThemeToggle(mode, applied);
+      resolved = applyTheme(mode);
+      updateThemeToggle(mode, resolved);
     });
   }
 
   btn.addEventListener("click", () => {
     mode = nextThemeMode(mode);
     saveThemeMode(mode);
-    applied = applyTheme(mode);
-    updateThemeToggle(mode, applied);
+    resolved = applyTheme(mode);
+    updateThemeToggle(mode, resolved);
   });
 }
 
 setupThemeToggle();
-
