@@ -488,6 +488,12 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 		if hostName == "" {
 			hostName = strings.TrimSpace(node.Stats.NodeID)
 		}
+		network := node.Stats.Network
+		uplinkRate := formatTelegramRate(network.TxBytesPerSec)
+		downlinkRate := formatTelegramRate(network.RxBytesPerSec)
+		uplinkTotal := formatTelegramBytes(float64(network.BytesSent))
+		downlinkTotal := formatTelegramBytes(float64(network.BytesRecv))
+		linkSpeed := formatTelegramLinkSpeed(node)
 		detail := []string{
 			"服务器状态",
 			fmt.Sprintf("ID: %s", node.ServerID),
@@ -496,6 +502,9 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 			fmt.Sprintf("系统: %s / %s", node.Stats.OS, node.Stats.Arch),
 			fmt.Sprintf("CPU: %.1f%%", node.Stats.CPU.UsagePercent),
 			fmt.Sprintf("内存: %.1f%%", node.Stats.Memory.UsedPercent),
+			fmt.Sprintf("网速: ↑ %s / ↓ %s", uplinkRate, downlinkRate),
+			fmt.Sprintf("累计流量: ↑ %s / ↓ %s", uplinkTotal, downlinkTotal),
+			fmt.Sprintf("带宽: %s", linkSpeed),
 			fmt.Sprintf("运行时长: %s", uptime),
 			fmt.Sprintf("最后上报: %s", lastSeen),
 			fmt.Sprintf("首次上线: %s", firstSeen),
@@ -598,6 +607,42 @@ func formatTelegramTime(value int64) string {
 		return "--"
 	}
 	return time.Unix(value, 0).Format("2006-01-02 15:04:05")
+}
+
+func formatTelegramBytes(value float64) string {
+	if value < 0 {
+		value = 0
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	unitIndex := 0
+	for value >= 1024 && unitIndex < len(units)-1 {
+		value /= 1024
+		unitIndex++
+	}
+	if value >= 100 {
+		return fmt.Sprintf("%.0f %s", value, units[unitIndex])
+	}
+	if value >= 10 {
+		return fmt.Sprintf("%.1f %s", value, units[unitIndex])
+	}
+	return fmt.Sprintf("%.2f %s", value, units[unitIndex])
+}
+
+func formatTelegramRate(value float64) string {
+	return fmt.Sprintf("%s/s", formatTelegramBytes(value))
+}
+
+func formatTelegramLinkSpeed(node NodeView) string {
+	if node.NetSpeedMbps > 0 {
+		return fmt.Sprintf("%d Mbps", node.NetSpeedMbps)
+	}
+	if node.Stats.NetSpeedMbps > 0 {
+		if node.Stats.NetSpeedMbps >= 100 {
+			return fmt.Sprintf("%.0f Mbps", node.Stats.NetSpeedMbps)
+		}
+		return fmt.Sprintf("%.1f Mbps", node.Stats.NetSpeedMbps)
+	}
+	return "--"
 }
 
 func formatTelegramError(description, fallback string) string {
