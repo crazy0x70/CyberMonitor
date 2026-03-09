@@ -11,6 +11,8 @@ const statNetRate = document.getElementById("stat-net-rate");
 const brandTitle = document.getElementById("brand-title");
 const brandSubtitle = document.getElementById("brand-subtitle");
 const siteIcon = document.getElementById("site-icon");
+const DEFAULT_SITE_ICON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
 
@@ -24,6 +26,7 @@ const state = {
   wsConnections: new Map(),
   nodes: new Map(),
   reconnectTimers: new Map(),
+  snapshotFailures: new Map(),
   selectedGroup: "全部",
   statusFilter: "all",
   lastNodes: [],
@@ -76,11 +79,19 @@ function connectWSForTarget(target) {
     return;
   }
 
-  const ws = new WebSocket(target.socketURL);
+  let ws;
+  try {
+    ws = new WebSocket(target.socketURL);
+  } catch (error) {
+    console.error("WebSocket 初始化失败", target.socketURL, error);
+    dropSourceSnapshot(target.key);
+    return;
+  }
   state.wsConnections.set(target.key, ws);
 
   ws.onclose = () => {
     state.wsConnections.delete(target.key);
+    dropSourceSnapshot(target.key);
     scheduleReconnect(target);
   };
 
@@ -115,13 +126,29 @@ function resolveTargets() {
 function normalizeAPIBase(value) {
   const raw = (value || "").trim();
   if (!raw) return "";
-  return raw.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch (error) {
+    return "";
+  }
 }
 
 function normalizeSocketURL(value) {
   const raw = (value || "").trim();
   if (!raw) return "";
-  return raw;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+      return "";
+    }
+    return parsed.toString();
+  } catch (error) {
+    return "";
+  }
 }
 
 function pickConfigEntry(entry, key = "") {
@@ -190,13 +217,18 @@ async function fetchPublicSnapshot() {
           cache: "no-store",
         });
         if (!resp.ok) {
+          state.snapshotFailures.set(target.key, (state.snapshotFailures.get(target.key) || 0) + 1);
+          dropSourceSnapshot(target.key);
           return;
         }
         const payload = await resp.json();
         if (payload && payload.type === "snapshot") {
+          state.snapshotFailures.delete(target.key);
           handleSnapshot(payload, target.key);
         }
       } catch (error) {
+        state.snapshotFailures.set(target.key, (state.snapshotFailures.get(target.key) || 0) + 1);
+        dropSourceSnapshot(target.key);
         return;
       }
     })
@@ -245,13 +277,7 @@ function mergeGroups(groupsBySource) {
   return Array.from(unique);
 }
 
-function handleSnapshot(payload, sourceKey = "default") {
-  if (!payload || typeof payload !== "object") {
-    return;
-  }
-
-  state.sourceSnapshots.set(sourceKey, payload);
-
+function rebuildMergedSnapshotState() {
   const snapshots = Array.from(state.sourceSnapshots.values());
   const mergedNodes = mergeByNodeID(snapshots.map((item) => item.nodes || []));
   const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
@@ -265,9 +291,10 @@ function handleSnapshot(payload, sourceKey = "default") {
 
   if (latestSnapshot) {
     applyPublicSettings(latestSnapshot.settings || {});
+  } else {
+    applyPublicSettings({});
   }
 
-  applyTestHistory(payload.test_history);
   cleanupDetachedHistory(state.lastNodes);
 
   if (lastUpdated) {
@@ -275,6 +302,25 @@ function handleSnapshot(payload, sourceKey = "default") {
     lastUpdated.textContent = ts ? new Date(ts * 1000).toLocaleTimeString() : "--";
   }
   render();
+}
+
+function dropSourceSnapshot(sourceKey) {
+  if (!sourceKey || !state.sourceSnapshots.has(sourceKey)) {
+    return;
+  }
+  state.sourceSnapshots.delete(sourceKey);
+  rebuildMergedSnapshotState();
+}
+
+function handleSnapshot(payload, sourceKey = "default") {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+
+  state.sourceSnapshots.set(sourceKey, payload);
+  state.snapshotFailures.delete(sourceKey);
+  applyTestHistory(payload.test_history);
+  rebuildMergedSnapshotState();
 }
 
 function render() {
@@ -345,7 +391,7 @@ function applyPublicSettings(settings) {
     if (icon) {
       siteIcon.setAttribute("href", icon);
     } else {
-      siteIcon.removeAttribute("href");
+      siteIcon.setAttribute("href", DEFAULT_SITE_ICON);
     }
   }
 
@@ -506,7 +552,7 @@ function trimTestHistoryEntry(entry) {
 }
 
 function cleanupDetachedHistory(nodes) {
-  if (!Array.isArray(nodes) || nodes.length === 0) return;
+  if (!Array.isArray(nodes)) return;
   const active = new Set();
   nodes.forEach((node) => {
     const id = resolveNodeId(node, "");

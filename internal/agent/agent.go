@@ -51,6 +51,7 @@ func Run(ctx context.Context, cfg Config) error {
 	fetchConfig := func() {
 		remote, err := fetchRemoteConfig(ctx, client, configEndpoint, cfg.NodeID, cfg.AgentToken)
 		if err != nil {
+			log.Printf("拉取远程配置失败: %v", err)
 			return
 		}
 		runtimeCfg.Update(remote)

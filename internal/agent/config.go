@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,12 +46,8 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if remote.Alias != "" {
-		r.alias = remote.Alias
-	}
-	if remote.Group != "" {
-		r.group = remote.Group
-	}
+	r.alias = remote.Alias
+	r.group = remote.Group
 	if remote.TestIntervalSec > 0 {
 		r.interval = time.Duration(remote.TestIntervalSec) * time.Second
 	}
@@ -93,11 +91,24 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return RemoteConfig{}, fmt.Errorf("config status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			return RemoteConfig{}, fmt.Errorf("config status %d", resp.StatusCode)
+		}
+		return RemoteConfig{}, fmt.Errorf("config status %d: %s", resp.StatusCode, message)
 	}
 
 	var payload RemoteConfig
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	decoder := json.NewDecoder(resp.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return RemoteConfig{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return RemoteConfig{}, fmt.Errorf("config response has trailing data")
+		}
 		return RemoteConfig{}, err
 	}
 	return payload, nil

@@ -19,10 +19,23 @@ docker run -d \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
 
-查看初始化信息（管理后台路径、账号、密码、Token）：
+查看初始化信息（管理后台路径、管理员账号、管理员密码、Agent Token）：
 ```bash
 docker logs cyber-monitor-server
 ```
+
+首次启动时，Server 会分别生成：
+
+- 管理后台路径
+- 管理员账号
+- 管理员密码
+- Agent Token
+
+说明：
+
+- 管理端 `JWT` 密钥与 `Agent Token` 已分离，不再复用同一个密钥。
+- 如果你没有显式设置 `CM_JWT_SECRET` 或 `CM_AGENT_TOKEN`，程序会自动生成并写入 `data` 目录中的持久化配置。
+- Agent 侧只需要使用 `Agent Token`，不需要知道管理端 `JWT` 密钥。
 
 ### 3. 运行 Agent
 ```bash
@@ -42,6 +55,21 @@ docker run -d \
 ### 4. 访问地址
 - 监控首页：`http://<server-host>:25012/`
 - 管理后台：`http://<server-host>:25012/<admin_path>`
+
+### 5. 数据目录权限
+
+镜像默认以非 `root` 用户运行，请确保挂载的 `./data` 目录对容器内用户可读写。
+
+如果 `data` 目录权限错误，Server 现在会直接拒绝启动，并在日志中提示对应文件路径与权限问题；不会再回退为默认配置并覆盖原有配置文件。
+
+### 6. 日志文件
+
+Server 会在 `data` 目录下写入两类日志：
+
+- `server.log`：服务启动、管理端操作、告警、错误等通用日志
+- `report.log`：Agent 上报相关日志，便于单独排查节点接入问题
+
+两类日志都会在达到大小上限后自动轮转，保留 `.1`、`.2`、`.3` 备份文件。
 
 ## 前后端分离部署（Cloudflare Pages / 静态站点）
 
@@ -120,7 +148,8 @@ HTTPS 示例（推荐）：
 ### 3) 常见问题
 
 - 如果静态站点使用 `https://`，浏览器会阻止连接 `ws://`（混合内容），请使用 `wss://`。
-- `config.json` 不存在时会自动回退到同域模式（使用当前页面域名连接后端）。
+- 一体化部署时无需手动创建 `config.json`，Server 会自动提供默认的 `/config.json`。
+- 如果你是自托管静态站点，`config.json` 不存在时会自动回退到同域模式（使用当前页面域名连接后端）。
 
 ## 深色模式
 
@@ -250,11 +279,13 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 ### Server
 - `CM_LISTEN`：监听地址，默认 `25012`
 - `CM_PUBLIC_LISTEN`：展示页监听地址（可选，留空则与 CM_LISTEN 一致）
-- `CM_DATA_DIR`：数据目录，默认 `/opt/CyberMonitor/data`
+- `CM_DATA_DIR`：数据目录，默认 `/data`
+- `CM_JWT_SECRET`：管理端 `JWT` 密钥；留空时首次启动自动生成
+- `CM_AGENT_TOKEN`：Agent 上报与拉取配置使用的共享令牌；留空时首次启动自动生成
 
 ### Agent
 - `CM_SERVER_URL`：Server 地址
-- `CM_AGENT_TOKEN`：与 Server 一致
+- `CM_AGENT_TOKEN`：与 Server 端 `Agent Token` 一致
 - `CM_NET_IFACE`：指定采集网卡（逗号分隔）
 - `CM_HOST_ROOT`：宿主机挂载根目录（容器部署时使用）
 - `CM_INTERVAL`：采样间隔
@@ -264,6 +295,7 @@ powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.gi
 - 服务器管理支持设置显示昵称、地域、硬盘/网速、分组标签、到期与续费信息
 - 离线告警在服务器管理内逐台配置，保存后下发到 Agent
 - 刷新按钮会提示刷新成功，便于确认加载状态
+- 基础设置支持配置导入／导出；导出文件不会包含 `Agent Token`，导入也不会覆盖当前 `Agent Token`
 - 「API提供商」用于配置 AI 运维能力，支持 OpenAI / Gemini / Volcengine 以及多个 OpenAI 兼容服务商
 - API 提供商卡片点击展开设置，可测试连接并获取可用模型列表
 

@@ -9,6 +9,7 @@ const logoutLink = document.getElementById("logout-link");
 const adminPathInput = document.getElementById("admin-path");
 const adminUserInput = document.getElementById("admin-user");
 const adminPassInput = document.getElementById("admin-pass");
+const settingsUsernameShadow = document.getElementById("settings-username-shadow");
 const agentEndpointInput = document.getElementById("agent-endpoint");
 const siteTitleInput = document.getElementById("site-title");
 const siteIconInput = document.getElementById("site-icon-input");
@@ -50,8 +51,14 @@ const addTestBtn = document.getElementById("add-test-btn");
 const saveTestsBtn = document.getElementById("save-tests-btn");
 const catalogHint = document.getElementById("catalog-hint");
 const groupHint = document.getElementById("group-hint");
+const exportConfigBtn = document.getElementById("export-config-btn");
+const importConfigBtn = document.getElementById("import-config-btn");
+const importConfigFile = document.getElementById("import-config-file");
+const settingsForm = document.getElementById("settings-form");
+const aiForm = document.getElementById("ai-form");
 const saveSettingsBtn = document.getElementById("save-settings-btn");
 const settingsHint = document.getElementById("settings-hint");
+const refreshHint = document.getElementById("refresh-hint");
 const sideLinks = document.querySelectorAll(".side-link[data-section]");
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
@@ -66,6 +73,8 @@ const installCodes = document.querySelectorAll(".install-code");
 const TOKEN_KEY = "cm_admin_token";
 const DEFAULT_TCP_INTERVAL = 5;
 const MODEL_CACHE_KEY = "cm_ai_models_cache";
+const DEFAULT_SITE_ICON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
@@ -98,15 +107,91 @@ const state = {
 };
 
 let adminSocket = null;
+let modelPickerGlobalsBound = false;
+
+function resetHintState(hint) {
+  if (!hint) return;
+  hint.classList.remove("error", "warning", "success", "inline-confirm");
+  hint.replaceChildren();
+  hint.textContent = "";
+}
+
+function setHintMessage(hint, message, tone = "") {
+  if (!hint) return;
+  resetHintState(hint);
+  if (!message) return;
+  hint.textContent = message;
+  if (tone) {
+    hint.classList.add(tone);
+  }
+}
+
+function showInlineConfirmation(hint, options) {
+  if (!hint || !options) return;
+  const tone = options.tone || "warning";
+  resetHintState(hint);
+  hint.classList.add("inline-confirm", tone);
+
+  const shell = document.createElement("div");
+  shell.className = "inline-confirm-shell";
+
+  const text = document.createElement("div");
+  text.className = "inline-confirm-text";
+  text.textContent = options.message || "请确认当前操作";
+
+  const actions = document.createElement("div");
+  actions.className = "inline-confirm-actions";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.type = "button";
+  confirmBtn.className = `btn ghost tiny ${options.confirmClass || "danger"}`.trim();
+  confirmBtn.textContent = options.confirmLabel || "确认";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn ghost tiny";
+  cancelBtn.textContent = options.cancelLabel || "取消";
+
+  const cleanup = () => {
+    if (hint.classList.contains("inline-confirm")) {
+      resetHintState(hint);
+    }
+  };
+
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    try {
+      await options.onConfirm?.();
+    } catch (error) {
+      setHintMessage(hint, error.message || "操作失败", "error");
+    }
+  });
+
+  cancelBtn.addEventListener("click", () => {
+    cleanup();
+    options.onCancel?.();
+  });
+
+  actions.append(confirmBtn, cancelBtn);
+  shell.append(text, actions);
+  hint.appendChild(shell);
+}
 
 function setView(loggedIn) {
   if (loggedIn) {
     loginPanel.classList.add("hidden");
     adminShell.classList.remove("hidden");
+    adminShell.removeAttribute("inert");
+    adminShell.setAttribute("aria-hidden", "false");
+    setAdminSecretFieldsEnabled(true);
     showSection("settings");
   } else {
     loginPanel.classList.remove("hidden");
     adminShell.classList.add("hidden");
+    adminShell.setAttribute("inert", "");
+    adminShell.setAttribute("aria-hidden", "true");
+    setAdminSecretFieldsEnabled(false);
     if (adminSocket) {
       adminSocket.close();
       adminSocket = null;
@@ -115,6 +200,16 @@ function setView(loggedIn) {
   if (logoutLink) {
     logoutLink.classList.toggle("hidden", !loggedIn);
   }
+}
+
+function setAdminSecretFieldsEnabled(enabled) {
+  adminShell.querySelectorAll('[data-admin-secret="true"]').forEach((input) => {
+    if (enabled) {
+      input.removeAttribute("disabled");
+    } else {
+      input.setAttribute("disabled", "");
+    }
+  });
 }
 
 function setToken(token) {
@@ -148,6 +243,14 @@ function saveModelCache() {
   } catch (error) {
     // ignore
   }
+}
+
+function isEnterSubmitTarget(target) {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.tagName === "TEXTAREA") return false;
+  if (target.tagName === "BUTTON") return false;
+  if (target.closest(".model-picker")) return false;
+  return target.tagName === "INPUT";
 }
 
 function authHeaders() {
@@ -220,6 +323,9 @@ function updateAdminBrand(settings) {
 function applySettingsView(data) {
   adminPathInput.value = data.admin_path || "";
   adminUserInput.value = data.admin_user || "";
+  if (settingsUsernameShadow) {
+    settingsUsernameShadow.value = data.admin_user || "admin";
+  }
   adminPassInput.value = "";
   if (typeof data.admin_user === "string") {
     state.settings.adminUser = data.admin_user;
@@ -298,7 +404,7 @@ function applySettingsView(data) {
     if (data.site_icon) {
       siteIconLink.setAttribute("href", data.site_icon);
     } else {
-      siteIconLink.removeAttribute("href");
+      siteIconLink.setAttribute("href", DEFAULT_SITE_ICON);
     }
   }
   if (typeof data.agent_token === "string" && data.agent_token) {
@@ -356,6 +462,12 @@ function applySettingsView(data) {
   updateInstallCommands();
 }
 
+if (adminUserInput && settingsUsernameShadow) {
+  adminUserInput.addEventListener("input", () => {
+    settingsUsernameShadow.value = adminUserInput.value.trim() || "admin";
+  });
+}
+
 function updateFooter(commit) {
   if (footerYear) {
     const currentYear = new Date().getFullYear();
@@ -385,8 +497,87 @@ async function saveSettingsPayload(payload) {
     throw new Error(message);
   }
   const data = await resp.json();
+  if (data && data.session_token) {
+    setToken(data.session_token);
+  }
   applySettingsView(data);
   await loadNodes();
+  return data;
+}
+
+function parseDownloadFilename(disposition) {
+  const value = String(disposition || "");
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch (error) {
+      return utf8Match[1];
+    }
+  }
+  const simpleMatch = value.match(/filename="?([^";]+)"?/i);
+  if (simpleMatch && simpleMatch[1]) {
+    return simpleMatch[1];
+  }
+  return "cybermonitor-config.json";
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "cybermonitor-config.json";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportConfig() {
+  const resp = await apiFetch("/api/v1/admin/config/export");
+  if (!resp.ok) {
+    let message = `导出配置失败: ${resp.status}`;
+    try {
+      const data = await resp.json();
+      if (data && data.error) {
+        message = data.error;
+      }
+    } catch (error) {
+      // ignore
+    }
+    throw new Error(message);
+  }
+  const blob = await resp.blob();
+  const filename = parseDownloadFilename(resp.headers.get("Content-Disposition"));
+  triggerDownload(blob, filename);
+}
+
+async function importConfigPayload(payload) {
+  const resp = await apiFetch("/api/v1/admin/config/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    let message = `导入配置失败: ${resp.status}`;
+    try {
+      const data = await resp.json();
+      if (data && data.error) {
+        message = data.error;
+      }
+    } catch (error) {
+      // ignore
+    }
+    throw new Error(message);
+  }
+  const data = await resp.json();
+  if (data && data.settings) {
+    if (data.settings.session_token) {
+      setToken(data.settings.session_token);
+    }
+    applySettingsView(data.settings);
+    await loadNodes();
+  }
   return data;
 }
 
@@ -685,6 +876,7 @@ function bindModelPicker(input, dropdown) {
   input.dataset.modelBound = "1";
   const wrapper = input.closest(".model-picker");
   if (!wrapper) return;
+  ensureModelPickerGlobals();
   const openPanel = () => {
     if (dropdown.children.length > 0) {
       wrapper.classList.add("open");
@@ -706,10 +898,20 @@ function bindModelPicker(input, dropdown) {
     input.value = option.dataset.model || option.textContent;
     closePanel();
   });
+}
+
+function ensureModelPickerGlobals() {
+  if (modelPickerGlobalsBound) return;
+  modelPickerGlobalsBound = true;
   document.addEventListener("click", (event) => {
-    if (!wrapper.contains(event.target)) {
-      closePanel();
-    }
+    const target = event.target;
+    document.querySelectorAll(".model-picker.open").forEach((wrapper) => {
+      if (!(wrapper instanceof HTMLElement)) return;
+      if (target instanceof Node && wrapper.contains(target)) {
+        return;
+      }
+      wrapper.classList.remove("open");
+    });
   });
 }
 
@@ -908,37 +1110,42 @@ function createCompatCard(item) {
       </div>
       <span class="ai-card-toggle" aria-hidden="true"></span>
     </summary>
-    <div class="ai-fields">
-      <label class="field">
-        <span>名称</span>
-        <input class="input" type="text" data-field="compat-name" placeholder="如：SiliconFlow" />
-      </label>
-      <label class="field">
-        <span>API Key</span>
-        <input class="input" type="password" data-field="compat-api-key" autocomplete="new-password" placeholder="sk-..." />
-      </label>
-      <label class="field">
-        <span>Base URL</span>
-        <input class="input" type="text" data-field="compat-base" placeholder="https://api.xxx.com/v1" />
-      </label>
-      <label class="field">
-        <span>模型</span>
-        <div class="model-picker" data-model-picker="openai_compatible">
-          <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" autocomplete="off" />
-          <div class="model-dropdown" data-field="compat-models" id="${listId}"></div>
-        </div>
-        <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
-      </label>
-    </div>
-    <div class="ai-actions">
-      <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="openai_compatible" data-provider-id="${id}">获取可用模型</button>
-      <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai_compatible" data-provider-id="${id}">测试连接</button>
-      <button class="btn danger tiny" type="button" data-action="ai-remove" data-provider="openai_compatible" data-provider-id="${id}">删除</button>
-    </div>
-    <div class="ai-hints">
-      <div class="form-hint" data-ai-hint="openai_compatible:${id}"></div>
-      <div class="form-hint" data-ai-models="openai_compatible:${id}"></div>
-    </div>
+    <form class="ai-card-form">
+      <input class="sr-only" type="text" autocomplete="username" tabindex="-1" aria-hidden="true" value="${escapeHtml(
+        `${name || "compat"}-service`
+      )}" />
+      <div class="ai-fields">
+        <label class="field">
+          <span>名称</span>
+          <input class="input" type="text" data-field="compat-name" placeholder="如：SiliconFlow" />
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input class="input" type="password" data-field="compat-api-key" autocomplete="new-password" placeholder="sk-..." data-admin-secret="true" />
+        </label>
+        <label class="field">
+          <span>Base URL</span>
+          <input class="input" type="text" data-field="compat-base" placeholder="https://api.xxx.com/v1" />
+        </label>
+        <label class="field">
+          <span>模型</span>
+          <div class="model-picker" data-model-picker="openai_compatible">
+            <input class="input" type="text" data-field="compat-model" placeholder="gpt-4o-mini" autocomplete="off" />
+            <div class="model-dropdown" data-field="compat-models" id="${listId}"></div>
+          </div>
+          <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
+        </label>
+      </div>
+      <div class="ai-actions">
+        <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="openai_compatible" data-provider-id="${id}">获取可用模型</button>
+        <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai_compatible" data-provider-id="${id}">测试连接</button>
+        <button class="btn danger tiny" type="button" data-action="ai-remove" data-provider="openai_compatible" data-provider-id="${id}">删除</button>
+      </div>
+      <div class="ai-hints">
+        <div class="form-hint" data-ai-hint="openai_compatible:${id}"></div>
+        <div class="form-hint" data-ai-models="openai_compatible:${id}"></div>
+      </div>
+    </form>
   `;
   const nameInput = card.querySelector('[data-field="compat-name"]');
   const apiKeyInput = card.querySelector('[data-field="compat-api-key"]');
@@ -1380,24 +1587,33 @@ function createNodeCard(node) {
   card.querySelector('[data-action="save"]').addEventListener("click", async (event) => {
     event.preventDefault();
     const hint = card.querySelector('[data-field="hint"]');
-    hint.textContent = "保存中...";
+    setHintMessage(hint, "保存中...", "warning");
     try {
       await saveNode(nodeID, card);
-      hint.textContent = "已保存并下发配置";
+      setHintMessage(hint, "已保存并下发配置", "success");
     } catch (error) {
-      hint.textContent = error.message;
-      hint.classList.add("error");
-      setTimeout(() => hint.classList.remove("error"), 2000);
+      setHintMessage(hint, error.message, "error");
     }
   });
 
   card.querySelector('[data-action="delete"]').addEventListener("click", async (event) => {
     event.preventDefault();
-    if (!confirm(`确认删除节点 ${nodeID} 吗？`)) {
-      return;
-    }
-    await deleteNode(nodeID);
-    await loadNodes();
+    const hint = card.querySelector('[data-field="hint"]');
+    showInlineConfirmation(hint, {
+      message: `确认删除节点 ${displayName} 吗？相关节点画像会一并移除。`,
+      confirmLabel: "确认删除",
+      cancelLabel: "取消",
+      confirmClass: "danger",
+      tone: "warning",
+      onConfirm: async () => {
+        setHintMessage(hint, `正在删除节点 ${displayName}...`, "warning");
+        await deleteNode(nodeID);
+        await loadNodes();
+      },
+      onCancel: () => {
+        setHintMessage(hint, "已取消删除", "warning");
+      },
+    });
   });
 
   return card;
@@ -2370,52 +2586,184 @@ refreshBtn.addEventListener("click", async () => {
   const originalText = refreshBtn.textContent || "刷新";
   refreshBtn.textContent = "刷新中...";
   refreshBtn.disabled = true;
+  resetHintState(refreshHint);
   try {
     await loadNodes();
     flashButtonText(refreshBtn, "刷新成功", 1600, originalText);
+    setHintMessage(refreshHint, "节点列表已刷新", "success");
   } catch (error) {
     refreshBtn.textContent = originalText;
     refreshBtn.disabled = false;
-    alert(error.message);
+    setHintMessage(refreshHint, error.message, "error");
   }
 });
 
-saveSettingsBtn.addEventListener("click", async () => {
+if (exportConfigBtn) {
+  exportConfigBtn.addEventListener("click", async () => {
+    const originalText = exportConfigBtn.textContent;
+    exportConfigBtn.textContent = "导出中...";
+    exportConfigBtn.disabled = true;
+    resetHintState(settingsHint);
+    try {
+      await exportConfig();
+      flashButtonText(exportConfigBtn, "已导出", 1800, originalText);
+      setHintMessage(settingsHint, "配置文件已导出", "success");
+    } catch (error) {
+      exportConfigBtn.textContent = originalText;
+      exportConfigBtn.disabled = false;
+      setHintMessage(settingsHint, error.message, "error");
+    }
+  });
+}
+
+if (importConfigBtn && importConfigFile) {
+  importConfigBtn.addEventListener("click", () => {
+    resetHintState(settingsHint);
+    importConfigFile.value = "";
+    importConfigFile.click();
+  });
+
+  importConfigFile.addEventListener("change", async () => {
+    const [file] = importConfigFile.files || [];
+    if (!file) {
+      return;
+    }
+    try {
+      const text = await file.text();
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch (error) {
+        throw new Error("导入文件不是有效的 JSON");
+      }
+      showInlineConfirmation(settingsHint, {
+        message: `即将导入 ${file.name}，这会覆盖当前后台设置与节点画像。`,
+        confirmLabel: "确认导入",
+        cancelLabel: "取消",
+        confirmClass: "danger",
+        tone: "warning",
+        onConfirm: async () => {
+          const originalText = importConfigBtn.textContent;
+          importConfigBtn.textContent = "导入中...";
+          importConfigBtn.disabled = true;
+          saveSettingsBtn.disabled = true;
+          setHintMessage(settingsHint, `正在导入 ${file.name}...`, "warning");
+          try {
+            const data = await importConfigPayload(payload);
+            const messages = ["配置已导入"];
+            const nextPath = data && data.settings ? data.settings.admin_path || "" : "";
+            if (nextPath && nextPath !== window.location.pathname) {
+              messages.push(`管理后台路径已更新为 ${nextPath}`);
+              window.history.replaceState({}, "", nextPath);
+            }
+            if (data && data.reauth_required) {
+              if (data.settings && data.settings.session_token) {
+                messages.push("管理员账号已变更，当前登录态已自动刷新");
+              } else {
+                messages.push("管理员账号已变更，请重新登录");
+                setToken("");
+                setView(false);
+                loginError.textContent = messages.join("；");
+              }
+            }
+            if (!loginPanel.classList.contains("hidden")) {
+              return;
+            }
+            setHintMessage(settingsHint, messages.join("；"), "success");
+            flashButtonText(importConfigBtn, "已导入", 1800, originalText);
+          } finally {
+            importConfigBtn.disabled = false;
+            importConfigBtn.textContent = "导入配置";
+            saveSettingsBtn.disabled = false;
+            importConfigFile.value = "";
+          }
+        },
+        onCancel: () => {
+          importConfigFile.value = "";
+          setHintMessage(settingsHint, "已取消导入", "warning");
+        },
+      });
+    } catch (error) {
+      setHintMessage(settingsHint, error.message, "error");
+      importConfigFile.value = "";
+    }
+  });
+}
+
+async function handleSaveSettings() {
   const originalText = saveSettingsBtn.textContent;
   saveSettingsBtn.textContent = "保存中...";
   saveSettingsBtn.disabled = true;
-  settingsHint.textContent = "";
-  settingsHint.classList.remove("error");
+  resetHintState(settingsHint);
   try {
-    await saveBaseSettings();
+    const previousUser = state.settings.adminUser || "";
+    const data = await saveBaseSettings();
+    const messages = ["基础设置已保存"];
+    const nextPath = data && data.admin_path ? data.admin_path : "";
+    if (nextPath && nextPath !== window.location.pathname) {
+      messages.push(`管理后台路径已更新为 ${nextPath}`);
+      window.history.replaceState({}, "", nextPath);
+    }
+    if (data && data.admin_user && data.admin_user !== previousUser) {
+      if (data.session_token) {
+        messages.push("管理员账号已变更，当前登录态已自动刷新");
+      } else {
+        messages.push("管理员账号已变更，请重新登录");
+        setToken("");
+        setView(false);
+        loginError.textContent = messages.join("；");
+      }
+    }
+    if (loginPanel.classList.contains("hidden")) {
+      setHintMessage(settingsHint, messages.join("；"), "success");
+    }
     flashButtonText(saveSettingsBtn, "已保存", 2000, originalText);
   } catch (error) {
     saveSettingsBtn.textContent = originalText;
     saveSettingsBtn.disabled = false;
-    settingsHint.textContent = error.message;
-    settingsHint.classList.add("error");
+    setHintMessage(settingsHint, error.message, "error");
   }
+}
+
+saveSettingsBtn.addEventListener("click", async (event) => {
+  event.preventDefault();
+  await handleSaveSettings();
 });
 
-if (saveAlertsBtn) {
+if (settingsForm) {
+  settingsForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (saveSettingsBtn.disabled) {
+      return;
+    }
+    await handleSaveSettings();
+  });
+  settingsForm.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" || !isEnterSubmitTarget(event.target)) {
+      return;
+    }
+    event.preventDefault();
+    if (saveSettingsBtn.disabled) {
+      return;
+    }
+    await handleSaveSettings();
+  });
+}
+
+  if (saveAlertsBtn) {
   saveAlertsBtn.addEventListener("click", async () => {
     const originalText = saveAlertsBtn.textContent;
     saveAlertsBtn.textContent = "保存中...";
     saveAlertsBtn.disabled = true;
-    if (alertsHint) {
-      alertsHint.textContent = "";
-      alertsHint.classList.remove("error");
-    }
+    resetHintState(alertsHint);
     try {
       await saveAlertSettings();
       flashButtonText(saveAlertsBtn, "已保存", 2000, originalText);
+      setHintMessage(alertsHint, "通知告警设置已保存", "success");
     } catch (error) {
       saveAlertsBtn.textContent = originalText;
       saveAlertsBtn.disabled = false;
-      if (alertsHint) {
-        alertsHint.textContent = error.message;
-        alertsHint.classList.add("error");
-      }
+      setHintMessage(alertsHint, error.message, "error");
     }
   });
 }
@@ -2425,47 +2773,64 @@ if (testAlertsBtn) {
     const originalText = testAlertsBtn.textContent;
     testAlertsBtn.textContent = "测试中...";
     testAlertsBtn.disabled = true;
-    if (alertsHint) {
-      alertsHint.textContent = "";
-      alertsHint.classList.remove("error");
-    }
+    resetHintState(alertsHint);
     try {
       await testAlertSettings();
       flashButtonText(testAlertsBtn, "测试成功", 2000, originalText);
-      if (alertsHint) {
-        alertsHint.textContent = "已发送测试消息，请检查飞书或 Telegram";
-      }
+      setHintMessage(alertsHint, "已发送测试消息，请检查飞书或 Telegram", "success");
     } catch (error) {
       testAlertsBtn.textContent = originalText;
       testAlertsBtn.disabled = false;
-      if (alertsHint) {
-        alertsHint.textContent = error.message;
-        alertsHint.classList.add("error");
-      }
+      setHintMessage(alertsHint, error.message, "error");
     }
   });
 }
 
-if (saveAiBtn) {
-  saveAiBtn.addEventListener("click", async () => {
-    const originalText = saveAiBtn.textContent;
-    saveAiBtn.textContent = "保存中...";
-    saveAiBtn.disabled = true;
+async function handleSaveAISettings() {
+  const originalText = saveAiBtn.textContent;
+  saveAiBtn.textContent = "保存中...";
+  saveAiBtn.disabled = true;
+  if (aiHint) {
+    aiHint.textContent = "";
+    aiHint.classList.remove("error");
+  }
+  try {
+    await saveAISettings();
+    flashButtonText(saveAiBtn, "已保存", 2000, originalText);
+  } catch (error) {
+    saveAiBtn.textContent = originalText;
+    saveAiBtn.disabled = false;
     if (aiHint) {
-      aiHint.textContent = "";
-      aiHint.classList.remove("error");
+      aiHint.textContent = error.message;
+      aiHint.classList.add("error");
     }
-    try {
-      await saveAISettings();
-      flashButtonText(saveAiBtn, "已保存", 2000, originalText);
-    } catch (error) {
-      saveAiBtn.textContent = originalText;
-      saveAiBtn.disabled = false;
-      if (aiHint) {
-        aiHint.textContent = error.message;
-        aiHint.classList.add("error");
-      }
+  }
+}
+
+if (saveAiBtn) {
+  saveAiBtn.addEventListener("click", async (event) => {
+    event.preventDefault();
+    await handleSaveAISettings();
+  });
+}
+
+if (aiForm) {
+  aiForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (saveAiBtn.disabled) {
+      return;
     }
+    await handleSaveAISettings();
+  });
+  aiForm.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" || !isEnterSubmitTarget(event.target)) {
+      return;
+    }
+    event.preventDefault();
+    if (saveAiBtn.disabled) {
+      return;
+    }
+    await handleSaveAISettings();
   });
 }
 

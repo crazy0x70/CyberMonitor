@@ -1,5 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=Open+Sans:wght@300;400;600;700&family=Inter:wght@300;400;600;700&display=swap");
-
 :root {
   color-scheme: light;
   --bg-1: #f4f7fb;
@@ -9,7 +7,7 @@
   --accent-3: #ff8a3d;
   --text: #0f172a;
   --muted: #6b7280;
-  --font-base: "Open Sans", "Inter", system-ui, sans-serif;
+  --font-base: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   --glass: rgba(255, 255, 255, 0.2);
   --glass-border: rgba(255, 255, 255, 0.4);
   --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
@@ -1284,6 +1282,7 @@ svg text {
   background: rgba(255, 255, 255, 0.75);
   border: 1px solid rgba(148, 163, 184, 0.25);
   box-shadow: 0 18px 30px rgba(15, 23, 42, 0.06);
+  min-width: 0;
 }
 
 .side-link {
@@ -1296,6 +1295,8 @@ svg text {
   text-align: left;
   color: var(--muted);
   cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .side-link.active {
@@ -1470,6 +1471,7 @@ svg text {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .admin-settings {
@@ -1708,6 +1710,7 @@ svg text {
   display: grid;
   gap: 16px;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  margin: 0;
 }
 
 .settings-card {
@@ -1774,6 +1777,13 @@ svg text {
   display: grid;
   gap: 16px;
   grid-template-columns: 1fr;
+  margin: 0;
+}
+
+.ai-card-form {
+  display: grid;
+  gap: 12px;
+  margin: 0;
 }
 
 .ai-card {
@@ -2451,6 +2461,45 @@ svg text {
   color: var(--muted);
 }
 
+.form-hint.success {
+  color: #059669;
+}
+
+.form-hint.warning {
+  color: #b45309;
+}
+
+.form-hint.inline-confirm {
+  color: var(--text);
+}
+
+.inline-confirm-shell {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.form-hint.inline-confirm.error .inline-confirm-shell {
+  border-color: rgba(239, 68, 68, 0.28);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.inline-confirm-text {
+  line-height: 1.5;
+}
+
+.inline-confirm-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .form-hint:empty {
   display: none;
 }
@@ -2491,6 +2540,18 @@ svg text {
 
 .hidden {
   display: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 @keyframes rise {
@@ -2580,12 +2641,61 @@ svg text {
 
   .admin-shell {
     grid-template-columns: 1fr;
+    gap: 14px;
   }
 
   .side-nav {
-    position: static;
+    position: sticky;
+    top: 12px;
+    z-index: 5;
     flex-direction: row;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    gap: 8px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    box-shadow: 0 12px 22px rgba(15, 23, 42, 0.08);
+  }
+
+  .side-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .side-link {
+    padding: 9px 12px;
+    font-size: 13px;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    background: rgba(255, 255, 255, 0.72);
+  }
+
+  .side-link.active {
+    border-color: transparent;
+  }
+
+  .panel {
+    padding: 16px;
+    border-radius: 20px;
+  }
+
+  .panel-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .panel-actions {
+    width: 100%;
+    gap: 8px;
+  }
+
+  .panel-actions .btn {
+    flex: 1 1 calc(50% - 8px);
+  }
+
+  .panel-actions .form-hint {
+    flex-basis: 100%;
   }
 
   .group-row {
@@ -2607,6 +2717,61 @@ svg text {
 
   .login-panel {
     margin-top: 48px;
+  }
+
+  .topbar {
+    gap: 16px;
+  }
+
+  .topbar-right {
+    width: 100%;
+    align-items: flex-start;
+  }
+
+  .install-card {
+    padding: 14px;
+    gap: 10px;
+  }
+
+  .install-tabs {
+    gap: 8px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    scrollbar-width: none;
+  }
+
+  .install-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .install-tab {
+    flex: 0 0 auto;
+  }
+
+  .node-admin-list {
+    gap: 14px;
+  }
+
+  .admin-head {
+    padding: 14px;
+  }
+
+  .admin-body {
+    gap: 14px;
+    padding: 12px 14px 14px;
+  }
+
+  .inline-confirm-shell {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .inline-confirm-actions {
+    width: 100%;
+  }
+
+  .inline-confirm-actions .btn {
+    flex: 1 1 calc(50% - 8px);
   }
 
 

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	mathrand "math/rand"
 	"net"
 	"os"
@@ -25,6 +27,7 @@ const (
 	defaultLoginLockSec    = 15 * 60
 	testHistoryVersion     = 1
 	testHistoryFileName    = "test_history.json"
+	configExportVersion    = 1
 )
 
 type Settings struct {
@@ -34,6 +37,7 @@ type Settings struct {
 	AdminPassPlain       string            `json:"-"`
 	TokenSalt            string            `json:"token_salt,omitempty"`
 	AuthToken            string            `json:"auth_token,omitempty"`
+	AgentToken           string            `json:"agent_token,omitempty"`
 	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
 	SiteTitle            string            `json:"site_title,omitempty"`
 	SiteIcon             string            `json:"site_icon,omitempty"`
@@ -79,6 +83,8 @@ type SettingsView struct {
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
 	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
+	SessionToken         string            `json:"session_token,omitempty"`
+	SessionExpiresAt     int64             `json:"session_expires_at,omitempty"`
 }
 
 type SettingsUpdate struct {
@@ -125,6 +131,13 @@ type TestHistoryData struct {
 	Version   int                                     `json:"version"`
 	UpdatedAt int64                                   `json:"updated_at,omitempty"`
 	Nodes     map[string]map[string]*TestHistoryEntry `json:"nodes,omitempty"`
+}
+
+type ConfigTransferData struct {
+	Version    int                     `json:"version"`
+	ExportedAt int64                   `json:"exported_at"`
+	Settings   SettingsView            `json:"settings"`
+	Profiles   map[string]*NodeProfile `json:"profiles,omitempty"`
 }
 
 type ResetResult struct {
@@ -189,6 +202,35 @@ func ensureDataDir(dir string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
+func normalizeJSONBytes(data []byte) []byte {
+	trimmed := bytes.TrimSpace(data)
+	return bytes.TrimPrefix(trimmed, []byte{0xEF, 0xBB, 0xBF})
+}
+
+func decodeFirstJSONValue(data []byte, target any) (bool, error) {
+	normalized := normalizeJSONBytes(data)
+	if len(normalized) == 0 {
+		return false, io.EOF
+	}
+	decoder := json.NewDecoder(bytes.NewReader(normalized))
+	if err := decoder.Decode(target); err != nil {
+		return false, err
+	}
+	rest := bytes.TrimSpace(normalized[decoder.InputOffset():])
+	return len(rest) > 0, nil
+}
+
+func strictUnmarshalJSON(data []byte, target any) error {
+	trailing, err := decodeFirstJSONValue(data, target)
+	if err != nil {
+		return err
+	}
+	if trailing {
+		return errors.New("extra content after JSON value")
+	}
+	return nil
+}
+
 func loadPersistedData(path string) (PersistedData, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -198,7 +240,7 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 		return PersistedData{}, false, err
 	}
 	var payload PersistedData
-	if err := json.Unmarshal(data, &payload); err != nil {
+	if err := strictUnmarshalJSON(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
 	if payload.Profiles == nil {
@@ -225,22 +267,66 @@ func savePersistedData(path string, payload PersistedData) error {
 	return os.Rename(tmp, path)
 }
 
-func loadTestHistoryData(path string) (TestHistoryData, bool, error) {
+func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return TestHistoryData{Nodes: make(map[string]map[string]*TestHistoryEntry)}, false, nil
+			return TestHistoryData{Nodes: make(map[string]map[string]*TestHistoryEntry)}, false, false, nil
 		}
-		return TestHistoryData{}, false, err
+		return TestHistoryData{}, false, false, err
 	}
+
 	var payload TestHistoryData
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return TestHistoryData{}, false, err
+	trailing, err := decodeFirstJSONValue(data, &payload)
+	if err == nil {
+		if payload.Version == 0 && payload.UpdatedAt == 0 && payload.Nodes == nil {
+			var legacy map[string]map[string]*TestHistoryEntry
+			legacyTrailing, legacyErr := decodeFirstJSONValue(data, &legacy)
+			if legacyErr == nil {
+				payload = TestHistoryData{
+					Version:   testHistoryVersion,
+					UpdatedAt: time.Now().Unix(),
+					Nodes:     legacy,
+				}
+				trailing = trailing || legacyTrailing || legacy != nil
+			}
+		}
+	} else {
+		var legacy map[string]map[string]*TestHistoryEntry
+		legacyTrailing, legacyErr := decodeFirstJSONValue(data, &legacy)
+		if legacyErr != nil {
+			return TestHistoryData{}, false, false, err
+		}
+		payload = TestHistoryData{
+			Version:   testHistoryVersion,
+			UpdatedAt: time.Now().Unix(),
+			Nodes:     legacy,
+		}
+		trailing = legacyTrailing || legacy != nil
 	}
 	if payload.Nodes == nil {
 		payload.Nodes = make(map[string]map[string]*TestHistoryEntry)
 	}
-	return payload, true, nil
+	needsRewrite := trailing
+	if payload.Version != testHistoryVersion {
+		payload.Version = testHistoryVersion
+		needsRewrite = true
+	}
+	for _, tests := range payload.Nodes {
+		for _, entry := range tests {
+			if entry == nil {
+				continue
+			}
+			beforeLatency := len(entry.Latency)
+			beforeLoss := len(entry.Loss)
+			beforeTimes := len(entry.Times)
+			normalizeHistoryEntry(entry)
+			if len(entry.Latency) != beforeLatency || len(entry.Loss) != beforeLoss || len(entry.Times) != beforeTimes {
+				needsRewrite = true
+			}
+		}
+	}
+	return payload, true, needsRewrite, nil
 }
 
 func saveTestHistoryData(path string, payload TestHistoryData) error {
@@ -256,6 +342,29 @@ func saveTestHistoryData(path string, payload TestHistoryData) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
+	if len(profiles) == 0 {
+		return map[string]*NodeProfile{}
+	}
+	cloned := make(map[string]*NodeProfile, len(profiles))
+	for id, profile := range profiles {
+		if profile == nil {
+			continue
+		}
+		copyProfile := *profile
+		copyProfile.Tags = cloneStringSlice(profile.Tags)
+		copyProfile.Groups = cloneStringSlice(profile.Groups)
+		copyProfile.Tests = cloneNetworkTestConfigs(profile.Tests)
+		copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
+		if profile.AlertEnabled != nil {
+			value := *profile.AlertEnabled
+			copyProfile.AlertEnabled = &value
+		}
+		cloned[id] = &copyProfile
+	}
+	return cloned
 }
 
 func initSettings(cfg Config) Settings {
@@ -283,6 +392,7 @@ func initSettings(cfg Config) Settings {
 		AdminPassPlain:       passPlain,
 		TokenSalt:            randomToken(adminTokenLength),
 		AuthToken:            cfg.JWTSecret,
+		AgentToken:           cfg.AgentToken,
 		AgentEndpoint:        "",
 		SiteTitle:            defaultSiteTitle,
 		SiteIcon:             "",
@@ -338,8 +448,17 @@ func mergeSettings(existing, fallback Settings) Settings {
 	if existing.TokenSalt == "" {
 		existing.TokenSalt = fallback.TokenSalt
 	}
+	if existing.AgentToken == "" && existing.AuthToken != "" {
+		existing.AgentToken = existing.AuthToken
+		if fallback.AuthToken != "" && fallback.AuthToken != existing.AuthToken {
+			existing.AuthToken = fallback.AuthToken
+		}
+	}
 	if existing.AuthToken == "" {
 		existing.AuthToken = fallback.AuthToken
+	}
+	if existing.AgentToken == "" {
+		existing.AgentToken = fallback.AgentToken
 	}
 	if existing.AgentEndpoint == "" {
 		existing.AgentEndpoint = fallback.AgentEndpoint

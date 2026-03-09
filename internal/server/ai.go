@@ -29,7 +29,15 @@ const (
 	defaultAITestPrompt        = "请仅回复 ok"
 	maxTelegramMessageRunes    = 3500
 	maxAIPromptRunes           = 2000
+	maxHTTPErrorBodyBytes      = 4096
 )
+
+func readResponseBodyLimited(body io.Reader) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	return io.ReadAll(io.LimitReader(body, maxHTTPErrorBodyBytes))
+}
 
 type AIProviderConfig struct {
 	APIKey  string `json:"api_key,omitempty"`
@@ -576,7 +584,7 @@ func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, e
 		return nil, fmt.Errorf("AI 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readResponseBodyLimited(resp.Body)
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -622,7 +630,7 @@ func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, e
 		return nil, fmt.Errorf("AI 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readResponseBodyLimited(resp.Body)
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -787,7 +795,7 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 		return "", fmt.Errorf("AI 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readResponseBodyLimited(resp.Body)
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -851,7 +859,7 @@ func callGemini(ctx context.Context, config AIProviderConfig, systemPrompt, user
 		return "", fmt.Errorf("AI 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := readResponseBodyLimited(resp.Body)
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}

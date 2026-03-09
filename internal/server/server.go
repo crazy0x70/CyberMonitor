@@ -31,10 +31,15 @@ import (
 
 const (
 	maxLogSize               = 10 * 1024 * 1024
+	maxLogBackupCount        = 3
 	maxTestHistoryPoints     = 5000
 	testHistoryHotSeconds    = 60 * 60
 	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
 	maxJSONBodySize          = 4 * 1024 * 1024
+	wsSendQueueSize          = 8
+	wsWriteWait              = 10 * time.Second
+	wsPongWait               = 60 * time.Second
+	wsPingPeriod             = (wsPongWait * 9) / 10
 )
 
 type sizeLimitedWriter struct {
@@ -42,6 +47,8 @@ type sizeLimitedWriter struct {
 	maxSize int64
 	mu      sync.Mutex
 }
+
+var reportLogger = log.New(io.Discard, "", log.LstdFlags)
 
 func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
 	if w == nil || w.path == "" || w.maxSize <= 0 {
@@ -55,11 +62,15 @@ func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
 		_ = os.MkdirAll(dir, 0755)
 	}
 
-	file, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0600)
+	file, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return len(p), err
 	}
-	defer file.Close()
+	defer func() {
+		if file != nil {
+			_ = file.Close()
+		}
+	}()
 
 	info, err := file.Stat()
 	if err != nil {
@@ -67,10 +78,15 @@ func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
 	}
 
 	if info.Size()+int64(len(p)) > w.maxSize {
-		if err := file.Truncate(0); err != nil {
+		if err := file.Close(); err != nil {
 			return len(p), err
 		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file = nil
+		if err := rotateLogFile(w.path, maxLogBackupCount); err != nil {
+			return len(p), err
+		}
+		file, err = os.OpenFile(w.path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
 			return len(p), err
 		}
 	} else {
@@ -86,13 +102,55 @@ func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func rotateLogFile(path string, backups int) error {
+	if path == "" || backups <= 0 {
+		return nil
+	}
+	for idx := backups; idx >= 1; idx-- {
+		src := path
+		if idx > 1 {
+			src = fmt.Sprintf("%s.%d", path, idx-1)
+		}
+		dst := fmt.Sprintf("%s.%d", path, idx)
+		if _, err := os.Stat(src); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if err := os.Rename(src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func setupLogger(dataDir string) {
+	serverOutput := io.Writer(os.Stdout)
+	reportOutput := io.Writer(os.Stdout)
 	if dataDir == "" {
+		log.SetOutput(serverOutput)
+		reportLogger.SetOutput(reportOutput)
 		return
 	}
-	logPath := filepath.Join(dataDir, "server.log")
-	writer := &sizeLimitedWriter{path: logPath, maxSize: maxLogSize}
-	log.SetOutput(io.MultiWriter(os.Stdout, writer))
+	serverPath := filepath.Join(dataDir, "server.log")
+	reportPath := filepath.Join(dataDir, "report.log")
+	serverWriter := &sizeLimitedWriter{path: serverPath, maxSize: maxLogSize}
+	reportWriter := &sizeLimitedWriter{path: reportPath, maxSize: maxLogSize}
+	serverOutput = io.MultiWriter(os.Stdout, serverWriter)
+	reportOutput = reportWriter
+	log.SetOutput(serverOutput)
+	reportLogger.SetOutput(reportOutput)
+}
+
+func wrapDataPathError(action, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if os.IsPermission(err) || errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("%s: %w（请检查 %s 的所有者与读写权限）", action, err, path)
+	}
+	return fmt.Errorf("%s: %w", action, err)
 }
 
 const (
@@ -118,6 +176,8 @@ type Config struct {
 
 type Store struct {
 	mu                 sync.RWMutex
+	persistMu          sync.Mutex
+	historyPersistMu   sync.Mutex
 	nodes              map[string]NodeState
 	profiles           map[string]*NodeProfile
 	settings           Settings
@@ -164,8 +224,8 @@ type TestSelection struct {
 }
 
 type AgentConfig struct {
-	Alias           string                      `json:"alias,omitempty"`
-	Group           string                      `json:"group,omitempty"`
+	Alias           string                      `json:"alias"`
+	Group           string                      `json:"group"`
 	TestIntervalSec int                         `json:"test_interval_sec"`
 	Tests           []metrics.NetworkTestConfig `json:"tests"`
 }
@@ -210,13 +270,21 @@ type Snapshot struct {
 }
 
 type Hub struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	clients map[*websocket.Conn]*hubClient
+}
+
+type hubMessage struct {
+	messageType int
+	payload     []byte
 }
 
 type hubClient struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
+	send chan hubMessage
+	done chan struct{}
+	once sync.Once
 }
 
 type loginAttempt struct {
@@ -227,15 +295,61 @@ type loginAttempt struct {
 }
 
 func (c *hubClient) writeMessage(messageType int, payload []byte) error {
+	if c == nil || c.conn == nil {
+		return errors.New("websocket 连接不存在")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 	return c.conn.WriteMessage(messageType, payload)
 }
 
 func (c *hubClient) close() error {
+	if c == nil {
+		return nil
+	}
+	c.once.Do(func() {
+		close(c.done)
+	})
+	if c.conn == nil {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.Close()
+}
+
+func (c *hubClient) enqueue(messageType int, payload []byte) bool {
+	if c == nil {
+		return false
+	}
+	msg := hubMessage{messageType: messageType, payload: payload}
+	if messageType == websocket.TextMessage {
+		for {
+			select {
+			case <-c.done:
+				return false
+			case c.send <- msg:
+				return true
+			default:
+			}
+			select {
+			case <-c.done:
+				return false
+			case <-c.send:
+			default:
+				return false
+			}
+		}
+	}
+	select {
+	case <-c.done:
+		return false
+	case c.send <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -245,14 +359,14 @@ func Run(ctx context.Context, cfg Config) error {
 	dataPath := filepath.Join(cfg.DataDir, "state.json")
 	persisted, loaded, err := loadPersistedData(dataPath)
 	if err != nil {
-		log.Printf("读取持久化数据失败: %v", err)
+		return wrapDataPathError("读取持久化数据失败", dataPath, err)
 	}
 	historyPath := filepath.Join(cfg.DataDir, testHistoryFileName)
-	historyPayload, _, historyErr := loadTestHistoryData(historyPath)
+	historyPayload, _, historyNeedsRewrite, historyErr := loadTestHistoryData(historyPath)
 	if historyErr != nil {
-		log.Printf("读取探测历史失败: %v", historyErr)
+		log.Printf("%v", wrapDataPathError("读取探测历史失败", historyPath, historyErr))
 	}
-	tokenGenerated := !loaded || persisted.Settings.AuthToken == ""
+	tokenGenerated := !loaded
 	defaultSettings := initSettings(cfg)
 	settings := defaultSettings
 	profiles := make(map[string]*NodeProfile)
@@ -261,7 +375,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if testHistory == nil {
 		testHistory = make(map[string]map[string]*TestHistoryEntry)
 	}
-	historyTrimmed := false
+	historyTrimmed := historyNeedsRewrite
 	nowSec := time.Now().Unix()
 	for _, tests := range testHistory {
 		for _, entry := range tests {
@@ -280,14 +394,16 @@ func Run(ctx context.Context, cfg Config) error {
 	ensureServerIDsForProfiles(profiles, nodes)
 	if settings.AuthToken != "" {
 		cfg.JWTSecret = settings.AuthToken
-		cfg.AgentToken = settings.AuthToken
+	}
+	if settings.AgentToken != "" {
+		cfg.AgentToken = settings.AgentToken
 	}
 	if err := savePersistedData(dataPath, PersistedData{
 		Settings: settings,
 		Profiles: profiles,
 		Nodes:    nodes,
 	}); err != nil {
-		log.Printf("写入持久化数据失败: %v", err)
+		return wrapDataPathError("写入持久化数据失败", dataPath, err)
 	}
 
 	commit := strings.TrimSpace(cfg.Commit)
@@ -382,6 +498,18 @@ func Run(ctx context.Context, cfg Config) error {
 		adminMux.HandleFunc("/api/v1/health", healthHandler)
 	}
 
+	publicMux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		apiBase, socketURL := buildDefaultPublicConfig(r)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"socket": socketURL,
+			"apiURL": apiBase,
+		})
+	})
+
 	publicMux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
@@ -439,7 +567,7 @@ func Run(ctx context.Context, cfg Config) error {
 			payload.NodeName = payload.NodeID
 		}
 		store.Update(payload)
-		log.Printf("Agent 上报: %s (%s)", payload.NodeID, r.RemoteAddr)
+		reportLogger.Printf("Agent 上报: %s (%s)", payload.NodeID, r.RemoteAddr)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -457,7 +585,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}))
 
 	adminMux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		nodeID := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
+		nodeID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+			return
+		}
+		nodeID = strings.TrimSpace(nodeID)
 		if nodeID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
 			return
@@ -505,6 +638,10 @@ func Run(ctx context.Context, cfg Config) error {
 			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
+			if err := attachAdminSession(cfg.JWTSecret, store, &view); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
+				return
+			}
 			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
 			hub.Broadcast(payload)
@@ -512,6 +649,58 @@ func Run(ctx context.Context, cfg Config) error {
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
+	}))
+
+	adminMux.HandleFunc("/api/v1/admin/config/export", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		payload := store.ExportConfig()
+		if splitMode && strings.TrimSpace(payload.Settings.AgentEndpoint) == "" {
+			payload.Settings.AgentEndpoint = cfg.PublicAddr
+		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "export failed"})
+			return
+		}
+		filename := fmt.Sprintf("cybermonitor-config-%s.json", time.Now().Format("20060102-150405"))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}))
+
+	adminMux.HandleFunc("/api/v1/admin/config/import", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var payload ConfigTransferData
+		if err := decodeJSON(w, r, &payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		view, reauthRequired, err := store.ImportConfig(payload)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
+			view.AgentEndpoint = cfg.PublicAddr
+		}
+		if err := attachAdminSession(cfg.JWTSecret, store, &view); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
+			return
+		}
+		snapshot := storeSnapshot(store, false)
+		broadcastPayload, _ := json.Marshal(snapshot)
+		hub.Broadcast(broadcastPayload)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"settings":        view,
+			"reauth_required": reauthRequired,
+		})
 	}))
 
 	adminMux.HandleFunc("/api/v1/admin/alerts/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
@@ -690,19 +879,22 @@ func Run(ctx context.Context, cfg Config) error {
 			if err != nil {
 				return
 			}
+			configureWSConn(conn)
 			client := hub.Add(conn)
 
 			// 首次连接立即推送快照
 			snapshot := storeSnapshot(store, true)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
+				if ok := client.enqueue(websocket.TextMessage, append([]byte(nil), payload...)); !ok {
 					hub.Remove(conn)
 					return
 				}
 			}
 
-			go readLoop(conn, hub)
+			go heartbeatLoop(client, hub)
+			go writeLoop(client, hub)
+			go readLoop(client, hub)
 		}
 	}
 
@@ -890,19 +1082,15 @@ func applyDefaults(cfg *Config) {
 		cfg.DataDir = defaultDataDir
 	}
 	if cfg.JWTSecret == "" && cfg.AgentToken == "" {
-		token := generateBootstrapToken()
-		cfg.JWTSecret = token
-		cfg.AgentToken = token
+		cfg.JWTSecret = generateBootstrapToken()
+		cfg.AgentToken = randomToken(32)
 		return
 	}
 	if cfg.JWTSecret == "" {
-		cfg.JWTSecret = cfg.AgentToken
+		cfg.JWTSecret = generateBootstrapToken()
 	}
 	if cfg.AgentToken == "" {
-		cfg.AgentToken = cfg.JWTSecret
-	}
-	if cfg.JWTSecret != cfg.AgentToken {
-		cfg.AgentToken = cfg.JWTSecret
+		cfg.AgentToken = randomToken(32)
 	}
 }
 
@@ -1401,7 +1589,7 @@ func sendFeishuText(webhook, text string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readResponseBodyLimited(resp.Body)
 		return fmt.Errorf("webhook 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
@@ -1460,6 +1648,102 @@ func formatAlertValue(value, fallback string) string {
 
 func boolPointer(value bool) *bool {
 	return &value
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func intPointer(value int) *int {
+	return &value
+}
+
+func int64Pointer(value int64) *int64 {
+	return &value
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneInt64Slice(values []int64) []int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]int64, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneNodeStates(values map[string]NodeState) map[string]NodeState {
+	if len(values) == 0 {
+		return map[string]NodeState{}
+	}
+	cloned := make(map[string]NodeState, len(values))
+	for id, value := range values {
+		cloned[id] = value
+	}
+	return cloned
+}
+
+func cloneNetworkTestConfigs(values []metrics.NetworkTestConfig) []metrics.NetworkTestConfig {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]metrics.NetworkTestConfig, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneTestSelections(values []TestSelection) []TestSelection {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]TestSelection, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneTestCatalogItems(values []TestCatalogItem) []TestCatalogItem {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]TestCatalogItem, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneGroupNodes(values []GroupNode) []GroupNode {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]GroupNode, len(values))
+	for i, value := range values {
+		cloned[i] = GroupNode{
+			Name:     value.Name,
+			Children: cloneGroupNodes(value.Children),
+		}
+	}
+	return cloned
+}
+
+func cloneAICompatibles(values []AIProviderProfile) []AIProviderProfile {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]AIProviderProfile, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneAISettings(settings AISettings) AISettings {
+	settings.OpenAICompatibles = cloneAICompatibles(settings.OpenAICompatibles)
+	return settings
 }
 
 func isAlertEnabled(profile *NodeProfile) bool {
@@ -1640,7 +1924,11 @@ func (s *Store) SettingsGroups() []string {
 }
 
 func (h *Hub) Add(conn *websocket.Conn) *hubClient {
-	client := &hubClient{conn: conn}
+	client := &hubClient{
+		conn: conn,
+		send: make(chan hubMessage, wsSendQueueSize),
+		done: make(chan struct{}),
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[conn] = client
@@ -1663,15 +1951,16 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 func (h *Hub) Broadcast(payload []byte) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
-		if err := client.writeMessage(websocket.TextMessage, payload); err != nil {
+		copied := append([]byte(nil), payload...)
+		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
 	}
 }
 
 func (h *Hub) snapshotClients() []*hubClient {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	clients := make([]*hubClient, 0, len(h.clients))
 	for _, client := range h.clients {
 		if client != nil {
@@ -1691,8 +1980,59 @@ func (h *Hub) removeClient(client *hubClient) {
 	_ = client.close()
 }
 
-func readLoop(conn *websocket.Conn, hub *Hub) {
-	defer hub.Remove(conn)
+func configureWSConn(conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
+	conn.SetReadLimit(maxJSONBodySize)
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+}
+
+func heartbeatLoop(client *hubClient, hub *Hub) {
+	if client == nil {
+		return
+	}
+	ticker := time.NewTicker(wsPingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-client.done:
+			return
+		case <-ticker.C:
+		}
+		if ok := client.enqueue(websocket.PingMessage, nil); !ok {
+			hub.removeClient(client)
+			return
+		}
+	}
+}
+
+func writeLoop(client *hubClient, hub *Hub) {
+	if client == nil {
+		return
+	}
+	for {
+		select {
+		case <-client.done:
+			return
+		case msg := <-client.send:
+			if err := client.writeMessage(msg.messageType, msg.payload); err != nil {
+				hub.removeClient(client)
+				return
+			}
+		}
+	}
+}
+
+func readLoop(client *hubClient, hub *Hub) {
+	if client == nil {
+		return
+	}
+	defer hub.removeClient(client)
+	conn := client.conn
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			return
@@ -1720,15 +2060,41 @@ func isAllowedOrigin(r *http.Request) bool {
 	return strings.EqualFold(parsed.Host, r.Host)
 }
 
+func buildDefaultPublicConfig(r *http.Request) (string, string) {
+	scheme := "http"
+	if r != nil {
+		if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); strings.EqualFold(proto, "https") {
+			scheme = "https"
+		} else if r.TLS != nil {
+			scheme = "https"
+		}
+	}
+	host := ""
+	if r != nil {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	wsScheme := "ws"
+	if scheme == "https" {
+		wsScheme = "wss"
+	}
+	apiBase := fmt.Sprintf("%s://%s", scheme, host)
+	socketURL := fmt.Sprintf("%s://%s/ws", wsScheme, host)
+	return apiBase, socketURL
+}
+
 func withSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		}
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws: wss:")
 		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
-		w.Header().Set("Clear-Site-Data", "\"cache\"")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
@@ -1947,7 +2313,7 @@ func (s *Store) SettingsView() SettingsView {
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
-		AgentToken:           s.settings.AuthToken,
+		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
 		SiteIcon:             s.settings.SiteIcon,
 		HomeTitle:            s.settings.HomeTitle,
@@ -1955,19 +2321,98 @@ func (s *Store) SettingsView() SettingsView {
 		AlertWebhook:         s.settings.AlertWebhook,
 		AlertOfflineSec:      s.settings.AlertOfflineSec,
 		AlertAll:             s.settings.AlertAll,
-		AlertNodes:           s.settings.AlertNodes,
+		AlertNodes:           cloneStringSlice(s.settings.AlertNodes),
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
-		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		AlertTelegramUserIDs: cloneInt64Slice(s.settings.AlertTelegramUserIDs),
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		LoginFailLimit:       loginFailLimit,
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
-		AISettings:           s.settings.AISettings,
+		AISettings:           cloneAISettings(s.settings.AISettings),
 		Commit:               s.buildCommit,
-		Groups:               s.settings.Groups,
-		GroupTree:            s.settings.GroupTree,
-		TestCatalog:          s.settings.TestCatalog,
+		Groups:               cloneStringSlice(s.settings.Groups),
+		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
+		TestCatalog:          cloneTestCatalogItems(s.settings.TestCatalog),
 	}
+}
+
+func (s *Store) ExportConfig() ConfigTransferData {
+	view := s.SettingsView()
+	view.AgentToken = ""
+	view.Commit = ""
+	view.SessionToken = ""
+	view.SessionExpiresAt = 0
+	s.mu.RLock()
+	profiles := cloneProfiles(s.profiles)
+	s.mu.RUnlock()
+	return ConfigTransferData{
+		Version:    configExportVersion,
+		ExportedAt: time.Now().Unix(),
+		Settings:   view,
+		Profiles:   profiles,
+	}
+}
+
+func attachAdminSession(secret string, store *Store, view *SettingsView) error {
+	if view == nil {
+		return nil
+	}
+	creds := store.Credentials()
+	if strings.TrimSpace(secret) == "" || strings.TrimSpace(creds.AdminUser) == "" || strings.TrimSpace(creds.TokenSalt) == "" {
+		return nil
+	}
+	token, exp, err := generateToken(secret, creds.AdminUser, creds.TokenSalt)
+	if err != nil {
+		return err
+	}
+	view.SessionToken = token
+	view.SessionExpiresAt = exp
+	return nil
+}
+
+func settingsViewToUpdate(view SettingsView) SettingsUpdate {
+	adminPath := strings.TrimSpace(view.AdminPath)
+	adminUser := strings.TrimSpace(view.AdminUser)
+	agentEndpoint := strings.TrimSpace(view.AgentEndpoint)
+	siteTitle := strings.TrimSpace(view.SiteTitle)
+	siteIcon := strings.TrimSpace(view.SiteIcon)
+	homeTitle := strings.TrimSpace(view.HomeTitle)
+	homeSubtitle := strings.TrimSpace(view.HomeSubtitle)
+	alertWebhook := strings.TrimSpace(view.AlertWebhook)
+	alertTelegramToken := strings.TrimSpace(view.AlertTelegramToken)
+	alertNodes := cloneStringSlice(view.AlertNodes)
+	alertTelegramUserIDs := cloneInt64Slice(view.AlertTelegramUserIDs)
+	aiSettings := cloneAISettings(view.AISettings)
+	groups := cloneStringSlice(view.Groups)
+	groupTree := cloneGroupNodes(view.GroupTree)
+	testCatalog := cloneTestCatalogItems(view.TestCatalog)
+	alertAll := view.AlertAll
+
+	update := SettingsUpdate{
+		AdminPath:            stringPointer(adminPath),
+		AdminUser:            stringPointer(adminUser),
+		AgentEndpoint:        stringPointer(agentEndpoint),
+		SiteTitle:            stringPointer(siteTitle),
+		SiteIcon:             stringPointer(siteIcon),
+		HomeTitle:            stringPointer(homeTitle),
+		HomeSubtitle:         stringPointer(homeSubtitle),
+		AlertWebhook:         stringPointer(alertWebhook),
+		AlertOfflineSec:      int64Pointer(view.AlertOfflineSec),
+		AlertAll:             &alertAll,
+		AlertNodes:           &alertNodes,
+		AlertTelegramToken:   stringPointer(alertTelegramToken),
+		AlertTelegramUserIDs: &alertTelegramUserIDs,
+		LoginFailLimit:       intPointer(view.LoginFailLimit),
+		LoginFailWindowSec:   int64Pointer(view.LoginFailWindowSec),
+		LoginLockSec:         int64Pointer(view.LoginLockSec),
+		AISettings:           &aiSettings,
+		Groups:               &groups,
+		TestCatalog:          &testCatalog,
+	}
+	if len(groupTree) > 0 {
+		update.GroupTree = &groupTree
+	}
+	return update
 }
 
 func (s *Store) AlertWebhook() string {
@@ -2186,6 +2631,8 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	view = SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
+		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
+		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
 		SiteIcon:             s.settings.SiteIcon,
 		HomeTitle:            s.settings.HomeTitle,
@@ -2193,23 +2640,134 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AlertWebhook:         s.settings.AlertWebhook,
 		AlertOfflineSec:      s.settings.AlertOfflineSec,
 		AlertAll:             s.settings.AlertAll,
-		AlertNodes:           s.settings.AlertNodes,
+		AlertNodes:           cloneStringSlice(s.settings.AlertNodes),
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
-		AlertTelegramUserIDs: s.settings.AlertTelegramUserIDs,
+		AlertTelegramUserIDs: cloneInt64Slice(s.settings.AlertTelegramUserIDs),
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		LoginFailLimit:       loginFailLimit,
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
-		AISettings:           s.settings.AISettings,
+		AISettings:           cloneAISettings(s.settings.AISettings),
 		Commit:               s.buildCommit,
-		Groups:               s.settings.Groups,
-		GroupTree:            s.settings.GroupTree,
-		TestCatalog:          s.settings.TestCatalog,
+		Groups:               cloneStringSlice(s.settings.Groups),
+		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
+		TestCatalog:          cloneTestCatalogItems(s.settings.TestCatalog),
 	}
 	s.mu.Unlock()
 
 	s.persist(data)
 	return view, nil
+}
+
+func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, bool, error) {
+	if payload.Version <= 0 {
+		return SettingsView{}, false, errors.New("导入文件版本无效")
+	}
+
+	current := s.SettingsView()
+	s.mu.RLock()
+	staged := &Store{
+		nodes:    cloneNodeStates(s.nodes),
+		profiles: cloneProfiles(s.profiles),
+		settings: s.settings,
+	}
+	s.mu.RUnlock()
+
+	if _, err := staged.UpdateSettings(settingsViewToUpdate(payload.Settings)); err != nil {
+		return SettingsView{}, false, err
+	}
+	staged.mu.Lock()
+	normalizedProfiles, err := staged.normalizeProfilesForImportLocked(payload.Profiles)
+	staged.mu.Unlock()
+	if err != nil {
+		return SettingsView{}, false, err
+	}
+
+	var data PersistedData
+	s.mu.Lock()
+	s.settings = staged.settings
+	s.profiles = normalizedProfiles
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+
+	reauthRequired := current.AdminUser != payload.Settings.AdminUser
+	return s.SettingsView(), reauthRequired, nil
+}
+
+func (s *Store) ReplaceProfiles(profiles map[string]*NodeProfile) error {
+	var data PersistedData
+	s.mu.Lock()
+	normalized, err := s.normalizeProfilesForImportLocked(profiles)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.profiles = normalized
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+	return nil
+}
+
+func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfile) (map[string]*NodeProfile, error) {
+	if profiles == nil {
+		return map[string]*NodeProfile{}, nil
+	}
+
+	now := time.Now().Unix()
+	normalized := make(map[string]*NodeProfile, len(profiles))
+	for rawNodeID, rawProfile := range profiles {
+		nodeID := strings.TrimSpace(rawNodeID)
+		if nodeID == "" {
+			return nil, errors.New("profiles 节点 ID 不能为空")
+		}
+
+		profile := &NodeProfile{}
+		if rawProfile != nil {
+			*profile = *rawProfile
+		}
+		profile.Alias = strings.TrimSpace(profile.Alias)
+		profile.Group = strings.TrimSpace(profile.Group)
+		profile.Tags = normalizeGroups(profile.Tags)
+		profile.Groups = normalizeGroupSelections(profile.Groups)
+		if len(profile.Groups) == 0 && (profile.Group != "" || len(profile.Tags) > 0) {
+			profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
+		}
+		if len(profile.Groups) > 0 {
+			group, tags := primaryGroupTagsFromSelections(profile.Groups)
+			profile.Group = group
+			profile.Tags = tags
+		}
+		profile.Region = strings.ToUpper(strings.TrimSpace(profile.Region))
+		profile.DiskType = strings.TrimSpace(profile.DiskType)
+		if profile.NetSpeedMbps < 0 {
+			profile.NetSpeedMbps = 0
+		}
+		if profile.ExpireAt < 0 {
+			profile.ExpireAt = 0
+		}
+		if profile.RenewIntervalSec < 0 {
+			profile.RenewIntervalSec = 0
+		}
+		if profile.TestIntervalSec <= 0 {
+			profile.TestIntervalSec = defaultTestIntervalSec
+		}
+		profile.Tests = cloneNetworkTestConfigs(profile.Tests)
+		profile.TestSelections = s.normalizeSelectionsLocked(cloneTestSelections(profile.TestSelections))
+		if profile.AlertEnabled == nil {
+			profile.AlertEnabled = boolPointer(true)
+		} else {
+			value := *profile.AlertEnabled
+			profile.AlertEnabled = &value
+		}
+		if profile.UpdatedAt <= 0 {
+			profile.UpdatedAt = now
+		}
+		normalized[nodeID] = profile
+	}
+	ensureServerIDsForProfiles(normalized, s.nodes)
+	return normalized, nil
 }
 
 func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
@@ -2505,9 +3063,15 @@ func (s *Store) ClearNodes() {
 }
 
 func (s *Store) AgentConfig(nodeID string) AgentConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	profile := s.ensureProfileLocked(nodeID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	profile := s.profiles[nodeID]
+	if profile == nil {
+		return AgentConfig{
+			TestIntervalSec: defaultTestIntervalSec,
+			Tests:           []metrics.NetworkTestConfig{},
+		}
+	}
 	tests := s.resolveTestsLocked(profile)
 	group, _ := primaryGroupTagsFromSelections(profile.Groups)
 	if group == "" {
@@ -2525,14 +3089,7 @@ func (s *Store) AgentConfig(nodeID string) AgentConfig {
 }
 
 func (s *Store) snapshotPersistedLocked() PersistedData {
-	profiles := make(map[string]*NodeProfile, len(s.profiles))
-	for id, profile := range s.profiles {
-		if profile == nil {
-			continue
-		}
-		copyProfile := *profile
-		profiles[id] = &copyProfile
-	}
+	profiles := cloneProfiles(s.profiles)
 	nodes := make(map[string]NodeState, len(s.nodes))
 	for id, node := range s.nodes {
 		nodes[id] = node
@@ -2556,8 +3113,10 @@ func (s *Store) persist(data PersistedData) {
 	if s.dataPath == "" {
 		return
 	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	if err := savePersistedData(s.dataPath, data); err != nil {
-		log.Printf("持久化失败: %v", err)
+		log.Printf("%v", wrapDataPathError("持久化失败", s.dataPath, err))
 		return
 	}
 	s.mu.Lock()
@@ -2569,8 +3128,10 @@ func (s *Store) persistHistory(data TestHistoryData) {
 	if s.historyPath == "" {
 		return
 	}
+	s.historyPersistMu.Lock()
+	defer s.historyPersistMu.Unlock()
 	if err := saveTestHistoryData(s.historyPath, data); err != nil {
-		log.Printf("探测历史持久化失败: %v", err)
+		log.Printf("%v", wrapDataPathError("探测历史持久化失败", s.historyPath, err))
 		return
 	}
 	s.mu.Lock()
@@ -2731,13 +3292,19 @@ func validateJWTFromRequest(secret string, r *http.Request) error {
 	if token == "" {
 		return errors.New("token required")
 	}
-	_, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
+	parsed, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(secret), nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if parsed == nil || !parsed.Valid {
+		return errors.New("token invalid")
+	}
+	return nil
 }
 
 func validateAdminJWT(store *Store, secret string, r *http.Request) error {
@@ -2746,7 +3313,7 @@ func validateAdminJWT(store *Store, secret string, r *http.Request) error {
 		return errors.New("token required")
 	}
 	claims := &jwt.RegisteredClaims{}
-	_, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
+	parsed, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
@@ -2754,6 +3321,9 @@ func validateAdminJWT(store *Store, secret string, r *http.Request) error {
 	})
 	if err != nil {
 		return err
+	}
+	if parsed == nil || !parsed.Valid {
+		return errors.New("token invalid")
 	}
 	creds := store.Credentials()
 	if creds.AdminUser != "" && claims.Subject != creds.AdminUser {
@@ -2781,7 +3351,17 @@ func extractToken(r *http.Request) string {
 func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	decoder := json.NewDecoder(r.Body)
-	return decoder.Decode(target)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("extra json content")
+		}
+		return errors.New("extra json content")
+	}
+	return nil
 }
 
 func validateWebhookURL(raw string) error {

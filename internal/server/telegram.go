@@ -6,14 +6,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+const telegramSendConcurrency = 4
+
+var telegramSendFunc = sendTelegramMessage
+
+func telegramBackoffDelay(err error) time.Duration {
+	if err == nil {
+		return 900 * time.Millisecond
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "429"):
+		return 8 * time.Second
+	case strings.Contains(message, "401"), strings.Contains(message, "403"), strings.Contains(message, "token"):
+		return 30 * time.Second
+	default:
+		return 2 * time.Second
+	}
+}
 
 type telegramUpdateResponse struct {
 	Ok          bool             `json:"ok"`
@@ -64,7 +83,9 @@ func startTelegramBot(ctx context.Context, store *Store) {
 			token, userIDs := store.TelegramSettings()
 			userIDs = normalizeTelegramUserIDs(userIDs)
 			if token == "" || len(userIDs) == 0 {
-				time.Sleep(2 * time.Second)
+				if !waitTelegramPoll(ctx, 2*time.Second) {
+					return
+				}
 				continue
 			}
 			userKey := buildTelegramUserKey(userIDs)
@@ -82,7 +103,9 @@ func startTelegramBot(ctx context.Context, store *Store) {
 			updates, err := fetchTelegramUpdates(client, token, offset)
 			if err != nil {
 				log.Printf("Telegram 轮询失败: %v", err)
-				time.Sleep(2 * time.Second)
+				if !waitTelegramPoll(ctx, telegramBackoffDelay(err)) {
+					return
+				}
 				continue
 			}
 			allowed := make(map[int64]struct{}, len(userIDs))
@@ -114,9 +137,25 @@ func startTelegramBot(ctx context.Context, store *Store) {
 					log.Printf("Telegram 回复失败: %v", err)
 				}
 			}
-			time.Sleep(900 * time.Millisecond)
+			if !waitTelegramPoll(ctx, 900*time.Millisecond) {
+				return
+			}
 		}
 	}()
+}
+
+func waitTelegramPoll(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]telegramUpdate, error) {
@@ -139,7 +178,7 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readResponseBodyLimited(resp.Body)
 		return nil, fmt.Errorf("更新响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload telegramUpdateResponse
@@ -182,12 +221,28 @@ func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []st
 	if token == "" || len(ids) == 0 || strings.TrimSpace(text) == "" {
 		return nil
 	}
-	var errs []string
+	errCh := make(chan string, len(ids))
+	sem := make(chan struct{}, telegramSendConcurrency)
+	var wg sync.WaitGroup
 	for _, id := range ids {
-		if err := sendTelegramMessage(token, id, text); err != nil {
-			errs = append(errs, err.Error())
-		}
+		id := id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := telegramSendFunc(token, id, text); err != nil {
+				errCh <- err.Error()
+			}
+		}()
 	}
+	wg.Wait()
+	close(errCh)
+	var errs []string
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	sort.Strings(errs)
 	return errs
 }
 
@@ -222,7 +277,7 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readResponseBodyLimited(resp.Body)
 		return fmt.Errorf("telegram 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var result telegramSendResponse
@@ -550,7 +605,7 @@ func setTelegramCommands(token string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readResponseBodyLimited(resp.Body)
 		return fmt.Errorf("telegram 菜单响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var result telegramSendResponse

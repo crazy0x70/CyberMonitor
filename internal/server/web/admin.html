@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CyberMonitor 管理后台</title>
-    <link rel="icon" id="site-icon" />
+    <link rel="icon" id="site-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/assets/styles.css" />
   </head>
   <body>
@@ -64,7 +64,7 @@
         </div>
       </section>
 
-      <section id="admin-shell" class="admin-shell hidden">
+      <section id="admin-shell" class="admin-shell hidden" inert aria-hidden="true">
         <aside class="side-nav">
           <button class="side-link active" type="button" data-section="settings">基础设置</button>
           <button class="side-link" type="button" data-section="groups">分组管理</button>
@@ -83,11 +83,15 @@
                 <p class="panel-desc">修改后台路径与管理员账号，密码留空则不修改。</p>
               </div>
               <div class="panel-actions">
-                <button class="btn small" id="save-settings-btn" type="button">保存</button>
+                <button class="btn ghost small" id="export-config-btn" type="button">导出配置</button>
+                <button class="btn ghost small" id="import-config-btn" type="button">导入配置</button>
+                <button class="btn small" id="save-settings-btn" type="submit" form="settings-form">保存</button>
+                <input class="hidden" id="import-config-file" type="file" accept=".json,application/json" />
                 <div class="form-hint" id="settings-hint"></div>
               </div>
             </div>
-            <div class="settings-grid">
+            <form class="settings-grid" id="settings-form">
+              <input class="sr-only" type="text" id="settings-username-shadow" autocomplete="username" tabindex="-1" aria-hidden="true" value="admin" />
               <div class="settings-card">
                 <div class="settings-card-head">
                   <h3>账号与入口</h3>
@@ -100,11 +104,11 @@
                   </label>
                   <label class="field">
                     <span>管理员账号</span>
-                    <input class="input" type="text" id="admin-user" placeholder="admin" />
+                    <input class="input" type="text" id="admin-user" placeholder="admin" autocomplete="username" />
                   </label>
                   <label class="field">
                     <span>新密码</span>
-                    <input class="input" type="password" id="admin-pass" placeholder="留空不修改" />
+                    <input class="input" type="password" id="admin-pass" placeholder="留空不修改" autocomplete="new-password" data-admin-secret="true" disabled />
                   </label>
                 </div>
               </div>
@@ -165,7 +169,7 @@
                   </label>
                 </div>
               </div>
-            </div>
+            </form>
           </section>
 
           <section class="panel hidden" data-section="groups">
@@ -206,6 +210,7 @@
               </div>
               <div class="panel-actions">
                 <button class="btn ghost" id="refresh-btn" type="button">刷新</button>
+                <div class="form-hint" id="refresh-hint"></div>
               </div>
             </div>
             <div class="install-card">
@@ -313,7 +318,7 @@
                 <div class="form-hint" id="ai-hint"></div>
               </div>
             </div>
-            <div class="ai-grid">
+            <div class="ai-grid" id="ai-form">
               <details class="ai-card" data-provider="openai">
                 <summary class="ai-card-head">
                   <div>
@@ -322,32 +327,35 @@
                   </div>
                   <span class="ai-card-toggle" aria-hidden="true"></span>
                 </summary>
-                <div class="ai-fields">
-                  <label class="field">
-                    <span>API Key</span>
-                    <input class="input" type="password" id="ai-openai-key" autocomplete="new-password" placeholder="sk-..." />
-                  </label>
-                  <label class="field">
-                    <span>Base URL</span>
-                    <input class="input" type="text" id="ai-openai-base" placeholder="https://api.openai.com/v1" />
-                  </label>
-                  <label class="field">
-                    <span>模型</span>
-                    <div class="model-picker" data-model-picker="openai">
-                      <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" autocomplete="off" />
-                      <div class="model-dropdown" data-model-dropdown="openai"></div>
-                    </div>
-                    <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
-                  </label>
-                </div>
-                <div class="ai-actions">
-                  <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="openai">获取可用模型</button>
-                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai">测试连接</button>
-                </div>
-                <div class="ai-hints">
-                  <div class="form-hint" data-ai-hint="openai"></div>
-                  <div class="form-hint" data-ai-models="openai"></div>
-                </div>
+                <form class="ai-card-form">
+                  <input class="sr-only" type="text" autocomplete="username" tabindex="-1" aria-hidden="true" value="openai-service" />
+                  <div class="ai-fields">
+                    <label class="field">
+                      <span>API Key</span>
+                      <input class="input" type="password" id="ai-openai-key" autocomplete="new-password" placeholder="sk-..." data-admin-secret="true" disabled />
+                    </label>
+                    <label class="field">
+                      <span>Base URL</span>
+                      <input class="input" type="text" id="ai-openai-base" placeholder="https://api.openai.com/v1" />
+                    </label>
+                    <label class="field">
+                      <span>模型</span>
+                      <div class="model-picker" data-model-picker="openai">
+                        <input class="input" type="text" id="ai-openai-model" placeholder="gpt-5.2" autocomplete="off" />
+                        <div class="model-dropdown" data-model-dropdown="openai"></div>
+                      </div>
+                      <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
+                    </label>
+                  </div>
+                  <div class="ai-actions">
+                    <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="openai">获取可用模型</button>
+                    <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="openai">测试连接</button>
+                  </div>
+                  <div class="ai-hints">
+                    <div class="form-hint" data-ai-hint="openai"></div>
+                    <div class="form-hint" data-ai-models="openai"></div>
+                  </div>
+                </form>
               </details>
 
               <details class="ai-card" data-provider="gemini">
@@ -358,32 +366,35 @@
                   </div>
                   <span class="ai-card-toggle" aria-hidden="true"></span>
                 </summary>
-                <div class="ai-fields">
-                  <label class="field">
-                    <span>API Key</span>
-                    <input class="input" type="password" id="ai-gemini-key" autocomplete="new-password" placeholder="AIza..." />
-                  </label>
-                  <label class="field">
-                    <span>Base URL</span>
-                    <input class="input" type="text" id="ai-gemini-base" placeholder="https://generativelanguage.googleapis.com/v1beta" />
-                  </label>
-                  <label class="field">
-                    <span>模型</span>
-                    <div class="model-picker" data-model-picker="gemini">
-                      <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" autocomplete="off" />
-                      <div class="model-dropdown" data-model-dropdown="gemini"></div>
-                    </div>
-                    <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
-                  </label>
-                </div>
-                <div class="ai-actions">
-                  <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="gemini">获取可用模型</button>
-                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="gemini">测试连接</button>
-                </div>
-                <div class="ai-hints">
-                  <div class="form-hint" data-ai-hint="gemini"></div>
-                  <div class="form-hint" data-ai-models="gemini"></div>
-                </div>
+                <form class="ai-card-form">
+                  <input class="sr-only" type="text" autocomplete="username" tabindex="-1" aria-hidden="true" value="gemini-service" />
+                  <div class="ai-fields">
+                    <label class="field">
+                      <span>API Key</span>
+                      <input class="input" type="password" id="ai-gemini-key" autocomplete="new-password" placeholder="AIza..." data-admin-secret="true" disabled />
+                    </label>
+                    <label class="field">
+                      <span>Base URL</span>
+                      <input class="input" type="text" id="ai-gemini-base" placeholder="https://generativelanguage.googleapis.com/v1beta" />
+                    </label>
+                    <label class="field">
+                      <span>模型</span>
+                      <div class="model-picker" data-model-picker="gemini">
+                        <input class="input" type="text" id="ai-gemini-model" placeholder="gemini-2.5-flash" autocomplete="off" />
+                        <div class="model-dropdown" data-model-dropdown="gemini"></div>
+                      </div>
+                      <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
+                    </label>
+                  </div>
+                  <div class="ai-actions">
+                    <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="gemini">获取可用模型</button>
+                    <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="gemini">测试连接</button>
+                  </div>
+                  <div class="ai-hints">
+                    <div class="form-hint" data-ai-hint="gemini"></div>
+                    <div class="form-hint" data-ai-models="gemini"></div>
+                  </div>
+                </form>
               </details>
 
               <details class="ai-card" data-provider="volcengine">
@@ -394,32 +405,35 @@
                   </div>
                   <span class="ai-card-toggle" aria-hidden="true"></span>
                 </summary>
-                <div class="ai-fields">
-                  <label class="field">
-                    <span>API Key</span>
-                    <input class="input" type="password" id="ai-volc-key" autocomplete="new-password" placeholder="volc-..." />
-                  </label>
-                  <label class="field">
-                    <span>Base URL</span>
-                    <input class="input" type="text" id="ai-volc-base" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
-                  </label>
-                  <label class="field">
-                    <span>模型</span>
-                    <div class="model-picker" data-model-picker="volcengine">
-                      <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" autocomplete="off" />
-                      <div class="model-dropdown" data-model-dropdown="volcengine"></div>
-                    </div>
-                    <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
-                  </label>
-                </div>
-                <div class="ai-actions">
-                  <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="volcengine">获取可用模型</button>
-                  <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="volcengine">测试连接</button>
-                </div>
-                <div class="ai-hints">
-                  <div class="form-hint" data-ai-hint="volcengine"></div>
-                  <div class="form-hint" data-ai-models="volcengine"></div>
-                </div>
+                <form class="ai-card-form">
+                  <input class="sr-only" type="text" autocomplete="username" tabindex="-1" aria-hidden="true" value="volcengine-service" />
+                  <div class="ai-fields">
+                    <label class="field">
+                      <span>API Key</span>
+                      <input class="input" type="password" id="ai-volc-key" autocomplete="new-password" placeholder="volc-..." data-admin-secret="true" disabled />
+                    </label>
+                    <label class="field">
+                      <span>Base URL</span>
+                      <input class="input" type="text" id="ai-volc-base" placeholder="https://ark.cn-beijing.volces.com/api/v3" />
+                    </label>
+                    <label class="field">
+                      <span>模型</span>
+                      <div class="model-picker" data-model-picker="volcengine">
+                        <input class="input" type="text" id="ai-volc-model" placeholder="doubao-seed-1-6-flash" autocomplete="off" />
+                        <div class="model-dropdown" data-model-dropdown="volcengine"></div>
+                      </div>
+                      <div class="form-hint">支持手动输入或从“获取可用模型”中选择</div>
+                    </label>
+                  </div>
+                  <div class="ai-actions">
+                    <button class="btn ghost tiny" type="button" data-action="ai-models" data-provider="volcengine">获取可用模型</button>
+                    <button class="btn ghost tiny" type="button" data-action="ai-test" data-provider="volcengine">测试连接</button>
+                  </div>
+                  <div class="ai-hints">
+                    <div class="form-hint" data-ai-hint="volcengine"></div>
+                    <div class="form-hint" data-ai-models="volcengine"></div>
+                  </div>
+                </form>
               </details>
 
               <div class="ai-compat-group">
