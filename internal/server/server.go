@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"log"
@@ -22,7 +23,9 @@ import (
 	"sync"
 	"time"
 
+	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/updater"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -30,16 +33,18 @@ import (
 )
 
 const (
-	maxLogSize               = 10 * 1024 * 1024
-	maxLogBackupCount        = 3
-	maxTestHistoryPoints     = 5000
-	testHistoryHotSeconds    = 60 * 60
-	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
-	maxJSONBodySize          = 4 * 1024 * 1024
-	wsSendQueueSize          = 8
-	wsWriteWait              = 10 * time.Second
-	wsPongWait               = 60 * time.Second
-	wsPingPeriod             = (wsPongWait * 9) / 10
+	maxLogSize                = 10 * 1024 * 1024
+	maxLogBackupCount         = 3
+	maxTestHistoryPoints      = 5000
+	testHistoryHotSeconds     = 60 * 60
+	testHistoryMaxAgeSeconds  = 60 * 60 * 24 * 365
+	maxJSONBodySize           = 4 * 1024 * 1024
+	wsSendQueueSize           = 8
+	wsWriteWait               = 10 * time.Second
+	wsPongWait                = 60 * time.Second
+	wsPingPeriod              = (wsPongWait * 9) / 10
+	publicVariantConservative = "conservative"
+	publicVariantBalanced     = "balanced"
 )
 
 type sizeLimitedWriter struct {
@@ -159,7 +164,7 @@ const (
 	defaultPersistInterval = 10 * time.Second
 )
 
-//go:embed web/* web/assets/*
+//go:embed web/* web/assets/* web/admin-app/* web/admin-assets/*
 var webFS embed.FS
 
 type Config struct {
@@ -171,6 +176,7 @@ type Config struct {
 	JWTSecret  string
 	AgentToken string
 	DataDir    string
+	Version    string
 	Commit     string
 }
 
@@ -181,6 +187,7 @@ type Store struct {
 	nodes              map[string]NodeState
 	profiles           map[string]*NodeProfile
 	settings           Settings
+	buildVersion       string
 	buildCommit        string
 	dataPath           string
 	historyPath        string
@@ -200,22 +207,34 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID         string                      `json:"server_id,omitempty"`
-	AlertEnabled     *bool                       `json:"alert_enabled,omitempty"`
-	Alias            string                      `json:"alias,omitempty"`
-	Group            string                      `json:"group,omitempty"`
-	Tags             []string                    `json:"tags,omitempty"`
-	Groups           []string                    `json:"groups,omitempty"`
-	Region           string                      `json:"region,omitempty"`
-	DiskType         string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps     int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt         int64                       `json:"expire_at,omitempty"`
-	AutoRenew        bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec  int                         `json:"test_interval_sec"`
-	Tests            []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections   []TestSelection             `json:"test_selections,omitempty"`
-	UpdatedAt        int64                       `json:"updated_at,omitempty"`
+	ServerID                 string                      `json:"server_id,omitempty"`
+	AlertEnabled             *bool                       `json:"alert_enabled,omitempty"`
+	Alias                    string                      `json:"alias,omitempty"`
+	Group                    string                      `json:"group,omitempty"`
+	Tags                     []string                    `json:"tags,omitempty"`
+	Groups                   []string                    `json:"groups,omitempty"`
+	Region                   string                      `json:"region,omitempty"`
+	DiskType                 string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                       `json:"expire_at,omitempty"`
+	AutoRenew                bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                         `json:"test_interval_sec"`
+	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
+	AgentUpdate              *AgentUpdateInstruction     `json:"agent_update,omitempty"`
+	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
+	AgentUpdateReportedAt    int64                       `json:"agent_update_reported_at,omitempty"`
+	UpdatedAt                int64                       `json:"updated_at,omitempty"`
+}
+
+type AgentUpdateInstruction struct {
+	Version     string `json:"version"`
+	DownloadURL string `json:"download_url"`
+	ChecksumURL string `json:"checksum_url,omitempty"`
+	RequestedAt int64  `json:"requested_at,omitempty"`
 }
 
 type TestSelection struct {
@@ -228,28 +247,34 @@ type AgentConfig struct {
 	Group           string                      `json:"group"`
 	TestIntervalSec int                         `json:"test_interval_sec"`
 	Tests           []metrics.NetworkTestConfig `json:"tests"`
+	Update          *AgentUpdateInstruction     `json:"update,omitempty"`
 }
 
 type NodeView struct {
-	Stats            metrics.NodeStats           `json:"stats"`
-	LastSeen         int64                       `json:"last_seen"`
-	FirstSeen        int64                       `json:"first_seen,omitempty"`
-	Status           string                      `json:"status"`
-	ServerID         string                      `json:"server_id,omitempty"`
-	AlertEnabled     bool                        `json:"alert_enabled"`
-	Alias            string                      `json:"alias,omitempty"`
-	Group            string                      `json:"group,omitempty"`
-	Tags             []string                    `json:"tags,omitempty"`
-	Groups           []string                    `json:"groups,omitempty"`
-	Region           string                      `json:"region,omitempty"`
-	DiskType         string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps     int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt         int64                       `json:"expire_at,omitempty"`
-	AutoRenew        bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec  int                         `json:"test_interval_sec,omitempty"`
-	Tests            []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections   []TestSelection             `json:"test_selections,omitempty"`
+	Stats                    metrics.NodeStats           `json:"stats"`
+	LastSeen                 int64                       `json:"last_seen"`
+	FirstSeen                int64                       `json:"first_seen,omitempty"`
+	Status                   string                      `json:"status"`
+	ServerID                 string                      `json:"server_id,omitempty"`
+	AlertEnabled             bool                        `json:"alert_enabled"`
+	Alias                    string                      `json:"alias,omitempty"`
+	Group                    string                      `json:"group,omitempty"`
+	Tags                     []string                    `json:"tags,omitempty"`
+	Groups                   []string                    `json:"groups,omitempty"`
+	Region                   string                      `json:"region,omitempty"`
+	DiskType                 string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                       `json:"expire_at,omitempty"`
+	AutoRenew                bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                         `json:"test_interval_sec,omitempty"`
+	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
+	AgentUpdateSupported     bool                        `json:"agent_update_supported"`
+	AgentUpdateMode          string                      `json:"agent_update_mode,omitempty"`
+	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
 }
 
 type PublicSettings struct {
@@ -257,6 +282,7 @@ type PublicSettings struct {
 	SiteIcon     string `json:"site_icon,omitempty"`
 	HomeTitle    string `json:"home_title,omitempty"`
 	HomeSubtitle string `json:"home_subtitle,omitempty"`
+	Version      string `json:"version,omitempty"`
 	Commit       string `json:"commit,omitempty"`
 }
 
@@ -267,6 +293,12 @@ type Snapshot struct {
 	Groups      []string                                `json:"groups,omitempty"`
 	Settings    PublicSettings                          `json:"settings,omitempty"`
 	TestHistory map[string]map[string]*TestHistoryEntry `json:"test_history,omitempty"`
+}
+
+type NodeDelta struct {
+	Type        string   `json:"type"`
+	GeneratedAt int64    `json:"generated_at"`
+	Node        NodeView `json:"node"`
 }
 
 type Hub struct {
@@ -280,11 +312,12 @@ type hubMessage struct {
 }
 
 type hubClient struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
-	send chan hubMessage
-	done chan struct{}
-	once sync.Once
+	conn    *websocket.Conn
+	variant string
+	mu      sync.Mutex
+	send    chan hubMessage
+	done    chan struct{}
+	once    sync.Once
 }
 
 type loginAttempt struct {
@@ -413,11 +446,16 @@ func Run(ctx context.Context, cfg Config) error {
 	if len(commit) > 7 {
 		commit = commit[:7]
 	}
+	version := strings.TrimSpace(cfg.Version)
+	if version == "" {
+		version = "dev"
+	}
 
 	store := &Store{
 		nodes:           nodes,
 		profiles:        profiles,
 		settings:        settings,
+		buildVersion:    version,
 		buildCommit:     commit,
 		dataPath:        dataPath,
 		historyPath:     historyPath,
@@ -435,6 +473,7 @@ func Run(ctx context.Context, cfg Config) error {
 		store.persistHistory(historyData)
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
+	systemUpdater := newSystemUpdateManager(version)
 	splitMode := strings.TrimSpace(cfg.PublicAddr) != "" && cfg.PublicAddr != cfg.Addr
 
 	webRoot, err := fs.Sub(webFS, "web")
@@ -454,8 +493,9 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		var req struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
+			Username       string `json:"username"`
+			Password       string `json:"password"`
+			TurnstileToken string `json:"turnstile_token"`
 		}
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -468,6 +508,13 @@ func Run(ctx context.Context, cfg Config) error {
 		if allowed, retryAfter := store.allowLoginAttempt(attemptKey, now); !allowed {
 			writeLoginRateLimit(w, retryAfter)
 			return
+		}
+		loginView := store.SettingsView()
+		if turnstileConfigured(loginView.TurnstileSiteKey, loginView.TurnstileSecretKey) {
+			if err := verifyTurnstileToken(r.Context(), loginView.TurnstileSecretKey, req.TurnstileToken, clientIPFromRemoteAddr(r.RemoteAddr)); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+				return
+			}
 		}
 		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
 			if locked, retryAfter := store.recordLoginFailure(attemptKey, now); locked {
@@ -488,6 +535,22 @@ func Run(ctx context.Context, cfg Config) error {
 			"token":      token,
 			"expires_at": exp,
 		})
+	})
+
+	adminMux.HandleFunc("/api/v1/login/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		view := store.SettingsView()
+		enabled := turnstileConfigured(view.TurnstileSiteKey, view.TurnstileSecretKey)
+		payload := map[string]interface{}{
+			"turnstile_enabled": enabled,
+		}
+		if enabled {
+			payload["turnstile_site_key"] = strings.TrimSpace(view.TurnstileSiteKey)
+		}
+		writeJSON(w, http.StatusOK, payload)
 	})
 
 	healthHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -567,6 +630,11 @@ func Run(ctx context.Context, cfg Config) error {
 			payload.NodeName = payload.NodeID
 		}
 		store.Update(payload)
+		if delta, ok := store.PublicNodeDelta(payload.NodeID); ok {
+			if data, err := json.Marshal(delta); err == nil {
+				hub.BroadcastVariant(data, publicVariantBalanced)
+			}
+		}
 		reportLogger.Printf("Agent 上报: %s (%s)", payload.NodeID, r.RemoteAddr)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -585,7 +653,86 @@ func Run(ctx context.Context, cfg Config) error {
 	}))
 
 	adminMux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		nodeID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/"))
+		path := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
+		if strings.HasSuffix(path, "/agent/update") {
+			if r.Method != http.MethodGet && r.Method != http.MethodPost {
+				writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+				return
+			}
+			rawNodeID := strings.TrimSuffix(path, "/agent/update")
+			nodeID, err := url.PathUnescape(rawNodeID)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+				return
+			}
+			nodeID = strings.TrimSpace(nodeID)
+			if nodeID == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+				return
+			}
+			store.mu.RLock()
+			node, exists := store.nodes[nodeID]
+			store.mu.RUnlock()
+			if !exists {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+				return
+			}
+
+			if r.Method == http.MethodGet {
+				if !resolveAgentUpdateSupported(node.Stats) {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点平台暂不支持后台自更新"))
+					return
+				}
+				if strings.TrimSpace(node.Stats.AgentVersion) == "" {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
+					return
+				}
+				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
+				releaseInfo, err := client.CheckLatest(r.Context())
+				if err != nil {
+					writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+					return
+				}
+				writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, releaseInfo, ""))
+				return
+			}
+
+			if !resolveAgentUpdateSupported(node.Stats) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前节点平台暂不支持后台自更新"})
+				return
+			}
+			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
+			releaseInfo, err := client.CheckLatest(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			if !releaseInfo.HasUpdate && updater.CompareVersions(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) >= 0 {
+				writeJSON(w, http.StatusOK, map[string]string{
+					"status":         "up_to_date",
+					"target_version": releaseInfo.LatestVersion,
+				})
+				return
+			}
+			if strings.TrimSpace(releaseInfo.DownloadURL) == "" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前节点平台对应的 Agent 安装包"})
+				return
+			}
+			store.QueueAgentUpdate(nodeID, AgentUpdateInstruction{
+				Version:     releaseInfo.LatestVersion,
+				DownloadURL: releaseInfo.DownloadURL,
+				ChecksumURL: releaseInfo.ChecksumURL,
+			})
+			snapshot := storeSnapshot(store, false)
+			payload, _ := json.Marshal(snapshot)
+			hub.Broadcast(payload)
+			writeJSON(w, http.StatusAccepted, map[string]string{
+				"status":         "queued",
+				"target_version": releaseInfo.LatestVersion,
+			})
+			return
+		}
+		nodeID, err := url.PathUnescape(path)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
 			return
@@ -635,6 +782,9 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
+			if strings.TrimSpace(view.AgentToken) != "" {
+				cfg.AgentToken = view.AgentToken
+			}
 			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
@@ -646,6 +796,53 @@ func Run(ctx context.Context, cfg Config) error {
 			payload, _ := json.Marshal(snapshot)
 			hub.Broadcast(payload)
 			writeJSON(w, http.StatusOK, view)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	}))
+
+	adminMux.HandleFunc("/api/v1/admin/system/update", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, systemUpdater.View(r.Context(), false))
+		case http.MethodPost:
+			if !updater.CanSelfUpdate() {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前平台暂不支持服务端自更新"})
+				return
+			}
+			releaseInfo, err := systemUpdater.CheckLatest(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			if !releaseInfo.HasUpdate && updater.CompareVersions(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) >= 0 {
+				writeJSON(w, http.StatusOK, map[string]string{
+					"status":         "up_to_date",
+					"target_version": releaseInfo.LatestVersion,
+				})
+				return
+			}
+			if strings.TrimSpace(releaseInfo.DownloadURL) == "" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前平台对应的服务端安装包"})
+				return
+			}
+			err = systemUpdater.Start(releaseInfo, func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cancel()
+				if err := systemUpdater.client.ApplyAsset(ctx, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
+					return err
+				}
+				time.Sleep(700 * time.Millisecond)
+				return updater.RestartSelf()
+			})
+			if err != nil {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
+				return
+			}
+			writeJSON(w, http.StatusAccepted, map[string]string{
+				"status":         "started",
+				"target_version": releaseInfo.LatestVersion,
+			})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
@@ -686,6 +883,9 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+		if strings.TrimSpace(view.AgentToken) != "" {
+			cfg.AgentToken = view.AgentToken
 		}
 		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 			view.AgentEndpoint = cfg.PublicAddr
@@ -843,6 +1043,44 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, config)
 	})
 
+	publicMux.HandleFunc("/api/v1/agent/update/report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if cfg.AgentToken != "" {
+			token := r.Header.Get("X-AGENT-TOKEN")
+			if token != cfg.AgentToken {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+				return
+			}
+		}
+		var req struct {
+			NodeID  string `json:"node_id"`
+			State   string `json:"state"`
+			Version string `json:"version,omitempty"`
+			Message string `json:"message,omitempty"`
+		}
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		nodeID := strings.TrimSpace(req.NodeID)
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+			return
+		}
+		store.ApplyAgentUpdateReport(nodeID, AgentUpdateReport{
+			State:   req.State,
+			Version: req.Version,
+			Message: req.Message,
+		})
+		snapshot := storeSnapshot(store, false)
+		payload, _ := json.Marshal(snapshot)
+		hub.Broadcast(payload)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
 	upgrader := websocket.Upgrader{
 		CheckOrigin: isAllowedOrigin,
 	}
@@ -853,6 +1091,18 @@ func Run(ctx context.Context, cfg Config) error {
 		wsAuthRequired
 		wsAuthForbidden
 	)
+
+	resolvePublicVariant := func(r *http.Request) string {
+		if r == nil {
+			return publicVariantBalanced
+		}
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("variant"))) {
+		case publicVariantBalanced:
+			return publicVariantBalanced
+		default:
+			return publicVariantBalanced
+		}
+	}
 
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -880,7 +1130,7 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			}
 			configureWSConn(conn)
-			client := hub.Add(conn)
+			client := hub.Add(conn, resolvePublicVariant(r))
 
 			// 首次连接立即推送快照
 			snapshot := storeSnapshot(store, true)
@@ -910,10 +1160,24 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	assetsHandler := http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot)))
+
+	adminAssetsRoot, err := fs.Sub(webRoot, "admin-assets")
+	if err != nil {
+		return err
+	}
+	adminBundleRoot, err := fs.Sub(adminAssetsRoot, "assets")
+	if err != nil {
+		return err
+	}
+	adminAssetsFileServer := http.FileServer(http.FS(adminAssetsRoot))
+	adminBundleFileServer := http.FileServer(http.FS(adminBundleRoot))
+	adminAssetsHandler := http.StripPrefix("/admin-assets/", adminAssetsFileServer)
 	if splitMode {
 		adminMux.Handle("/assets/", assetsHandler)
+		adminMux.Handle("/admin-assets/", adminAssetsHandler)
 	} else {
 		publicMux.Handle("/assets/", assetsHandler)
+		publicMux.Handle("/admin-assets/", adminAssetsHandler)
 	}
 
 	if !splitMode {
@@ -926,21 +1190,70 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	}
 
+	writeEmbeddedHTML := func(w http.ResponseWriter, path string, notFoundMessage string) {
+		data, err := webFS.ReadFile(path)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": notFoundMessage})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}
+
+	writeAdminAppHTML := func(w http.ResponseWriter, adminPath string) {
+		data, err := webFS.ReadFile("web/admin-app/index.html")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
+			return
+		}
+		assetBase := adminPath + "/"
+		html := strings.ReplaceAll(string(data), "__CM_ADMIN_ASSET_BASE_PATH__", assetBase)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(html))
+	}
+
+	serveAdminAssetsAt := func(w http.ResponseWriter, r *http.Request, prefix string) {
+		trimmedPath := strings.TrimPrefix(r.URL.Path, prefix)
+		if trimmedPath == r.URL.Path {
+			http.NotFound(w, r)
+			return
+		}
+		next := r.Clone(r.Context())
+		next.URL.Path = "/" + strings.TrimPrefix(trimmedPath, "/")
+		if r.URL.RawPath != "" {
+			trimmedRawPath := strings.TrimPrefix(r.URL.RawPath, prefix)
+			next.URL.RawPath = "/" + strings.TrimPrefix(trimmedRawPath, "/")
+		}
+		adminBundleFileServer.ServeHTTP(w, next)
+	}
+
 	if splitMode {
 		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			adminPath := store.AdminPath()
-			if r.URL.Path != adminPath {
+			if r.URL.Path == adminPath+"/assets" {
+				http.Redirect(w, r, adminPath+"/assets/", http.StatusFound)
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, adminPath+"/assets/") {
+				serveAdminAssetsAt(w, r, adminPath+"/assets/")
+				return
+			}
+			switch r.URL.Path {
+			case adminPath + "/preview", adminPath + "/preview/":
+				http.Redirect(w, r, adminPath, http.StatusFound)
+				return
+			case adminPath + "/legacy":
+				writeEmbeddedHTML(w, "web/admin.html", "admin not found")
+				return
+			case adminPath, adminPath + "/":
+				writeAdminAppHTML(w, adminPath)
+				return
+			default:
 				http.NotFound(w, r)
 				return
 			}
-			data, err := webFS.ReadFile("web/admin.html")
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin not found"})
-				return
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
 		})
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -949,15 +1262,23 @@ func Run(ctx context.Context, cfg Config) error {
 	} else {
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			adminPath := store.AdminPath()
-			if r.URL.Path == adminPath {
-				data, err := webFS.ReadFile("web/admin.html")
-				if err != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin not found"})
-					return
-				}
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write(data)
+			if r.URL.Path == adminPath+"/assets" {
+				http.Redirect(w, r, adminPath+"/assets/", http.StatusFound)
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, adminPath+"/assets/") {
+				serveAdminAssetsAt(w, r, adminPath+"/assets/")
+				return
+			}
+			switch r.URL.Path {
+			case adminPath + "/preview", adminPath + "/preview/":
+				http.Redirect(w, r, adminPath, http.StatusFound)
+				return
+			case adminPath + "/legacy":
+				writeEmbeddedHTML(w, "web/admin.html", "admin not found")
+				return
+			case adminPath, adminPath + "/":
+				writeAdminAppHTML(w, adminPath)
 				return
 			}
 			if r.URL.Path != "/" {
@@ -999,15 +1320,30 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		lastBalancedDigest := ""
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				now := time.Now()
-				snapshot := storeSnapshot(store, false)
-				payload, _ := json.Marshal(snapshot)
-				hub.Broadcast(payload)
+				hasConservative := hub.HasVariant(publicVariantConservative)
+				hasBalanced := hub.HasVariant(publicVariantBalanced)
+				if hasConservative || hasBalanced {
+					snapshot := storeSnapshot(store, false)
+					if payload, err := json.Marshal(snapshot); err == nil {
+						if hasConservative {
+							hub.BroadcastVariant(payload, publicVariantConservative)
+						}
+						if hasBalanced {
+							digest := digestPublicSnapshot(snapshot)
+							if digest != lastBalancedDigest {
+								hub.BroadcastVariant(payload, publicVariantBalanced)
+								lastBalancedDigest = digest
+							}
+						}
+					}
+				}
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
 				if len(offlineEvents) > 0 {
 					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
@@ -1079,7 +1415,7 @@ func applyDefaults(cfg *Config) {
 		cfg.PublicAddr = cfg.Addr
 	}
 	if cfg.DataDir == "" {
-		cfg.DataDir = defaultDataDir
+		cfg.DataDir = cmdutil.DefaultDataDir()
 	}
 	if cfg.JWTSecret == "" && cfg.AgentToken == "" {
 		cfg.JWTSecret = generateBootstrapToken()
@@ -1451,7 +1787,7 @@ type AlertTargets struct {
 }
 
 type alertState struct {
-	OfflineAt time.Time
+	OfflineSince time.Time
 }
 
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
@@ -1486,8 +1822,8 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			if wasAlerted {
 				stats := node.Stats
 				display := resolveAlertDisplay(profile, stats, nodeID)
-				offlineSec := int64(now.Sub(state.OfflineAt).Seconds())
-				if state.OfflineAt.IsZero() {
+				offlineSec := int64(now.Sub(state.OfflineSince).Seconds())
+				if state.OfflineSince.IsZero() {
 					offlineSec = 0
 				}
 				recoveredEvents = append(recoveredEvents, AlertEvent{
@@ -1513,7 +1849,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			LastSeen:   node.LastSeen.Unix(),
 			OfflineSec: int64(offlineFor.Seconds()),
 		})
-		s.alerted[nodeID] = alertState{OfflineAt: now}
+		s.alerted[nodeID] = alertState{OfflineSince: node.LastSeen}
 	}
 
 	for nodeID := range s.alerted {
@@ -1756,6 +2092,36 @@ func isAlertEnabled(profile *NodeProfile) bool {
 	return *profile.AlertEnabled
 }
 
+func cloneAgentUpdateInstruction(value *AgentUpdateInstruction) *AgentUpdateInstruction {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func resolveAgentUpdateMode(stats metrics.NodeStats) string {
+	osLabel := strings.ToLower(strings.TrimSpace(stats.OS))
+	if strings.Contains(osLabel, "windows") {
+		return "windows"
+	}
+	if osLabel == "" {
+		return "binary"
+	}
+	return "binary"
+}
+
+func resolveAgentUpdateSupported(stats metrics.NodeStats) bool {
+	return resolveAgentUpdateMode(stats) != "windows"
+}
+
+func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
+	if profile == nil {
+		return resolveAgentUpdateSupported(stats), resolveAgentUpdateMode(stats), "", "", ""
+	}
+	return resolveAgentUpdateSupported(stats), resolveAgentUpdateMode(stats), strings.TrimSpace(profile.AgentUpdateState), strings.TrimSpace(profile.AgentUpdateTargetVersion), strings.TrimSpace(profile.AgentUpdateMessage)
+}
+
 func normalizeTelegramUserIDs(ids []int64) []int64 {
 	seen := make(map[int64]struct{})
 	normalized := make([]int64, 0, len(ids))
@@ -1801,6 +2167,23 @@ func storeSnapshot(s *Store, withHistory bool) Snapshot {
 		snapshot.TestHistory = s.snapshotTestHistory()
 	}
 	return snapshot
+}
+
+func digestPublicSnapshot(snapshot Snapshot) string {
+	hash := fnv.New64a()
+	encoder := json.NewEncoder(hash)
+	_ = encoder.Encode(struct {
+		Type     string         `json:"type"`
+		Nodes    []NodeView     `json:"nodes"`
+		Groups   []string       `json:"groups,omitempty"`
+		Settings PublicSettings `json:"settings,omitempty"`
+	}{
+		Type:     snapshot.Type,
+		Nodes:    snapshot.Nodes,
+		Groups:   snapshot.Groups,
+		Settings: snapshot.Settings,
+	})
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
@@ -1859,26 +2242,32 @@ func (s *Store) Snapshot() []NodeView {
 		}
 		group, tags := resolveProfileGroupTags(profile, node.Stats)
 		groups := normalizeGroupSelections(profile.Groups)
+		updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 		views = append(views, NodeView{
-			Stats:            node.Stats,
-			LastSeen:         node.LastSeen.Unix(),
-			FirstSeen:        node.FirstSeen.Unix(),
-			Status:           status,
-			ServerID:         profile.ServerID,
-			AlertEnabled:     isAlertEnabled(profile),
-			Alias:            profile.Alias,
-			Group:            group,
-			Tags:             tags,
-			Groups:           groups,
-			Region:           profile.Region,
-			DiskType:         profile.DiskType,
-			NetSpeedMbps:     profile.NetSpeedMbps,
-			ExpireAt:         profile.ExpireAt,
-			AutoRenew:        profile.AutoRenew,
-			RenewIntervalSec: profile.RenewIntervalSec,
-			TestIntervalSec:  profile.TestIntervalSec,
-			Tests:            profile.Tests,
-			TestSelections:   profile.TestSelections,
+			Stats:                    node.Stats,
+			LastSeen:                 node.LastSeen.Unix(),
+			FirstSeen:                node.FirstSeen.Unix(),
+			Status:                   status,
+			ServerID:                 profile.ServerID,
+			AlertEnabled:             isAlertEnabled(profile),
+			Alias:                    profile.Alias,
+			Group:                    group,
+			Tags:                     tags,
+			Groups:                   groups,
+			Region:                   profile.Region,
+			DiskType:                 profile.DiskType,
+			NetSpeedMbps:             profile.NetSpeedMbps,
+			ExpireAt:                 profile.ExpireAt,
+			AutoRenew:                profile.AutoRenew,
+			RenewIntervalSec:         profile.RenewIntervalSec,
+			TestIntervalSec:          profile.TestIntervalSec,
+			Tests:                    profile.Tests,
+			TestSelections:           profile.TestSelections,
+			AgentUpdateSupported:     updateSupported,
+			AgentUpdateMode:          updateMode,
+			AgentUpdateState:         updateState,
+			AgentUpdateTargetVersion: updateTargetVersion,
+			AgentUpdateMessage:       updateMessage,
 		})
 	}
 	sort.Slice(views, func(i, j int) bool {
@@ -1898,6 +2287,64 @@ func (s *Store) Snapshot() []NodeView {
 		s.persist(data)
 	}
 	return views
+}
+
+func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return NodeDelta{}, false
+	}
+	node, ok := s.nodes[nodeID]
+	if !ok {
+		return NodeDelta{}, false
+	}
+
+	profile := s.profiles[nodeID]
+	if profile == nil {
+		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+	}
+
+	status := "online"
+	if time.Since(node.LastSeen) > 5*time.Second {
+		status = "offline"
+	}
+	group, tags := resolveProfileGroupTags(profile, node.Stats)
+	groups := normalizeGroupSelections(profile.Groups)
+	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
+
+	return NodeDelta{
+		Type:        "node_delta",
+		GeneratedAt: time.Now().Unix(),
+		Node: NodeView{
+			Stats:                    node.Stats,
+			LastSeen:                 node.LastSeen.Unix(),
+			FirstSeen:                node.FirstSeen.Unix(),
+			Status:                   status,
+			ServerID:                 profile.ServerID,
+			AlertEnabled:             isAlertEnabled(profile),
+			Alias:                    profile.Alias,
+			Group:                    group,
+			Tags:                     tags,
+			Groups:                   groups,
+			Region:                   profile.Region,
+			DiskType:                 profile.DiskType,
+			NetSpeedMbps:             profile.NetSpeedMbps,
+			ExpireAt:                 profile.ExpireAt,
+			AutoRenew:                profile.AutoRenew,
+			RenewIntervalSec:         profile.RenewIntervalSec,
+			TestIntervalSec:          profile.TestIntervalSec,
+			Tests:                    profile.Tests,
+			TestSelections:           profile.TestSelections,
+			AgentUpdateSupported:     updateSupported,
+			AgentUpdateMode:          updateMode,
+			AgentUpdateState:         updateState,
+			AgentUpdateTargetVersion: updateTargetVersion,
+			AgentUpdateMessage:       updateMessage,
+		},
+	}, true
 }
 
 func resolveProfileGroupTags(profile *NodeProfile, stats metrics.NodeStats) (string, []string) {
@@ -1923,11 +2370,12 @@ func (s *Store) SettingsGroups() []string {
 	return groups
 }
 
-func (h *Hub) Add(conn *websocket.Conn) *hubClient {
+func (h *Hub) Add(conn *websocket.Conn, variant string) *hubClient {
 	client := &hubClient{
-		conn: conn,
-		send: make(chan hubMessage, wsSendQueueSize),
-		done: make(chan struct{}),
+		conn:    conn,
+		variant: variant,
+		send:    make(chan hubMessage, wsSendQueueSize),
+		done:    make(chan struct{}),
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1956,6 +2404,30 @@ func (h *Hub) Broadcast(payload []byte) {
 			h.removeClient(client)
 		}
 	}
+}
+
+func (h *Hub) BroadcastVariant(payload []byte, variant string) {
+	clients := h.snapshotClients()
+	for _, client := range clients {
+		if client == nil || client.variant != variant {
+			continue
+		}
+		copied := append([]byte(nil), payload...)
+		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+			h.removeClient(client)
+		}
+	}
+}
+
+func (h *Hub) HasVariant(variant string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, client := range h.clients {
+		if client != nil && client.variant == variant {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) snapshotClients() []*hubClient {
@@ -2298,6 +2770,7 @@ func (s *Store) PublicSettings() PublicSettings {
 		SiteIcon:     s.settings.SiteIcon,
 		HomeTitle:    s.settings.HomeTitle,
 		HomeSubtitle: s.settings.HomeSubtitle,
+		Version:      s.buildVersion,
 		Commit:       s.buildCommit,
 	}
 }
@@ -2312,6 +2785,8 @@ func (s *Store) SettingsView() SettingsView {
 	return SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
+		TurnstileSiteKey:     strings.TrimSpace(s.settings.TurnstileSiteKey),
+		TurnstileSecretKey:   strings.TrimSpace(s.settings.TurnstileSecretKey),
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
@@ -2329,6 +2804,7 @@ func (s *Store) SettingsView() SettingsView {
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
 		AISettings:           cloneAISettings(s.settings.AISettings),
+		Version:              s.buildVersion,
 		Commit:               s.buildCommit,
 		Groups:               cloneStringSlice(s.settings.Groups),
 		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
@@ -2373,6 +2849,7 @@ func attachAdminSession(secret string, store *Store, view *SettingsView) error {
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	adminPath := strings.TrimSpace(view.AdminPath)
 	adminUser := strings.TrimSpace(view.AdminUser)
+	agentToken := strings.TrimSpace(view.AgentToken)
 	agentEndpoint := strings.TrimSpace(view.AgentEndpoint)
 	siteTitle := strings.TrimSpace(view.SiteTitle)
 	siteIcon := strings.TrimSpace(view.SiteIcon)
@@ -2391,6 +2868,8 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	update := SettingsUpdate{
 		AdminPath:            stringPointer(adminPath),
 		AdminUser:            stringPointer(adminUser),
+		TurnstileSiteKey:     stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
+		TurnstileSecretKey:   stringPointer(strings.TrimSpace(view.TurnstileSecretKey)),
 		AgentEndpoint:        stringPointer(agentEndpoint),
 		SiteTitle:            stringPointer(siteTitle),
 		SiteIcon:             stringPointer(siteIcon),
@@ -2408,6 +2887,9 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 		AISettings:           &aiSettings,
 		Groups:               &groups,
 		TestCatalog:          &testCatalog,
+	}
+	if agentToken != "" {
+		update.AgentToken = stringPointer(agentToken)
 	}
 	if len(groupTree) > 0 {
 		update.GroupTree = &groupTree
@@ -2482,8 +2964,26 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AdminPassPlain = ""
 	}
+	if update.AgentToken != nil {
+		token := strings.TrimSpace(*update.AgentToken)
+		if token == "" {
+			s.mu.Unlock()
+			return SettingsView{}, errors.New("agent_token invalid")
+		}
+		s.settings.AgentToken = token
+	}
 	if update.AgentEndpoint != nil {
 		s.settings.AgentEndpoint = strings.TrimSpace(*update.AgentEndpoint)
+	}
+	if update.TurnstileSiteKey != nil {
+		s.settings.TurnstileSiteKey = strings.TrimSpace(*update.TurnstileSiteKey)
+	}
+	if update.TurnstileSecretKey != nil {
+		s.settings.TurnstileSecretKey = strings.TrimSpace(*update.TurnstileSecretKey)
+	}
+	if (s.settings.TurnstileSiteKey == "") != (s.settings.TurnstileSecretKey == "") {
+		s.mu.Unlock()
+		return SettingsView{}, errors.New("turnstile 站点 Key 与 Secret Key 需要同时配置")
 	}
 	if update.SiteTitle != nil {
 		s.settings.SiteTitle = strings.TrimSpace(*update.SiteTitle)
@@ -2631,6 +3131,8 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	view = SettingsView{
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
+		TurnstileSiteKey:     strings.TrimSpace(s.settings.TurnstileSiteKey),
+		TurnstileSecretKey:   strings.TrimSpace(s.settings.TurnstileSecretKey),
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
@@ -2648,6 +3150,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
 		AISettings:           cloneAISettings(s.settings.AISettings),
+		Version:              s.buildVersion,
 		Commit:               s.buildCommit,
 		Groups:               cloneStringSlice(s.settings.Groups),
 		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
@@ -3062,6 +3565,57 @@ func (s *Store) ClearNodes() {
 	}
 }
 
+type AgentUpdateReport struct {
+	State   string `json:"state"`
+	Version string `json:"version,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstruction) NodeProfile {
+	var data PersistedData
+	s.mu.Lock()
+	profile := s.ensureProfileLocked(nodeID)
+	instruction.Version = strings.TrimSpace(instruction.Version)
+	instruction.DownloadURL = strings.TrimSpace(instruction.DownloadURL)
+	instruction.ChecksumURL = strings.TrimSpace(instruction.ChecksumURL)
+	instruction.RequestedAt = time.Now().Unix()
+	profile.AgentUpdate = cloneAgentUpdateInstruction(&instruction)
+	profile.AgentUpdateState = "pending"
+	profile.AgentUpdateTargetVersion = instruction.Version
+	profile.AgentUpdateMessage = "已下发更新任务，等待 Agent 执行"
+	profile.AgentUpdateReportedAt = instruction.RequestedAt
+	profile.UpdatedAt = instruction.RequestedAt
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+	return *profile
+}
+
+func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) NodeProfile {
+	var data PersistedData
+	s.mu.Lock()
+	profile := s.ensureProfileLocked(nodeID)
+	reportedAt := time.Now().Unix()
+	state := strings.TrimSpace(report.State)
+	if state == "" {
+		state = "unknown"
+	}
+	profile.AgentUpdateState = state
+	if version := strings.TrimSpace(report.Version); version != "" {
+		profile.AgentUpdateTargetVersion = version
+	}
+	profile.AgentUpdateMessage = strings.TrimSpace(report.Message)
+	profile.AgentUpdateReportedAt = reportedAt
+	if state == "succeeded" || state == "failed" {
+		profile.AgentUpdate = nil
+	}
+	profile.UpdatedAt = reportedAt
+	data = s.snapshotPersistedLocked()
+	s.mu.Unlock()
+	s.persist(data)
+	return *profile
+}
+
 func (s *Store) AgentConfig(nodeID string) AgentConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -3085,6 +3639,7 @@ func (s *Store) AgentConfig(nodeID string) AgentConfig {
 		Group:           group,
 		TestIntervalSec: profile.TestIntervalSec,
 		Tests:           tests,
+		Update:          cloneAgentUpdateInstruction(profile.AgentUpdate),
 	}
 }
 

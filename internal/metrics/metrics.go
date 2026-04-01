@@ -147,7 +147,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 	}
 
 	loadAvg, _ := load.Avg()
-	memStat, _ := mem.VirtualMemory()
+	memStat := c.collectMemoryStat()
 	partitions, _ := disk.Partitions(false)
 
 	diskUsage := c.collectDiskUsage(partitions)
@@ -256,6 +256,14 @@ func (c *Collector) Collect() (NodeStats, error) {
 	c.prevDisk = &disk.IOCountersStat{ReadBytes: diskRead, WriteBytes: diskWrite}
 
 	return stats, nil
+}
+
+func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {
+	if hostStat, ok := readHostVirtualMemory(c.hostRoot); ok {
+		return hostStat
+	}
+	memStat, _ := mem.VirtualMemory()
+	return memStat
 }
 
 func valueOrZero(stat *load.AvgStat) *load.AvgStat {
@@ -398,8 +406,12 @@ func parseSpeedMbps(raw string) float64 {
 }
 
 func (c *Collector) collectDiskUsage(partitions []disk.PartitionStat) []DiskPartition {
+	if hostUsage := c.collectHostDiskUsage(); len(hostUsage) > 0 {
+		return hostUsage
+	}
+
 	if hostRoot := strings.TrimSpace(c.hostRoot); hostRoot != "" && isDir(hostRoot) {
-		if usageStat, err := disk.Usage(hostRoot); err == nil {
+		if usageStat, err := statFilesystemUsage(hostRoot); err == nil {
 			return []DiskPartition{
 				{
 					Device:      "host-root",
@@ -424,7 +436,7 @@ func (c *Collector) collectDiskUsage(partitions []disk.PartitionStat) []DiskPart
 			continue
 		}
 		seen[p.Mountpoint] = struct{}{}
-		usageStat, err := disk.Usage(p.Mountpoint)
+		usageStat, err := statFilesystemUsage(p.Mountpoint)
 		if err != nil {
 			continue
 		}
@@ -438,6 +450,71 @@ func (c *Collector) collectDiskUsage(partitions []disk.PartitionStat) []DiskPart
 			UsedPercent: usageStat.UsedPercent,
 		})
 	}
+	return diskUsage
+}
+
+type filesystemUsage struct {
+	Total       uint64
+	Used        uint64
+	Free        uint64
+	UsedPercent float64
+	Fstype      string
+}
+
+type hostMount struct {
+	Device     string
+	Mountpoint string
+	Fstype     string
+}
+
+func (c *Collector) collectHostDiskUsage() []DiskPartition {
+	hostRoot := strings.TrimSpace(c.hostRoot)
+	if hostRoot == "" || !isDir(hostRoot) {
+		return nil
+	}
+
+	mounts, err := readHostMounts(hostRoot)
+	if err != nil || len(mounts) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	diskUsage := make([]DiskPartition, 0, len(mounts))
+	for _, mount := range mounts {
+		partition := disk.PartitionStat{
+			Device:     mount.Device,
+			Mountpoint: mount.Mountpoint,
+			Fstype:     mount.Fstype,
+		}
+		if shouldSkipPartition(partition) {
+			continue
+		}
+		if _, exists := seen[mount.Mountpoint]; exists {
+			continue
+		}
+		seen[mount.Mountpoint] = struct{}{}
+
+		hostPath := resolveHostMountPath(hostRoot, mount.Mountpoint)
+		usageStat, err := statFilesystemUsage(hostPath)
+		if err != nil {
+			continue
+		}
+		usageStat = applyDeviceTotal(usageStat, readBlockDeviceTotal(hostRoot, mount.Device))
+		if mount.Fstype != "" {
+			usageStat.Fstype = mount.Fstype
+		}
+
+		diskUsage = append(diskUsage, DiskPartition{
+			Device:      mount.Device,
+			Mountpoint:  mount.Mountpoint,
+			Fstype:      usageStat.Fstype,
+			Total:       usageStat.Total,
+			Used:        usageStat.Used,
+			Free:        usageStat.Free,
+			UsedPercent: usageStat.UsedPercent,
+		})
+	}
+
 	return diskUsage
 }
 
@@ -471,6 +548,258 @@ func shouldSkipPartition(p disk.PartitionStat) bool {
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+func readHostVirtualMemory(hostRoot string) (*mem.VirtualMemoryStat, bool) {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		return nil, false
+	}
+	values, err := parseMemInfoFile(filepath.Join(root, "proc", "meminfo"))
+	if err != nil {
+		return nil, false
+	}
+
+	total := kibToBytes(values["MemTotal"])
+	if total == 0 {
+		return nil, false
+	}
+	available := kibToBytes(values["MemAvailable"])
+	if available == 0 {
+		available = kibToBytes(estimateMemAvailable(values))
+	}
+	if available > total {
+		available = total
+	}
+	used := total - available
+	return &mem.VirtualMemoryStat{
+		Total:       total,
+		Available:   available,
+		Free:        available,
+		Used:        used,
+		UsedPercent: percentOf(used, total),
+	}, true
+}
+
+func parseMemInfoFile(path string) (map[string]uint64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	values := make(map[string]uint64)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) == 0 {
+			continue
+		}
+		value, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		values[strings.TrimSpace(parts[0])] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func estimateMemAvailable(values map[string]uint64) uint64 {
+	free := values["MemFree"]
+	buffers := values["Buffers"]
+	cached := values["Cached"]
+	sreclaimable := values["SReclaimable"]
+	shmem := values["Shmem"]
+	if cached+sreclaimable > shmem {
+		return free + buffers + cached + sreclaimable - shmem
+	}
+	return free + buffers + cached
+}
+
+func kibToBytes(value uint64) uint64 {
+	return value * 1024
+}
+
+func percentOf(used, total uint64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return (float64(used) / float64(total)) * 100
+}
+
+func resolveHostMountPath(hostRoot, mountpoint string) string {
+	cleaned := filepath.Clean("/" + strings.TrimSpace(strings.TrimPrefix(mountpoint, "/")))
+	if cleaned == "/" {
+		return hostRoot
+	}
+	return filepath.Join(hostRoot, strings.TrimPrefix(cleaned, "/"))
+}
+
+func applyDeviceTotal(usage filesystemUsage, deviceTotal uint64) filesystemUsage {
+	if deviceTotal == 0 || deviceTotal <= usage.Total {
+		return usage
+	}
+	usage.Total = deviceTotal
+	if usage.Used > usage.Total {
+		usage.Used = usage.Total
+	}
+	usage.Free = usage.Total - usage.Used
+	usage.UsedPercent = percentOf(usage.Used, usage.Total)
+	return usage
+}
+
+func readBlockDeviceTotal(hostRoot, device string) uint64 {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		return 0
+	}
+	for _, candidate := range blockDeviceCandidates(device) {
+		sizePath := filepath.Join(root, "sys", "class", "block", candidate, "size")
+		data, err := os.ReadFile(sizePath)
+		if err != nil {
+			continue
+		}
+		sectors, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil || sectors == 0 {
+			continue
+		}
+		return sectors * 512
+	}
+	return 0
+}
+
+func blockDeviceCandidates(device string) []string {
+	base := filepath.Base(strings.TrimSpace(device))
+	if base == "" {
+		return nil
+	}
+	candidates := []string{base}
+	if parent := blockDeviceName(base); parent != "" && parent != base {
+		candidates = append(candidates, parent)
+	}
+	return candidates
+}
+
+func readHostMounts(hostRoot string) ([]hostMount, error) {
+	paths := []string{
+		filepath.Join(hostRoot, "proc", "1", "mountinfo"),
+		filepath.Join(hostRoot, "proc", "self", "mountinfo"),
+		filepath.Join(hostRoot, "proc", "mounts"),
+	}
+	var lastErr error
+	for _, path := range paths {
+		mounts, err := readMountFile(path)
+		if err == nil && len(mounts) > 0 {
+			return mounts, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	return nil, lastErr
+}
+
+func readMountFile(path string) ([]hostMount, error) {
+	if strings.HasSuffix(path, "mountinfo") {
+		return parseMountInfoFile(path)
+	}
+	return parseProcMountsFile(path)
+}
+
+func parseMountInfoFile(path string) ([]hostMount, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	mounts := make([]hostMount, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		left := strings.Fields(parts[0])
+		right := strings.Fields(parts[1])
+		if len(left) < 5 || len(right) < 2 {
+			continue
+		}
+		mounts = append(mounts, hostMount{
+			Device:     decodeMountField(right[1]),
+			Mountpoint: decodeMountField(left[4]),
+			Fstype:     decodeMountField(right[0]),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return mounts, nil
+}
+
+func parseProcMountsFile(path string) ([]hostMount, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	mounts := make([]hostMount, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(strings.TrimSpace(scanner.Text()))
+		if len(fields) < 3 {
+			continue
+		}
+		mounts = append(mounts, hostMount{
+			Device:     decodeMountField(fields[0]),
+			Mountpoint: decodeMountField(fields[1]),
+			Fstype:     decodeMountField(fields[2]),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return mounts, nil
+}
+
+func decodeMountField(value string) string {
+	if !strings.ContainsRune(value, '\\') {
+		return value
+	}
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+3 < len(value) && isOctalDigit(value[i+1]) && isOctalDigit(value[i+2]) && isOctalDigit(value[i+3]) {
+			decoded, err := strconv.ParseUint(value[i+1:i+4], 8, 8)
+			if err == nil {
+				builder.WriteByte(byte(decoded))
+				i += 3
+				continue
+			}
+		}
+		builder.WriteByte(value[i])
+	}
+	return builder.String()
+}
+
+func isOctalDigit(value byte) bool {
+	return value >= '0' && value <= '7'
 }
 
 func readHostOSRelease(hostRoot string) string {

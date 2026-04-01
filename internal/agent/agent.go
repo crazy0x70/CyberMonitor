@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/updater"
 )
 
 type Config struct {
@@ -44,6 +46,7 @@ func Run(ctx context.Context, cfg Config) error {
 	collector := metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces)
 	endpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/ingest"
 	configEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/config"
+	updateReportEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/update/report"
 
 	runtimeCfg := newRuntimeConfig(cfg)
 	testCache := make(map[string]cachedTest)
@@ -55,6 +58,9 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		runtimeCfg.Update(remote)
+		if err := maybeApplyRemoteUpdate(ctx, client, updateReportEndpoint, cfg, remote.Update); err != nil {
+			log.Printf("执行远程更新失败: %v", err)
+		}
 	}
 
 	sendOnce := func() {
@@ -72,7 +78,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.AgentVersion != "" {
 			sample.AgentVersion = cfg.AgentVersion
 		}
-		alias, group, tests, interval := runtimeCfg.Snapshot()
+		alias, group, tests, interval, _ := runtimeCfg.Snapshot()
 		if alias != "" {
 			sample.NodeAlias = alias
 		}
@@ -127,6 +133,88 @@ func Run(ctx context.Context, cfg Config) error {
 			fetchConfig()
 		}
 	}
+}
+
+func maybeApplyRemoteUpdate(
+	ctx context.Context,
+	client *http.Client,
+	reportEndpoint string,
+	cfg Config,
+	update *RemoteUpdateInstruction,
+) error {
+	if update == nil {
+		return nil
+	}
+	targetVersion := strings.TrimSpace(update.Version)
+	if targetVersion == "" {
+		return nil
+	}
+	currentVersion := strings.TrimSpace(cfg.AgentVersion)
+	if currentVersion == targetVersion {
+		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
+	}
+	if !updater.CanSelfUpdate() {
+		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", currentVersion, "当前平台暂不支持 Agent 自更新")
+	}
+	if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
+		return err
+	}
+	clientUpdater := updater.NewClient(updater.DefaultRepo, updater.KindAgent, currentVersion)
+	if err := clientUpdater.ApplyAsset(ctx, update.DownloadURL, update.ChecksumURL); err != nil {
+		reportErr := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+		if reportErr != nil {
+			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
+		}
+		return err
+	}
+	if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
+		log.Printf("上报 Agent 重启状态失败: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	return updater.RestartSelf()
+}
+
+func postAgentUpdateReport(
+	ctx context.Context,
+	client *http.Client,
+	endpoint string,
+	nodeID string,
+	token string,
+	state string,
+	version string,
+	message string,
+) error {
+	payload, err := json.Marshal(map[string]string{
+		"node_id": nodeID,
+		"state":   state,
+		"version": version,
+		"message": message,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-AGENT-TOKEN", token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		text := strings.TrimSpace(string(body))
+		if text == "" {
+			text = fmt.Sprintf("status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("update report failed: %s", text)
+	}
+	return nil
 }
 
 type cachedTest struct {

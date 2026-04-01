@@ -9,8 +9,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"cyber_monitor/internal/metrics"
 )
 
 const (
@@ -74,26 +78,68 @@ type aiSnapshot struct {
 }
 
 type aiServerSummary struct {
-	ServerID      string   `json:"server_id"`
-	DisplayName   string   `json:"display_name"`
-	Hostname      string   `json:"hostname,omitempty"`
-	Status        string   `json:"status"`
-	Group         string   `json:"group,omitempty"`
-	Tags          []string `json:"tags,omitempty"`
-	Groups        []string `json:"groups,omitempty"`
-	OS            string   `json:"os,omitempty"`
-	Arch          string   `json:"arch,omitempty"`
-	CPUUsage      float64  `json:"cpu_usage_percent"`
-	MemUsage      float64  `json:"mem_usage_percent"`
-	DiskUsed      float64  `json:"disk_used_percent,omitempty"`
-	NetRecvBytes  uint64   `json:"net_recv_bytes"`
-	NetSendBytes  uint64   `json:"net_send_bytes"`
-	RxBytesPerSec float64  `json:"rx_bytes_per_sec"`
-	TxBytesPerSec float64  `json:"tx_bytes_per_sec"`
-	UptimeSec     uint64   `json:"uptime_sec"`
-	LastSeen      int64    `json:"last_seen"`
-	FirstSeen     int64    `json:"first_seen"`
-	AlertEnabled  bool     `json:"alert_enabled"`
+	ServerID          string                 `json:"server_id"`
+	DisplayName       string                 `json:"display_name"`
+	Hostname          string                 `json:"hostname,omitempty"`
+	Status            string                 `json:"status"`
+	Group             string                 `json:"group,omitempty"`
+	Tags              []string               `json:"tags,omitempty"`
+	Groups            []string               `json:"groups,omitempty"`
+	Region            string                 `json:"region,omitempty"`
+	OS                string                 `json:"os,omitempty"`
+	Arch              string                 `json:"arch,omitempty"`
+	AgentVersion      string                 `json:"agent_version,omitempty"`
+	CPUUsage          float64                `json:"cpu_usage_percent"`
+	MemUsage          float64                `json:"mem_usage_percent"`
+	DiskUsed          float64                `json:"disk_used_percent,omitempty"`
+	DiskType          string                 `json:"disk_type,omitempty"`
+	NetSpeedMbps      float64                `json:"net_speed_mbps,omitempty"`
+	NetRecvBytes      uint64                 `json:"net_recv_bytes"`
+	NetSendBytes      uint64                 `json:"net_send_bytes"`
+	RxBytesPerSec     float64                `json:"rx_bytes_per_sec"`
+	TxBytesPerSec     float64                `json:"tx_bytes_per_sec"`
+	ProcessCount      int                    `json:"process_count,omitempty"`
+	TCPConns          int                    `json:"tcp_conns,omitempty"`
+	UDPConns          int                    `json:"udp_conns,omitempty"`
+	UptimeSec         uint64                 `json:"uptime_sec"`
+	LastSeen          int64                  `json:"last_seen"`
+	FirstSeen         int64                  `json:"first_seen"`
+	ExpireAt          int64                  `json:"expire_at,omitempty"`
+	RenewIntervalSec  int64                  `json:"renew_interval_sec,omitempty"`
+	AlertEnabled      bool                   `json:"alert_enabled"`
+	NetworkTests      []aiNetworkTestSummary `json:"network_tests,omitempty"`
+	NetworkTestTrends []aiNetworkTrend       `json:"network_test_trends,omitempty"`
+}
+
+type aiNetworkTestSummary struct {
+	Name       string   `json:"name,omitempty"`
+	Type       string   `json:"type"`
+	Host       string   `json:"host,omitempty"`
+	Port       int      `json:"port,omitempty"`
+	Status     string   `json:"status,omitempty"`
+	Error      string   `json:"error,omitempty"`
+	CheckedAt  int64    `json:"checked_at,omitempty"`
+	LatencyMs  *float64 `json:"latency_ms,omitempty"`
+	PacketLoss float64  `json:"packet_loss"`
+}
+
+type aiNetworkTrend struct {
+	Name           string   `json:"name,omitempty"`
+	Type           string   `json:"type"`
+	Host           string   `json:"host,omitempty"`
+	Port           int      `json:"port,omitempty"`
+	Samples        int      `json:"samples"`
+	WindowStart    int64    `json:"window_start,omitempty"`
+	WindowEnd      int64    `json:"window_end,omitempty"`
+	LatestCheckedAt int64   `json:"latest_checked_at,omitempty"`
+	LatestLatencyMs *float64 `json:"latest_latency_ms,omitempty"`
+	LatestLoss     *float64 `json:"latest_loss,omitempty"`
+	AvgLatencyMs   *float64 `json:"avg_latency_ms,omitempty"`
+	MaxLatencyMs   *float64 `json:"max_latency_ms,omitempty"`
+	AvgLoss        *float64 `json:"avg_loss,omitempty"`
+	MinIntervalSec int64    `json:"min_interval_sec,omitempty"`
+	AvgIntervalSec float64  `json:"avg_interval_sec,omitempty"`
+	StatusHint     string   `json:"status_hint,omitempty"`
 }
 
 type openAIChatResponse struct {
@@ -682,6 +728,7 @@ func buildAIUserPrompt(store *Store, question string) (string, error) {
 
 func buildAISnapshot(store *Store) aiSnapshot {
 	nodes := store.Snapshot()
+	history := store.snapshotTestHistory()
 	servers := make([]aiServerSummary, 0, len(nodes))
 	for _, node := range nodes {
 		stats := node.Stats
@@ -702,33 +749,291 @@ func buildAISnapshot(store *Store) aiSnapshot {
 		group := strings.TrimSpace(node.Group)
 		tags := append([]string{}, node.Tags...)
 		groups := append([]string{}, node.Groups...)
+		diskType := strings.TrimSpace(node.DiskType)
+		if diskType == "" {
+			diskType = strings.TrimSpace(stats.DiskType)
+		}
+		netSpeedMbps := float64(node.NetSpeedMbps)
+		if netSpeedMbps <= 0 {
+			netSpeedMbps = stats.NetSpeedMbps
+		}
+		testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
+		testTrends := buildAINetworkTrendSummaries(stats.NodeID, testsByKey, history)
 		servers = append(servers, aiServerSummary{
-			ServerID:      node.ServerID,
-			DisplayName:   name,
-			Hostname:      hostName,
-			Status:        node.Status,
-			Group:         group,
-			Tags:          tags,
-			Groups:        groups,
-			OS:            stats.OS,
-			Arch:          stats.Arch,
-			CPUUsage:      stats.CPU.UsagePercent,
-			MemUsage:      stats.Memory.UsedPercent,
-			DiskUsed:      diskUsed,
-			NetRecvBytes:  stats.Network.BytesRecv,
-			NetSendBytes:  stats.Network.BytesSent,
-			RxBytesPerSec: stats.Network.RxBytesPerSec,
-			TxBytesPerSec: stats.Network.TxBytesPerSec,
-			UptimeSec:     stats.UptimeSec,
-			LastSeen:      node.LastSeen,
-			FirstSeen:     node.FirstSeen,
-			AlertEnabled:  node.AlertEnabled,
+			ServerID:          node.ServerID,
+			DisplayName:       name,
+			Hostname:          hostName,
+			Status:            node.Status,
+			Group:             group,
+			Tags:              tags,
+			Groups:            groups,
+			Region:            strings.TrimSpace(node.Region),
+			OS:                stats.OS,
+			Arch:              stats.Arch,
+			AgentVersion:      strings.TrimSpace(stats.AgentVersion),
+			CPUUsage:          stats.CPU.UsagePercent,
+			MemUsage:          stats.Memory.UsedPercent,
+			DiskUsed:          diskUsed,
+			DiskType:          diskType,
+			NetSpeedMbps:      netSpeedMbps,
+			NetRecvBytes:      stats.Network.BytesRecv,
+			NetSendBytes:      stats.Network.BytesSent,
+			RxBytesPerSec:     stats.Network.RxBytesPerSec,
+			TxBytesPerSec:     stats.Network.TxBytesPerSec,
+			ProcessCount:      stats.ProcessCount,
+			TCPConns:          stats.TCPConns,
+			UDPConns:          stats.UDPConns,
+			UptimeSec:         stats.UptimeSec,
+			LastSeen:          node.LastSeen,
+			FirstSeen:         node.FirstSeen,
+			ExpireAt:          node.ExpireAt,
+			RenewIntervalSec:  node.RenewIntervalSec,
+			AlertEnabled:      node.AlertEnabled,
+			NetworkTests:      testSummaries,
+			NetworkTestTrends: testTrends,
 		})
 	}
 	return aiSnapshot{
 		GeneratedAt: time.Now().Format("2006-01-02 15:04:05"),
 		Servers:     servers,
 	}
+}
+
+func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetworkTestSummary, map[string]metrics.NetworkTestResult) {
+	if len(tests) == 0 {
+		return nil, nil
+	}
+	testsByKey := make(map[string]metrics.NetworkTestResult)
+	keys := make([]string, 0, len(tests))
+	for _, test := range tests {
+		key := buildTestHistoryKey(test)
+		if key == "" {
+			key = fmt.Sprintf("%s|%s|%d|%s", strings.ToLower(strings.TrimSpace(test.Type)), strings.ToLower(strings.TrimSpace(test.Host)), test.Port, strings.ToLower(strings.TrimSpace(test.Name)))
+		}
+		existing, ok := testsByKey[key]
+		if !ok || test.CheckedAt >= existing.CheckedAt {
+			if !ok {
+				keys = append(keys, key)
+			}
+			testsByKey[key] = test
+		}
+	}
+	sort.Strings(keys)
+
+	summaries := make([]aiNetworkTestSummary, 0, len(keys))
+	for _, key := range keys {
+		test := testsByKey[key]
+		summaries = append(summaries, aiNetworkTestSummary{
+			Name:       strings.TrimSpace(test.Name),
+			Type:       strings.ToLower(strings.TrimSpace(test.Type)),
+			Host:       strings.TrimSpace(test.Host),
+			Port:       test.Port,
+			Status:     strings.TrimSpace(test.Status),
+			Error:      strings.TrimSpace(test.Error),
+			CheckedAt:  test.CheckedAt,
+			LatencyMs:  normalizeFloatPointer(test.LatencyMs),
+			PacketLoss: test.PacketLoss,
+		})
+	}
+	return summaries, testsByKey
+}
+
+func buildAINetworkTrendSummaries(
+	nodeID string,
+	currentByKey map[string]metrics.NetworkTestResult,
+	history map[string]map[string]*TestHistoryEntry,
+) []aiNetworkTrend {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || history == nil {
+		return nil
+	}
+	nodeHistory := history[nodeID]
+	if len(nodeHistory) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(nodeHistory))
+	for key, entry := range nodeHistory {
+		if key == "" || entry == nil || len(entry.Times) == 0 {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+
+	trends := make([]aiNetworkTrend, 0, len(keys))
+	for _, key := range keys {
+		entry := nodeHistory[key]
+		kind, host, port, name := parseTestHistoryKey(key)
+		var current *metrics.NetworkTestResult
+		if currentByKey != nil {
+			if test, ok := currentByKey[key]; ok {
+				current = &test
+				if strings.TrimSpace(test.Type) != "" {
+					kind = strings.ToLower(strings.TrimSpace(test.Type))
+				}
+				if strings.TrimSpace(test.Host) != "" {
+					host = strings.TrimSpace(test.Host)
+				}
+				if test.Port > 0 {
+					port = test.Port
+				}
+				if strings.TrimSpace(test.Name) != "" {
+					name = strings.TrimSpace(test.Name)
+				}
+			}
+		}
+		trends = append(trends, summarizeAINetworkTrend(kind, host, port, name, entry, current))
+	}
+	return trends
+}
+
+func summarizeAINetworkTrend(
+	kind string,
+	host string,
+	port int,
+	name string,
+	entry *TestHistoryEntry,
+	current *metrics.NetworkTestResult,
+) aiNetworkTrend {
+	normalizeHistoryEntry(entry)
+	windowStart := int64(0)
+	windowEnd := int64(0)
+	if len(entry.Times) > 0 {
+		windowStart = entry.Times[0]
+		windowEnd = entry.Times[len(entry.Times)-1]
+	}
+	latestCheckedAt := entry.LastAt
+	if latestCheckedAt <= 0 {
+		latestCheckedAt = windowEnd
+	}
+	latestLatency := latestNonNilFloat(entry.Latency)
+	latestLoss := latestNonNilFloat(entry.Loss)
+	if current != nil {
+		currentCheckedAt := current.CheckedAt
+		if currentCheckedAt <= 0 {
+			currentCheckedAt = latestCheckedAt
+		}
+		if currentCheckedAt >= latestCheckedAt {
+			latestCheckedAt = currentCheckedAt
+			latestLatency = normalizeFloatPointer(current.LatencyMs)
+			latestLoss = normalizeFloatValue(current.PacketLoss)
+		}
+	}
+	avgLatency := averageNonNilFloat(entry.Latency)
+	maxLatency := maxNonNilFloat(entry.Latency)
+	avgLoss := averageNonNilFloat(entry.Loss)
+
+	return aiNetworkTrend{
+		Name:            strings.TrimSpace(name),
+		Type:            strings.ToLower(strings.TrimSpace(kind)),
+		Host:            strings.TrimSpace(host),
+		Port:            port,
+		Samples:         len(entry.Times),
+		WindowStart:     windowStart,
+		WindowEnd:       windowEnd,
+		LatestCheckedAt: latestCheckedAt,
+		LatestLatencyMs: latestLatency,
+		LatestLoss:      latestLoss,
+		AvgLatencyMs:    avgLatency,
+		MaxLatencyMs:    maxLatency,
+		AvgLoss:         avgLoss,
+		MinIntervalSec:  entry.MinIntervalSec,
+		AvgIntervalSec:  entry.AvgIntervalSec,
+		StatusHint:      deriveAINetworkStatusHint(current, latestLatency, latestLoss, avgLatency),
+	}
+}
+
+func parseTestHistoryKey(key string) (kind string, host string, port int, name string) {
+	parts := strings.SplitN(key, "|", 4)
+	if len(parts) == 4 {
+		kind = strings.TrimSpace(parts[0])
+		host = strings.TrimSpace(parts[1])
+		if parsed, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && parsed > 0 {
+			port = parsed
+		}
+		name = strings.TrimSpace(parts[3])
+	}
+	if kind == "" {
+		kind = "icmp"
+	}
+	return kind, host, port, name
+}
+
+func latestNonNilFloat(values []*float64) *float64 {
+	for idx := len(values) - 1; idx >= 0; idx-- {
+		if value := normalizeFloatPointer(values[idx]); value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func averageNonNilFloat(values []*float64) *float64 {
+	total := 0.0
+	count := 0
+	for _, raw := range values {
+		value := normalizeFloatPointer(raw)
+		if value == nil {
+			continue
+		}
+		total += *value
+		count++
+	}
+	if count == 0 {
+		return nil
+	}
+	avg := total / float64(count)
+	return &avg
+}
+
+func maxNonNilFloat(values []*float64) *float64 {
+	var maxValue *float64
+	for _, raw := range values {
+		value := normalizeFloatPointer(raw)
+		if value == nil {
+			continue
+		}
+		if maxValue == nil || *value > *maxValue {
+			cloned := *value
+			maxValue = &cloned
+		}
+	}
+	return maxValue
+}
+
+func deriveAINetworkStatusHint(
+	current *metrics.NetworkTestResult,
+	latestLatency *float64,
+	latestLoss *float64,
+	avgLatency *float64,
+) string {
+	if current != nil {
+		if status := strings.ToLower(strings.TrimSpace(current.Status)); status != "" {
+			return status
+		}
+		if errText := strings.TrimSpace(current.Error); errText != "" {
+			return "error"
+		}
+	}
+	if latestLoss != nil {
+		if *latestLoss >= 99.9 {
+			return "unreachable"
+		}
+		if *latestLoss > 0 {
+			return "packet_loss"
+		}
+	}
+	if latestLatency == nil {
+		return "unknown"
+	}
+	if avgLatency != nil && *avgLatency > 0 && *latestLatency > *avgLatency*1.5 {
+		return "latency_spike"
+	}
+	return "healthy"
 }
 
 func resolveNodeDisplayNameForAI(node NodeView) string {

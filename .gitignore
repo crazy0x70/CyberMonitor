@@ -21,8 +21,24 @@
 go.work
 go.work.sum
 
+# Local binaries produced by `go build ./cmd/...`
+/agent
+/server
+/cyber-monitor
+
 # env file
 .env
 
 # macOS specific file to ignore
 .DS_Store
+
+# Local tooling and generated frontend workspace artifacts
+.serena/
+output/
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/.DS_Store
+
+# Generated admin assets
+internal/server/web/admin-app/*
+internal/server/web/admin-assets/*

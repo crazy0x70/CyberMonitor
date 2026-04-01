@@ -1,327 +1,89 @@
-# CyberMonitor
-
-CyberMonitor 是一款极简美观的服务器探针监控系统，采用 Go 驱动，支持多平台部署。
-
-## Docker 部署
-
-### 1. 创建数据目录
-```bash
-mkdir -p ./data
-```
-
-### 2. 运行 Server
-```bash
-docker run -d \
-  -p 25012:25012 \
-  -v "$(pwd)/data:/data" \
-  --name cyber-monitor-server \
-  --restart=always \
-  ghcr.io/crazy0x70/cyber-monitor-server:latest
-```
-
-查看初始化信息（管理后台路径、管理员账号、管理员密码、Agent Token）：
-```bash
-docker logs cyber-monitor-server
-```
-
-首次启动时，Server 会分别生成：
-
-- 管理后台路径
-- 管理员账号
-- 管理员密码
-- Agent Token
-
-说明：
-
-- 管理端 `JWT` 密钥与 `Agent Token` 已分离，不再复用同一个密钥。
-- 如果你没有显式设置 `CM_JWT_SECRET` 或 `CM_AGENT_TOKEN`，程序会自动生成并写入 `data` 目录中的持久化配置。
-- Agent 侧只需要使用 `Agent Token`，不需要知道管理端 `JWT` 密钥。
-
-### 3. 运行 Agent
-```bash
-docker run -d \
-  --name cyber-monitor-agent \
-  --restart=always \
-  --network host \
-  -e CM_SERVER_URL=http://<your_server_ip>:25012 \
-  -e CM_AGENT_TOKEN=<your_token> \
-  -v /:/host:ro \
-  -v /proc:/host/proc:ro \
-  -v /sys:/host/sys:ro \
-  -v /etc:/host/etc:ro \
-  ghcr.io/crazy0x70/cyber-monitor-agent:latest
-```
-
-### 4. 访问地址
-- 监控首页：`http://<server-host>:25012/`
-- 管理后台：`http://<server-host>:25012/<admin_path>`
-
-### 5. 数据目录权限
-
-镜像默认以非 `root` 用户运行，请确保挂载的 `./data` 目录对容器内用户可读写。
-
-如果 `data` 目录权限错误，Server 现在会直接拒绝启动，并在日志中提示对应文件路径与权限问题；不会再回退为默认配置并覆盖原有配置文件。
-
-### 6. 日志文件
-
-Server 会在 `data` 目录下写入两类日志：
-
-- `server.log`：服务启动、管理端操作、告警、错误等通用日志
-- `report.log`：Agent 上报相关日志，便于单独排查节点接入问题
-
-两类日志都会在达到大小上限后自动轮转，保留 `.1`、`.2`、`.3` 备份文件。
-
-## 前后端分离部署（Cloudflare Pages / 静态站点）
-
-默认情况下 CyberMonitor 以前后端一体化方式运行（展示页与管理后台都由 Server 提供）。
-
-如果你希望将**展示页**部署到 Cloudflare Pages 等静态站点，可使用“前后端分离模式”：
-
-### 1) 准备前端静态文件
-
-将以下目录/文件复制到你的静态站点根目录（例如 Cloudflare Pages 项目根目录）：
-
-- `internal/server/web/index.html`
-- `internal/server/web/assets/`（目录）
-- `config.json`（你需要新增，见下方示例）
-
-提示：以上 `web/` 目录内的文件仅用于复制到静态站点托管（例如 Cloudflare Pages）。
-默认一体化模式下 Server 也会通过 embed 提供这些页面；如果启用“硬隔离”（`CM_PUBLIC_LISTEN`），展示接口端口将不再提供页面，仅提供 API/WS。
-
-说明：分离模式下只部署展示页，不部署 `admin.html`，因此用户无法通过前端域名访问管理后台。
-
-### 2) 创建 config.json
-
-HTTP 示例：
-
-```json
-{
-  "socket": "ws://127.0.0.1:56789/ws",
-  "apiURL": "http://127.0.0.1:56789"
-}
-```
-
-HTTPS 示例（推荐）：
-
-```json
-{
-  "socket": "wss://127.0.0.1:56789/ws",
-  "apiURL": "https://127.0.0.1:56789"
-}
-```
-
-也可以直接参考项目内示例文件：`examples/config.example.json`。
-
-`config.json` 支持两种格式：
-
-1) 单组地址（推荐默认）：
-
-```json
-{
-  "socket": "wss://example.com:25013/ws",
-  "apiURL": "https://example.com:25013"
-}
-```
-
-2) 多组地址（多 CDN 入口）：
-
-```json
-{
-  "cloudflare": {
-    "socket": "wss://example.com:25013/ws",
-    "apiURL": "https://example.com:25013"
-  },
-  "edgeone": {
-    "socket": "wss://example.com:25013/ws",
-    "apiURL": "https://example.com:25013"
-  }
-}
-```
-
-前端会并行连接所有合法配置并合并节点数据，不会只选其中一组。
-
-字段说明：
-
-- `socket`：展示页使用的 WebSocket 地址（请包含 `/ws` 路径）
-- `apiURL`：展示页拉取快照的 API Base URL（不需要包含 `/api/...` 路径）
-
-### 3) 常见问题
-
-- 如果静态站点使用 `https://`，浏览器会阻止连接 `ws://`（混合内容），请使用 `wss://`。
-- 一体化部署时无需手动创建 `config.json`，Server 会自动提供默认的 `/config.json`。
-- 如果你是自托管静态站点，`config.json` 不存在时会自动回退到同域模式（使用当前页面域名连接后端）。
-
-## 深色模式
-
-右上角提供主题切换按钮，支持三种模式：
-
-- 默认：自动（跟随系统外观）
-- 手动：浅色 / 深色
-
-点击按钮会在浅色与深色间切换；默认不保存时为自动模式。设置会保存在浏览器本地存储中，前台与管理后台共用同一套主题设置。
-
-## 硬隔离（可选）：管理后台与展示接口端口分离
-
-默认情况下管理后台与展示页复用同一端口（例如 `:25012`）。
-
-如果你希望更进一步“硬隔离”，可以让管理后台与展示接口分别监听不同端口：
-
-- 管理后台端口：Admin API、管理后台页面
-- 展示接口端口：Agent 上报、Public API、Public WebSocket
-
-启用方式（Server）：
-
-- CLI：`--public-listen 25013`
-- 环境变量：`CM_PUBLIC_LISTEN=25013`
-
-启用后行为变化：
-
-- 展示接口端口只提供：`/api/v1/ingest`、`/api/v1/agent/config`、`/api/v1/public/snapshot`、`/api/v1/health`、`/ws`（仅 Public，无 token）
-- 展示接口端口不提供页面：`/`、`/dashboard`、`/assets/*` 都不可访问
-- 管理端口只提供：管理后台页面、Admin API、`/ws`（仅 Admin，必须带 token）
-
-这样可以把前端页面完全托管在 Cloudflare Pages / EdgeOne 等 CDN 静态服务上，后端仅暴露数据接口。
-
-![前后端分离部署架构图](images/architecture-separated.svg)
-
-Docker 部署示例（端口映射）：
-
-- 管理端口：`25012:25012`
-- 展示接口端口：`25013:25013`
-
-前端静态站点的 `config.json` 指向展示接口端口，例如：
-
-```json
-{
-  "socket": "wss://example.com:25013/ws",
-  "apiURL": "https://example.com:25013"
-}
-```
-
-当同一个静态站点经由多个 CDN 域名/入口时，也可写成多组配置（程序会并行连接并合并展示数据）：
-
-```json
-{
-  "cloudflare": {
-    "socket": "wss://example.com:25013/ws",
-    "apiURL": "https://example.com:25013"
-  },
-  "edgeone": {
-    "socket": "wss://example.com:25013/ws",
-    "apiURL": "https://example.com:25013"
-  }
-}
-```
-
-## Agent 容器网络测试权限
-
-如果你在 Agent 容器内执行 `ping` 看到类似错误：
-
-```
-ping: permission denied (are you root?)
-```
-
-请在容器运行时为 Agent 增加 `NET_RAW` 能力（docker-compose 示例见 `agent-example.yml`）。
-
-## Systemd 一键脚本
-
-适用于使用 systemd 的发行版（需 root），脚本会自动创建 `/opt/CyberMonitor/`。
-
-安装：
+<div align="center">
+  <h1>CyberMonitor</h1>
+  <p>极简、美观、轻量级的自托管服务器探针与监控系统</p>
+
+  <p>
+    <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+    <img src="https://img.shields.io/badge/Go-1.24-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
+  </p>
+</div>
+
+## ✨ 核心特性
+
+- **极简资源占用**：采用 Go 单文件二进制与 Docker 部署，无微服务包袱。
+- **全方位指标**：实时监控 CPU、内存、磁盘、网速，以及 TCP/ICMP 连通性。
+- **现代化 UI**：前台展示页与后台管理系统分离设计，支持深浅色无缝切换。
+- **灵活部署**：支持前后端一体化部署，也可将展示页完全静态化部署至 Cloudflare Pages 等 CDN 节点（硬隔离）。
+- **AI 智能运维**：集成 OpenAI / Gemini 等大模型 API，一键获取故障排查建议。
+- **多渠道告警**：内置 Telegram Bot 与飞书 Webhook，按节点精细化配置离线规则。
+- **平滑自更新**：主控端支持一键检测与更新，并可向探针（Agent）下发远程更新指令。
+
+## 🚀 快速上手
+
+### 1. 一键安装 (推荐)
+自动配置 systemd 服务（按提示可选择安装主控 Server 或探针 Agent）：
 ```bash
 bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/one-click.sh)" @ install
 ```
 
-卸载：
+### 2. Docker 部署主控
 ```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/one-click.sh)" @ remove
+mkdir -p ./data
+docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" --name cyber-monitor-server --restart=always ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
+*(部署后，通过 `docker logs cyber-monitor-server` 获取初始后台路径与 Agent Token)*
 
-## 二进制部署
-
-从 Releases 下载对应平台的 Server/Agent 二进制：
-https://github.com/crazy0x70/CyberMonitor/releases
-
-### Server 示例
+### 3. 安装探针 (Agent)
+**Linux / macOS**
 ```bash
-./cyber-monitor-server -listen 25012 --data-dir ./data
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token>
 ```
-
-重置管理员密码：
-```bash
-sudo /opt/CyberMonitor/cyber-monitor-server --reset-password
-```
-
-### Agent 示例
-```bash
-./cyber-monitor-agent --server-url http://<your_server_ip>:25012 --agent-token <your_token>
-```
-
-## 快速安装 Agent
-
-### Linux / macOS
-```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<your_server_ip>:25012 --agent-token <your_token>
-```
-
-### Windows
+**Windows**
 ```powershell
-powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile "$env:TEMP\\agent.ps1"; & "$env:TEMP\\agent.ps1" -ServerUrl "http://<your_server_ip>:25012" -AgentToken "<your_token>"'
+powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'"
 ```
 
-### Windows 卸载 Agent
-```powershell
-powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1 -OutFile "$env:TEMP\\agent-uninstall.ps1"; & "$env:TEMP\\agent-uninstall.ps1"'
+## 📖 灵活部署与架构拓扑
+
+CyberMonitor 采用 `Agent 采集 -> Server 聚合 -> HTTP + WebSocket 展示` 的标准架构，支持两种典型部署模式：
+
+### 1. 直接部署（一体化架构）
+默认 `:25012` 端口同时负责前台展示、后台管理与 Agent 上报，配置最简单，适合绝大多数自托管场景。
+
+![直接部署](images/architecture-direct.svg)
+
+### 2. 前后端分离部署（硬隔离架构）
+如果你希望将前台状态页完全公开，但不暴露管理后台，可以使用 `CM_PUBLIC_LISTEN` 环境变量（例如设为 `25013`）分离展示接口与管理端口。
+
+同时，你可以提取前端静态文件（位于 `internal/server/web/` 下），将其纯静态化托管至 Cloudflare Pages / Vercel 等 CDN 服务，隐藏真实后端 IP。
+
+![分离部署](images/architecture-separated.svg)
+
+**CDN 节点静态配置示例 (`config.json`)**
+部署到静态托管服务时，只需在静态文件根目录新建一个 `config.json` 指定后端接口：
+```json
+{
+  "socket": "wss://api.example.com:25013/ws",
+  "apiURL": "https://api.example.com:25013"
+}
 ```
 
-## 常用环境变量
+## 🔄 升级与数据保留
 
-### Server
-- `CM_LISTEN`：监听地址，默认 `25012`
-- `CM_PUBLIC_LISTEN`：展示页监听地址（可选，留空则与 CM_LISTEN 一致）
-- `CM_DATA_DIR`：数据目录，默认 `/data`
-- `CM_JWT_SECRET`：管理端 `JWT` 密钥；留空时首次启动自动生成
-- `CM_AGENT_TOKEN`：Agent 上报与拉取配置使用的共享令牌；留空时首次启动自动生成
+升级十分平滑：只要 **保持原有数据目录路径 (`./data`) 不变**，无论替换二进制程序还是拉取新 Docker 镜像，系统在启动时均会自动兼容并回填历史数据。*(建议跨大版本升级前先备份 data 目录)*
 
-### Agent
-- `CM_SERVER_URL`：Server 地址
-- `CM_AGENT_TOKEN`：与 Server 端 `Agent Token` 一致
-- `CM_NET_IFACE`：指定采集网卡（逗号分隔）
-- `CM_HOST_ROOT`：宿主机挂载根目录（容器部署时使用）
-- `CM_INTERVAL`：采样间隔
+## 💻 本地源码开发
 
-## 管理后台
+由于项目包含 React 管理界面，在编译 Go 后端之前需要先构建前端产物：
+```bash
+npm --prefix admin-ui ci
+./scripts/build-admin.sh
+go build ./cmd/server
+```
 
-- 服务器管理支持设置显示昵称、地域、硬盘/网速、分组标签、到期与续费信息
-- 离线告警在服务器管理内逐台配置，保存后下发到 Agent
-- 刷新按钮会提示刷新成功，便于确认加载状态
-- 基础设置支持配置导入／导出；导出文件不会包含 `Agent Token`，导入也不会覆盖当前 `Agent Token`
-- 「API提供商」用于配置 AI 运维能力，支持 OpenAI / Gemini / Volcengine 以及多个 OpenAI 兼容服务商
-- API 提供商卡片点击展开设置，可测试连接并获取可用模型列表
+---
 
-## AI 运维
-
-- 在「API提供商」配置 API Key、Base URL 与模型，可测试连接并获取可用模型
-- `/ai` 会基于当前服务器状态与分组标签生成运维回答
-- 通知告警中可指定 /ai 使用的提供商与 Prompt
-
-## 通知告警
-
-管理后台「通知告警」支持飞书 Webhook 与 Telegram Bot。
-
-### Telegram 配置
-- 需要同时填写 `Bot Token` 与 `Telegram 用户 ID`（多个用户用逗号分隔）
-- 配置完成后可通过 Telegram 获取告警与服务器信息
-- 离线告警开关请在「服务器管理」为每台服务器单独设置
-
-### Telegram 命令
-- `/cmall`：查看所有服务器统计
-- `/server`：查看服务器列表（在线/离线分组）
-- `/status <服务器ID>`：查看指定服务器状态
-- `/alarmson <服务器ID>`：开启该服务器告警
-- `/alarmsoff <服务器ID>`：关闭该服务器告警
-- `/ai <问题>`：AI 运维查询（例如：/ai 哪台服务器下载量最多）
-
-## 架构图
-
-![直接部署架构图](images/architecture-direct.svg)
+<div align="center">
+  如果 CyberMonitor 对你有帮助，欢迎点亮 ⭐️ <b>Star</b> 予以支持！
+</div>

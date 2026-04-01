@@ -19,6 +19,14 @@ type RemoteConfig struct {
 	Group           string                      `json:"group"`
 	Tests           []metrics.NetworkTestConfig `json:"tests"`
 	TestIntervalSec int                         `json:"test_interval_sec"`
+	Update          *RemoteUpdateInstruction    `json:"update,omitempty"`
+}
+
+type RemoteUpdateInstruction struct {
+	Version     string `json:"version"`
+	DownloadURL string `json:"download_url"`
+	ChecksumURL string `json:"checksum_url,omitempty"`
+	RequestedAt int64  `json:"requested_at,omitempty"`
 }
 
 type runtimeConfig struct {
@@ -27,6 +35,7 @@ type runtimeConfig struct {
 	group    string
 	tests    []metrics.NetworkTestConfig
 	interval time.Duration
+	update   *RemoteUpdateInstruction
 }
 
 func newRuntimeConfig(cfg Config) *runtimeConfig {
@@ -54,15 +63,24 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 	if remote.Tests != nil {
 		r.tests = remote.Tests
 	}
+	r.update = cloneRemoteUpdateInstruction(remote.Update)
 }
 
-func (r *runtimeConfig) Snapshot() (string, string, []metrics.NetworkTestConfig, time.Duration) {
+func (r *runtimeConfig) Snapshot() (string, string, []metrics.NetworkTestConfig, time.Duration, *RemoteUpdateInstruction) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	copyTests := make([]metrics.NetworkTestConfig, len(r.tests))
 	copy(copyTests, r.tests)
-	return r.alias, r.group, copyTests, r.interval
+	return r.alias, r.group, copyTests, r.interval, cloneRemoteUpdateInstruction(r.update)
+}
+
+func cloneRemoteUpdateInstruction(value *RemoteUpdateInstruction) *RemoteUpdateInstruction {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeID, token string) (RemoteConfig, error) {

@@ -16,5 +16,6 @@ services:
       # 可选：启用“硬隔离”模式后，展示页与管理后台分别监听不同端口。
       # 例如：CM_PUBLIC_LISTEN=25013
       - CM_PUBLIC_LISTEN=
+      - CM_DATA_DIR=/data
     volumes:
       - ./data:/data

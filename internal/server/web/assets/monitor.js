@@ -15,8 +15,17 @@ const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
+const urlParams = new URLSearchParams(window.location.search);
 
 const CONFIG_PATH = "/config.json";
+const VARIANT_CONSERVATIVE = "conservative";
+const VARIANT_BALANCED = "balanced";
+
+const activeVariant =
+  urlParams.get("variant") === VARIANT_CONSERVATIVE
+    ? VARIANT_CONSERVATIVE
+    : VARIANT_BALANCED;
+const demoEnabled = urlParams.get("demo") === "1" || urlParams.has("variant");
 
 const remoteConfig = {
   targets: [],
@@ -39,6 +48,12 @@ const state = {
   historyCacheTimer: null,
   historyCacheLoading: false,
   sourceSnapshots: new Map(),
+  renderFrame: 0,
+  variant: activeVariant,
+  demoEnabled,
+  lastTransportAt: 0,
+  lastTransportType: "snapshot",
+  realtimeStatus: new Map(),
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
@@ -47,6 +62,64 @@ const HISTORY_CACHE_MAX_POINTS = 5000;
 const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
 const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 const HISTORY_CACHE_SAVE_DELAY = 1500;
+
+function buildVariantURL(variant) {
+  const next = new URL(window.location.href);
+  next.searchParams.set("variant", variant);
+  next.searchParams.set("demo", "1");
+  return `${next.pathname}${next.search}${next.hash}`;
+}
+
+function appendVariantToSocketURL(value) {
+  const raw = (value || "").trim();
+  if (!raw) return raw;
+  try {
+    const parsed = new URL(raw);
+    parsed.searchParams.set("variant", state.variant);
+    return parsed.toString();
+  } catch (error) {
+    return raw;
+  }
+}
+
+function ensureVariantBanner() {
+  if (!state.demoEnabled) return;
+  if (document.querySelector(".demo-variant-banner")) return;
+  const topbar = document.querySelector(".topbar");
+  if (!topbar || !topbar.parentElement) return;
+
+  const banner = document.createElement("section");
+  banner.className = "demo-variant-banner";
+  banner.innerHTML = `
+    <div class="demo-variant-copy">
+      <span class="demo-variant-eyebrow">本地对比</span>
+      <strong>${state.variant === VARIANT_BALANCED ? "平衡方案" : "保守方案"}</strong>
+      <span class="demo-variant-desc">${
+        state.variant === VARIANT_BALANCED
+          ? "WS 增量推送 + 静默 full snapshot"
+          : "保留 full snapshot，前台做增量渲染"
+      }</span>
+      <span class="demo-variant-live" data-field="demo-variant-live">等待首帧数据…</span>
+    </div>
+    <div class="demo-variant-actions">
+      <a class="demo-variant-link${
+        state.variant === VARIANT_CONSERVATIVE ? " active" : ""
+      }" href="${buildVariantURL(VARIANT_CONSERVATIVE)}">保守版</a>
+      <a class="demo-variant-link${
+        state.variant === VARIANT_BALANCED ? " active" : ""
+      }" href="${buildVariantURL(VARIANT_BALANCED)}">平衡版</a>
+    </div>
+  `;
+  topbar.insertAdjacentElement("afterend", banner);
+}
+
+function scheduleRender() {
+  if (state.renderFrame) return;
+  state.renderFrame = window.requestAnimationFrame(() => {
+    state.renderFrame = 0;
+    render();
+  });
+}
 
 function resetToAllGroups() {
   if (state.selectedGroup === "全部") {
@@ -81,7 +154,7 @@ function connectWSForTarget(target) {
 
   let ws;
   try {
-    ws = new WebSocket(target.socketURL);
+    ws = new WebSocket(appendVariantToSocketURL(target.socketURL));
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
     dropSourceSnapshot(target.key);
@@ -104,6 +177,8 @@ function connectWSForTarget(target) {
       const payload = JSON.parse(event.data);
       if (payload.type === "snapshot") {
         handleSnapshot(payload, target.key);
+      } else if (payload.type === "node_delta") {
+        handleNodeDelta(payload, target.key);
       }
     } catch (error) {
       console.error(error);
@@ -301,7 +376,48 @@ function rebuildMergedSnapshotState() {
     const ts = latestSnapshot ? (latestSnapshot.generated_at || 0) : 0;
     lastUpdated.textContent = ts ? new Date(ts * 1000).toLocaleTimeString() : "--";
   }
-  render();
+  syncRealtimeStatus(mergedNodes);
+  scheduleRender();
+}
+
+function resolveNodeStatus(node) {
+  if (!node) return "offline";
+  const lastSeen = Number(node.last_seen || 0);
+  if (!lastSeen) {
+    return node.status === "offline" ? "offline" : "online";
+  }
+  return Math.floor(Date.now() / 1000) - lastSeen > 5 ? "offline" : "online";
+}
+
+function syncRealtimeStatus(nodes) {
+  const active = new Set();
+  (nodes || []).forEach((node) => {
+    const id = resolveNodeId(node, "").trim();
+    if (!id) return;
+    active.add(id);
+    state.realtimeStatus.set(id, resolveNodeStatus(node));
+  });
+  Array.from(state.realtimeStatus.keys()).forEach((id) => {
+    if (!active.has(id)) {
+      state.realtimeStatus.delete(id);
+    }
+  });
+}
+
+function refreshRealtimeStatus() {
+  let changed = false;
+  state.lastNodes.forEach((node) => {
+    const id = resolveNodeId(node, "").trim();
+    if (!id) return;
+    const next = resolveNodeStatus(node);
+    if (state.realtimeStatus.get(id) !== next) {
+      state.realtimeStatus.set(id, next);
+      changed = true;
+    }
+  });
+  if (changed) {
+    scheduleRender();
+  }
 }
 
 function dropSourceSnapshot(sourceKey) {
@@ -312,6 +428,28 @@ function dropSourceSnapshot(sourceKey) {
   rebuildMergedSnapshotState();
 }
 
+function updateTransportState(type, generatedAt) {
+  state.lastTransportType = type || "snapshot";
+  state.lastTransportAt = Number(generatedAt) || Math.floor(Date.now() / 1000);
+  const live = document.querySelector('[data-field="demo-variant-live"]');
+  if (!live) return;
+  const label = state.lastTransportType === "delta" ? "delta" : "snapshot";
+  live.textContent = `最近 ${label}：${formatTime(state.lastTransportAt)}`;
+}
+
+function upsertNodeInSnapshot(nodes, nextNode) {
+  const list = Array.isArray(nodes) ? nodes.slice() : [];
+  const nodeID = resolveNodeId(nextNode, "").trim();
+  if (!nodeID) return list;
+  const index = list.findIndex((item) => resolveNodeId(item, "").trim() === nodeID);
+  if (index === -1) {
+    list.push(nextNode);
+    return list;
+  }
+  list[index] = nextNode;
+  return list;
+}
+
 function handleSnapshot(payload, sourceKey = "default") {
   if (!payload || typeof payload !== "object") {
     return;
@@ -319,7 +457,30 @@ function handleSnapshot(payload, sourceKey = "default") {
 
   state.sourceSnapshots.set(sourceKey, payload);
   state.snapshotFailures.delete(sourceKey);
+  updateTransportState("snapshot", payload.generated_at);
   applyTestHistory(payload.test_history);
+  rebuildMergedSnapshotState();
+}
+
+function handleNodeDelta(payload, sourceKey = "default") {
+  if (!payload || typeof payload !== "object" || !payload.node) {
+    return;
+  }
+  const previous = state.sourceSnapshots.get(sourceKey) || {
+    type: "snapshot",
+    nodes: [],
+    groups: [],
+    settings: {},
+  };
+  const next = {
+    ...previous,
+    type: "snapshot",
+    generated_at: payload.generated_at || Math.floor(Date.now() / 1000),
+    nodes: upsertNodeInSnapshot(previous.nodes, payload.node),
+  };
+  state.sourceSnapshots.set(sourceKey, next);
+  state.snapshotFailures.delete(sourceKey);
+  updateTransportState("delta", payload.generated_at);
   rebuildMergedSnapshotState();
 }
 
@@ -852,10 +1013,10 @@ function filterNodesByGroup(nodes, group) {
 
 function filterNodesByStatus(nodes, status) {
   if (status === "online") {
-    return nodes.filter((node) => node.status !== "offline");
+    return nodes.filter((node) => resolveNodeStatus(node) !== "offline");
   }
   if (status === "offline") {
-    return nodes.filter((node) => node.status === "offline");
+    return nodes.filter((node) => resolveNodeStatus(node) === "offline");
   }
   return nodes;
 }
@@ -882,7 +1043,7 @@ function normalizeTagList(tags) {
 }
 
 function updateStats(nodes) {
-  const online = nodes.filter((node) => node.status !== "offline").length;
+  const online = nodes.filter((node) => resolveNodeStatus(node) !== "offline").length;
   const offline = nodes.length - online;
   const totalUpRate = nodes.reduce(
     (sum, node) => sum + (node.stats?.network?.tx_bytes_per_sec || 0),
@@ -1293,6 +1454,12 @@ function createCard() {
   };
 
   card._fields = fields;
+  card.addEventListener("toggle", () => {
+    if (!card.open || !card._lastNode || !card._nodeId) {
+      return;
+    }
+    renderCardDetails(card, card._lastNode, card._nodeId);
+  });
   return card;
 }
 
@@ -1312,8 +1479,8 @@ function updateCard(card, node, nodeId) {
 
   fields.meta.textContent = `${stats.os || "--"} · ${stats.arch || "--"}`;
 
-  const status = node.status === "offline" ? "离线" : "在线";
-  fields.statusDot.classList.toggle("offline", node.status === "offline");
+  const status = resolveNodeStatus(node) === "offline" ? "离线" : "在线";
+  fields.statusDot.classList.toggle("offline", status === "离线");
 
   const cpuPercent = clamp(cpu.usage_percent || 0);
   fields.cpuSummary.textContent = `${cpuPercent.toFixed(0)}%`;
@@ -1379,7 +1546,10 @@ function updateCard(card, node, nodeId) {
   fields.connValue.textContent = `${tcpCount} / ${udpCount}`;
   fields.connDetail.textContent = "TCP / UDP";
 
-  const history = updateMetricHistory(nodeId, stats, {
+  card._nodeId = nodeId;
+  card._lastNode = node;
+
+  updateMetricHistory(nodeId, stats, {
     cpu: cpuPercent,
     mem: mem.used || 0,
     disk: diskAgg.used || 0,
@@ -1389,29 +1559,6 @@ function updateCard(card, node, nodeId) {
     tcp: stats.tcp_conns || 0,
     udp: stats.udp_conns || 0,
   });
-  fields.cpuChart.innerHTML = renderSparklineMulti([history.cpu], ["#4f7cff"]);
-  fields.procChart.innerHTML = renderSparklineMulti([history.process], ["#f97316"]);
-  fields.memChart.innerHTML = renderSparklineMulti(
-    [history.mem],
-    ["#22c55e"],
-    mem.total || 0
-  );
-  fields.diskChart.innerHTML = renderSparklineMulti(
-    [history.disk],
-    ["#f97316"],
-    diskAgg.total || 0
-  );
-  fields.netChart.innerHTML = renderSparklineMulti(
-    [history.netUp, history.netDown],
-    ["#38bdf8", "#a855f7"]
-  );
-  fields.connChart.innerHTML = renderSparklineMulti(
-    [history.tcp, history.udp],
-    ["#60a5fa", "#a855f7"]
-  );
-
-  updateNetworkTests(fields, tests, nodeId);
-
   fields.uptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
   fields.lastSeen.textContent = `更新 ${formatTime(node.last_seen || 0)}`;
   fields.summaryUptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
@@ -1443,6 +1590,53 @@ function updateCard(card, node, nodeId) {
   fields.detailDownload.textContent = formatBytes(net.bytes_recv);
   fields.detailFirst.textContent = formatTimeFull(node.first_seen || 0);
   fields.detailLast.textContent = formatTimeFull(node.last_seen || 0);
+  updateTestHistory(nodeId, tests);
+
+  if (card.open) {
+    renderCardDetails(card, node, nodeId);
+  }
+}
+
+function renderCardDetails(card, node, nodeId) {
+  const fields = card._fields;
+  const stats = node.stats || {};
+  const cpu = stats.cpu || {};
+  const mem = stats.memory || {};
+  const diskAgg = aggregateDisk(stats.disk || []);
+  const net = stats.network || {};
+  const history = state.metricHistory.get(nodeId) || updateMetricHistory(nodeId, stats, {
+    cpu: clamp(cpu.usage_percent || 0),
+    mem: mem.used || 0,
+    disk: diskAgg.used || 0,
+    netUp: net.tx_bytes_per_sec || 0,
+    netDown: net.rx_bytes_per_sec || 0,
+    process: stats.process_count || 0,
+    tcp: stats.tcp_conns || 0,
+    udp: stats.udp_conns || 0,
+  });
+
+  fields.cpuChart.innerHTML = renderSparklineMulti([history.cpu], ["#4f7cff"]);
+  fields.procChart.innerHTML = renderSparklineMulti([history.process], ["#f97316"]);
+  fields.memChart.innerHTML = renderSparklineMulti(
+    [history.mem],
+    ["#22c55e"],
+    mem.total || 0
+  );
+  fields.diskChart.innerHTML = renderSparklineMulti(
+    [history.disk],
+    ["#f97316"],
+    diskAgg.total || 0
+  );
+  fields.netChart.innerHTML = renderSparklineMulti(
+    [history.netUp, history.netDown],
+    ["#38bdf8", "#a855f7"]
+  );
+  fields.connChart.innerHTML = renderSparklineMulti(
+    [history.tcp, history.udp],
+    ["#60a5fa", "#a855f7"]
+  );
+
+  updateNetworkTests(fields, stats.network_tests || [], nodeId);
 }
 
 function updateNetworkTests(fields, tests, nodeId) {
@@ -1884,7 +2078,7 @@ function renderSparklineMulti(seriesList, colors, maxValueOverride) {
 function buildLatencyChart(seriesList, colors, times, rangeSec) {
   const width = 680;
   const height = 220;
-  const padding = { top: 28, right: 20, bottom: 32, left: 44 };
+  const padding = { top: 28, right: 20, bottom: 18, left: 44 };
   const normalized = seriesList
     .map((series) => (Array.isArray(series) ? series : []))
     .filter((series) => series.length > 0);
@@ -1926,29 +2120,19 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
     );
   }
 
-  const timeLabels = buildTimeLabels(paddedTimes, maxLen, 12, rangeSec);
-  const xLabels = timeLabels
-    .map((tick) => {
-      const x = padding.left + tick.index * stepX;
-      return `<text x="${x.toFixed(
-        1
-      )}" y="${height - 8}" text-anchor="middle">${tick.label}</text>`;
-    })
-    .join("");
-
   const lines = paddedSeries
     .map((series, idx) => {
       const path = buildLinePath(series, stepX, padding, plotHeight, maxValue);
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
-      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.1" />`;
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
     })
     .join("");
 
   const svg = `
     <svg class="latency-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <g class="latency-grid">${gridLines.join("")}</g>
-      <g class="latency-axis">${yLabels.join("")}${xLabels}</g>
+      <g class="latency-axis">${yLabels.join("")}</g>
       <g class="latency-lines">${lines}</g>
     </svg>
   `;
@@ -2148,9 +2332,7 @@ function formatTimeFull(timestamp) {
 }
 
 function formatLatencyTick(value) {
-  if (value >= 100) return `${Math.round(value)}ms`;
-  if (value >= 10) return `${value.toFixed(0)}ms`;
-  return `${value.toFixed(1)}ms`;
+  return formatLatency(value);
 }
 
 function summarizeLatency(series) {
@@ -2178,10 +2360,7 @@ function summarizeLoss(series) {
 }
 
 function formatLatencyStat(value) {
-  if (value === null || value === undefined) {
-    return "--";
-  }
-  return `${value.toFixed(1)} ms`;
+  return formatLatency(value);
 }
 
 function formatLossValue(loss) {
@@ -2241,9 +2420,22 @@ function formatTestName(test) {
 
 function formatLatencyValue(test) {
   if (test.latency_ms !== null && test.latency_ms !== undefined) {
-    return `${test.latency_ms.toFixed(1)} ms`;
+    return formatLatency(test.latency_ms);
   }
   return "--";
+}
+
+function formatLatency(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "--";
+  }
+  const unit = "ms";
+  if (Math.abs(value) < Number.EPSILON) {
+    return `0${unit}`;
+  }
+  if (value >= 100) return `${Math.round(value)}${unit}`;
+  if (value >= 10) return `${value.toFixed(0)}${unit}`;
+  return `${value.toFixed(1)}${unit}`;
 }
 
 function testKey(test) {
@@ -2401,7 +2593,9 @@ function aggregateDisk(list) {
 }
 
 updateFooter("");
+ensureVariantBanner();
 loadTestHistoryCache();
+window.setInterval(refreshRealtimeStatus, 1000);
 
 loadRemoteConfig().finally(() => {
   fetchPublicSnapshot().finally(() => {

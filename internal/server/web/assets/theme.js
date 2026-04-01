@@ -1,4 +1,8 @@
 const THEME_STORAGE_KEY = "cm_theme_mode";
+const THEME_ICON_MOON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z"></path></svg>';
+const THEME_ICON_SUN =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>';
 
 function getSystemTheme() {
   return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -18,9 +22,10 @@ function updateThemeToggle(mode, resolvedTheme) {
   if (!icon || !btn) return;
 
   const isDark = resolvedTheme === "dark";
-  icon.textContent = isDark ? "🌙" : "🌞";
+  icon.innerHTML = isDark ? THEME_ICON_SUN : THEME_ICON_MOON;
   btn.setAttribute("data-theme-mode", mode);
-  btn.removeAttribute("title");
+  btn.setAttribute("aria-label", isDark ? "切换到浅色模式" : "切换到深色模式");
+  btn.setAttribute("title", isDark ? "切换到浅色模式" : "切换到深色模式");
 }
 
 function loadThemeMode() {

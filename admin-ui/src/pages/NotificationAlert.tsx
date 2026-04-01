@@ -1,0 +1,358 @@
+import { useEffect, useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { AlertTriangle, Bell, Clock3, Send, ShieldAlert } from "lucide-react";
+import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+import {
+  adminActionButtonClass,
+  adminDetailGroupClass,
+  adminDirtyBadgeClass,
+  adminInputClass,
+  adminOverviewCardClass,
+  adminPageActionsClass,
+  adminPageHeaderClass,
+  adminPageShellClass,
+  adminPageTitleClass,
+  adminPanelFooterClass,
+  adminPanelHeaderClass,
+  adminPrimaryButtonClass,
+  adminStatCardClass,
+  adminStatCardHeaderClass,
+  adminStatEyebrowClass,
+  adminStatIconChipClass,
+  adminStatIconChipClassByTone,
+  adminStatSurfaceClassByTone,
+  adminStatValueToneClassByTone,
+  adminSurfaceCardClass,
+} from "@/lib/admin-ui";
+import type { AlertTestPayload, NodeView, SettingsView } from "@/lib/admin-types";
+
+const panelCardClass = `flex h-full flex-col overflow-hidden ${adminSurfaceCardClass}`;
+
+const panelHeaderClass = adminPanelHeaderClass;
+
+const panelFooterClass = `justify-end ${adminPanelFooterClass}`;
+
+export interface NotificationAlertProps {
+  settings: SettingsView | null;
+  nodes: NodeView[];
+  saving?: boolean;
+  onSave: (payload: Record<string, unknown>) => Promise<void>;
+  onTest: (payload: AlertTestPayload) => Promise<void>;
+}
+
+function parseTelegramIds(raw: string) {
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,，\s]+/)
+        .map((item) => Number.parseInt(item.trim(), 10))
+        .filter((value) => Number.isFinite(value) && value > 0),
+    ),
+  );
+}
+
+export default function NotificationAlert({
+  settings,
+  nodes,
+  saving = false,
+  onSave,
+  onTest,
+}: NotificationAlertProps) {
+  const [webhook, setWebhook] = useState("");
+  const [telegramToken, setTelegramToken] = useState("");
+  const [telegramUserIds, setTelegramUserIds] = useState("");
+  const [offlineMinutes, setOfflineMinutes] = useState("5");
+  const [isDirty, setIsDirty] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [testingChannel, setTestingChannel] = useState<"telegram" | "feishu" | null>(null);
+
+  useEffect(() => {
+    const userIds = Array.isArray(settings?.alert_telegram_user_ids)
+      ? settings?.alert_telegram_user_ids
+      : typeof settings?.alert_telegram_user_id === "number" && settings.alert_telegram_user_id > 0
+        ? [settings.alert_telegram_user_id]
+        : [];
+
+    setWebhook(settings?.alert_webhook || "");
+    setTelegramToken(settings?.alert_telegram_token || "");
+    setTelegramUserIds(userIds.length > 0 ? userIds.join(",") : "");
+    setOfflineMinutes(
+      settings?.alert_offline_sec && settings.alert_offline_sec > 0
+        ? String(Math.round(settings.alert_offline_sec / 60))
+        : "5",
+    );
+    setIsDirty(false);
+  }, [settings]);
+
+  const counts = useMemo(() => {
+    const total = nodes.length;
+    const enabled = nodes.filter((node) => node.alert_enabled !== false).length;
+    const disabled = total - enabled;
+    return { total, enabled, disabled };
+  }, [nodes]);
+
+  const handleSave = async () => {
+    const ids = parseTelegramIds(telegramUserIds);
+    if ((telegramToken || telegramUserIds.trim()) && (!telegramToken || ids.length === 0)) {
+      toast.error("Telegram Bot Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
+      return;
+    }
+
+    const minutes = Number.parseInt(offlineMinutes, 10);
+    const normalizedMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 5;
+
+    setIsSaving(true);
+    try {
+      await onSave({
+        alert_webhook: webhook.trim(),
+        alert_telegram_token: telegramToken.trim(),
+        alert_telegram_user_ids: ids,
+        alert_offline_sec: normalizedMinutes * 60,
+      });
+      toast.success("告警配置已保存");
+      setIsDirty(false);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "保存告警配置失败");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleTest = async (channel: "telegram" | "feishu") => {
+    const ids = parseTelegramIds(telegramUserIds);
+    if (channel === "telegram" && (!telegramToken.trim() || ids.length === 0)) {
+      toast.error("Telegram Bot Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
+      return;
+    }
+    const payload: AlertTestPayload = {};
+    if (channel === "telegram") {
+      payload.telegram_token = telegramToken.trim();
+      payload.telegram_user_ids = ids;
+    }
+    if (channel === "feishu") {
+      payload.webhook = webhook.trim();
+    }
+
+    setTestingChannel(channel);
+    try {
+      await onTest(payload);
+      toast.success("测试消息已发送");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "测试发送失败");
+    } finally {
+      setTestingChannel(null);
+    }
+  };
+
+  const statCards = [
+    {
+      label: "节点总数",
+      value: counts.total,
+      tone: "neutral",
+      icon: Bell,
+    },
+    {
+      label: "已启用告警",
+      value: counts.enabled,
+      tone: "success",
+      icon: ShieldAlert,
+    },
+    {
+      label: "已关闭告警",
+      value: counts.disabled,
+      tone: "warning",
+      icon: AlertTriangle,
+    },
+    {
+      label: "离线阈值",
+      value: `${offlineMinutes || "5"} 分钟`,
+      tone: "info",
+      icon: Clock3,
+    },
+  ] as const;
+
+  return (
+    <div className={adminPageShellClass}>
+      <div className={adminPageHeaderClass}>
+        <div>
+          <h2 className={adminPageTitleClass}>通知告警</h2>
+        </div>
+        <div className={adminPageActionsClass}>
+          {isDirty && (
+            <span className={adminDirtyBadgeClass}>有未保存的修改</span>
+          )}
+          <Button
+            className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
+            onClick={handleSave}
+            disabled={!isDirty || isSaving || saving}
+          >
+            {isSaving || saving ? "保存中..." : "保存更改"}
+          </Button>
+        </div>
+      </div>
+
+      <div className="grid auto-rows-fr gap-4 md:grid-cols-2 xl:grid-cols-4">
+        {statCards.map((item) => {
+          const Icon = item.icon;
+          return (
+            <Card
+              key={item.label}
+              className={`${adminOverviewCardClass} ${adminStatCardClass} ${adminStatSurfaceClassByTone[item.tone]}`}
+            >
+              <CardHeader className={adminStatCardHeaderClass}>
+                <div>
+                  <CardDescription className={adminStatEyebrowClass}>
+                    {item.label}
+                  </CardDescription>
+                  <CardTitle className={`text-3xl font-black tracking-tighter ${adminStatValueToneClassByTone[item.tone]}`}>
+                    {item.value}
+                  </CardTitle>
+                </div>
+                <div className={`${adminStatIconChipClass} ${adminStatIconChipClassByTone[item.tone]}`}>
+                  <Icon className="h-5 w-5" />
+                </div>
+              </CardHeader>
+            </Card>
+          );
+        })}
+      </div>
+
+      <div className="grid gap-6">
+        <Card className={panelCardClass}>
+          <CardHeader className={panelHeaderClass}>
+            <CardTitle className="flex items-center gap-3 text-lg font-black tracking-tight">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500/10 text-amber-500">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              全局告警策略
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-6 pb-6">
+            <div className={adminDetailGroupClass}>
+              <div className="grid gap-2">
+                <Label htmlFor="offline-minutes" className="text-xs font-black uppercase tracking-widest text-slate-400">离线阈值（分钟）</Label>
+                <Input
+                  id="offline-minutes"
+                  type="number"
+                  min={1}
+                  className={adminInputClass}
+                  value={offlineMinutes}
+                  onChange={(event) => {
+                    setOfflineMinutes(event.target.value);
+                    setIsDirty(true);
+                  }}
+                />
+                <p className="text-[11px] font-medium text-slate-400 mt-1">当节点超过此时间未上报心跳时，将触发离线通知。</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className={panelCardClass}>
+          <CardHeader className={panelHeaderClass}>
+            <CardTitle className="flex items-center gap-3 text-lg font-black tracking-tight">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-500">
+                <Bell className="h-5 w-5" />
+              </div>
+              Telegram 告警
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-6 pb-6 space-y-4">
+            <div className={adminDetailGroupClass}>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="telegram-token" className="text-xs font-black uppercase tracking-widest text-slate-400">Bot Token</Label>
+                  <Input
+                    id="telegram-token"
+                    type="password"
+                    className={adminInputClass}
+                    value={telegramToken}
+                    onChange={(event) => {
+                      setTelegramToken(event.target.value);
+                      setIsDirty(true);
+                    }}
+                    placeholder="例如：123456789:ABC..."
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="telegram-user-ids" className="text-xs font-black uppercase tracking-widest text-slate-400">用户 ID</Label>
+                  <Input
+                    id="telegram-user-ids"
+                    className={adminInputClass}
+                    value={telegramUserIds}
+                    onChange={(event) => {
+                      setTelegramUserIds(event.target.value);
+                      setIsDirty(true);
+                    }}
+                    placeholder="多个 ID 用逗号分隔"
+                  />
+                </div>
+              </div>
+            </div>
+          </CardContent>
+          <CardFooter className={`${panelFooterClass} px-6 pb-6`}>
+            <Button
+              variant="outline"
+              className={cn(adminActionButtonClass, "h-11 shadow-none")}
+              onClick={() => handleTest("telegram")}
+              disabled={testingChannel !== null}
+            >
+              <Send className="mr-2 h-4 w-4" />
+              {testingChannel === "telegram" ? "正在发送..." : "测试推送"}
+            </Button>
+          </CardFooter>
+        </Card>
+
+        <Card className={panelCardClass}>
+          <CardHeader className={panelHeaderClass}>
+            <CardTitle className="flex items-center gap-3 text-lg font-black tracking-tight">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/10 text-sky-500">
+                <Bell className="h-5 w-5" />
+              </div>
+              飞书告警
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-6 pb-6">
+            <div className={adminDetailGroupClass}>
+              <div className="grid gap-2">
+                <Label htmlFor="feishu-webhook" className="text-xs font-black uppercase tracking-widest text-slate-400">Webhook 地址</Label>
+                <Input
+                  id="feishu-webhook"
+                  className={adminInputClass}
+                  value={webhook}
+                  onChange={(event) => {
+                    setWebhook(event.target.value);
+                    setIsDirty(true);
+                  }}
+                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                />
+              </div>
+            </div>
+          </CardContent>
+          <CardFooter className={`${panelFooterClass} px-6 pb-6`}>
+            <Button
+              variant="outline"
+              className={cn(adminActionButtonClass, "h-11 shadow-none")}
+              onClick={() => handleTest("feishu")}
+              disabled={testingChannel !== null}
+            >
+              <Send className="mr-2 h-4 w-4" />
+              {testingChannel === "feishu" ? "正在发送..." : "测试推送"}
+            </Button>
+          </CardFooter>
+        </Card>
+      </div>
+    </div>
+  );
+}

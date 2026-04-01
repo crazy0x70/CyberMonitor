@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	defaultDataDir         = "/data"
 	adminTokenLength       = 12
 	defaultSiteTitle       = "CyberMonitor"
 	defaultHomeTitle       = "CyberMonitor"
@@ -35,6 +34,8 @@ type Settings struct {
 	AdminUser            string            `json:"admin_user"`
 	AdminPass            string            `json:"admin_pass"`
 	AdminPassPlain       string            `json:"-"`
+	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
 	TokenSalt            string            `json:"token_salt,omitempty"`
 	AuthToken            string            `json:"auth_token,omitempty"`
 	AgentToken           string            `json:"agent_token,omitempty"`
@@ -62,6 +63,8 @@ type Settings struct {
 type SettingsView struct {
 	AdminPath            string            `json:"admin_path"`
 	AdminUser            string            `json:"admin_user"`
+	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
 	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
 	AgentToken           string            `json:"agent_token,omitempty"`
 	SiteTitle            string            `json:"site_title,omitempty"`
@@ -79,6 +82,7 @@ type SettingsView struct {
 	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
 	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
 	AISettings           AISettings        `json:"ai_settings,omitempty"`
+	Version              string            `json:"version,omitempty"`
 	Commit               string            `json:"commit,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
@@ -91,6 +95,9 @@ type SettingsUpdate struct {
 	AdminPath            *string            `json:"admin_path"`
 	AdminUser            *string            `json:"admin_user"`
 	AdminPass            *string            `json:"admin_pass"`
+	TurnstileSiteKey     *string            `json:"turnstile_site_key"`
+	TurnstileSecretKey   *string            `json:"turnstile_secret_key"`
+	AgentToken           *string            `json:"agent_token"`
 	AgentEndpoint        *string            `json:"agent_endpoint"`
 	SiteTitle            *string            `json:"site_title"`
 	SiteIcon             *string            `json:"site_icon"`
@@ -358,6 +365,7 @@ func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 		copyProfile.Groups = cloneStringSlice(profile.Groups)
 		copyProfile.Tests = cloneNetworkTestConfigs(profile.Tests)
 		copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
+		copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
 		if profile.AlertEnabled != nil {
 			value := *profile.AlertEnabled
 			copyProfile.AlertEnabled = &value
@@ -540,7 +548,7 @@ func normalizeAdminPath(path string) (string, error) {
 	if strings.Contains(trimmed, "..") {
 		return "", errors.New("admin path invalid")
 	}
-	for _, prefix := range []string{"/api", "/assets", "/ws"} {
+	for _, prefix := range []string{"/api", "/assets", "/admin-assets", "/ws"} {
 		if strings.HasPrefix(trimmed, prefix) {
 			return "", fmt.Errorf("admin path conflicts with %s", prefix)
 		}

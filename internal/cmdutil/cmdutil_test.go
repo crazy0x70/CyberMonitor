@@ -1,0 +1,72 @@
+package cmdutil
+
+import (
+	"os"
+	"reflect"
+	"testing"
+	"time"
+)
+
+func TestEnvOrDefault(t *testing.T) {
+	t.Setenv("CM_TEST_EMPTY", "   ")
+	t.Setenv("CM_TEST_VALUE", " value ")
+
+	if got := EnvOrDefault("CM_TEST_EMPTY", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback for empty env, got %q", got)
+	}
+	if got := EnvOrDefault("CM_TEST_VALUE", "fallback"); got != "value" {
+		t.Fatalf("expected trimmed value, got %q", got)
+	}
+}
+
+func TestEnvDuration(t *testing.T) {
+	t.Setenv("CM_TEST_DURATION", "15s")
+	t.Setenv("CM_TEST_BAD_DURATION", "abc")
+
+	if got := EnvDuration("CM_TEST_DURATION", time.Second); got != 15*time.Second {
+		t.Fatalf("expected 15s, got %s", got)
+	}
+	if got := EnvDuration("CM_TEST_BAD_DURATION", 3*time.Second); got != 3*time.Second {
+		t.Fatalf("expected fallback duration, got %s", got)
+	}
+}
+
+func TestParseCommaList(t *testing.T) {
+	got := ParseCommaList(" eth0, ,en0, lo0 ")
+	want := []string{"eth0", "en0", "lo0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestNormalizeListen(t *testing.T) {
+	cases := map[string]string{
+		"":            "",
+		" 8080 ":      ":8080",
+		":25012":      ":25012",
+		"127.0.0.1:9": "127.0.0.1:9",
+	}
+	for input, want := range cases {
+		if got := NormalizeListen(input); got != want {
+			t.Fatalf("normalize %q: want %q, got %q", input, want, got)
+		}
+	}
+}
+
+func TestDefaultHostnameFallback(t *testing.T) {
+	if os.Getenv("CM_CMDUTIL_SKIP_HOSTNAME") != "" {
+		t.Skip("skipped in forced environment")
+	}
+	got := DefaultHostname()
+	if got == "" {
+		t.Fatal("expected non-empty hostname")
+	}
+}
+
+func TestDefaultDataDir(t *testing.T) {
+	t.Parallel()
+
+	if got := DefaultDataDir(); got != "./data" {
+		t.Fatalf("expected default data dir ./data, got %q", got)
+	}
+}

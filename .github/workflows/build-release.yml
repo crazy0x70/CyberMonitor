@@ -12,9 +12,6 @@ on:
         default: ''
         type: string
 
-env:
-  GO_VERSION: '1.22'
-
 permissions:
   contents: write
   packages: write
@@ -31,6 +28,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       build_time: ${{ steps.version.outputs.build_time }}
+      image_repo: ${{ steps.version.outputs.image_repo }}
     steps:
       - name: 计算版本号
         id: version
@@ -46,13 +44,43 @@ jobs:
             VERSION="${TAG#v}"
           fi
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          REPO_OWNER="$(printf '%s' "${GITHUB_REPOSITORY%/*}" | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME_KEBAB="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | sed -E 's/([[:lower:][:digit:]])([[:upper:]])/\1-\2/g; s/[[:space:]_]+/-/g' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPO="${REPO_OWNER}/${REPO_NAME_KEBAB}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+          echo "image_repo=$IMAGE_REPO" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
-  build:
-    needs: version
+  verify-go:
+    needs: [version, build-admin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download admin assets
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-web-sync
+          path: .
+
+      - name: Restore admin assets
+        run: |
+          mkdir -p internal/server/web
+          tar -xzf admin-web-sync.tar.gz -C internal/server/web
+
+      - name: Run Go tests
+        run: go test ./...
+
+  build-server:
+    needs: [version, verify-go, build-admin]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -98,6 +126,55 @@ jobs:
             os: freebsd
             arch: arm64
             output: cyber-monitor-server-freebsd-arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download admin assets
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-web-sync
+          path: .
+
+      - name: Restore admin assets
+        run: |
+          mkdir -p internal/server/web
+          tar -xzf admin-web-sync.tar.gz -C internal/server/web
+
+      - name: Build ${{ matrix.output }}
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM=${{ matrix.goarm }}
+          fi
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o dist/${{ matrix.output }} \
+            ${{ matrix.cmd_path }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          retention-days: 30
+
+  build-agent:
+    needs: [version, verify-go]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
           - name: agent
             cmd_path: ./cmd/agent
             os: linux
@@ -172,12 +249,57 @@ jobs:
           path: dist/${{ matrix.output }}
           retention-days: 30
 
-  build-web:
+  build-admin:
     needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Verify admin build inputs
+        run: ./scripts/verify-admin-build-inputs.sh --require-tracked
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Build admin assets
+        run: |
+          npm --prefix admin-ui ci
+          npm --prefix admin-ui run lint
+          ./scripts/build-admin.sh
+
+      - name: Package synced admin assets
+        run: |
+          tar -czf admin-web-sync.tar.gz -C internal/server/web admin-app admin-assets
+
+      - name: Upload synced admin assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-web-sync
+          path: admin-web-sync.tar.gz
+          retention-days: 30
+
+  build-web:
+    needs: [version, build-admin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download admin assets
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-web-sync
+          path: .
+
+      - name: Restore admin assets
+        run: |
+          mkdir -p internal/server/web
+          tar -xzf admin-web-sync.tar.gz -C internal/server/web
 
       - name: 打包前端资源
         run: |
@@ -198,22 +320,63 @@ jobs:
           path: web-dist.zip
           retention-days: 30
 
-  docker:
-    needs: version
+  docker-server:
+    needs: [version, verify-go, build-admin]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     env:
-      IMAGE_PREFIX: ghcr.io/crazy0x70/cyber-monitor
+      IMAGE_PREFIX: ghcr.io/${{ needs.version.outputs.image_repo }}
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        include:
-          - name: server
-            target: server
-          - name: agent
-            target: agent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify admin build inputs
+        run: ./scripts/verify-admin-build-inputs.sh --require-tracked
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          target: release-server
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-server:${{ needs.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}-server:latest
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ needs.version.outputs.build_time }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+  docker-agent:
+    needs: [version, verify-go]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      IMAGE_PREFIX: ghcr.io/${{ needs.version.outputs.image_repo }}
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
@@ -238,20 +401,20 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          target: release-agent
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}:${{ needs.version.outputs.version }}
-            ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}:latest
+            ${{ env.IMAGE_PREFIX }}-agent:${{ needs.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}-agent:latest
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
             COMMIT=${{ github.sha }}
             BUILD_TIME=${{ needs.version.outputs.build_time }}
-            TARGET=${{ matrix.target }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-from: type=gha,scope=agent
+          cache-to: type=gha,mode=max,scope=agent
 
   release:
-    needs: [version, build, build-web]
+    needs: [version, build-server, build-agent, build-web]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
 
@@ -280,6 +443,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
       - name: Prepare release files
         run: |
