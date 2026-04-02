@@ -1,0 +1,432 @@
+package updater
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+)
+
+const (
+	dockerSocketEnvKey             = "CM_DOCKER_SOCKET"
+	containerIDEnvKey              = "CM_CONTAINER_ID"
+	dockerHelperCommand            = "docker-recreate-helper"
+	dockerHelperTargetContainerEnv = "CM_DOCKER_HELPER_TARGET_CONTAINER"
+	dockerHelperTargetImageEnv     = "CM_DOCKER_HELPER_TARGET_IMAGE"
+	dockerHelperSocketSourceEnv    = "CM_DOCKER_HELPER_SOCKET_SOURCE"
+	dockerHelperSocketTargetEnv    = "CM_DOCKER_HELPER_SOCKET_TARGET"
+	dockerDefaultSocketPath        = "/var/run/docker.sock"
+	dockerHelperMountTarget        = "/var/run/docker.sock"
+	dockerManagedMode              = "docker-managed"
+)
+
+type DockerManagedUpdater struct {
+	socketPath       string
+	socketSource     string
+	containerID      string
+	containerName    string
+	currentImage     string
+	helperImage      string
+	helperEntrypoint []string
+	cli              *client.Client
+}
+
+func (u *DockerManagedUpdater) CurrentImage() string {
+	if u == nil {
+		return ""
+	}
+	return strings.TrimSpace(u.currentImage)
+}
+
+func DetectUpdateMode() string {
+	if DetectDeployMode() == DeployModeDocker {
+		if CanDockerManagedUpdate() {
+			return dockerManagedMode
+		}
+		return string(DeployModeDocker)
+	}
+	if runtime.GOOS == "windows" {
+		return "windows"
+	}
+	return string(DeployModeBinary)
+}
+
+func CanDockerManagedUpdate() bool {
+	if DetectDeployMode() != DeployModeDocker {
+		return false
+	}
+	socketPath := resolveDockerSocketPath()
+	if socketPath == "" {
+		return false
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		return false
+	}
+	if _, err := resolveCurrentContainerID(); err != nil {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func CanCurrentDeployUpdate() bool {
+	return CanSelfUpdate() || CanDockerManagedUpdate()
+}
+
+func ResolveDockerTargetImage(currentImage, targetVersion string) string {
+	currentImage = strings.TrimSpace(currentImage)
+	targetVersion = strings.TrimSpace(targetVersion)
+	if currentImage == "" {
+		return ""
+	}
+	repo := currentImage
+	if at := strings.Index(repo, "@"); at >= 0 {
+		repo = repo[:at]
+	}
+	lastSlash := strings.LastIndex(repo, "/")
+	lastColon := strings.LastIndex(repo, ":")
+	if lastColon > lastSlash {
+		repo = repo[:lastColon]
+	}
+	if targetVersion == "" {
+		return repo
+	}
+	return repo + ":" + strings.TrimPrefix(targetVersion, "v")
+}
+
+func resolveDockerSocketPath() string {
+	if value := strings.TrimSpace(os.Getenv(dockerSocketEnvKey)); value != "" {
+		return value
+	}
+	return dockerDefaultSocketPath
+}
+
+func resolveCurrentContainerID() (string, error) {
+	if value := strings.TrimSpace(os.Getenv(containerIDEnvKey)); value != "" {
+		return value, nil
+	}
+	if value := strings.TrimSpace(os.Getenv("HOSTNAME")); value != "" {
+		return value, nil
+	}
+	return "", fmt.Errorf("无法解析当前容器 ID")
+}
+
+func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
+	if DetectDeployMode() != DeployModeDocker {
+		return nil, fmt.Errorf("当前部署模式不是 Docker")
+	}
+	if !CanDockerManagedUpdate() {
+		return nil, fmt.Errorf("Docker 一键更新需要挂载可访问的 docker.sock")
+	}
+	containerID, err := resolveCurrentContainerID()
+	if err != nil {
+		return nil, err
+	}
+	socketPath := resolveDockerSocketPath()
+	cli, err := newDockerClient(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	inspectResult, err := cli.ContainerInspect(context.Background(), containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("读取当前容器信息失败: %w", err)
+	}
+	inspect := inspectResult.Container
+	if inspect.Config == nil {
+		return nil, fmt.Errorf("当前容器缺少 Config 信息")
+	}
+	if inspect.HostConfig == nil {
+		return nil, fmt.Errorf("当前容器缺少 HostConfig 信息")
+	}
+	socketSource := resolveDockerSocketSource(inspect.Mounts, dockerHelperMountTarget)
+	if socketSource == "" {
+		return nil, fmt.Errorf("当前容器未挂载 docker.sock")
+	}
+	helperEntrypoint := append([]string{}, inspect.Config.Entrypoint...)
+	if len(helperEntrypoint) == 0 {
+		helperEntrypoint = []string{"/app/cyber-monitor"}
+	}
+	return &DockerManagedUpdater{
+		socketPath:       socketPath,
+		socketSource:     socketSource,
+		containerID:      inspect.ID,
+		containerName:    strings.TrimPrefix(inspect.Name, "/"),
+		currentImage:     strings.TrimSpace(inspect.Config.Image),
+		helperImage:      strings.TrimSpace(inspect.Config.Image),
+		helperEntrypoint: helperEntrypoint,
+		cli:              cli,
+	}, nil
+}
+
+func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, targetImage string) error {
+	if u == nil {
+		return fmt.Errorf("docker updater 未初始化")
+	}
+	targetImage = strings.TrimSpace(targetImage)
+	if targetImage == "" {
+		return fmt.Errorf("缺少目标镜像")
+	}
+	helperName := fmt.Sprintf("cm-update-helper-%s-%d", sanitizeContainerName(u.containerName), time.Now().Unix())
+	config := &container.Config{
+		Image:      u.helperImage,
+		Entrypoint: append([]string{}, u.helperEntrypoint...),
+		Cmd:        []string{dockerHelperCommand},
+		User:       "0",
+		Env: []string{
+			fmt.Sprintf("%s=%s", dockerHelperTargetContainerEnv, u.containerID),
+			fmt.Sprintf("%s=%s", dockerHelperTargetImageEnv, targetImage),
+			fmt.Sprintf("%s=%s", dockerHelperSocketSourceEnv, u.socketSource),
+			fmt.Sprintf("%s=%s", dockerHelperSocketTargetEnv, dockerHelperMountTarget),
+		},
+	}
+	hostConfig := &container.HostConfig{
+		AutoRemove:  true,
+		NetworkMode: "none",
+		Binds: []string{
+			fmt.Sprintf("%s:%s", u.socketSource, dockerHelperMountTarget),
+		},
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+	}
+	resp, err := u.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     config,
+		HostConfig: hostConfig,
+		Name:       helperName,
+	})
+	if err != nil {
+		return fmt.Errorf("创建 Docker 更新 helper 失败: %w", err)
+	}
+	if _, err := u.cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("启动 Docker 更新 helper 失败: %w", err)
+	}
+	return nil
+}
+
+func RunDockerRecreateHelper(ctx context.Context) error {
+	targetContainerID := strings.TrimSpace(os.Getenv(dockerHelperTargetContainerEnv))
+	targetImage := strings.TrimSpace(os.Getenv(dockerHelperTargetImageEnv))
+	socketPath := strings.TrimSpace(os.Getenv(dockerHelperSocketTargetEnv))
+	if socketPath == "" {
+		socketPath = dockerHelperMountTarget
+	}
+	if targetContainerID == "" {
+		return fmt.Errorf("缺少 helper 目标容器 ID")
+	}
+	if targetImage == "" {
+		return fmt.Errorf("缺少 helper 目标镜像")
+	}
+	cli, err := newDockerClient(socketPath)
+	if err != nil {
+		return err
+	}
+	inspectResult, err := cli.ContainerInspect(ctx, targetContainerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("读取目标容器信息失败: %w", err)
+	}
+	inspect := inspectResult.Container
+	if inspect.Config == nil {
+		return fmt.Errorf("目标容器缺少 Config 信息")
+	}
+	if inspect.HostConfig == nil {
+		return fmt.Errorf("目标容器缺少 HostConfig 信息")
+	}
+	if err := pullDockerImage(ctx, cli, targetImage); err != nil {
+		return err
+	}
+	tempName := fmt.Sprintf("%s-next-%d", sanitizeContainerName(strings.TrimPrefix(inspect.Name, "/")), time.Now().Unix())
+	cfg, hostCfg, netCfg, extraNetworks := buildReplacementSpec(inspect, targetImage)
+	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           cfg,
+		HostConfig:       hostCfg,
+		NetworkingConfig: netCfg,
+		Name:             tempName,
+	})
+	if err != nil {
+		return fmt.Errorf("创建替换容器失败: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_, _ = cli.ContainerRemove(context.Background(), created.ID, client.ContainerRemoveOptions{Force: true})
+		}
+	}()
+	for networkName, endpoint := range extraNetworks {
+		if _, connectErr := cli.NetworkConnect(ctx, networkName, client.NetworkConnectOptions{
+			Container:      created.ID,
+			EndpointConfig: endpoint,
+		}); connectErr != nil {
+			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
+			return err
+		}
+	}
+	timeout := 20
+	_, _ = cli.ContainerStop(ctx, inspect.ID, client.ContainerStopOptions{Timeout: &timeout})
+	if _, removeErr := cli.ContainerRemove(ctx, inspect.ID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
+		return fmt.Errorf("移除旧容器失败: %w", removeErr)
+	}
+	originalName := strings.TrimPrefix(inspect.Name, "/")
+	if _, renameErr := cli.ContainerRename(ctx, created.ID, client.ContainerRenameOptions{NewName: originalName}); renameErr != nil {
+		return fmt.Errorf("恢复容器名称失败: %w", renameErr)
+	}
+	if _, startErr := cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); startErr != nil {
+		return fmt.Errorf("启动新容器失败: %w", startErr)
+	}
+	return nil
+}
+
+func buildReplacementSpec(inspect container.InspectResponse, targetImage string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
+	hostname := strings.TrimSpace(inspect.Config.Hostname)
+	shortID := strings.TrimSpace(inspect.ID)
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	if hostname == shortID {
+		hostname = ""
+	}
+	cfg := &container.Config{
+		Hostname:     hostname,
+		Image:        targetImage,
+		Env:          append([]string{}, inspect.Config.Env...),
+		Cmd:          append([]string{}, inspect.Config.Cmd...),
+		Entrypoint:   append([]string{}, inspect.Config.Entrypoint...),
+		WorkingDir:   inspect.Config.WorkingDir,
+		User:         inspect.Config.User,
+		Labels:       cloneStringMap(inspect.Config.Labels),
+		ExposedPorts: clonePortSet(inspect.Config.ExposedPorts),
+		Volumes:      cloneVolumeMap(inspect.Config.Volumes),
+		Tty:          inspect.Config.Tty,
+		OpenStdin:    inspect.Config.OpenStdin,
+		StdinOnce:    inspect.Config.StdinOnce,
+		AttachStdin:  inspect.Config.AttachStdin,
+		AttachStdout: inspect.Config.AttachStdout,
+		AttachStderr: inspect.Config.AttachStderr,
+	}
+	hostCfg := *inspect.HostConfig
+	hostCfg.RestartPolicy = inspect.HostConfig.RestartPolicy
+	hostCfg.AutoRemove = false
+	hostCfg.Mounts = append([]mount.Mount{}, inspect.HostConfig.Mounts...)
+	netCfg := &network.NetworkingConfig{}
+	extraNetworks := make(map[string]*network.EndpointSettings)
+	mode := strings.TrimSpace(string(inspect.HostConfig.NetworkMode))
+	if inspect.NetworkSettings != nil {
+		for networkName, endpoint := range inspect.NetworkSettings.Networks {
+			copied := cloneEndpointSettings(endpoint)
+			if mode == networkName {
+				netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+					networkName: copied,
+				}
+				continue
+			}
+			if mode == "" && len(inspect.NetworkSettings.Networks) == 1 {
+				netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+					networkName: copied,
+				}
+				continue
+			}
+			extraNetworks[networkName] = copied
+		}
+	}
+	return cfg, &hostCfg, netCfg, extraNetworks
+}
+
+func newDockerClient(socketPath string) (*client.Client, error) {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" {
+		socketPath = dockerDefaultSocketPath
+	}
+	host := "unix://" + socketPath
+	return client.NewClientWithOpts(client.WithHost(host), client.WithAPIVersionNegotiation())
+}
+
+func pullDockerImage(ctx context.Context, cli *client.Client, targetImage string) error {
+	reader, err := cli.ImagePull(ctx, targetImage, client.ImagePullOptions{})
+	if err != nil {
+		return fmt.Errorf("拉取目标镜像失败: %w", err)
+	}
+	defer reader.Close()
+	_, _ = io.Copy(io.Discard, reader)
+	return nil
+}
+
+func resolveDockerSocketSource(mounts []container.MountPoint, target string) string {
+	target = strings.TrimSpace(target)
+	for _, item := range mounts {
+		if strings.TrimSpace(item.Destination) == target {
+			return strings.TrimSpace(item.Source)
+		}
+	}
+	if target == dockerHelperMountTarget {
+		return dockerDefaultSocketPath
+	}
+	return ""
+}
+
+func sanitizeContainerName(value string) string {
+	value = strings.TrimSpace(strings.TrimPrefix(value, "/"))
+	if value == "" {
+		return "cyber-monitor"
+	}
+	replacer := strings.NewReplacer("/", "-", ":", "-", "@", "-", ".", "-", "_", "-")
+	return replacer.Replace(value)
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(input))
+	for key, value := range input {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func clonePortSet(input network.PortSet) network.PortSet {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make(network.PortSet, len(input))
+	for key, value := range input {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneVolumeMap(input map[string]struct{}) map[string]struct{} {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make(map[string]struct{}, len(input))
+	for key, value := range input {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneEndpointSettings(input *network.EndpointSettings) *network.EndpointSettings {
+	if input == nil {
+		return nil
+	}
+	cloned := *input
+	if len(input.Aliases) > 0 {
+		cloned.Aliases = append([]string{}, input.Aliases...)
+	}
+	if input.DriverOpts != nil {
+		cloned.DriverOpts = cloneStringMap(input.DriverOpts)
+	}
+	if input.Links != nil {
+		cloned.Links = append([]string{}, input.Links...)
+	}
+	return &cloned
+}

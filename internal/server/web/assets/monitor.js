@@ -2560,8 +2560,7 @@ function formatLatency(value) {
   if (Math.abs(value) < Number.EPSILON) {
     return `0${unit}`;
   }
-  if (value >= 100) return `${Math.round(value)}${unit}`;
-  if (value >= 10) return `${value.toFixed(0)}${unit}`;
+  if (value >= 1) return `${Math.round(value)}${unit}`;
   return `${value.toFixed(1)}${unit}`;
 }
 

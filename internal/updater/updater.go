@@ -111,7 +111,10 @@ func DetectDeployMode() DeployMode {
 
 func DefaultUnsupportedUpdateMessage() string {
 	if DetectDeployMode() == DeployModeDocker {
-		return "Docker 部署请拉取最新镜像并重建容器完成更新"
+		if CanDockerManagedUpdate() {
+			return ""
+		}
+		return "Docker 部署请挂载 /var/run/docker.sock 以启用后台一键更新；否则请拉取最新镜像并重建容器"
 	}
 	return ""
 }

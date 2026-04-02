@@ -13,6 +13,7 @@ import (
 
 	"cyber_monitor/internal/agent"
 	"cyber_monitor/internal/cmdutil"
+	"cyber_monitor/internal/updater"
 )
 
 var (
@@ -30,6 +31,13 @@ func resolvedCommit() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "docker-recreate-helper" {
+		if err := updater.RunDockerRecreateHelper(context.Background()); err != nil {
+			log.Fatalf("Docker helper 执行失败: %v", err)
+		}
+		return
+	}
+
 	showVersion := flag.Bool("version", false, "输出版本信息")
 	serverURL := flag.String("server-url", cmdutil.EnvOrDefault("CM_SERVER_URL", ""), "管理端地址")
 	interval := flag.Duration("interval", cmdutil.EnvDuration("CM_INTERVAL", time.Second), "采样间隔")

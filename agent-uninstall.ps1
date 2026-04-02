@@ -1,3 +1,4 @@
+# Keep this script ASCII-only so Windows PowerShell 5.1 can parse the raw GitHub download reliably.
 param()
 
 $ErrorActionPreference = "Stop"

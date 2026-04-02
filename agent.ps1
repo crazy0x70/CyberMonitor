@@ -1,3 +1,4 @@
+# Keep this script ASCII-only so Windows PowerShell 5.1 can parse the raw GitHub download reliably.
 param(
   [Parameter(Mandatory = $true)]
   [string]$ServerUrl,
@@ -22,8 +23,7 @@ function Assert-Admin {
 function Ensure-Tls12 {
   if ($PSVersionTable.PSVersion.Major -lt 7) {
     try {
-      [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol `
-        -bor [Net.SecurityProtocolType]::Tls12
+      [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     } catch {
     }
   }
@@ -127,10 +127,11 @@ function Register-Agent {
     [string]$BootstrapToken,
     [string]$CurrentNodeId
   )
-  $uri = ($RegisterServerUrl.TrimEnd('/')) + "/api/v1/agent/register?node_id=$([Uri]::EscapeDataString($CurrentNodeId))"
+  $registerNodeId = [Uri]::EscapeDataString($CurrentNodeId)
+  $uri = "{0}/api/v1/agent/register?node_id={1}" -f $RegisterServerUrl.TrimEnd('/'), $registerNodeId
   $response = Invoke-RestMethod -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
   if (-not $response -or -not $response.agent_token) {
-    Write-Host "Agent 注册成功但未返回专属凭据。"
+    Write-Host "Agent registration succeeded but the server did not return a dedicated token."
     exit 1
   }
   return [string]$response.agent_token

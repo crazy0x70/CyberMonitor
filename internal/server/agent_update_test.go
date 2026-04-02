@@ -118,9 +118,19 @@ func TestResolveAgentUpdateSupportedRejectsDisabledOrDockerNodes(t *testing.T) {
 	if resolveAgentUpdateSupported(metrics.NodeStats{
 		OS:                  "Linux",
 		DeployMode:          "docker",
+		DockerManagedUpdate: false,
 		AgentUpdateDisabled: false,
 	}) {
 		t.Fatal("expected docker deploy mode to disable agent self update")
+	}
+
+	if !resolveAgentUpdateSupported(metrics.NodeStats{
+		OS:                  "Linux",
+		DeployMode:          "docker",
+		DockerManagedUpdate: true,
+		AgentUpdateDisabled: false,
+	}) {
+		t.Fatal("expected docker managed agent node to allow background update")
 	}
 
 	if resolveAgentUpdateSupported(metrics.NodeStats{
@@ -129,5 +139,18 @@ func TestResolveAgentUpdateSupportedRejectsDisabledOrDockerNodes(t *testing.T) {
 		AgentUpdateDisabled: true,
 	}) {
 		t.Fatal("expected disable-update agent to reject remote update")
+	}
+}
+
+func TestResolveAgentUpdateModeReturnsDockerManagedWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	mode := resolveAgentUpdateMode(metrics.NodeStats{
+		OS:                  "Linux",
+		DeployMode:          "docker",
+		DockerManagedUpdate: true,
+	})
+	if mode != "docker-managed" {
+		t.Fatalf("expected docker-managed mode, got %q", mode)
 	}
 }

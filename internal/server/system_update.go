@@ -81,7 +81,11 @@ func (m *systemUpdateManager) Start(info updater.ReleaseInfo, apply func() error
 	m.updating = true
 	m.lastInfo = info
 	m.lastStartedAt = time.Now()
-	m.message = "正在下载并替换服务端二进制"
+	if updater.CanDockerManagedUpdate() {
+		m.message = "正在拉取新镜像并准备重建服务端容器"
+	} else {
+		m.message = "正在下载并替换服务端二进制"
+	}
 	m.mu.Unlock()
 
 	go func() {
@@ -95,7 +99,11 @@ func (m *systemUpdateManager) Start(info updater.ReleaseInfo, apply func() error
 			return
 		}
 		m.updating = false
-		m.message = "更新包已写入，服务正在重启"
+		if updater.CanDockerManagedUpdate() {
+			m.message = "Docker 更新任务已启动，服务端容器即将重建"
+		} else {
+			m.message = "更新包已写入，服务正在重启"
+		}
 	}()
 
 	return nil
@@ -111,8 +119,8 @@ func (m *systemUpdateManager) snapshotLocked() SystemUpdateView {
 		LatestVersion:  strings.TrimSpace(m.lastInfo.LatestVersion),
 		Available:      m.lastInfo.HasUpdate,
 		Updating:       m.updating,
-		Supported:      updater.CanSelfUpdate(),
-		Mode:           string(updater.DetectDeployMode()),
+		Supported:      updater.CanCurrentDeployUpdate(),
+		Mode:           updater.DetectUpdateMode(),
 		Message:        systemUpdateMessage(strings.TrimSpace(m.message)),
 		HTMLURL:        strings.TrimSpace(m.lastInfo.HTMLURL),
 		PublishedAt:    strings.TrimSpace(m.lastInfo.PublishedAt),

@@ -86,6 +86,7 @@ type NodeStats struct {
 	OS                  string              `json:"os"`
 	Arch                string              `json:"arch"`
 	DeployMode          string              `json:"deploy_mode,omitempty"`
+	DockerManagedUpdate bool                `json:"docker_managed_update,omitempty"`
 	AgentVersion        string              `json:"agent_version,omitempty"`
 	AgentUpdateDisabled bool                `json:"agent_update_disabled,omitempty"`
 	UptimeSec           uint64              `json:"uptime_sec"`

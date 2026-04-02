@@ -53,6 +53,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	runtimeCfg := newRuntimeConfig(cfg)
 	testCache := make(map[string]cachedTest)
+	dockerManagedUpdate := updater.CanDockerManagedUpdate()
 	agentToken := strings.TrimSpace(cfg.AgentToken)
 	if cfg.TokenFile != "" {
 		if persisted, err := loadPersistedAgentToken(cfg.TokenFile); err == nil && persisted != "" {
@@ -113,6 +114,7 @@ func Run(ctx context.Context, cfg Config) error {
 			sample.AgentVersion = cfg.AgentVersion
 		}
 		sample.DeployMode = string(updater.DetectDeployMode())
+		sample.DockerManagedUpdate = dockerManagedUpdate
 		sample.AgentUpdateDisabled = cfg.DisableUpdate
 		alias, group, tests, interval, _ := runtimeCfg.Snapshot()
 		if alias != "" {
@@ -191,6 +193,27 @@ func maybeApplyRemoteUpdate(
 	}
 	if cfg.DisableUpdate {
 		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+	}
+	if updater.CanDockerManagedUpdate() {
+		dockerUpdater, err := updater.NewDockerManagedUpdater()
+		if err != nil {
+			return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+		}
+		if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+			return err
+		}
+		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
+		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage); err != nil {
+			reportErr := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+			if reportErr != nil {
+				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
+			}
+			return err
+		}
+		if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
+		}
+		return nil
 	}
 	if !updater.CanSelfUpdate() {
 		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())

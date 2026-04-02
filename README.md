@@ -32,6 +32,33 @@ docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" --name 
 ```
 *(部署后，通过 `docker logs cyber-monitor-server` 获取初始后台路径与 Agent Token)*
 
+如果你希望 **管理后台支持一键更新 Docker 版服务端**，请额外挂载：
+
+```bash
+-v /var/run/docker.sock:/var/run/docker.sock
+```
+
+完整示例：
+
+```bash
+mkdir -p ./data
+docker run -d \
+  -p 25012:25012 \
+  -e CM_DATA_DIR=/data \
+  -v "$(pwd)/data:/data" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --name cyber-monitor-server \
+  --restart=always \
+  ghcr.io/crazy0x70/cyber-monitor-server:latest
+```
+
+启用后，后台的“立即更新”会改为调用宿主机 Docker API 执行：
+- 拉取目标镜像
+- 保留原容器的环境变量、卷挂载、网络和重启策略
+- 重建容器并拉起新版本
+
+注意：挂载 `docker.sock` 等于把宿主机 Docker 控制权授予容器，请仅在可信环境启用。
+
 ### 3. Docker 部署探针 (Agent)
 ```bash
 docker run -d \
@@ -48,6 +75,36 @@ docker run -d \
   -v /etc:/host/etc:ro \
   ghcr.io/crazy0x70/cyber-monitor-agent:latest
 ```
+
+如果你希望 **管理后台支持一键更新 Docker 版 Agent**，则每个 Agent 容器也需要额外挂载：
+
+```bash
+-v /var/run/docker.sock:/var/run/docker.sock
+```
+
+完整示例：
+
+```bash
+docker run -d \
+  --name cyber-monitor-agent \
+  --network host \
+  --restart always \
+  --cap-add NET_RAW \
+  -e CM_SERVER_URL="http://<主控IP>:25012" \
+  -e CM_AGENT_TOKEN="<你的Token>" \
+  -e CM_NODE_ID="my-node-id" \
+  -v /:/host:ro \
+  -v /proc:/host/proc:ro \
+  -v /sys:/host/sys:ro \
+  -v /etc:/host/etc:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/crazy0x70/cyber-monitor-agent:latest
+```
+
+这样服务端下发“立即更新”后，Agent 会在本机调用 Docker API：
+- 拉取对应版本的新镜像
+- 复用当前容器配置创建替换容器
+- 停掉旧容器并启动新容器
 
 建议 Docker 部署时始终显式指定 `CM_NODE_ID`。这样容器重建、迁移宿主机或回滚镜像后，服务端仍会把它识别为原来的同一台节点，而不是新增一台随机节点。
 
@@ -118,7 +175,12 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 CM_DISABLE_UPDATE=1 ./cyber-monitor-agent --server-url http://<主控IP>:25012 --agent-token <你的Token>
 ```
 
-注意：Docker 部署的 Agent 同样不适合容器内自更新。正确方式是拉取新镜像并重建容器；如果你还希望该容器明确拒绝服务端更新任务，可同时追加 `--disable-update` 或设置 `CM_DISABLE_UPDATE=1`。
+注意：
+
+- **未挂载 `docker.sock` 的 Docker Agent** 仍然不会执行后台一键更新，后台会提示你手动拉取新镜像并重建容器。
+- **挂载了 `docker.sock` 的 Docker Agent** 才能执行后台一键更新。
+- 如果你还希望该容器明确拒绝服务端更新任务，可同时追加 `--disable-update` 或设置 `CM_DISABLE_UPDATE=1`。
+- 如果你当前运行的是不包含这套 Docker 编排更新能力的旧版本镜像，那么首次切换到本版本前，仍需要先手动升级一次；升级到这一版之后，后续才能在后台直接点击更新。
 
 ## 🔄 服务端升级后，旧版 Agent 如何处理
 

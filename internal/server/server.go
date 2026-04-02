@@ -829,7 +829,7 @@ func Run(ctx context.Context, cfg Config) error {
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, systemUpdater.View(r.Context(), false))
 		case http.MethodPost:
-			if !updater.CanSelfUpdate() {
+			if !updater.CanCurrentDeployUpdate() {
 				message := updater.DefaultUnsupportedUpdateMessage()
 				if strings.TrimSpace(message) == "" {
 					message = "当前平台暂不支持服务端自更新"
@@ -854,6 +854,14 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			}
 			err = systemUpdater.Start(releaseInfo, func() error {
+				if updater.CanDockerManagedUpdate() {
+					dockerUpdater, err := updater.NewDockerManagedUpdater()
+					if err != nil {
+						return err
+					}
+					targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
+					return dockerUpdater.LaunchSelfContainerUpdate(context.Background(), targetImage)
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 				defer cancel()
 				if err := systemUpdater.client.ApplyAsset(ctx, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
@@ -2172,6 +2180,9 @@ func cloneAgentUpdateInstruction(value *AgentUpdateInstruction) *AgentUpdateInst
 func resolveAgentUpdateMode(stats metrics.NodeStats) string {
 	deployMode := strings.ToLower(strings.TrimSpace(stats.DeployMode))
 	if deployMode == string(updater.DeployModeDocker) {
+		if stats.DockerManagedUpdate {
+			return "docker-managed"
+		}
 		return string(updater.DeployModeDocker)
 	}
 	osLabel := strings.ToLower(strings.TrimSpace(stats.OS))
@@ -2195,8 +2206,10 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	switch resolveAgentUpdateMode(stats) {
 	case "windows":
 		return "当前节点平台暂不支持后台自更新"
+	case "docker-managed":
+		return ""
 	case string(updater.DeployModeDocker):
-		return "Docker 部署的 Agent 请拉取新镜像并重建容器完成更新"
+		return "Docker 部署的 Agent 需要挂载 /var/run/docker.sock 才能启用后台一键更新"
 	default:
 		return ""
 	}

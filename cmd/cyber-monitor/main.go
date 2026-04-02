@@ -15,6 +15,7 @@ import (
 	"cyber_monitor/internal/agent"
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/server"
+	"cyber_monitor/internal/updater"
 )
 
 var (
@@ -25,6 +26,13 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "docker-recreate-helper" {
+		if err := updater.RunDockerRecreateHelper(context.Background()); err != nil {
+			log.Fatalf("Docker helper 执行失败: %v", err)
+		}
+		return
+	}
+
 	showVersion := flag.Bool("version", false, "输出版本信息")
 	resetPassword := flag.Bool("reset-password", false, "重置管理员密码")
 	mode := flag.String("mode", cmdutil.EnvOrDefault("CM_MODE", DefaultMode), "server 或 agent")

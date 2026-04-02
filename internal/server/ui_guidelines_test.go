@@ -367,6 +367,8 @@ func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 	}
 
 	disallowedSnippets := []string{
+		".node-card {\n  background: var(--glass);\n  border: 1px solid var(--glass-border);\n  border-radius: 20px;\n  overflow: hidden;\n  backdrop-filter: blur(18px);\n  box-shadow: var(--shadow);\n  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;\n  content-visibility: auto;",
+		".tag-section {\n  display: grid;\n  gap: 16px;\n  content-visibility: auto;",
 		".tag-list .node-card {\n  box-shadow: none;",
 		".tag-list .node-card:hover {\n  transform: none;\n  box-shadow: none;",
 		".tag-list .node-card[open] {\n  box-shadow: none;",
@@ -375,6 +377,31 @@ func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 	for _, snippet := range disallowedSnippets {
 		if strings.Contains(content, snippet) {
 			t.Fatalf("tagged node cards should share the default surface styling: found %q", snippet)
+		}
+	}
+}
+
+func TestLatencyAxisUsesCompactWholeMillisecondLabels(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	disallowedSnippets := []string{
+		"if (value >= 10) return `${value.toFixed(0)}${unit}`;",
+	}
+	requiredSnippets := []string{
+		"function formatLatencyTick(value) {",
+		"if (value >= 1) return `${Math.round(value)}${unit}`;",
+		"return `${value.toFixed(1)}${unit}`;",
+	}
+
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("latency labels should avoid decimal millisecond formatting: found %q", snippet)
+		}
+	}
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency formatting regression: missing %q", snippet)
 		}
 	}
 }
@@ -470,8 +497,17 @@ func TestWindowsAgentScriptBuildsServiceArgsWithoutInlineEscapes(t *testing.T) {
 	t.Parallel()
 
 	content := readRepoFileForUITest(t, "agent.ps1")
-	if strings.Contains(content, `$args = "--server-url `+"`"+`"$ServerUrl`) {
-		t.Fatal("agent.ps1 should not build service arguments using fragile inline quote escapes")
+	disallowedSnippets := []string{
+		`$args = "--server-url ` + "`" + `"$ServerUrl`,
+		`$([Uri]::EscapeDataString($CurrentNodeId))`,
+		"Agent 注册成功但未返回专属凭据。",
+		"::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol `",
+	}
+
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("agent.ps1 should avoid fragile PowerShell parsing pattern %q", snippet)
+		}
 	}
 
 	requiredSnippets := []string{
@@ -480,11 +516,36 @@ func TestWindowsAgentScriptBuildsServiceArgsWithoutInlineEscapes(t *testing.T) {
 		`('"{0}"' -f $NodeId)`,
 		`('"{0}"' -f $nodeToken)`,
 		`$serviceBinPath = ('"{0}" {1}' -f $binary, ($serviceArgs -join ' '))`,
+		`$registerNodeId = [Uri]::EscapeDataString($CurrentNodeId)`,
+		`$uri = "{0}/api/v1/agent/register?node_id={1}" -f $RegisterServerUrl.TrimEnd('/'), $registerNodeId`,
+		`Write-Host "Agent registration succeeded but the server did not return a dedicated token."`,
 	}
 
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("agent.ps1 Windows service argument regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestWindowsPowerShellScriptsStayASCIIOnly(t *testing.T) {
+	t.Parallel()
+
+	files := []string{
+		"agent.ps1",
+		"agent-uninstall.ps1",
+	}
+
+	for _, relativePath := range files {
+		content := readRepoFileForUITest(t, relativePath)
+		for i := 0; i < len(content); i++ {
+			b := content[i]
+			if b == '\n' || b == '\r' || b == '\t' {
+				continue
+			}
+			if b < 0x20 || b > 0x7e {
+				t.Fatalf("%s should stay ASCII-only for Windows PowerShell 5.1 compatibility; found byte 0x%02x at offset %d", relativePath, b, i)
+			}
 		}
 	}
 }

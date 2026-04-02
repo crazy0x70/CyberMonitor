@@ -12,6 +12,7 @@ import (
 
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/server"
+	"cyber_monitor/internal/updater"
 )
 
 var (
@@ -29,6 +30,13 @@ func resolvedCommit() string {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "docker-recreate-helper" {
+		if err := updater.RunDockerRecreateHelper(context.Background()); err != nil {
+			log.Fatalf("Docker helper 执行失败: %v", err)
+		}
+		return
+	}
+
 	showVersion := flag.Bool("version", false, "输出版本信息")
 	resetPassword := flag.Bool("reset-password", false, "重置管理员密码")
 	listen := flag.String("listen", cmdutil.EnvOrDefault("CM_LISTEN", ":25012"), "管理端监听地址")
