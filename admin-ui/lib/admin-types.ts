@@ -3,7 +3,6 @@ export interface ApiErrorPayload {
 }
 
 export interface LoginResponse {
-  token: string;
   expires_at: number;
 }
 
@@ -207,6 +206,10 @@ export interface PublicSettings {
   home_subtitle?: string;
   version?: string;
   commit?: string;
+}
+
+export interface AdminBootPayload {
+  settings?: PublicSettings | null;
 }
 
 export interface SystemUpdateInfo {

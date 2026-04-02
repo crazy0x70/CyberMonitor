@@ -11,6 +11,8 @@ services:
     environment:
       CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
       CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"
+      # 可选：设置为 "1" 后，拒绝服务端下发的远程更新任务。
+      CM_DISABLE_UPDATE: "0"
     volumes:
       - /:/host:ro
       - /proc:/host/proc:ro

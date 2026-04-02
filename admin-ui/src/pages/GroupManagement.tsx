@@ -82,6 +82,7 @@ import type { GroupNode, NodeView } from "@/lib/admin-types";
 export interface GroupManagementProps {
   groupTree: GroupNode[];
   nodes: NodeView[];
+  onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
   onSave: (groupTree: GroupNode[]) => Promise<void>;
 }
@@ -94,6 +95,10 @@ type GroupSelection = {
 type ValidationIssue = {
   key: string;
   message: string;
+  target?: {
+    groupIndex: number;
+    tagIndex?: number;
+  };
 };
 
 const statCardLabelClass = adminStatEyebrowClass;
@@ -257,16 +262,19 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
       issues.push({
         key: `group-name-${groupIndex}`,
         message: `${groupLabel} 名称不能为空。`,
+        target: { groupIndex },
       });
     } else if (groupName === "全部") {
       issues.push({
         key: `group-all-${groupIndex}`,
         message: "一级分组名称不能使用“全部”。",
+        target: { groupIndex },
       });
     } else if (seenGroups.has(groupName)) {
       issues.push({
         key: `group-duplicate-${groupIndex}`,
         message: `一级分组“${groupName}”重复，请保留唯一名称。`,
+        target: { groupIndex },
       });
     } else {
       seenGroups.add(groupName);
@@ -280,6 +288,7 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
         issues.push({
           key: `tag-name-${groupIndex}-${tagIndex}`,
           message: `${groupLabel} 下第 ${tagIndex + 1} 个标签名称不能为空。`,
+          target: { groupIndex, tagIndex },
         });
         return;
       }
@@ -288,6 +297,7 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
         issues.push({
           key: `tag-all-${groupIndex}-${tagIndex}`,
           message: `${groupLabel} 下的标签不能使用“全部”。`,
+          target: { groupIndex, tagIndex },
         });
         return;
       }
@@ -296,6 +306,7 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
         issues.push({
           key: `tag-duplicate-${groupIndex}-${tagIndex}`,
           message: `${groupLabel} 下标签“${tagName}”重复，请保留唯一名称。`,
+          target: { groupIndex, tagIndex },
         });
         return;
       }
@@ -310,6 +321,7 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
 export default function GroupManagement({
   groupTree,
   nodes,
+  onDirtyChange,
   saving = false,
   onSave,
 }: GroupManagementProps) {
@@ -332,7 +344,36 @@ export default function GroupManagement({
   const draftSignature = useMemo(() => serializeEditableTree(draftTree), [draftTree]);
   const isDirty = incomingSignature !== draftSignature;
 
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
+
   const validationIssues = useMemo(() => buildValidationIssues(draftTree), [draftTree]);
+  const validationLookup = useMemo(() => {
+    const groupErrors: Record<string, string> = {};
+    const tagErrors: Record<string, string> = {};
+    validationIssues.forEach((issue) => {
+      if (!issue.target) {
+        return;
+      }
+      if (typeof issue.target.tagIndex === "number") {
+        tagErrors[`${issue.target.groupIndex}-${issue.target.tagIndex}`] = issue.message;
+        return;
+      }
+      groupErrors[String(issue.target.groupIndex)] = issue.message;
+    });
+    return { groupErrors, tagErrors };
+  }, [validationIssues]);
+  const generalValidationMessage = useMemo(
+    () => validationIssues.find((issue) => !issue.target)?.message || "",
+    [validationIssues],
+  );
 
   const usageStats = useMemo(() => {
     const groupCount = new Map<string, number>();
@@ -494,13 +535,22 @@ export default function GroupManagement({
 
   const handleSave = async () => {
     if (validationIssues.length > 0) {
-      toast.error(validationIssues[0].message);
+      const firstIssue = validationIssues[0];
+      if (firstIssue.target) {
+        const targetID =
+          typeof firstIssue.target.tagIndex === "number"
+            ? `group-tag-name-${firstIssue.target.groupIndex}-${firstIssue.target.tagIndex}`
+            : `group-name-${firstIssue.target.groupIndex}`;
+        const element = document.getElementById(targetID);
+        if (element instanceof HTMLElement) {
+          element.focus();
+        }
+      }
       return;
     }
 
     const nextTree = normalizeGroupTree(draftTree);
     if (nextTree.length === 0) {
-      toast.error("至少需要保留一个一级分组。");
       return;
     }
 
@@ -520,7 +570,7 @@ export default function GroupManagement({
     <div className={adminPageShellClass}>
       <section className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>分组管理</h2>
+          <h1 className={adminPageTitleClass}>分组管理</h1>
         </div>
         <div className={adminPageActionsClass}>
           {isDirty ? (
@@ -538,9 +588,9 @@ export default function GroupManagement({
           <Button
             className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
             onClick={handleSave}
-            disabled={!isDirty || isSaving || saving || validationIssues.length > 0}
+            disabled={!isDirty || isSaving || saving}
           >
-            {isSaving || saving ? "保存中..." : "保存更改"}
+            {isSaving || saving ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </section>
@@ -583,6 +633,14 @@ export default function GroupManagement({
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-5 p-5">
+          {generalValidationMessage ? (
+            <div
+              className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
+              aria-live="polite"
+            >
+              {generalValidationMessage}
+            </div>
+          ) : null}
           {draftTree.length === 0 ? (
             <div className={adminEmptyStateClass}>
               <p className="text-sm font-medium text-slate-700 dark:text-slate-200">还没有一级分组</p>
@@ -610,6 +668,7 @@ export default function GroupManagement({
                   groupCardClass={groupCardClass}
                   groupCardHeaderClass={groupCardHeaderClass}
                   isBusy={isSaving || saving}
+                  validationLookup={validationLookup}
                   onAddTag={addTag}
                   onRemoveGroup={removeGroup}
                   onRemoveTag={removeTag}
@@ -633,6 +692,7 @@ function SortableGroupCard({
   groupCardClass,
   groupCardHeaderClass,
   isBusy,
+  validationLookup,
   onAddTag,
   onRemoveGroup,
   onRemoveTag,
@@ -647,6 +707,10 @@ function SortableGroupCard({
   groupCardClass: string;
   groupCardHeaderClass: string;
   isBusy: boolean;
+  validationLookup: {
+    groupErrors: Record<string, string>;
+    tagErrors: Record<string, string>;
+  };
   onAddTag: (groupIndex: number) => void;
   onRemoveGroup: (groupIndex: number) => void;
   onRemoveTag: (groupIndex: number, tagIndex: number) => void;
@@ -687,11 +751,29 @@ function SortableGroupCard({
             <div className="flex-1 space-y-2">
               <p className={statCardLabelClass}>一级分组名称</p>
               <Input
+                id={`group-name-${groupIndex}`}
+                name={`group-name-${groupIndex}`}
+                autoComplete="off"
                 value={group.name}
-                placeholder="例如：美国、香港、日本"
+                placeholder="例如：美国、香港、日本…"
                 className={adminWideInputClass}
+                aria-invalid={Boolean(validationLookup.groupErrors[String(groupIndex)])}
+                aria-describedby={
+                  validationLookup.groupErrors[String(groupIndex)]
+                    ? `group-name-${groupIndex}-error`
+                    : undefined
+                }
                 onChange={(event) => onUpdateGroupName(groupIndex, event.target.value)}
               />
+              {validationLookup.groupErrors[String(groupIndex)] ? (
+                <p
+                  id={`group-name-${groupIndex}-error`}
+                  className="text-xs font-medium text-rose-500"
+                  aria-live="polite"
+                >
+                  {validationLookup.groupErrors[String(groupIndex)]}
+                </p>
+              ) : null}
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                 <Badge variant="secondary" className={adminNeutralBadgeClass}>
                   {groupUsageCount} 个节点
@@ -780,11 +862,29 @@ function SortableGroupCard({
                     </div>
 
                     <Input
+                      id={`group-tag-name-${groupIndex}-${tagIndex}`}
+                      name={`group-tag-name-${groupIndex}-${tagIndex}`}
+                      autoComplete="off"
                       value={tag.name}
-                      placeholder="例如：CN2、BGP、GIA"
+                      placeholder="例如：CN2、BGP、GIA…"
                       className="h-10 w-full rounded-xl border-slate-300 bg-white text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                      aria-invalid={Boolean(validationLookup.tagErrors[`${groupIndex}-${tagIndex}`])}
+                      aria-describedby={
+                        validationLookup.tagErrors[`${groupIndex}-${tagIndex}`]
+                          ? `group-tag-name-${groupIndex}-${tagIndex}-error`
+                          : undefined
+                      }
                       onChange={(event) => onUpdateTagName(groupIndex, tagIndex, event.target.value)}
                     />
+                    {validationLookup.tagErrors[`${groupIndex}-${tagIndex}`] ? (
+                      <p
+                        id={`group-tag-name-${groupIndex}-${tagIndex}-error`}
+                        className="text-xs font-medium text-rose-500"
+                        aria-live="polite"
+                      >
+                        {validationLookup.tagErrors[`${groupIndex}-${tagIndex}`]}
+                      </p>
+                    ) : null}
                   </div>
 
                   <Button

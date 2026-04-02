@@ -62,8 +62,13 @@ WORKDIR /app
 RUN addgroup -S cm && adduser -S -G cm cm && chown -R cm:cm /app
 
 FROM runtime-base AS release-server
+ARG VERSION=dev
+ARG COMMIT=none
 RUN mkdir -p /data && chown -R cm:cm /data
-ENV CM_DATA_DIR=/data
+ENV CM_DATA_DIR=/data \
+    CM_DEPLOY_MODE=docker \
+    CM_VERSION=${VERSION} \
+    CM_COMMIT=${COMMIT}
 COPY --from=build-server /out/cyber-monitor /app/cyber-monitor
 EXPOSE 25012
 EXPOSE 25013
@@ -73,6 +78,8 @@ USER cm
 ENTRYPOINT ["/app/cyber-monitor"]
 
 FROM runtime-base AS release-agent
+ARG VERSION=dev
+ARG COMMIT=none
 COPY --from=build-agent /out/cyber-monitor /app/cyber-monitor
 RUN apk add --no-cache iputils libcap-utils && \
     setcap cap_net_raw+ep /bin/ping && \
@@ -80,5 +87,8 @@ RUN apk add --no-cache iputils libcap-utils && \
     if [ -n "$ping6_path" ] && [ ! -L "$ping6_path" ] && [ "$ping6_path" != "/bin/ping" ]; then \
       setcap cap_net_raw+ep "$ping6_path"; \
     fi
+ENV CM_DEPLOY_MODE=docker \
+    CM_VERSION=${VERSION} \
+    CM_COMMIT=${COMMIT}
 USER cm
 ENTRYPOINT ["/app/cyber-monitor"]

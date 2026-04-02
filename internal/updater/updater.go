@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,13 +23,18 @@ const (
 	DefaultRepo      = "crazy0x70/CyberMonitor"
 	defaultUserAgent = "CyberMonitor-Updater"
 	maxDownloadBytes = 512 * 1024 * 1024
+	deployModeEnvKey = "CM_DEPLOY_MODE"
 )
 
 type Kind string
+type DeployMode string
 
 const (
 	KindServer Kind = "server"
 	KindAgent  Kind = "agent"
+
+	DeployModeBinary DeployMode = "binary"
+	DeployModeDocker DeployMode = "docker"
 )
 
 type ReleaseAsset struct {
@@ -86,7 +93,40 @@ func NewClient(repo string, kind Kind, currentVersion string) *Client {
 }
 
 func CanSelfUpdate() bool {
-	return runtime.GOOS != "windows"
+	return runtime.GOOS != "windows" && DetectDeployMode() == DeployModeBinary
+}
+
+func DetectDeployMode() DeployMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(deployModeEnvKey))) {
+	case "docker", "container", "podman":
+		return DeployModeDocker
+	case "binary":
+		return DeployModeBinary
+	}
+	if isContainerRuntime() {
+		return DeployModeDocker
+	}
+	return DeployModeBinary
+}
+
+func DefaultUnsupportedUpdateMessage() string {
+	if DetectDeployMode() == DeployModeDocker {
+		return "Docker 部署请拉取最新镜像并重建容器完成更新"
+	}
+	return ""
+}
+
+func isContainerRuntime() bool {
+	if value := strings.TrimSpace(os.Getenv("container")); value != "" {
+		return true
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	return false
 }
 
 func (c *Client) CheckLatest(ctx context.Context) (ReleaseInfo, error) {
@@ -137,7 +177,7 @@ func (c *Client) ApplyAsset(ctx context.Context, downloadURL, checksumURL string
 		return err
 	}
 	if checksumURL = strings.TrimSpace(checksumURL); checksumURL != "" {
-		if err := c.verifyChecksum(ctx, tmpBinary, checksumURL); err != nil {
+		if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
 			return err
 		}
 	}
@@ -202,7 +242,7 @@ func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) 
 		if message == "" {
 			message = fmt.Sprintf("GitHub API 返回状态码 %d", resp.StatusCode)
 		}
-			return githubRelease{}, fmt.Errorf("%s", message)
+		return githubRelease{}, fmt.Errorf("%s", message)
 	}
 
 	var release githubRelease
@@ -230,7 +270,7 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 		if message == "" {
 			message = fmt.Sprintf("下载返回状态码 %d", resp.StatusCode)
 		}
-			return fmt.Errorf("%s", message)
+		return fmt.Errorf("%s", message)
 	}
 	if resp.ContentLength > maxDownloadBytes {
 		return fmt.Errorf("更新文件过大: %d bytes", resp.ContentLength)
@@ -255,7 +295,7 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 	return nil
 }
 
-func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL string) error {
+func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, downloadURL string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
 	if err != nil {
 		return err
@@ -286,7 +326,7 @@ func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL strin
 		return fmt.Errorf("计算更新文件校验失败: %w", err)
 	}
 	actual := hex.EncodeToString(sum.Sum(nil))
-	expected, err := lookupChecksum(string(checksumBytes), filepath.Base(filePath))
+	expected, err := lookupChecksum(string(checksumBytes), resolveChecksumLookupName(downloadURL, filePath))
 	if err != nil {
 		return err
 	}
@@ -294,6 +334,18 @@ func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL strin
 		return fmt.Errorf("校验和不匹配")
 	}
 	return nil
+}
+
+func resolveChecksumLookupName(downloadURL, filePath string) string {
+	if raw := strings.TrimSpace(downloadURL); raw != "" {
+		if parsed, err := url.Parse(raw); err == nil {
+			name := path.Base(strings.TrimSpace(parsed.Path))
+			if name != "" && name != "." && name != "/" {
+				return name
+			}
+		}
+	}
+	return filepath.Base(filePath)
 }
 
 func lookupChecksum(contents, filename string) (string, error) {

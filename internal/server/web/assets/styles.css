@@ -73,6 +73,26 @@ body {
   overflow-x: hidden;
 }
 
+.skip-link {
+  position: absolute;
+  left: 16px;
+  top: -48px;
+  z-index: 30;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: #0f172a;
+  color: #fff;
+  text-decoration: none;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.2);
+  transition: top 0.2s ease;
+}
+
+.skip-link:focus-visible {
+  top: 16px;
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
 button,
 input,
 textarea,
@@ -125,6 +145,13 @@ svg text {
   max-width: 1180px;
   margin: 0 auto;
   padding: 36px 28px 0;
+}
+
+#public-main-content {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .landing .topbar-right {
@@ -246,8 +273,18 @@ svg text {
   font-family: inherit;
 }
 
+.brand-heading {
+  margin: 0;
+}
+
 .brand-link {
   cursor: pointer;
+}
+
+.brand-link:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 6px;
+  border-radius: 10px;
 }
 
 .subtitle {
@@ -339,6 +376,20 @@ html[data-theme="dark"] .theme-toggle:hover {
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
+.stat-filter-button {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  appearance: none;
+  cursor: pointer;
+}
+
+.stat-filter-button:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
 .stat-card.clickable {
   cursor: pointer;
 }
@@ -397,6 +448,8 @@ html[data-theme="dark"] .theme-toggle:hover {
 }
 
 .group-tab {
+  display: inline-flex;
+  align-items: center;
   border: 1px solid var(--tab-border);
   background: var(--tab-bg);
   color: var(--tab-text);
@@ -404,12 +457,17 @@ html[data-theme="dark"] .theme-toggle:hover {
   border-radius: 999px;
   font-size: 13px;
   cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  text-decoration: none;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
 }
 
 .group-tab:hover {
-  transform: translateY(-1px);
   box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+}
+
+.group-tab:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
 }
 
 .group-tab.active {
@@ -458,6 +516,8 @@ html[data-theme="dark"] .theme-toggle:hover {
 .tag-section {
   display: grid;
   gap: 12px;
+  content-visibility: auto;
+  contain-intrinsic-size: 120px;
 }
 
 .tag-list {
@@ -498,6 +558,8 @@ html[data-theme="dark"] .theme-toggle:hover {
   backdrop-filter: blur(18px);
   box-shadow: var(--shadow);
   transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  content-visibility: auto;
+  contain-intrinsic-size: 720px;
 }
 
 .node-card.animate {
@@ -807,6 +869,8 @@ html[data-theme="dark"] .theme-toggle:hover {
   box-shadow: var(--shadow);
   transition: transform 0.3s ease, box-shadow 0.3s ease;
   animation: rise 0.8s ease both;
+  content-visibility: auto;
+  contain-intrinsic-size: 540px;
 }
 
 .card:hover {
@@ -2671,6 +2735,26 @@ html[data-theme="dark"] .theme-toggle:hover {
   }
   to {
     opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .bg-orb,
+  .topbar,
+  .node-card.animate,
+  .empty,
+  .modal-card,
+  .login-panel {
+    animation: none !important;
   }
 }
 

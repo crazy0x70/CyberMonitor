@@ -20,6 +20,14 @@ var (
 	BuildTime = "unknown"
 )
 
+func resolvedVersion() string {
+	return cmdutil.EnvOrDefault("CM_VERSION", Version)
+}
+
+func resolvedCommit() string {
+	return cmdutil.EnvOrDefault("CM_COMMIT", Commit)
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "输出版本信息")
 	resetPassword := flag.Bool("reset-password", false, "重置管理员密码")
@@ -61,8 +69,8 @@ func main() {
 		JWTSecret:  *jwtSecret,
 		AgentToken: *agentToken,
 		DataDir:    *dataDir,
-		Version:    Version,
-		Commit:     Commit,
+		Version:    resolvedVersion(),
+		Commit:     resolvedCommit(),
 	}
 	if err := server.Run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("服务启动失败: %v", err)
@@ -70,5 +78,5 @@ func main() {
 }
 
 func printVersion() {
-	fmt.Printf("CyberMonitor Server %s (commit %s, build %s)\n", Version, Commit, BuildTime)
+	fmt.Printf("CyberMonitor Server %s (commit %s, build %s)\n", resolvedVersion(), resolvedCommit(), BuildTime)
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -88,6 +89,7 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 	baseURL, _ := startTestServer(t, Config{
 		Addr:      reserveTCPAddr(t),
 		AdminPath: "/cm-admin",
+		Version:   "1.2.3",
 	})
 
 	resp, err := http.Get(baseURL + "/cm-admin")
@@ -110,6 +112,20 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 	}
 	if !strings.Contains(bodyText, "CyberMonitor 管理后台") {
 		t.Fatalf("expected admin title marker, got: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "cm-admin-boot") {
+		t.Fatalf("expected admin boot payload, got: %s", bodyText)
+	}
+	bootMatch := regexp.MustCompile(`name="cm-admin-boot" content="([^"]+)"`).FindStringSubmatch(bodyText)
+	if len(bootMatch) != 2 {
+		t.Fatalf("expected admin boot meta content, got: %s", bodyText)
+	}
+	bootPayload, err := base64.StdEncoding.DecodeString(bootMatch[1])
+	if err != nil {
+		t.Fatalf("decode admin boot payload: %v", err)
+	}
+	if !strings.Contains(string(bootPayload), "\"version\":\"1.2.3\"") {
+		t.Fatalf("expected boot payload to include deployed version, got: %s", string(bootPayload))
 	}
 	if !strings.Contains(bodyText, "/cm-admin/assets/") {
 		t.Fatalf("expected admin asset base path, got: %s", bodyText)

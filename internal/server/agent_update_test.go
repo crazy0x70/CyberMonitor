@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"cyber_monitor/internal/metrics"
+)
 
 func TestAgentConfigIncludesPendingUpdateInstruction(t *testing.T) {
 	t.Parallel()
@@ -72,5 +76,58 @@ func TestApplyAgentUpdateReportClearsPendingTaskOnSuccess(t *testing.T) {
 	}
 	if profile.AgentUpdateMessage != "updated" {
 		t.Fatalf("expected success message to persist, got %q", profile.AgentUpdateMessage)
+	}
+}
+
+func TestApplyAgentUpdateReportClearsPendingTaskOnDisableReject(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{AdminUser: "admin", AdminPass: "pass"}),
+		profiles: map[string]*NodeProfile{
+			"node-1": {
+				TestIntervalSec: defaultTestIntervalSec,
+				AgentUpdate: &AgentUpdateInstruction{
+					Version:     "1.2.3",
+					DownloadURL: "https://example.com/agent",
+				},
+				AgentUpdateState: "pending",
+			},
+		},
+		nodes: map[string]NodeState{},
+	}
+
+	store.ApplyAgentUpdateReport("node-1", AgentUpdateReport{
+		State:   "failed",
+		Version: "1.2.3",
+		Message: "当前 Agent 已禁用远程更新",
+	})
+
+	profile := store.profiles["node-1"]
+	if profile.AgentUpdate != nil {
+		t.Fatalf("expected pending update to be cleared after disable reject, got %+v", profile.AgentUpdate)
+	}
+	if profile.AgentUpdateMessage != "当前 Agent 已禁用远程更新" {
+		t.Fatalf("unexpected reject message: %q", profile.AgentUpdateMessage)
+	}
+}
+
+func TestResolveAgentUpdateSupportedRejectsDisabledOrDockerNodes(t *testing.T) {
+	t.Parallel()
+
+	if resolveAgentUpdateSupported(metrics.NodeStats{
+		OS:                  "Linux",
+		DeployMode:          "docker",
+		AgentUpdateDisabled: false,
+	}) {
+		t.Fatal("expected docker deploy mode to disable agent self update")
+	}
+
+	if resolveAgentUpdateSupported(metrics.NodeStats{
+		OS:                  "Linux",
+		DeployMode:          "binary",
+		AgentUpdateDisabled: true,
+	}) {
+		t.Fatal("expected disable-update agent to reject remote update")
 	}
 }

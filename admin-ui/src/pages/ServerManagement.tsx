@@ -15,6 +15,16 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -80,6 +90,7 @@ import {
   adminDetailHeaderClass,
   adminDetailHintPanelClass,
   adminDetailWarningPanelClass,
+  adminDialogCancelClass,
   adminDialogContentClass,
   adminDangerBadgeClass,
   adminDialogDangerActionClass,
@@ -512,6 +523,7 @@ export default function ServerManagement({
   const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshingAgentUpdate, setRefreshingAgentUpdate] = useState(false);
   const [agentUpdateInfo, setAgentUpdateInfo] = useState<AgentUpdateInfo | null>(null);
@@ -689,16 +701,16 @@ export default function ServerManagement({
   const agentUpdateDisabledReason = !editingNode
     ? "请选择节点后再执行更新"
     : !editingNode.agent_update_supported
-      ? "当前节点平台暂不支持后台自更新"
+      ? editingNode.agent_update_message?.trim() || "当前 Agent 已禁用远程更新"
       : !editingAgentVersion
         ? "当前节点还没有上报 Agent 版本"
         : "";
   const agentLatestVersionLabel = !editingNode
     ? "--"
     : !editingNode.agent_update_supported
-      ? "不支持"
+      ? "已禁用更新"
       : refreshingAgentUpdate && !agentUpdateInfo
-        ? "检查中..."
+        ? "检查中…"
         : agentUpdateInfo?.latest_version
           ? formatVersionLabel(agentUpdateInfo.latest_version)
           : editingNode.agent_update_target_version
@@ -805,13 +817,11 @@ export default function ServerManagement({
     if (!editingNode) {
       return;
     }
-    if (!window.confirm(`确认删除节点 “${resolveNodeName(editingNode)}” 吗？`)) {
-      return;
-    }
     setDeleting(true);
     try {
       await onDeleteNode(resolveNodeId(editingNode));
       toast.success("节点已删除");
+      setDeleteDialogOpen(false);
       closeEditor();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除节点失败");
@@ -893,14 +903,18 @@ export default function ServerManagement({
     <div className={adminPageShellClass}>
       <section className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>节点管理</h2>
+          <h1 className={adminPageTitleClass}>节点管理</h1>
         </div>
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
           <div className="relative min-w-[320px]">
             <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <Input
+              aria-label="搜索节点"
+              type="search"
               className={`rounded-full pl-11 ${adminInputClass}`}
-              placeholder="搜索节点名、Node ID、主机名、地区"
+              name="node-search"
+              autoComplete="off"
+              placeholder="例如：搜索节点名、Node ID、主机名、地区…"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
@@ -957,14 +971,18 @@ export default function ServerManagement({
               </div>
 
               <div className="grid gap-2">
-                <pre
+                <button
+                  aria-label={`复制${installPlatform === "windows" ? " Windows " : " Linux / macOS "}Agent 接入命令`}
                   id={installPlatform === "windows" ? agentInstallWindowsId : agentInstallLinuxId}
-                  className={`${adminCodeBlockPanelClass} w-full cursor-pointer select-text whitespace-pre-wrap break-all text-left transition-colors hover:border-sky-200 hover:bg-slate-100 dark:hover:border-sky-800 dark:hover:bg-slate-900`}
+                  type="button"
+                  className={`${adminCodeBlockPanelClass} w-full select-text whitespace-pre-wrap break-all text-left transition-colors hover:border-sky-200 hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-400 dark:hover:border-sky-800 dark:hover:bg-slate-900`}
                   onClick={() => copyInstallCommand(activeInstallCommand)}
                   title="单击复制完整命令，拖拽可自由选择局部内容"
                 >
-                  {activeInstallCommand}
-                </pre>
+                  <code className="block w-full select-text whitespace-pre-wrap break-all text-left font-inherit">
+                    {activeInstallCommand}
+                  </code>
+                </button>
               </div>
             </div>
           ) : (
@@ -1028,6 +1046,7 @@ export default function ServerManagement({
                     type="button"
                     onClick={() => handleOpen(node)}
                     className={adminWorkspaceItemClass}
+                    style={{ contentVisibility: "auto", containIntrinsicSize: "296px" }}
                   >
                     <div className={adminWorkspaceHeaderClass}>
                       <div className="space-y-2">
@@ -1158,29 +1177,35 @@ export default function ServerManagement({
                           </p>
                         </div>
                       </div>
-                      <div className="flex flex-wrap items-center gap-3">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          className={`${adminActionButtonClass} h-11 px-5`}
-                          onClick={handleCheckAgentUpdate}
-                          disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
-                          title={agentUpdateDisabledReason || undefined}
-                        >
-                          {refreshingAgentUpdate ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-                          检查更新
-                        </Button>
-                        <Button
-                          type="button"
-                          className={`${adminPrimaryButtonClass} h-11 px-5`}
-                          onClick={handleAgentUpdate}
-                          disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
-                          title={agentUpdateDisabledReason || undefined}
-                        >
-                          {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                          {updatingAgent ? "更新中" : "立即更新"}
-                        </Button>
-                      </div>
+                      {editingNode.agent_update_supported ? (
+                        <div className="flex flex-wrap items-center gap-3">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className={`${adminActionButtonClass} h-11 px-5`}
+                            onClick={handleCheckAgentUpdate}
+                            disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
+                            title={agentUpdateDisabledReason || undefined}
+                          >
+                            {refreshingAgentUpdate ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                            检查更新
+                          </Button>
+                          <Button
+                            type="button"
+                            className={`${adminPrimaryButtonClass} h-11 px-5`}
+                            onClick={handleAgentUpdate}
+                            disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
+                            title={agentUpdateDisabledReason || undefined}
+                          >
+                            {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                            {updatingAgent ? "更新中" : "立即更新"}
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className={adminDetailHintPanelClass}>
+                          {agentUpdateDisabledReason || "当前 Agent 已禁用远程更新"}
+                        </div>
+                      )}
                     </CardContent>
                   </Card>
                   <Card className={adminDetailCardClass}>
@@ -1200,6 +1225,8 @@ export default function ServerManagement({
                             <Label htmlFor="node-alias">显示名称</Label>
                             <Input
                               id="node-alias"
+                              name="node-alias"
+                              autoComplete="off"
                               className={formInputClass}
                               value={form.alias}
                               onChange={(event) =>
@@ -1212,6 +1239,8 @@ export default function ServerManagement({
                             <Label htmlFor="node-region">地区代码</Label>
                             <Input
                               id="node-region"
+                              name="node-region"
+                              autoComplete="off"
                               className={formInputClass}
                               value={form.region}
                               onChange={(event) =>
@@ -1244,6 +1273,8 @@ export default function ServerManagement({
                             <Label htmlFor="node-disk-type">磁盘类型</Label>
                             <Input
                               id="node-disk-type"
+                              name="node-disk-type"
+                              autoComplete="off"
                               className={formInputClass}
                               value={form.diskType}
                               onChange={(event) =>
@@ -1256,9 +1287,11 @@ export default function ServerManagement({
                             <Label htmlFor="node-net-speed">带宽（Mbps）</Label>
                             <Input
                               id="node-net-speed"
+                              name="node-net-speed"
                               className={formInputClass}
                               type="number"
                               min={0}
+                              autoComplete="off"
                               value={form.netSpeedMbps}
                               onChange={(event) =>
                                 setForm((current) => current && ({ ...current, netSpeedMbps: event.target.value }))
@@ -1340,10 +1373,12 @@ export default function ServerManagement({
                                           Interval
                                         </span>
                                         <Input
+                                          name={item.id ? `probe-interval-${item.id}` : "probe-interval"}
                                           className="h-10 w-[148px] rounded-xl border-slate-300 bg-white text-sm dark:border-slate-700 dark:bg-slate-950"
                                           type="number"
                                           min={0}
                                           max={3600}
+                                          autoComplete="off"
                                           disabled={!active || !item.id}
                                           value={intervalValue}
                                           onChange={(event) => {
@@ -1404,8 +1439,10 @@ export default function ServerManagement({
                             <Label htmlFor="node-expire-at">到期时间</Label>
                             <Input
                               id="node-expire-at"
+                              name="node-expire-at"
                               className={formInputClass}
                               type="datetime-local"
+                              autoComplete="off"
                               value={form.expireAt}
                               onChange={(event) =>
                                 setForm((current) => current && ({ ...current, expireAt: event.target.value }))
@@ -1422,7 +1459,7 @@ export default function ServerManagement({
                               disabled={!hasExpireAt}
                             >
                               <SelectTrigger id="node-renew-plan" className={adminSelectTriggerClass}>
-                                <SelectValue placeholder="选择续费方案" />
+                                <SelectValue placeholder="选择续费方案…" />
                               </SelectTrigger>
                               <SelectContent className={adminSelectContentClass}>
                                 <SelectItem value="none">不自动续费</SelectItem>
@@ -1449,14 +1486,14 @@ export default function ServerManagement({
                             <button
                               type="button"
                               onClick={() => setForm((current) => current && ({ ...current, alertEnabled: true }))}
-                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-all ${form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
+                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
                               开启
                             </button>
                             <button
                               type="button"
                               onClick={() => setForm((current) => current && ({ ...current, alertEnabled: false }))}
-                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-all ${!form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
+                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${!form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
                               关闭
                             </button>
@@ -1614,20 +1651,40 @@ export default function ServerManagement({
               <Separator className="bg-slate-200 dark:bg-slate-800" />
 
               <DialogFooter className={`${adminDialogFooterClass} flex-col-reverse gap-3 sm:flex-row sm:justify-between items-center px-8 py-6`}>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
-                  onClick={handleDelete}
-                  disabled={saving || deleting}
-                >
-                  {deleting ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Trash2 className="mr-2 h-4 w-4" />
-                  )}
-                  删除节点
-                </Button>
+                <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
+                      disabled={saving || deleting}
+                    >
+                      {deleting ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="mr-2 h-4 w-4" />
+                      )}
+                      删除节点
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent className={adminDialogContentClass}>
+                    <AlertDialogHeader className={adminDialogHeaderClass}>
+                      <AlertDialogTitle>
+                        {editingNode ? `确认删除节点“${resolveNodeName(editingNode)}”？` : "确认删除节点？"}
+                      </AlertDialogTitle>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter className={adminDialogFooterClass}>
+                      <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                      <AlertDialogAction
+                        className={adminDialogDangerActionClass}
+                        onClick={handleDelete}
+                      >
+                        {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                        确认删除
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
                 <div className="flex gap-3 w-full sm:w-auto">
                   <Button
                     type="button"

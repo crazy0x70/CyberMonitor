@@ -3,6 +3,8 @@ param(
   [string]$ServerUrl,
   [Parameter(Mandatory = $true)]
   [string]$AgentToken,
+  [string]$NodeId = "",
+  [switch]$DisableUpdate,
   [string]$Version = ""
 )
 
@@ -115,6 +117,25 @@ function Get-LatestVersion {
   exit 1
 }
 
+function New-NodeId {
+  return "node-" + ([guid]::NewGuid().ToString("N").Substring(0, 16))
+}
+
+function Register-Agent {
+  param(
+    [string]$RegisterServerUrl,
+    [string]$BootstrapToken,
+    [string]$CurrentNodeId
+  )
+  $uri = ($RegisterServerUrl.TrimEnd('/')) + "/api/v1/agent/register?node_id=$([Uri]::EscapeDataString($CurrentNodeId))"
+  $response = Invoke-RestMethod -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
+  if (-not $response -or -not $response.agent_token) {
+    Write-Host "Agent 注册成功但未返回专属凭据。"
+    exit 1
+  }
+  return [string]$response.agent_token
+}
+
 Assert-Admin
 Ensure-Tls12
 
@@ -123,13 +144,21 @@ $installDir = Get-InstallDir
 $binary = Join-Path $installDir "cyber-monitor-agent.exe"
 $arch = Get-Arch
 $resolvedVersion = Get-LatestVersion -Repo $repo -FallbackVersion $Version
+if (-not $NodeId) {
+  $NodeId = New-NodeId
+}
+$nodeToken = Register-Agent -RegisterServerUrl $ServerUrl -BootstrapToken $AgentToken -CurrentNodeId $NodeId
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 $url = "https://github.com/$repo/releases/download/$resolvedVersion/cyber-monitor-agent-windows-$arch.exe"
 Invoke-WebRequestCompat -Uri $url -OutFile $binary
+[System.IO.File]::WriteAllText((Join-Path $installDir ".cybermonitor-agent-token"), $nodeToken + [Environment]::NewLine)
 
 $serviceName = "CyberMonitorAgent"
-$args = "--server-url `"$ServerUrl`" --agent-token `"$AgentToken`""
+$args = "--server-url `"$ServerUrl`" --node-id `"$NodeId`" --agent-token `"$nodeToken`""
+if ($DisableUpdate) {
+  $args += " --disable-update"
+}
 
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
   Stop-Service -Name $serviceName -Force
@@ -142,3 +171,4 @@ sc.exe failureflag $serviceName 1 | Out-Null
 sc.exe start $serviceName | Out-Null
 
 Write-Host "Service installed: $serviceName"
+Write-Host "Node ID: $NodeId"

@@ -1,4 +1,5 @@
 import type {
+  AdminBootPayload,
   AlertTestPayload,
   AgentUpdateInfo,
   AIProviderConfig,
@@ -28,15 +29,15 @@ export class AdminApiError extends Error {
 }
 
 export function getStoredAdminToken() {
-  return window.localStorage.getItem(ADMIN_TOKEN_KEY) || "";
+  return window.sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
 }
 
 export function setStoredAdminToken(token: string) {
   if (token) {
-    window.localStorage.setItem(ADMIN_TOKEN_KEY, token);
+    window.sessionStorage.setItem(ADMIN_TOKEN_KEY, "session");
     return;
   }
-  window.localStorage.removeItem(ADMIN_TOKEN_KEY);
+  window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
 }
 
 async function parseErrorMessage(resp: Response, fallback: string) {
@@ -63,10 +64,7 @@ async function unwrapResponse<T>(resp: Response, fallback: string) {
 
 async function apiFetch(path: string, init: RequestInit = {}, token = getStoredAdminToken()) {
   const headers = new Headers(init.headers || {});
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-  const resp = await fetch(path, { ...init, headers });
+  const resp = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (resp.status === 401 && token) {
     setStoredAdminToken("");
   }
@@ -83,14 +81,40 @@ export async function fetchPublicSnapshot() {
   return unwrapResponse<Snapshot>(resp, "加载公开展示配置失败");
 }
 
+export async function fetchSessionStatus() {
+  const resp = await fetch("/api/v1/admin/session", { credentials: "same-origin" });
+  return unwrapResponse<{ authenticated: boolean }>(resp, "检测登录会话失败");
+}
+
+export function readAdminBootPayload(): AdminBootPayload {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  const meta = document.querySelector('meta[name="cm-admin-boot"]');
+  const encoded = meta?.getAttribute("content")?.trim();
+  if (encoded) {
+    try {
+      return JSON.parse(window.atob(encoded)) as AdminBootPayload;
+    } catch {
+      // ignore malformed boot payload
+    }
+  }
+  const payload = window.__CM_ADMIN_BOOT__;
+  if (!payload || typeof payload !== "object") {
+    return {};
+  }
+  return payload;
+}
+
 export async function loginAdmin(username: string, password: string, turnstileToken = "") {
   const resp = await fetch("/api/v1/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ username, password, turnstile_token: turnstileToken }),
   });
   const data = await unwrapResponse<LoginResponse>(resp, "登录失败");
-  setStoredAdminToken(data.token);
+  setStoredAdminToken("session");
   return data;
 }
 
@@ -109,11 +133,7 @@ export async function saveSettings(payload: Record<string, unknown>, token = get
     },
     token,
   );
-  const data = await unwrapResponse<SettingsView>(resp, "保存设置失败");
-  if (data.session_token) {
-    setStoredAdminToken(data.session_token);
-  }
-  return data;
+  return unwrapResponse<SettingsView>(resp, "保存设置失败");
 }
 
 export async function exportConfig(token = getStoredAdminToken()) {
@@ -138,15 +158,23 @@ export async function importConfig(payload: Record<string, unknown>, token = get
     },
     token,
   );
-  const data = await unwrapResponse<ConfigImportResponse>(resp, "导入配置失败");
-  if (data.settings?.session_token) {
-    setStoredAdminToken(data.settings.session_token);
+  return unwrapResponse<ConfigImportResponse>(resp, "导入配置失败");
+}
+
+export async function logoutAdmin() {
+  const resp = await fetch("/api/v1/logout", {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  if (!resp.ok) {
+    const message = await parseErrorMessage(resp, "退出登录失败");
+    throw new AdminApiError(message, resp.status);
   }
-  return data;
+  setStoredAdminToken("");
 }
 
 export async function fetchNodes(token = getStoredAdminToken()) {
-  const resp = await apiFetch("/api/v1/admin/nodes", {}, token);
+  const resp = await apiFetch("/api/v1/admin/nodes?history=0", {}, token);
   return unwrapResponse<Snapshot>(resp, "加载节点失败");
 }
 
@@ -244,8 +272,9 @@ export async function fetchAIModels(provider: string, config: AIProviderConfig, 
 }
 
 export function connectAdminSocket(token: string, onSnapshot: (snapshot: Snapshot) => void) {
+  void token;
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = `${protocol}://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+  const url = `${protocol}://${window.location.host}/ws`;
   const socket = new WebSocket(url);
   socket.addEventListener("message", (event) => {
     try {

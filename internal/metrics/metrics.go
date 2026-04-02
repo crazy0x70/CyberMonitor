@@ -78,27 +78,29 @@ type NetworkTestResult struct {
 }
 
 type NodeStats struct {
-	NodeID       string              `json:"node_id"`
-	NodeName     string              `json:"node_name"`
-	NodeAlias    string              `json:"node_alias,omitempty"`
-	NodeGroup    string              `json:"node_group,omitempty"`
-	Hostname     string              `json:"hostname"`
-	OS           string              `json:"os"`
-	Arch         string              `json:"arch"`
-	AgentVersion string              `json:"agent_version,omitempty"`
-	UptimeSec    uint64              `json:"uptime_sec"`
-	Timestamp    int64               `json:"timestamp"`
-	NetSpeedMbps float64             `json:"net_speed_mbps,omitempty"`
-	CPU          CPUInfo             `json:"cpu"`
-	Memory       MemInfo             `json:"memory"`
-	Disk         []DiskPartition     `json:"disk"`
-	DiskType     string              `json:"disk_type,omitempty"`
-	DiskIO       DiskIO              `json:"disk_io"`
-	Network      NetworkIO           `json:"network"`
-	ProcessCount int                 `json:"process_count,omitempty"`
-	TCPConns     int                 `json:"tcp_conns,omitempty"`
-	UDPConns     int                 `json:"udp_conns,omitempty"`
-	NetworkTests []NetworkTestResult `json:"network_tests,omitempty"`
+	NodeID              string              `json:"node_id"`
+	NodeName            string              `json:"node_name"`
+	NodeAlias           string              `json:"node_alias,omitempty"`
+	NodeGroup           string              `json:"node_group,omitempty"`
+	Hostname            string              `json:"hostname"`
+	OS                  string              `json:"os"`
+	Arch                string              `json:"arch"`
+	DeployMode          string              `json:"deploy_mode,omitempty"`
+	AgentVersion        string              `json:"agent_version,omitempty"`
+	AgentUpdateDisabled bool                `json:"agent_update_disabled,omitempty"`
+	UptimeSec           uint64              `json:"uptime_sec"`
+	Timestamp           int64               `json:"timestamp"`
+	NetSpeedMbps        float64             `json:"net_speed_mbps,omitempty"`
+	CPU                 CPUInfo             `json:"cpu"`
+	Memory              MemInfo             `json:"memory"`
+	Disk                []DiskPartition     `json:"disk"`
+	DiskType            string              `json:"disk_type,omitempty"`
+	DiskIO              DiskIO              `json:"disk_io"`
+	Network             NetworkIO           `json:"network"`
+	ProcessCount        int                 `json:"process_count,omitempty"`
+	TCPConns            int                 `json:"tcp_conns,omitempty"`
+	UDPConns            int                 `json:"udp_conns,omitempty"`
+	NetworkTests        []NetworkTestResult `json:"network_tests,omitempty"`
 }
 
 type Collector struct {

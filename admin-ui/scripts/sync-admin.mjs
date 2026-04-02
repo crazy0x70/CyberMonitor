@@ -60,9 +60,11 @@ if (!entryMatch?.[1]) {
 }
 const entryBundlePath = path.join(adminBundleRoot, entryMatch[1]);
 const entryBundleSource = await readFile(entryBundlePath, "utf8");
-const entryBundlePatched = entryBundleSource.replace(
-  `return"${legacyAdminAssetBasePath}"+t`,
-  `return((document.querySelector('meta[name="cm-admin-asset-base"]')?.content)||"${legacyAdminAssetBasePath}")+t`,
+const assetBaseRuntimeExpr =
+  `((document.querySelector('meta[name="cm-admin-asset-base"]')?.content)||"${legacyAdminAssetBasePath}")+`;
+const entryBundlePatched = entryBundleSource.replaceAll(
+  `"${legacyAdminAssetBasePath}"+`,
+  assetBaseRuntimeExpr,
 );
 
 if (entryBundlePatched === entryBundleSource) {

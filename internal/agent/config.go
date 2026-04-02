@@ -17,6 +17,7 @@ import (
 type RemoteConfig struct {
 	Alias           string                      `json:"alias"`
 	Group           string                      `json:"group"`
+	AgentToken      string                      `json:"agent_token,omitempty"`
 	Tests           []metrics.NetworkTestConfig `json:"tests"`
 	TestIntervalSec int                         `json:"test_interval_sec"`
 	Update          *RemoteUpdateInstruction    `json:"update,omitempty"`

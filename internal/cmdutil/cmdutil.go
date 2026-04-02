@@ -2,6 +2,7 @@ package cmdutil
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +25,18 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return duration
+}
+
+func EnvBool(key string, def bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return def
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return def
+	}
+	return parsed
 }
 
 func ParseCommaList(raw string) []string {

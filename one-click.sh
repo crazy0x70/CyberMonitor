@@ -89,6 +89,12 @@ download_binary() {
   echo "${target}"
 }
 
+write_agent_token_file() {
+  local token="$1"
+  printf '%s\n' "${token}" > "${INSTALL_DIR}/.cybermonitor-agent-token"
+  chmod 600 "${INSTALL_DIR}/.cybermonitor-agent-token"
+}
+
 write_server_conf() {
   mkdir -p "${CONF_DIR}"
   cat > "${CONF_DIR}/server.conf" <<EOF
@@ -101,9 +107,31 @@ write_agent_conf() {
   mkdir -p "${CONF_DIR}"
   cat > "${CONF_DIR}/agent.conf" <<EOF
 CM_SERVER_URL=${1}
-CM_AGENT_TOKEN=${2}
-CM_NET_IFACE=${3}
+CM_NODE_ID=${2}
+CM_AGENT_TOKEN=${3}
+CM_NET_IFACE=${4}
+CM_DISABLE_UPDATE=${5}
 EOF
+}
+
+generate_node_id() {
+  local random_hex
+  random_hex="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  echo "node-${random_hex}"
+}
+
+register_agent() {
+  local server_url="$1"
+  local bootstrap_token="$2"
+  local node_id="$3"
+  local endpoint="${server_url%/}/api/v1/agent/register?node_id=${node_id}"
+  local response
+  response="$(curl -fsSL -X POST -H "X-AGENT-TOKEN: ${bootstrap_token}" "${endpoint}")" || \
+    die "Agent 注册失败，请检查 Server 地址与 Agent Token"
+  local node_token
+  node_token="$(printf '%s' "${response}" | sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  [[ -n "${node_token}" ]] || die "Agent 注册成功但未返回专属凭据"
+  echo "${node_token}"
 }
 
 read_admin_settings() {
@@ -235,25 +263,34 @@ EOF
 
 install_agent() {
   local server_url="$1"
-  local token="$2"
-  local net_iface="$3"
-  local version="$4"
+  local bootstrap_token="$2"
+  local node_id="$3"
+  local net_iface="$4"
+  local disable_update="$5"
+  local version="$6"
   [[ -z "${server_url}" ]] && die "被控需要填写 Server 地址"
-  [[ -z "${token}" ]] && die "被控需要填写 Token"
+  [[ -z "${bootstrap_token}" ]] && die "被控需要填写 Token"
 
   local arch
   arch="$(detect_arch)"
   version="$(resolve_version "${version}")"
+  [[ -n "${node_id}" ]] || node_id="$(generate_node_id)"
+  local node_token
+  node_token="$(register_agent "${server_url}" "${bootstrap_token}" "${node_id}")"
 
   local bin
   bin="$(download_binary "agent" "${version}" "${arch}")"
-  write_agent_conf "${server_url}" "${token}" "${net_iface}"
+  write_agent_token_file "${node_token}"
+  write_agent_conf "${server_url}" "${node_id}" "${node_token}" "${net_iface}" "${disable_update}"
 
   local service="cyber-monitor-agent"
   local service_file="/etc/systemd/system/${service}.service"
   local extra_args=""
   if [[ -n "${net_iface}" ]]; then
     extra_args="-net-iface ${net_iface}"
+  fi
+  if [[ "${disable_update}" == "1" ]]; then
+    extra_args="${extra_args} -disable-update"
   fi
 
   cat > "${service_file}" <<EOF
@@ -264,7 +301,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=${CONF_DIR}/agent.conf
-ExecStart=${bin} -server-url \${CM_SERVER_URL} -agent-token \${CM_AGENT_TOKEN} ${extra_args}
+ExecStart=${bin} -server-url \${CM_SERVER_URL} -node-id \${CM_NODE_ID} -agent-token \${CM_AGENT_TOKEN} ${extra_args}
 Restart=on-failure
 LimitNOFILE=1048576
 
@@ -275,6 +312,7 @@ EOF
   systemctl daemon-reload
   systemctl enable --now "${service}"
   echo "已安装并启动 ${service}"
+  echo "Node ID: ${node_id}"
 }
 
 uninstall_service() {
@@ -348,9 +386,15 @@ run_install_menu() {
       2)
         read -r -p "Server 地址(例如 http://1.2.3.4:25012): " server_url
         read -r -p "Agent Token: " token
+        read -r -p "Node ID（可空，留空则随机生成）: " node_id
         read -r -p "指定网卡(可空): " net_iface
+        read -r -p "是否禁用服务端远程更新? [y/N]: " disable_update_answer
         read -r -p "版本号(默认 latest): " version
-        install_agent "${server_url}" "${token}" "${net_iface}" "${version}"
+        disable_update="0"
+        if [[ "${disable_update_answer}" =~ ^[Yy]$ ]]; then
+          disable_update="1"
+        fi
+        install_agent "${server_url}" "${token}" "${node_id}" "${net_iface}" "${disable_update}" "${version}"
         ;;
       0)
         exit 0

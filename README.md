@@ -13,11 +13,9 @@
 
 - **极简资源占用**：采用 Go 单文件二进制与 Docker 部署，无微服务包袱。
 - **全方位指标**：实时监控 CPU、内存、磁盘、网速，以及 TCP/ICMP 连通性。
-- **现代化 UI**：前台展示页与后台管理系统分离设计，支持深浅色无缝切换。
 - **灵活部署**：支持前后端一体化部署，也可将展示页完全静态化部署至 Cloudflare Pages 等 CDN 节点（硬隔离）。
 - **AI 智能运维**：集成 OpenAI / Gemini 等大模型 API，一键获取故障排查建议。
 - **多渠道告警**：内置 Telegram Bot 与飞书 Webhook，按节点精细化配置离线规则。
-- **平滑自更新**：主控端支持一键检测与更新，并可向探针（Agent）下发远程更新指令。
 
 ## 🚀 快速上手
 
@@ -34,7 +32,33 @@ docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" --name 
 ```
 *(部署后，通过 `docker logs cyber-monitor-server` 获取初始后台路径与 Agent Token)*
 
-### 3. 安装探针 (Agent)
+### 3. Docker 部署探针 (Agent)
+```bash
+docker run -d \
+  --name cyber-monitor-agent \
+  --network host \
+  --restart always \
+  --cap-add NET_RAW \
+  -e CM_SERVER_URL="http://<主控IP>:25012" \
+  -e CM_AGENT_TOKEN="<你的Token>" \
+  -v /:/host:ro \
+  -v /proc:/host/proc:ro \
+  -v /sys:/host/sys:ro \
+  -v /etc:/host/etc:ro \
+  ghcr.io/crazy0x70/cyber-monitor-agent:latest
+```
+
+如果该 Agent 需要拒绝后台下发的远程更新任务，可额外追加：
+
+```bash
+-e CM_DISABLE_UPDATE=1
+```
+
+这会让节点继续正常上报监控数据，但后台会把它识别为“已禁用远程更新”的节点。
+
+### 4. 安装探针 (Agent)
+`Node ID` 现在默认会在首次安装时随机生成，并持久化到本地；如果你希望和现有资产命名、自动化编排或迁移策略对齐，也可以在安装时显式指定。
+
 **Linux / macOS**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token>
@@ -44,7 +68,45 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.s
 powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'"
 ```
 
-### 4. 卸载探针 (Agent)
+如果需要手动指定 `Node ID`：
+
+**Linux / macOS**
+```bash
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --node-id my-node-id
+```
+
+**Windows**
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -NodeId 'my-node-id'"
+```
+
+如果你希望该节点拒绝服务端下发的远程更新，可以在部署时显式追加 `disable-update`：
+
+**Linux / macOS**
+```bash
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --disable-update
+```
+
+**Windows**
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -DisableUpdate"
+```
+
+手工运行二进制时，也可以使用：
+
+```bash
+./cyber-monitor-agent --server-url http://<主控IP>:25012 --agent-token <你的Token> --disable-update
+```
+
+或环境变量：
+
+```bash
+CM_DISABLE_UPDATE=1 ./cyber-monitor-agent --server-url http://<主控IP>:25012 --agent-token <你的Token>
+```
+
+注意：Docker 部署的 Agent 同样不适合容器内自更新。正确方式是拉取新镜像并重建容器；如果你还希望该容器明确拒绝服务端更新任务，可同时追加 `--disable-update` 或设置 `CM_DISABLE_UPDATE=1`。
+
+### 5. 卸载探针 (Agent)
 **Linux / macOS**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh

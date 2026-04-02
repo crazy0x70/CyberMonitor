@@ -18,18 +18,20 @@ import (
 )
 
 type Config struct {
-	ServerURL    string
-	Interval     time.Duration
-	NodeID       string
-	NodeName     string
-	NodeAlias    string
-	NodeGroup    string
-	AgentToken   string
-	AgentVersion string
-	HostRoot     string
-	NetTests     []metrics.NetworkTestConfig
-	TestInterval time.Duration
-	NetIfaces    []string
+	ServerURL     string
+	Interval      time.Duration
+	NodeID        string
+	NodeName      string
+	NodeAlias     string
+	NodeGroup     string
+	AgentToken    string
+	AgentVersion  string
+	HostRoot      string
+	NetTests      []metrics.NetworkTestConfig
+	TestInterval  time.Duration
+	NetIfaces     []string
+	DisableUpdate bool
+	TokenFile     string
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -46,19 +48,51 @@ func Run(ctx context.Context, cfg Config) error {
 	collector := metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces)
 	endpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/ingest"
 	configEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/config"
+	registerEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/register"
 	updateReportEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/update/report"
 
 	runtimeCfg := newRuntimeConfig(cfg)
 	testCache := make(map[string]cachedTest)
+	agentToken := strings.TrimSpace(cfg.AgentToken)
+	if cfg.TokenFile != "" {
+		if persisted, err := loadPersistedAgentToken(cfg.TokenFile); err == nil && persisted != "" {
+			agentToken = persisted
+		} else if err != nil && !os.IsNotExist(err) {
+			log.Printf("读取 Agent 凭据文件失败: %v", err)
+		}
+	}
+
+	if cfg.AgentToken != "" && agentToken == strings.TrimSpace(cfg.AgentToken) {
+		if issuedToken, err := registerNodeToken(ctx, client, registerEndpoint, cfg.NodeID, cfg.AgentToken); err == nil && issuedToken != "" {
+			agentToken = issuedToken
+			if cfg.TokenFile != "" {
+				if err := persistAgentToken(cfg.TokenFile, issuedToken); err != nil {
+					log.Printf("持久化 Agent 专属凭据失败: %v", err)
+				}
+			}
+		} else if err != nil && !strings.Contains(err.Error(), "register status 401") {
+			log.Printf("节点注册未成功，继续尝试使用当前 Agent Token: %v", err)
+		}
+	}
 
 	fetchConfig := func() {
-		remote, err := fetchRemoteConfig(ctx, client, configEndpoint, cfg.NodeID, cfg.AgentToken)
+		remote, err := fetchRemoteConfig(ctx, client, configEndpoint, cfg.NodeID, agentToken)
 		if err != nil {
 			log.Printf("拉取远程配置失败: %v", err)
 			return
 		}
+		if nextToken := strings.TrimSpace(remote.AgentToken); nextToken != "" && nextToken != agentToken {
+			agentToken = nextToken
+			if cfg.TokenFile != "" {
+				if err := persistAgentToken(cfg.TokenFile, nextToken); err != nil {
+					log.Printf("持久化 Agent 专属凭据失败: %v", err)
+				}
+			}
+		}
 		runtimeCfg.Update(remote)
-		if err := maybeApplyRemoteUpdate(ctx, client, updateReportEndpoint, cfg, remote.Update); err != nil {
+		runtimeCfgConfig := cfg
+		runtimeCfgConfig.AgentToken = agentToken
+		if err := maybeApplyRemoteUpdate(ctx, client, updateReportEndpoint, runtimeCfgConfig, remote.Update); err != nil {
 			log.Printf("执行远程更新失败: %v", err)
 		}
 	}
@@ -78,6 +112,8 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.AgentVersion != "" {
 			sample.AgentVersion = cfg.AgentVersion
 		}
+		sample.DeployMode = string(updater.DetectDeployMode())
+		sample.AgentUpdateDisabled = cfg.DisableUpdate
 		alias, group, tests, interval, _ := runtimeCfg.Snapshot()
 		if alias != "" {
 			sample.NodeAlias = alias
@@ -101,8 +137,8 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if cfg.AgentToken != "" {
-			req.Header.Set("X-AGENT-TOKEN", cfg.AgentToken)
+		if agentToken != "" {
+			req.Header.Set("X-AGENT-TOKEN", agentToken)
 		}
 
 		resp, err := client.Do(req)
@@ -153,8 +189,11 @@ func maybeApplyRemoteUpdate(
 	if currentVersion == targetVersion {
 		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
 	}
+	if cfg.DisableUpdate {
+		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+	}
 	if !updater.CanSelfUpdate() {
-		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", currentVersion, "当前平台暂不支持 Agent 自更新")
+		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
 	if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
@@ -172,6 +211,14 @@ func maybeApplyRemoteUpdate(
 	}
 	time.Sleep(500 * time.Millisecond)
 	return updater.RestartSelf()
+}
+
+func resolveUnsupportedUpdateMessage() string {
+	message := strings.TrimSpace(updater.DefaultUnsupportedUpdateMessage())
+	if message != "" {
+		return message
+	}
+	return "当前平台暂不支持 Agent 自更新"
 }
 
 func postAgentUpdateReport(

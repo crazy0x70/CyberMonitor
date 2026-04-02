@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Dialog,
   DialogContent,
   DialogFooter,
@@ -16,6 +25,7 @@ import type { TestCatalogItem } from "@/lib/admin-types";
 import {
   adminActionButtonClass,
   adminAccentBadgeClass,
+  adminDialogCancelClass,
   adminDangerIconButtonClass,
   adminDialogContentClass,
   adminDialogFooterClass,
@@ -54,8 +64,27 @@ type ProbeFormState = {
   intervalSec: string;
 };
 
+type ProbeField = "name" | "host" | "port" | "intervalSec";
+
+type ProbeValidationResult =
+  | {
+      item: TestCatalogItem;
+    }
+  | {
+      field: ProbeField;
+      error: string;
+    };
+
+const probeFieldIDMap: Record<ProbeField, string> = {
+  name: "probe-name",
+  host: "probe-host",
+  port: "probe-port",
+  intervalSec: "probe-interval",
+};
+
 export interface ProbeSettingsProps {
   testCatalog: TestCatalogItem[];
+  onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
   onSave: (catalog: TestCatalogItem[]) => Promise<unknown>;
 }
@@ -151,21 +180,21 @@ function isValidHost(value: string) {
   });
 }
 
-function validateProbeForm(formState: ProbeFormState) {
+function validateProbeForm(formState: ProbeFormState): ProbeValidationResult {
   const name = formState.name.trim();
   const host = formState.host.trim();
 
   if (!name) {
-    return { error: "探测节点名称不能为空" };
+    return { field: "name", error: "探测节点名称不能为空。" };
   }
   if (/[<>"'`]/.test(name)) {
-    return { error: "探测节点名称包含非法字符" };
+    return { field: "name", error: "探测节点名称包含非法字符。" };
   }
   if (!host) {
-    return { error: "探测节点地址不能为空" };
+    return { field: "host", error: "探测节点地址不能为空。" };
   }
   if (/[<>"'`]/.test(host) || !isValidHost(host)) {
-    return { error: "探测节点地址格式不正确" };
+    return { field: "host", error: "探测节点地址格式不正确。" };
   }
 
   if (formState.type === "icmp") {
@@ -181,7 +210,7 @@ function validateProbeForm(formState: ProbeFormState) {
 
   const port = Number.parseInt(formState.port, 10);
   if (!Number.isFinite(port) || port < 1 || port > MAX_TCP_PORT) {
-    return { error: `TCP 端口需为 1 - ${MAX_TCP_PORT}` };
+    return { field: "port", error: `TCP 端口需为 1 - ${MAX_TCP_PORT}。` };
   }
 
   const intervalRaw = formState.intervalSec.trim();
@@ -190,7 +219,10 @@ function validateProbeForm(formState: ProbeFormState) {
     intervalRaw !== "" &&
     (!Number.isFinite(intervalValue) || intervalValue < 0 || intervalValue > MAX_TCP_INTERVAL)
   ) {
-    return { error: `TCP 默认间隔需为 0 - ${MAX_TCP_INTERVAL} 秒，留空或 0 表示默认 ${DEFAULT_TCP_INTERVAL} 秒` };
+    return {
+      field: "intervalSec",
+      error: `TCP 默认间隔需为 0 - ${MAX_TCP_INTERVAL} 秒，留空或 0 表示默认 ${DEFAULT_TCP_INTERVAL} 秒。`,
+    };
   }
 
   return {
@@ -223,6 +255,7 @@ function formatProbeInterval(item: TestCatalogItem) {
 
 export default function ProbeSettings({
   testCatalog,
+  onDirtyChange,
   saving = false,
   onSave,
 }: ProbeSettingsProps) {
@@ -238,7 +271,9 @@ export default function ProbeSettings({
   const [isSaving, setIsSaving] = useState(false);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null);
   const [formState, setFormState] = useState<ProbeFormState>(() => toFormState());
+  const [formError, setFormError] = useState<{ field: ProbeField; message: string } | null>(null);
 
   useEffect(() => {
     if (normalizedCatalogSignature === sourceSignature) {
@@ -249,22 +284,42 @@ export default function ProbeSettings({
     setIsDirty(false);
   }, [normalizedCatalog, normalizedCatalogSignature, sourceSignature]);
 
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
+
   const openCreateDialog = () => {
     setEditingIndex(null);
     setFormState(toFormState());
+    setFormError(null);
     setIsDialogOpen(true);
   };
 
   const openEditDialog = (item: TestCatalogItem, index: number) => {
     setEditingIndex(index);
     setFormState(toFormState(item));
+    setFormError(null);
     setIsDialogOpen(true);
+  };
+
+  const focusProbeField = (field: ProbeField) => {
+    const element = document.getElementById(probeFieldIDMap[field]);
+    if (element instanceof HTMLElement) {
+      element.focus();
+    }
   };
 
   const handleDialogSave = () => {
     const result = validateProbeForm(formState);
-    if (!result.item) {
-      toast.error(result.error || "探测节点配置无效");
+    if (!("item" in result)) {
+      setFormError({ field: result.field, message: result.error });
+      focusProbeField(result.field);
       return;
     }
 
@@ -276,6 +331,7 @@ export default function ProbeSettings({
     });
     setIsDirty(true);
     setIsDialogOpen(false);
+    setFormError(null);
     toast.success(editingIndex === null ? "探测节点已添加" : "探测节点已更新");
   };
 
@@ -307,7 +363,7 @@ export default function ProbeSettings({
     <div className={adminPageShellClass}>
       <div className={adminPageHeaderClass}>
         <div className="space-y-2">
-          <h2 className={adminPageTitleClass}>探测设置</h2>
+          <h1 className={adminPageTitleClass}>探测设置</h1>
         </div>
         <div className={cn(adminPageActionsClass, "flex-col gap-2 sm:flex-row sm:items-center")}>
           {isDirty ? (
@@ -326,7 +382,7 @@ export default function ProbeSettings({
             onClick={handleSave}
             disabled={!isDirty || submitting}
           >
-            {submitting ? "保存中..." : "保存更改"}
+            {submitting ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>
@@ -373,6 +429,7 @@ export default function ProbeSettings({
                     variant="outline"
                     size="icon"
                     className={cn(adminActionButtonClass, "h-9 w-9 px-0")}
+                    aria-label={`编辑探测节点 ${item.name || formatProbeTarget(item)}`}
                     onClick={() => openEditDialog(item, index)}
                   >
                     <Edit2 className="h-4 w-4" />
@@ -381,7 +438,8 @@ export default function ProbeSettings({
                     variant="outline"
                     size="icon"
                     className={adminDangerIconButtonClass}
-                    onClick={() => handleDelete(index)}
+                    aria-label={`删除探测节点 ${item.name || formatProbeTarget(item)}`}
+                    onClick={() => setPendingDeleteIndex(index)}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -409,7 +467,15 @@ export default function ProbeSettings({
         })}
       </div>
 
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+      <Dialog
+        open={isDialogOpen}
+        onOpenChange={(open) => {
+          setIsDialogOpen(open);
+          if (!open) {
+            setFormError(null);
+          }
+        }}
+      >
         <DialogContent className={`sm:max-w-[620px] ${adminDialogContentClass}`}>
           <DialogHeader className={adminDialogHeaderClass}>
             <DialogTitle className="dark:text-slate-50">
@@ -423,13 +489,25 @@ export default function ProbeSettings({
                 <Label htmlFor="probe-name">名称</Label>
                 <Input
                   id="probe-name"
+                  name="probe-name"
+                  autoComplete="off"
                   className={adminInputClass}
+                  aria-invalid={formError?.field === "name"}
+                  aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
                   value={formState.name}
-                  onChange={(event) =>
-                    setFormState((current) => ({ ...current, name: event.target.value }))
-                  }
-                  placeholder="例如：主站 TCP 443"
+                  onChange={(event) => {
+                    setFormState((current) => ({ ...current, name: event.target.value }));
+                    if (formError?.field === "name") {
+                      setFormError(null);
+                    }
+                  }}
+                  placeholder="例如：主站 TCP 443…"
                 />
+                {formError?.field === "name" ? (
+                  <p id="probe-name-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                    {formError.message}
+                  </p>
+                ) : null}
               </div>
 
               <div className="grid gap-2">
@@ -468,13 +546,26 @@ export default function ProbeSettings({
               <Label htmlFor="probe-host">目标地址</Label>
               <Input
                 id="probe-host"
+                name="probe-host"
+                autoComplete="off"
+                spellCheck={false}
                 className={adminInputClass}
+                aria-invalid={formError?.field === "host"}
+                aria-describedby={formError?.field === "host" ? "probe-host-error" : undefined}
                 value={formState.host}
-                onChange={(event) =>
-                  setFormState((current) => ({ ...current, host: event.target.value }))
-                }
-                placeholder="例如：1.1.1.1 / example.com"
+                onChange={(event) => {
+                  setFormState((current) => ({ ...current, host: event.target.value }));
+                  if (formError?.field === "host") {
+                    setFormError(null);
+                  }
+                }}
+                placeholder="例如：1.1.1.1 / example.com…"
               />
+              {formError?.field === "host" ? (
+                <p id="probe-host-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                  {formError.message}
+                </p>
+              ) : null}
             </div>
 
             {formState.type === "tcp" ? (
@@ -483,32 +574,61 @@ export default function ProbeSettings({
                   <Label htmlFor="probe-port">端口</Label>
                   <Input
                     id="probe-port"
+                    name="probe-port"
                     type="number"
                     min={1}
                     max={MAX_TCP_PORT}
+                    autoComplete="off"
+                    inputMode="numeric"
                     className={adminInputClass}
+                    aria-invalid={formError?.field === "port"}
+                    aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
                     value={formState.port}
-                    onChange={(event) =>
-                      setFormState((current) => ({ ...current, port: event.target.value }))
-                    }
-                    placeholder="443"
+                    onChange={(event) => {
+                      setFormState((current) => ({ ...current, port: event.target.value }));
+                      if (formError?.field === "port") {
+                        setFormError(null);
+                      }
+                    }}
+                    placeholder="例如：443…"
                   />
+                  {formError?.field === "port" ? (
+                    <p id="probe-port-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                      {formError.message}
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="grid gap-2">
                   <Label htmlFor="probe-interval">默认间隔（秒）</Label>
                   <Input
                     id="probe-interval"
+                    name="probe-interval"
                     type="number"
                     min={0}
                     max={MAX_TCP_INTERVAL}
+                    autoComplete="off"
+                    inputMode="numeric"
                     className={adminInputClass}
+                    aria-invalid={formError?.field === "intervalSec"}
+                    aria-describedby={formError?.field === "intervalSec" ? "probe-interval-error" : undefined}
                     value={formState.intervalSec}
-                    onChange={(event) =>
-                      setFormState((current) => ({ ...current, intervalSec: event.target.value }))
-                    }
-                    placeholder={`默认 ${DEFAULT_TCP_INTERVAL}`}
+                    onChange={(event) => {
+                      setFormState((current) => ({ ...current, intervalSec: event.target.value }));
+                      if (formError?.field === "intervalSec") {
+                        setFormError(null);
+                      }
+                    }}
+                    placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
                   />
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    留空或填写 `0` 时，将沿用默认间隔 {DEFAULT_TCP_INTERVAL} 秒。
+                  </p>
+                  {formError?.field === "intervalSec" ? (
+                    <p id="probe-interval-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                      {formError.message}
+                    </p>
+                  ) : null}
                 </div>
               </div>
             ) : null}
@@ -531,6 +651,35 @@ export default function ProbeSettings({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        open={pendingDeleteIndex !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingDeleteIndex(null);
+          }
+        }}
+      >
+        <AlertDialogContent className={adminDialogContentClass}>
+          <AlertDialogHeader className={adminDialogHeaderClass}>
+            <AlertDialogTitle>确认删除探测节点？</AlertDialogTitle>
+          </AlertDialogHeader>
+          <AlertDialogFooter className={adminDialogFooterClass}>
+            <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className={adminPrimaryButtonClass}
+              onClick={() => {
+                if (pendingDeleteIndex !== null) {
+                  handleDelete(pendingDeleteIndex);
+                }
+                setPendingDeleteIndex(null);
+              }}
+            >
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

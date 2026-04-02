@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,7 @@ const (
 	wsPingPeriod              = (wsPongWait * 9) / 10
 	publicVariantConservative = "conservative"
 	publicVariantBalanced     = "balanced"
+	adminSessionCookieName    = "cm_admin_session"
 )
 
 type sizeLimitedWriter struct {
@@ -208,6 +210,7 @@ type NodeState struct {
 
 type NodeProfile struct {
 	ServerID                 string                      `json:"server_id,omitempty"`
+	AgentAuthToken           string                      `json:"agent_auth_token,omitempty"`
 	AlertEnabled             *bool                       `json:"alert_enabled,omitempty"`
 	Alias                    string                      `json:"alias,omitempty"`
 	Group                    string                      `json:"group,omitempty"`
@@ -245,6 +248,7 @@ type TestSelection struct {
 type AgentConfig struct {
 	Alias           string                      `json:"alias"`
 	Group           string                      `json:"group"`
+	AgentToken      string                      `json:"agent_token,omitempty"`
 	TestIntervalSec int                         `json:"test_interval_sec"`
 	Tests           []metrics.NetworkTestConfig `json:"tests"`
 	Update          *AgentUpdateInstruction     `json:"update,omitempty"`
@@ -530,11 +534,20 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token error"})
 			return
 		}
+		setAdminSessionCookie(w, r, token, exp)
 		log.Printf("管理员登录: %s (%s)", req.Username, r.RemoteAddr)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"token":      token,
 			"expires_at": exp,
 		})
+	})
+
+	adminMux.HandleFunc("/api/v1/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		clearAdminSessionCookie(w, r)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	adminMux.HandleFunc("/api/v1/login/config", func(w http.ResponseWriter, r *http.Request) {
@@ -602,13 +615,6 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		if cfg.AgentToken != "" {
-			token := r.Header.Get("X-AGENT-TOKEN")
-			if token != cfg.AgentToken {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
-				return
-			}
-		}
 
 		var payload metrics.NodeStats
 		if err := decodeJSON(w, r, &payload); err != nil {
@@ -629,6 +635,10 @@ func Run(ctx context.Context, cfg Config) error {
 		if payload.NodeName == "" {
 			payload.NodeName = payload.NodeID
 		}
+		if !store.validateAgentAuthToken(payload.NodeID, r.Header.Get("X-AGENT-TOKEN")) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+			return
+		}
 		store.Update(payload)
 		if delta, ok := store.PublicNodeDelta(payload.NodeID); ok {
 			if data, err := json.Marshal(delta); err == nil {
@@ -642,7 +652,7 @@ func Run(ctx context.Context, cfg Config) error {
 	adminMux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			snapshot := storeSnapshot(store, true)
+			snapshot := storeSnapshot(store, parseBoolQuery(r, "history"))
 			writeJSON(w, http.StatusOK, snapshot)
 		case http.MethodDelete:
 			store.ClearNodes()
@@ -680,7 +690,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 			if r.Method == http.MethodGet {
 				if !resolveAgentUpdateSupported(node.Stats) {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点平台暂不支持后台自更新"))
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(node.Stats)))
 					return
 				}
 				if strings.TrimSpace(node.Stats.AgentVersion) == "" {
@@ -698,7 +708,11 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 
 			if !resolveAgentUpdateSupported(node.Stats) {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前节点平台暂不支持后台自更新"})
+				message := resolveAgentUpdateUnsupportedReason(node.Stats)
+				if strings.TrimSpace(message) == "" {
+					message = "当前节点平台暂不支持后台自更新"
+				}
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 				return
 			}
 			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
@@ -763,6 +777,15 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}))
 
+	adminMux.HandleFunc("/api/v1/admin/session", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		authenticated := validateAdminJWT(store, cfg.JWTSecret, r) == nil
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": authenticated})
+	})
+
 	adminMux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -788,7 +811,7 @@ func Run(ctx context.Context, cfg Config) error {
 			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
-			if err := attachAdminSession(cfg.JWTSecret, store, &view); err != nil {
+			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
 				return
 			}
@@ -807,7 +830,11 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusOK, systemUpdater.View(r.Context(), false))
 		case http.MethodPost:
 			if !updater.CanSelfUpdate() {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前平台暂不支持服务端自更新"})
+				message := updater.DefaultUnsupportedUpdateMessage()
+				if strings.TrimSpace(message) == "" {
+					message = "当前平台暂不支持服务端自更新"
+				}
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 				return
 			}
 			releaseInfo, err := systemUpdater.CheckLatest(r.Context())
@@ -890,7 +917,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 			view.AgentEndpoint = cfg.PublicAddr
 		}
-		if err := attachAdminSession(cfg.JWTSecret, store, &view); err != nil {
+		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
 			return
 		}
@@ -1027,33 +1054,47 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		if cfg.AgentToken != "" {
-			token := r.Header.Get("X-AGENT-TOKEN")
-			if token != cfg.AgentToken {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
-				return
-			}
-		}
 		nodeID := r.URL.Query().Get("node_id")
 		if nodeID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+			return
+		}
+		if !store.validateAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN")) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
 			return
 		}
 		config := store.AgentConfig(nodeID)
 		writeJSON(w, http.StatusOK, config)
 	})
 
-	publicMux.HandleFunc("/api/v1/agent/update/report", func(w http.ResponseWriter, r *http.Request) {
+	publicMux.HandleFunc("/api/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		if cfg.AgentToken != "" {
-			token := r.Header.Get("X-AGENT-TOKEN")
-			if token != cfg.AgentToken {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+			token := strings.TrimSpace(r.Header.Get("X-AGENT-TOKEN"))
+			if token != strings.TrimSpace(cfg.AgentToken) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid bootstrap token"})
 				return
 			}
+		}
+		nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+			return
+		}
+		agentToken := store.ensureAgentAuthToken(nodeID)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"node_id":     nodeID,
+			"agent_token": agentToken,
+		})
+	})
+
+	publicMux.HandleFunc("/api/v1/agent/update/report", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
 		}
 		var req struct {
 			NodeID  string `json:"node_id"`
@@ -1070,6 +1111,10 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
 			return
 		}
+		if !store.validateAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN")) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
+			return
+		}
 		store.ApplyAgentUpdateReport(nodeID, AgentUpdateReport{
 			State:   req.State,
 			Version: req.Version,
@@ -1080,10 +1125,6 @@ func Run(ctx context.Context, cfg Config) error {
 		hub.Broadcast(payload)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-
-	upgrader := websocket.Upgrader{
-		CheckOrigin: isAllowedOrigin,
-	}
 
 	type wsAuthMode int
 	const (
@@ -1106,24 +1147,42 @@ func Run(ctx context.Context, cfg Config) error {
 
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			token := extractToken(r)
+			explicitToken := extractExplicitToken(r)
 			switch mode {
 			case wsAuthRequired:
-				if token == "" {
+				sessionToken := extractToken(r)
+				if sessionToken == "" {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
-			case wsAuthForbidden:
-				if token != "" {
+				if !isSameOrigin(r) {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
-			}
-			if token != "" {
 				if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
+			case wsAuthForbidden:
+				if explicitToken != "" {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+			case wsAuthOptional:
+				if explicitToken != "" {
+					if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
+						writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+						return
+					}
+				}
+			}
+			upgrader := websocket.Upgrader{
+				CheckOrigin: func(request *http.Request) bool {
+					if mode == wsAuthRequired {
+						return isSameOrigin(request)
+					}
+					return true
+				},
 			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
@@ -1209,6 +1268,16 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		assetBase := adminPath + "/"
 		html := strings.ReplaceAll(string(data), "__CM_ADMIN_ASSET_BASE_PATH__", assetBase)
+		html = strings.Replace(html, "<title>CyberMonitor 管理后台</title>", "<title>"+adminDocumentTitle(store.SiteTitle())+"</title>", 1)
+		bootPayload, err := buildAdminBootPayload(store)
+		if err == nil {
+			bootMeta := `<meta name="cm-admin-boot" content="` + bootPayload + `" />`
+			if strings.Contains(html, "</head>") {
+				html = strings.Replace(html, "</head>", bootMeta+"</head>", 1)
+			} else {
+				html = bootMeta + html
+			}
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(html))
@@ -2101,6 +2170,10 @@ func cloneAgentUpdateInstruction(value *AgentUpdateInstruction) *AgentUpdateInst
 }
 
 func resolveAgentUpdateMode(stats metrics.NodeStats) string {
+	deployMode := strings.ToLower(strings.TrimSpace(stats.DeployMode))
+	if deployMode == string(updater.DeployModeDocker) {
+		return string(updater.DeployModeDocker)
+	}
 	osLabel := strings.ToLower(strings.TrimSpace(stats.OS))
 	if strings.Contains(osLabel, "windows") {
 		return "windows"
@@ -2112,7 +2185,21 @@ func resolveAgentUpdateMode(stats metrics.NodeStats) string {
 }
 
 func resolveAgentUpdateSupported(stats metrics.NodeStats) bool {
-	return resolveAgentUpdateMode(stats) != "windows"
+	return resolveAgentUpdateUnsupportedReason(stats) == ""
+}
+
+func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
+	if stats.AgentUpdateDisabled {
+		return "当前 Agent 已禁用远程更新"
+	}
+	switch resolveAgentUpdateMode(stats) {
+	case "windows":
+		return "当前节点平台暂不支持后台自更新"
+	case string(updater.DeployModeDocker):
+		return "Docker 部署的 Agent 请拉取新镜像并重建容器完成更新"
+	default:
+		return ""
+	}
 }
 
 func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
@@ -2152,6 +2239,10 @@ func normalizeSiteTitle(title string) string {
 		return defaultSiteTitle
 	}
 	return value
+}
+
+func adminDocumentTitle(siteTitle string) string {
+	return normalizeSiteTitle(siteTitle) + " 管理后台"
 }
 
 func storeSnapshot(s *Store, withHistory bool) Snapshot {
@@ -2512,14 +2603,9 @@ func readLoop(client *hubClient, hub *Hub) {
 	}
 }
 
-func isAllowedOrigin(r *http.Request) bool {
+func isSameOrigin(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
-		return true
-	}
-	// 管理端 WebSocket（携带 token）保持同源校验，避免跨站点复用管理权限。
-	// 展示页 WebSocket（不携带 token）允许跨域，用于前后端分离部署。
-	if extractToken(r) == "" {
 		return true
 	}
 	parsed, err := url.Parse(origin)
@@ -2829,8 +2915,8 @@ func (s *Store) ExportConfig() ConfigTransferData {
 	}
 }
 
-func attachAdminSession(secret string, store *Store, view *SettingsView) error {
-	if view == nil {
+func refreshAdminSessionCookie(w http.ResponseWriter, r *http.Request, secret string, store *Store) error {
+	if w == nil || store == nil {
 		return nil
 	}
 	creds := store.Credentials()
@@ -2841,9 +2927,57 @@ func attachAdminSession(secret string, store *Store, view *SettingsView) error {
 	if err != nil {
 		return err
 	}
-	view.SessionToken = token
-	view.SessionExpiresAt = exp
+	setAdminSessionCookie(w, r, token, exp)
 	return nil
+}
+
+func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string, exp int64) {
+	if w == nil {
+		return
+	}
+	cookie := &http.Cookie{
+		Name:     adminSessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	if exp > 0 {
+		cookie.Expires = time.Unix(exp, 0)
+	}
+	if requestIsSecure(r) {
+		cookie.Secure = true
+	}
+	http.SetCookie(w, cookie)
+}
+
+func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request) {
+	if w == nil {
+		return
+	}
+	cookie := &http.Cookie{
+		Name:     adminSessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		SameSite: http.SameSiteLaxMode,
+	}
+	if requestIsSecure(r) {
+		cookie.Secure = true
+	}
+	http.SetCookie(w, cookie)
+}
+
+func requestIsSecure(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
@@ -3304,6 +3438,80 @@ func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
 	return profile
 }
 
+func (s *Store) ensureAgentAuthToken(nodeID string) string {
+	var data PersistedData
+	changed := false
+	s.mu.Lock()
+	profile := s.ensureProfileLocked(strings.TrimSpace(nodeID))
+	if strings.TrimSpace(profile.AgentAuthToken) == "" || s.isAgentAuthTokenDuplicateLocked(nodeID, profile.AgentAuthToken) {
+		profile.AgentAuthToken = s.generateAgentAuthTokenLocked()
+		profile.UpdatedAt = time.Now().Unix()
+		data = s.snapshotPersistedLocked()
+		changed = true
+	}
+	token := strings.TrimSpace(profile.AgentAuthToken)
+	s.mu.Unlock()
+	if changed {
+		s.persist(data)
+	}
+	return token
+}
+
+func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	token = strings.TrimSpace(token)
+	if nodeID == "" || token == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	profile := s.profiles[nodeID]
+	if profile == nil {
+		return false
+	}
+	expected := strings.TrimSpace(profile.AgentAuthToken)
+	if expected == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
+}
+
+func (s *Store) generateAgentAuthTokenLocked() string {
+	for {
+		token := randomToken(40)
+		if !s.isAgentAuthTokenUsedLocked(token) {
+			return token
+		}
+	}
+}
+
+func (s *Store) isAgentAuthTokenUsedLocked(token string) bool {
+	if token == "" {
+		return true
+	}
+	for _, profile := range s.profiles {
+		if profile != nil && strings.TrimSpace(profile.AgentAuthToken) == token {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) isAgentAuthTokenDuplicateLocked(nodeID, token string) bool {
+	if strings.TrimSpace(token) == "" {
+		return false
+	}
+	for key, profile := range s.profiles {
+		if key == nodeID || profile == nil {
+			continue
+		}
+		if strings.TrimSpace(profile.AgentAuthToken) == strings.TrimSpace(token) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) ensureServerIDLocked(nodeID string, profile *NodeProfile) bool {
 	if profile == nil {
 		return false
@@ -3637,6 +3845,7 @@ func (s *Store) AgentConfig(nodeID string) AgentConfig {
 	return AgentConfig{
 		Alias:           profile.Alias,
 		Group:           group,
+		AgentToken:      strings.TrimSpace(profile.AgentAuthToken),
 		TestIntervalSec: profile.TestIntervalSec,
 		Tests:           tests,
 		Update:          cloneAgentUpdateInstruction(profile.AgentUpdate),
@@ -3890,15 +4099,24 @@ func validateAdminJWT(store *Store, secret string, r *http.Request) error {
 	return nil
 }
 
-func extractToken(r *http.Request) string {
+func extractExplicitToken(r *http.Request) string {
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		parts := strings.SplitN(auth, " ", 2)
 		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
 			return parts[1]
 		}
 	}
-	if token := r.URL.Query().Get("token"); token != "" {
+	return ""
+}
+
+func extractToken(r *http.Request) string {
+	if token := extractExplicitToken(r); token != "" {
 		return token
+	}
+	if r != nil {
+		if cookie, err := r.Cookie(adminSessionCookieName); err == nil {
+			return strings.TrimSpace(cookie.Value)
+		}
 	}
 	return ""
 }
@@ -3940,6 +4158,29 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func buildAdminBootPayload(store *Store) (string, error) {
+	payload := struct {
+		Settings PublicSettings `json:"settings"`
+	}{
+		Settings: store.PublicSettings(),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+func parseBoolQuery(r *http.Request, key string) bool {
+	value := strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key)))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeLoginRateLimit(w http.ResponseWriter, retryAfter time.Duration) {

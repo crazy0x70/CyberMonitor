@@ -16,10 +16,18 @@ const DEFAULT_SITE_ICON =
 const footerYear = document.getElementById("footer-year");
 const footerCommit = document.getElementById("footer-commit");
 const urlParams = new URLSearchParams(window.location.search);
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
 
 const CONFIG_PATH = "/config.json";
 const VARIANT_CONSERVATIVE = "conservative";
 const VARIANT_BALANCED = "balanced";
+const DEFAULT_GROUP = "全部";
+const DEFAULT_STATUS_FILTER = "all";
+const STATUS_FILTERS = new Set(["all", "online", "offline"]);
 
 const activeVariant =
   urlParams.get("variant") === VARIANT_CONSERVATIVE
@@ -31,13 +39,23 @@ const remoteConfig = {
   targets: [],
 };
 
+function readViewStateFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  const selectedGroup = (params.get("group") || DEFAULT_GROUP).trim() || DEFAULT_GROUP;
+  const statusFilter = params.get("status") || DEFAULT_STATUS_FILTER;
+  return {
+    selectedGroup,
+    statusFilter: STATUS_FILTERS.has(statusFilter) ? statusFilter : DEFAULT_STATUS_FILTER,
+  };
+}
+
 const state = {
   wsConnections: new Map(),
   nodes: new Map(),
   reconnectTimers: new Map(),
   snapshotFailures: new Map(),
-  selectedGroup: "全部",
-  statusFilter: "all",
+  selectedGroup: readViewStateFromURL().selectedGroup,
+  statusFilter: readViewStateFromURL().statusFilter,
   lastNodes: [],
   settingsGroups: [],
   testHistory: new Map(),
@@ -54,6 +72,7 @@ const state = {
   lastTransportAt: 0,
   lastTransportType: "snapshot",
   realtimeStatus: new Map(),
+  groupTabSignature: "",
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
@@ -68,6 +87,45 @@ function buildVariantURL(variant) {
   next.searchParams.set("variant", variant);
   next.searchParams.set("demo", "1");
   return `${next.pathname}${next.search}${next.hash}`;
+}
+
+function syncViewStateToURL(replace = false) {
+  const nextLocation = buildViewURL(state.selectedGroup, state.statusFilter);
+  const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextLocation === currentLocation) {
+    return;
+  }
+  if (replace) {
+    window.history.replaceState({}, "", nextLocation);
+  } else {
+    window.history.pushState({}, "", nextLocation);
+  }
+}
+
+function buildViewURL(group = state.selectedGroup, status = state.statusFilter) {
+  const nextURL = new URL(window.location.href);
+  if (!group || group === DEFAULT_GROUP) {
+    nextURL.searchParams.delete("group");
+  } else {
+    nextURL.searchParams.set("group", group);
+  }
+  if (!status || status === DEFAULT_STATUS_FILTER) {
+    nextURL.searchParams.delete("status");
+  } else {
+    nextURL.searchParams.set("status", status);
+  }
+  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
+}
+
+function shouldHandleLocalNavigation(event) {
+  return !(
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
 }
 
 function appendVariantToSocketURL(value) {
@@ -122,10 +180,11 @@ function scheduleRender() {
 }
 
 function resetToAllGroups() {
-  if (state.selectedGroup === "全部") {
+  if (state.selectedGroup === DEFAULT_GROUP) {
     return;
   }
-  state.selectedGroup = "全部";
+  state.selectedGroup = DEFAULT_GROUP;
+  syncViewStateToURL();
   render();
 }
 
@@ -134,6 +193,7 @@ function setStatusFilter(mode) {
     return;
   }
   state.statusFilter = mode;
+  syncViewStateToURL();
   render();
 }
 
@@ -374,7 +434,7 @@ function rebuildMergedSnapshotState() {
 
   if (lastUpdated) {
     const ts = latestSnapshot ? (latestSnapshot.generated_at || 0) : 0;
-    lastUpdated.textContent = ts ? new Date(ts * 1000).toLocaleTimeString() : "--";
+    lastUpdated.textContent = ts ? timeFormatter.format(new Date(ts * 1000)) : "--";
   }
   syncRealtimeStatus(mergedNodes);
   scheduleRender();
@@ -494,7 +554,7 @@ function render() {
   }
   updateStats(groupNodes);
   updateEmptyState(visibleNodes.length, groupNodes.length);
-  const mode = state.selectedGroup === "全部" ? "flat" : "tag";
+  const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
   if (state.renderMode !== mode) {
     resetRenderMode(mode);
   }
@@ -511,7 +571,7 @@ function updateEmptyState(visibleCount, totalCount) {
     return;
   }
   empty.style.display = "block";
-  if (totalCount > 0 && state.selectedGroup !== "全部") {
+  if (totalCount > 0 && state.selectedGroup !== DEFAULT_GROUP) {
     empty.querySelector("h2").textContent = "当前分组暂无节点";
     empty.querySelector("p").textContent = "请选择其他分组或返回全部查看。";
   } else {
@@ -544,6 +604,9 @@ function applyPublicSettings(settings) {
   }
   if (brandTitle) {
     brandTitle.textContent = resolvedHomeTitle;
+    if (brandTitle.tagName === "A") {
+      brandTitle.setAttribute("href", buildViewURL(DEFAULT_GROUP, state.statusFilter));
+    }
   }
   if (brandSubtitle) {
     brandSubtitle.textContent = resolvedSubtitle;
@@ -828,7 +891,13 @@ function updateFooter(commit) {
 }
 
 if (brandTitle) {
-  brandTitle.addEventListener("click", resetToAllGroups);
+  brandTitle.addEventListener("click", (event) => {
+    if (!shouldHandleLocalNavigation(event)) {
+      return;
+    }
+    event.preventDefault();
+    resetToAllGroups();
+  });
 }
 
 const statTotalCard = statTotal ? statTotal.closest(".stat-card") : null;
@@ -836,17 +905,26 @@ const statOnlineCard = statOnline ? statOnline.closest(".stat-card") : null;
 const statOfflineCard = statOffline ? statOffline.closest(".stat-card") : null;
 
 if (statTotalCard) {
-  statTotalCard.classList.add("clickable");
   statTotalCard.addEventListener("click", () => setStatusFilter("all"));
 }
 if (statOnlineCard) {
-  statOnlineCard.classList.add("clickable");
   statOnlineCard.addEventListener("click", () => setStatusFilter("online"));
 }
 if (statOfflineCard) {
-  statOfflineCard.classList.add("clickable");
   statOfflineCard.addEventListener("click", () => setStatusFilter("offline"));
 }
+
+window.addEventListener("popstate", () => {
+  const next = readViewStateFromURL();
+  const changed =
+    state.selectedGroup !== next.selectedGroup || state.statusFilter !== next.statusFilter;
+  if (!changed) {
+    return;
+  }
+  state.selectedGroup = next.selectedGroup;
+  state.statusFilter = next.statusFilter;
+  render();
+});
 
 function rangeSeconds(key) {
   const match = RANGE_OPTIONS.find((item) => item.key === key);
@@ -982,30 +1060,44 @@ function resetRenderMode(mode) {
 
 function renderGroupTabs(groups) {
   if (!groupTabs) return;
-  const allGroups = ["全部", ...groups];
+  const allGroups = [DEFAULT_GROUP, ...groups];
+  const signature = allGroups.join("\n");
   if (!allGroups.includes(state.selectedGroup)) {
-    state.selectedGroup = "全部";
+    state.selectedGroup = DEFAULT_GROUP;
+    syncViewStateToURL(true);
   }
-  groupTabs.innerHTML = "";
-  allGroups.forEach((group) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "group-tab";
-    if (group === state.selectedGroup) {
-      button.classList.add("active");
-    }
-    button.textContent = formatGroupLabel(group);
-    button.addEventListener("click", () => {
-      if (state.selectedGroup === group) return;
-      state.selectedGroup = group;
-      render();
+  if (state.groupTabSignature !== signature) {
+    state.groupTabSignature = signature;
+    groupTabs.innerHTML = "";
+    allGroups.forEach((group) => {
+      const link = document.createElement("a");
+      link.className = "group-tab";
+      link.dataset.group = group;
+      link.href = buildViewURL(group, state.statusFilter);
+      link.textContent = formatGroupLabel(group);
+      link.addEventListener("click", (event) => {
+        if (!shouldHandleLocalNavigation(event)) {
+          return;
+        }
+        event.preventDefault();
+        if (state.selectedGroup === group) return;
+        state.selectedGroup = group;
+        syncViewStateToURL();
+        render();
+      });
+      groupTabs.appendChild(link);
     });
-    groupTabs.appendChild(button);
+  }
+  Array.from(groupTabs.querySelectorAll(".group-tab")).forEach((button) => {
+    button.classList.toggle("active", button.dataset.group === state.selectedGroup);
+    if (button.tagName === "A") {
+      button.setAttribute("href", buildViewURL(button.dataset.group || DEFAULT_GROUP, state.statusFilter));
+    }
   });
 }
 
 function filterNodesByGroup(nodes, group) {
-  if (!group || group === "全部") return nodes;
+  if (!group || group === DEFAULT_GROUP) return nodes;
   return nodes.filter((node) =>
     extractGroupSelections(node).some((item) => item.group === group)
   );
@@ -2569,7 +2661,7 @@ function formatRate(bytes = 0) {
 
 function formatTime(timestamp) {
   if (!timestamp) return "--";
-  return new Date(timestamp * 1000).toLocaleTimeString();
+  return timeFormatter.format(new Date(timestamp * 1000));
 }
 
 function formatUptime(seconds = 0) {

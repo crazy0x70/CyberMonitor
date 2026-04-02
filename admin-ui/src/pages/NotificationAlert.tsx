@@ -43,9 +43,19 @@ const panelHeaderClass = adminPanelHeaderClass;
 
 const panelFooterClass = `justify-end ${adminPanelFooterClass}`;
 
+type AlertField = "offlineMinutes" | "telegramToken" | "telegramUserIds" | "webhook";
+
+const alertFieldIDMap: Record<AlertField, string> = {
+  offlineMinutes: "offline-minutes",
+  telegramToken: "telegram-token",
+  telegramUserIds: "telegram-user-ids",
+  webhook: "feishu-webhook",
+};
+
 export interface NotificationAlertProps {
   settings: SettingsView | null;
   nodes: NodeView[];
+  onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
   onTest: (payload: AlertTestPayload) => Promise<void>;
@@ -62,9 +72,19 @@ function parseTelegramIds(raw: string) {
   );
 }
 
+function isValidHTTPURL(value: string) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export default function NotificationAlert({
   settings,
   nodes,
+  onDirtyChange,
   saving = false,
   onSave,
   onTest,
@@ -76,6 +96,7 @@ export default function NotificationAlert({
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [testingChannel, setTestingChannel] = useState<"telegram" | "feishu" | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<AlertField, string>>>({});
 
   useEffect(() => {
     const userIds = Array.isArray(settings?.alert_telegram_user_ids)
@@ -93,7 +114,18 @@ export default function NotificationAlert({
         : "5",
     );
     setIsDirty(false);
+    setFieldErrors({});
   }, [settings]);
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
 
   const counts = useMemo(() => {
     const total = nodes.length;
@@ -102,26 +134,78 @@ export default function NotificationAlert({
     return { total, enabled, disabled };
   }, [nodes]);
 
-  const handleSave = async () => {
+  const focusAlertField = (field: AlertField) => {
+    const element = document.getElementById(alertFieldIDMap[field]);
+    if (element instanceof HTMLElement) {
+      element.focus();
+    }
+  };
+
+  const validateAlertForm = ({
+    requireTelegram = false,
+    requireWebhook = false,
+  }: {
+    requireTelegram?: boolean;
+    requireWebhook?: boolean;
+  }) => {
+    const nextErrors: Partial<Record<AlertField, string>> = {};
+    const normalizedWebhook = webhook.trim();
+    const normalizedToken = telegramToken.trim();
+    const normalizedUserIds = telegramUserIds.trim();
     const ids = parseTelegramIds(telegramUserIds);
-    if ((telegramToken || telegramUserIds.trim()) && (!telegramToken || ids.length === 0)) {
-      toast.error("Telegram Bot Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
-      return;
+    const minutes = Number.parseInt(offlineMinutes, 10);
+
+    if (!Number.isFinite(minutes) || minutes < 1) {
+      nextErrors.offlineMinutes = "请输入大于或等于 1 的离线阈值。";
     }
 
-    const minutes = Number.parseInt(offlineMinutes, 10);
-    const normalizedMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 5;
+    if (normalizedWebhook) {
+      if (!isValidHTTPURL(normalizedWebhook)) {
+        nextErrors.webhook = "Webhook 地址需为有效的 http 或 https 地址。";
+      }
+    } else if (requireWebhook) {
+      nextErrors.webhook = "测试飞书告警前，请先填写 Webhook 地址。";
+    }
+
+    if (requireTelegram || normalizedToken || normalizedUserIds) {
+      if (!normalizedToken) {
+        nextErrors.telegramToken = "请输入 Telegram Bot Token。";
+      }
+      if (!normalizedUserIds) {
+        nextErrors.telegramUserIds = "请输入至少一个 Telegram 用户 ID。";
+      } else if (ids.length === 0) {
+        nextErrors.telegramUserIds = "用户 ID 必须为正整数，多个 ID 请用逗号分隔。";
+      }
+    }
+
+    const firstField = (Object.keys(alertFieldIDMap) as AlertField[]).find((field) => nextErrors[field]);
+    return {
+      errors: nextErrors,
+      firstField,
+      ids,
+      normalizedMinutes: Number.isFinite(minutes) && minutes > 0 ? minutes : 5,
+    };
+  };
+
+  const handleSave = async () => {
+    const validation = validateAlertForm({});
+    setFieldErrors(validation.errors);
+    if (validation.firstField) {
+      focusAlertField(validation.firstField);
+      return;
+    }
 
     setIsSaving(true);
     try {
       await onSave({
         alert_webhook: webhook.trim(),
         alert_telegram_token: telegramToken.trim(),
-        alert_telegram_user_ids: ids,
-        alert_offline_sec: normalizedMinutes * 60,
+        alert_telegram_user_ids: validation.ids,
+        alert_offline_sec: validation.normalizedMinutes * 60,
       });
       toast.success("告警配置已保存");
       setIsDirty(false);
+      setFieldErrors({});
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存告警配置失败");
     } finally {
@@ -130,15 +214,19 @@ export default function NotificationAlert({
   };
 
   const handleTest = async (channel: "telegram" | "feishu") => {
-    const ids = parseTelegramIds(telegramUserIds);
-    if (channel === "telegram" && (!telegramToken.trim() || ids.length === 0)) {
-      toast.error("Telegram Bot Token 与用户 ID 需要同时填写，且用户 ID 必须为数字");
+    const validation = validateAlertForm({
+      requireTelegram: channel === "telegram",
+      requireWebhook: channel === "feishu",
+    });
+    setFieldErrors(validation.errors);
+    if (validation.firstField) {
+      focusAlertField(validation.firstField);
       return;
     }
     const payload: AlertTestPayload = {};
     if (channel === "telegram") {
       payload.telegram_token = telegramToken.trim();
-      payload.telegram_user_ids = ids;
+      payload.telegram_user_ids = validation.ids;
     }
     if (channel === "feishu") {
       payload.webhook = webhook.trim();
@@ -186,7 +274,7 @@ export default function NotificationAlert({
     <div className={adminPageShellClass}>
       <div className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>通知告警</h2>
+          <h1 className={adminPageTitleClass}>通知告警</h1>
         </div>
         <div className={adminPageActionsClass}>
           {isDirty && (
@@ -197,7 +285,7 @@ export default function NotificationAlert({
             onClick={handleSave}
             disabled={!isDirty || isSaving || saving}
           >
-            {isSaving || saving ? "保存中..." : "保存更改"}
+            {isSaving || saving ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>
@@ -245,14 +333,25 @@ export default function NotificationAlert({
                 <Input
                   id="offline-minutes"
                   type="number"
+                  name="offline-minutes"
                   min={1}
+                  autoComplete="off"
+                  inputMode="numeric"
                   className={adminInputClass}
+                  aria-invalid={Boolean(fieldErrors.offlineMinutes)}
+                  aria-describedby={fieldErrors.offlineMinutes ? "offline-minutes-error" : undefined}
                   value={offlineMinutes}
                   onChange={(event) => {
                     setOfflineMinutes(event.target.value);
+                    setFieldErrors((current) => ({ ...current, offlineMinutes: undefined }));
                     setIsDirty(true);
                   }}
                 />
+                {fieldErrors.offlineMinutes ? (
+                  <p id="offline-minutes-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
+                    {fieldErrors.offlineMinutes}
+                  </p>
+                ) : null}
                 <p className="text-[11px] font-medium text-slate-400 mt-1">当节点超过此时间未上报心跳时，将触发离线通知。</p>
               </div>
             </div>
@@ -276,27 +375,53 @@ export default function NotificationAlert({
                   <Input
                     id="telegram-token"
                     type="password"
+                    name="telegram-token"
+                    autoComplete="off"
+                    spellCheck={false}
                     className={adminInputClass}
+                    aria-invalid={Boolean(fieldErrors.telegramToken)}
+                    aria-describedby={fieldErrors.telegramToken ? "telegram-token-error" : undefined}
                     value={telegramToken}
                     onChange={(event) => {
                       setTelegramToken(event.target.value);
+                      setFieldErrors((current) => ({ ...current, telegramToken: undefined }));
                       setIsDirty(true);
                     }}
-                    placeholder="例如：123456789:ABC..."
+                    placeholder="例如：123456789:ABC…"
                   />
+                  {fieldErrors.telegramToken ? (
+                    <p id="telegram-token-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
+                      {fieldErrors.telegramToken}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="telegram-user-ids" className="text-xs font-black uppercase tracking-widest text-slate-400">用户 ID</Label>
                   <Input
                     id="telegram-user-ids"
+                    name="telegram-user-ids"
+                    autoComplete="off"
+                    inputMode="numeric"
+                    spellCheck={false}
                     className={adminInputClass}
+                    aria-invalid={Boolean(fieldErrors.telegramUserIds)}
+                    aria-describedby={fieldErrors.telegramUserIds ? "telegram-user-ids-error" : undefined}
                     value={telegramUserIds}
                     onChange={(event) => {
                       setTelegramUserIds(event.target.value);
+                      setFieldErrors((current) => ({ ...current, telegramUserIds: undefined }));
                       setIsDirty(true);
                     }}
-                    placeholder="多个 ID 用逗号分隔"
+                    placeholder="例如：123456789,987654321…"
                   />
+                  <p className="text-[11px] font-medium text-slate-400">
+                    多个用户 ID 请使用逗号分隔。
+                  </p>
+                  {fieldErrors.telegramUserIds ? (
+                    <p id="telegram-user-ids-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
+                      {fieldErrors.telegramUserIds}
+                    </p>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -309,7 +434,7 @@ export default function NotificationAlert({
               disabled={testingChannel !== null}
             >
               <Send className="mr-2 h-4 w-4" />
-              {testingChannel === "telegram" ? "正在发送..." : "测试推送"}
+              {testingChannel === "telegram" ? "正在发送…" : "测试推送"}
             </Button>
           </CardFooter>
         </Card>
@@ -329,14 +454,27 @@ export default function NotificationAlert({
                 <Label htmlFor="feishu-webhook" className="text-xs font-black uppercase tracking-widest text-slate-400">Webhook 地址</Label>
                 <Input
                   id="feishu-webhook"
+                  type="url"
+                  name="feishu-webhook"
+                  autoComplete="off"
+                  inputMode="url"
+                  spellCheck={false}
                   className={adminInputClass}
+                  aria-invalid={Boolean(fieldErrors.webhook)}
+                  aria-describedby={fieldErrors.webhook ? "feishu-webhook-error" : undefined}
                   value={webhook}
                   onChange={(event) => {
                     setWebhook(event.target.value);
+                    setFieldErrors((current) => ({ ...current, webhook: undefined }));
                     setIsDirty(true);
                   }}
-                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
                 />
+                {fieldErrors.webhook ? (
+                  <p id="feishu-webhook-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
+                    {fieldErrors.webhook}
+                  </p>
+                ) : null}
               </div>
             </div>
           </CardContent>
@@ -348,7 +486,7 @@ export default function NotificationAlert({
               disabled={testingChannel !== null}
             >
               <Send className="mr-2 h-4 w-4" />
-              {testingChannel === "feishu" ? "正在发送..." : "测试推送"}
+              {testingChannel === "feishu" ? "正在发送…" : "测试推送"}
             </Button>
           </CardFooter>
         </Card>

@@ -31,6 +31,22 @@ func TestEnvDuration(t *testing.T) {
 	}
 }
 
+func TestEnvBool(t *testing.T) {
+	t.Setenv("CM_TEST_TRUE", " true ")
+	t.Setenv("CM_TEST_FALSE", "0")
+	t.Setenv("CM_TEST_BAD_BOOL", "maybe")
+
+	if got := EnvBool("CM_TEST_TRUE", false); !got {
+		t.Fatal("expected true bool env value")
+	}
+	if got := EnvBool("CM_TEST_FALSE", true); got {
+		t.Fatal("expected false bool env value")
+	}
+	if got := EnvBool("CM_TEST_BAD_BOOL", true); !got {
+		t.Fatal("expected fallback bool value for invalid input")
+	}
+}
+
 func TestParseCommaList(t *testing.T) {
 	got := ParseCommaList(" eth0, ,en0, lo0 ")
 	want := []string{"eth0", "en0", "lo0"}

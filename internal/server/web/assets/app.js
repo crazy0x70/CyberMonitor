@@ -6,9 +6,14 @@ const lastUpdated = document.getElementById("last-updated");
 const loginModal = document.getElementById("login-modal");
 const loginForm = document.getElementById("login-form");
 const loginError = document.getElementById("login-error");
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
 
 const state = {
-  token: localStorage.getItem("cm_token") || "",
+  token: sessionStorage.getItem("cm_token") || "",
   ws: null,
   nodes: new Map(),
   reconnectTimer: null,
@@ -54,11 +59,8 @@ async function login(username, password) {
     throw new Error(message);
   }
   const data = await resp.json();
-  if (!data.token) {
-    throw new Error("未返回 token");
-  }
-  state.token = data.token;
-  localStorage.setItem("cm_token", data.token);
+  state.token = "session";
+  sessionStorage.setItem("cm_token", "session");
   hideLogin();
   connectWS();
 }
@@ -81,13 +83,11 @@ function connectWS() {
     return;
   }
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  const wsUrl = `${protocol}://${location.host}/ws?token=${encodeURIComponent(
-    state.token
-  )}`;
+  const wsUrl = `${protocol}://${location.host}/ws`;
   const ws = new WebSocket(wsUrl);
   state.ws = ws;
 
-  setWsStatus("连接中...", false);
+  setWsStatus("连接中…", false);
 
   ws.onopen = () => {
     setWsStatus("已连接", true);
@@ -108,9 +108,9 @@ function connectWS() {
       const payload = JSON.parse(event.data);
       if (payload.type === "snapshot") {
         updateNodes(payload.nodes || []);
-        lastUpdated.textContent = new Date(
-          (payload.generated_at || 0) * 1000
-        ).toLocaleTimeString();
+        lastUpdated.textContent = timeFormatter.format(
+          new Date((payload.generated_at || 0) * 1000)
+        );
       }
     } catch (error) {
       console.error(error);
@@ -329,7 +329,7 @@ function formatRate(bytes = 0) {
 
 function formatTime(timestamp) {
   if (!timestamp) return "--";
-  return new Date(timestamp * 1000).toLocaleTimeString();
+  return timeFormatter.format(new Date(timestamp * 1000));
 }
 
 function formatUptime(seconds = 0) {

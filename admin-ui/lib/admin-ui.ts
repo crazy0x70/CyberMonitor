@@ -13,16 +13,16 @@ export const adminPageLeadClass =
 export const adminPageActionsClass = "flex flex-wrap items-center gap-3";
 
 export const adminSurfaceCardClass =
-  "overflow-hidden rounded-[1.75rem] border border-slate-200/60 bg-white/70 backdrop-blur-xl shadow-[0_24px_48px_-32px_rgba(15,23,42,0.1)] transition-all hover:shadow-[0_32px_64px_-32px_rgba(15,23,42,0.15)] dark:border-[rgba(148,163,184,0.12)] dark:bg-[rgba(15,23,42,0.8)] dark:shadow-[0_24px_48px_-32px_rgba(2,8,23,0.4)] dark:hover:shadow-[0_32px_64px_-32px_rgba(2,8,23,0.5)]";
+  "overflow-hidden rounded-[1.75rem] border border-[var(--cm-panel-border)] bg-[var(--cm-panel-bg)] backdrop-blur-xl shadow-[var(--cm-panel-shadow)] transition-[box-shadow,border-color,background-color] hover:shadow-[0_32px_72px_-36px_rgba(15,23,42,0.18)] dark:hover:shadow-[0_32px_72px_-36px_rgba(0,0,0,0.58)]";
 
 export const adminSurfaceMutedClass =
-  "border border-slate-200/80 bg-slate-50/80 backdrop-blur-md dark:border-[rgba(148,163,184,0.14)] dark:bg-slate-900/60";
+  "border border-[var(--cm-control-border)] bg-[var(--cm-muted-surface)] backdrop-blur-md";
 
 export const adminSectionHeaderClass =
-  "border-b border-slate-200/60 bg-white/40 px-6 py-4 dark:border-[rgba(148,163,184,0.12)] dark:bg-slate-950/40";
+  "border-b border-[var(--cm-panel-border)] bg-[var(--cm-panel-header-bg)] px-6 py-4";
 
 export const adminInsetCardClass =
-  "rounded-[1.25rem] border border-slate-200/80 bg-white/50 backdrop-blur-sm dark:border-slate-800/80 dark:bg-slate-950/50";
+  "rounded-[1.25rem] border border-[var(--cm-control-border)] bg-[var(--cm-muted-surface)] backdrop-blur-sm";
 
 export const adminNotePanelClass = `${adminInsetCardClass} p-4`;
 
@@ -52,15 +52,16 @@ export const adminAccentBadgeClass =
   "bg-indigo-100/80 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:hover:bg-indigo-900";
 
 export const adminPrimaryButtonClass =
-  "inline-flex h-11 min-w-[110px] items-center justify-center rounded-full border border-transparent bg-sky-600 px-5 text-sm font-bold text-white shadow-[0_16px_32px_-8px_rgba(14,116,214,0.3)] transition-all hover:scale-[1.02] hover:bg-sky-500 active:scale-[0.98] disabled:scale-100 disabled:opacity-50 dark:bg-sky-500 dark:hover:bg-sky-400";
+  "inline-flex h-11 min-w-[110px] items-center justify-center rounded-full border border-transparent bg-[#1f5dff] px-5 text-sm font-bold text-white shadow-[0_18px_36px_-10px_rgba(31,93,255,0.38)] outline-none transition-[background-color,box-shadow,transform,opacity] hover:scale-[1.02] hover:bg-[#2554dd] focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-[0.98] disabled:scale-100 disabled:opacity-50 dark:bg-[#3b82f6] dark:hover:bg-[#60a5fa] dark:focus-visible:border-sky-700";
 
 export const adminOutlineButtonClass =
-  "h-11 rounded-full border-slate-300/80 bg-white/80 text-slate-700 shadow-sm backdrop-blur-md transition-all hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 active:scale-[0.98] dark:border-slate-800 dark:bg-slate-950/80 dark:text-slate-200 dark:hover:border-sky-700 dark:hover:text-sky-400";
+  "h-11 rounded-full border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] text-slate-700 shadow-sm backdrop-blur-md outline-none transition-[border-color,background-color,color,transform,opacity] hover:border-sky-300 hover:bg-[var(--cm-control-hover)] hover:text-sky-700 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-[0.98] dark:text-slate-200 dark:hover:border-sky-700 dark:hover:text-sky-300 dark:focus-visible:border-sky-700";
 
 export const adminActionButtonClass =
   `${adminOutlineButtonClass} inline-flex min-w-[110px] items-center justify-center px-5`;
 
-export const adminCompactActionButtonClass = `${adminOutlineButtonClass} h-9 px-4 text-xs font-bold`;
+export const adminCompactActionButtonClass =
+  `${adminOutlineButtonClass} inline-flex items-center justify-center gap-1.5 h-9 px-4 text-xs font-bold`;
 
 export const adminDangerOutlineButtonClass =
   "h-11 rounded-full border-rose-200/80 bg-rose-50/80 text-rose-600 shadow-none backdrop-blur-sm hover:bg-rose-100 hover:text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/60";
@@ -74,7 +75,7 @@ export const adminPanelFooterClass =
   "border-t border-slate-200/60 bg-slate-50/60 px-6 py-4 dark:border-slate-800/60 dark:bg-slate-950/60";
 
 export const adminStatCardClass =
-  "flex h-full flex-col justify-between overflow-hidden rounded-[1.75rem] border border-slate-200/60 shadow-none transition-all hover:translate-y-[-2px]";
+  "flex h-full flex-col justify-between overflow-hidden rounded-[1.75rem] border border-slate-200/60 shadow-none transition-[transform,border-color,background-color] hover:translate-y-[-2px]";
 
 export const adminStatCardHeaderClass =
   "flex flex-row items-start justify-between space-y-0 p-6 pb-3";
@@ -123,7 +124,7 @@ export const adminLoadingCardContentClass =
   "flex items-center justify-center gap-4 py-10 text-sm font-medium text-slate-500 dark:text-slate-400";
 
 export const adminInputClass =
-  "h-11 rounded-xl border-slate-200 bg-white/50 px-4 text-sm text-slate-900 backdrop-blur-sm transition-all placeholder:text-slate-400 focus:border-sky-500 focus:ring-4 focus:ring-sky-500/10 dark:border-slate-800 dark:bg-slate-950/50 dark:text-slate-50 dark:focus:border-sky-400 dark:focus:ring-sky-400/10";
+  "h-11 rounded-xl border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] px-4 text-sm text-slate-900 backdrop-blur-sm transition-[border-color,background-color,color,box-shadow] placeholder:text-slate-400 focus:border-sky-500 focus:ring-4 focus:ring-sky-500/10 dark:text-slate-50 dark:focus:border-sky-400 dark:focus:ring-sky-400/10";
 
 export const adminWideInputClass = `max-w-xl ${adminInputClass}`;
 
@@ -131,13 +132,13 @@ export const adminCompactInputClass =
   `h-9 w-full min-w-[200px] max-w-sm rounded-lg ${adminInputClass}`;
 
 export const adminTextareaClass =
-  "rounded-xl border-slate-200 bg-white/50 px-4 py-3 text-sm leading-relaxed text-slate-700 backdrop-blur-sm transition-all placeholder:text-slate-400 focus:border-sky-500 focus:ring-4 focus:ring-sky-500/10 dark:border-slate-800 dark:bg-slate-950/50 dark:text-slate-50 dark:focus:border-sky-400 dark:focus:ring-sky-400/10";
+  "rounded-xl border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] px-4 py-3 text-sm leading-relaxed text-slate-700 backdrop-blur-sm transition-[border-color,background-color,color,box-shadow] placeholder:text-slate-400 focus:border-sky-500 focus:ring-4 focus:ring-sky-500/10 dark:text-slate-50 dark:focus:border-sky-400 dark:focus:ring-sky-400/10";
 
 export const adminSelectTriggerClass =
-  "h-11 rounded-xl border-slate-200 bg-white/50 px-4 text-sm text-slate-900 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/50 dark:text-slate-50";
+  "h-11 rounded-xl border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] px-4 text-sm text-slate-900 backdrop-blur-sm dark:text-slate-50";
 
 export const adminSelectContentClass =
-  "rounded-xl border border-slate-200 bg-white/95 text-slate-900 backdrop-blur-2xl dark:border-slate-800 dark:bg-slate-950/95 dark:text-slate-50";
+  "rounded-xl border border-[var(--cm-control-border)] bg-[var(--cm-panel-bg)] text-slate-900 backdrop-blur-2xl dark:text-slate-50";
 
 export const adminDialogContentClass =
   "overflow-hidden rounded-[2rem] border-slate-200/60 bg-white/95 p-0 backdrop-blur-2xl dark:border-slate-800/60 dark:bg-slate-950/95 shadow-[0_48px_96px_-32px_rgba(15,23,42,0.4)]";
@@ -158,7 +159,7 @@ export const adminTabsListClass =
   "grid h-auto w-full grid-cols-2 border-b border-slate-200 bg-transparent p-0 shadow-none sm:grid-cols-3 dark:border-slate-800";
 
 export const adminTabsTriggerClass =
-  "rounded-none border-b-2 border-transparent px-1 py-3.5 text-[11px] font-black uppercase tracking-widest text-slate-400 transition-all data-[state=active]:border-sky-500 data-[state=active]:bg-transparent data-[state=active]:text-slate-900 dark:text-slate-500 dark:data-[state=active]:border-sky-400 dark:data-[state=active]:text-slate-50";
+  "rounded-none border-b-2 border-transparent px-1 py-3.5 text-[11px] font-black uppercase tracking-widest text-slate-400 transition-[border-color,color,background-color] data-[state=active]:border-sky-500 data-[state=active]:bg-transparent data-[state=active]:text-slate-900 dark:text-slate-500 dark:data-[state=active]:border-sky-400 dark:data-[state=active]:text-slate-50";
 
 export const adminTableShellClass =
   "overflow-hidden rounded-[1.5rem] border border-slate-200/60 bg-white/40 dark:border-slate-800/60 dark:bg-slate-950/40";
@@ -205,47 +206,47 @@ export const adminDetailWarningPanelClass =
 export const adminWorkspaceListClass = "space-y-4";
 
 export const adminWorkspaceItemClass =
-  "flex w-full flex-col gap-4 rounded-[1.75rem] border border-slate-200/60 bg-white/80 p-6 text-left shadow-[0_16px_32px_-24px_rgba(15,23,42,0.1)] transition-all hover:border-sky-300 hover:bg-slate-50 hover:shadow-[0_24px_48px_-24px_rgba(15,23,42,0.12)] dark:border-slate-800/60 dark:bg-slate-950/80 dark:hover:border-sky-800 dark:hover:bg-slate-900";
+  "flex w-full flex-col gap-4 rounded-[1.75rem] border border-[var(--cm-panel-border)] bg-[var(--cm-panel-bg)] p-6 text-left shadow-[0_16px_32px_-24px_rgba(15,23,42,0.1)] transition-[border-color,background-color,box-shadow] hover:border-sky-300 hover:bg-[var(--cm-muted-surface)] hover:shadow-[0_24px_48px_-24px_rgba(15,23,42,0.14)] dark:hover:border-sky-700";
 
 export const adminWorkspaceHeaderClass =
   "flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between";
 
 export const adminWorkspaceActionChipClass =
-  "inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50/80 px-3.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500 transition-all hover:border-sky-200 hover:text-sky-600 dark:border-slate-800 dark:bg-slate-900/80 dark:text-slate-400";
+  "inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50/80 px-3.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-500 transition-[border-color,color,background-color] hover:border-sky-200 hover:text-sky-600 dark:border-slate-800 dark:bg-slate-900/80 dark:text-slate-400";
 
 export const adminSelectionChipActiveClass =
   "rounded-full bg-slate-900 px-4 py-1.5 text-[11px] font-black uppercase tracking-widest text-white shadow-lg shadow-slate-900/20 dark:bg-slate-100 dark:text-slate-950 dark:shadow-white/10";
 
 export const adminSelectionChipInactiveClass =
-  "rounded-full border border-slate-200 bg-white/80 px-4 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-600 transition-all hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 dark:border-slate-800 dark:bg-slate-950/80 dark:text-slate-300";
+  "rounded-full border border-slate-200 bg-white/80 px-4 py-1.5 text-[11px] font-bold uppercase tracking-widest text-slate-600 transition-[border-color,color,background-color] hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 dark:border-slate-800 dark:bg-slate-950/80 dark:text-slate-300";
 
 export const adminSidebarNavItemClass =
-  "group grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-[13px] font-bold transition-all duration-300";
+  "group grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-[13px] font-bold outline-none transition-[border-color,background-color,color,box-shadow] duration-300 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:focus-visible:border-sky-700";
 
 export const adminSidebarNavLabelClass = "flex min-w-0 items-center gap-2";
 
 export const adminSidebarLogoChipClass =
-  "flex items-center justify-center rounded-[1.25rem] border border-sidebar-border bg-white text-primary shadow-md transition-transform group-hover:scale-105 dark:bg-slate-950";
+  "flex items-center justify-center rounded-[1.25rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-control-bg)] text-primary shadow-md transition-transform group-hover:scale-105";
 
 export const adminSidebarChromeCardClass =
-  "rounded-[1.75rem] border border-sidebar-border/40 bg-white/80 shadow-[0_20px_40px_-24px_rgba(15,23,42,0.12)] backdrop-blur-2xl dark:bg-slate-950/80";
+  "rounded-[1.75rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] shadow-[var(--cm-panel-shadow)] backdrop-blur-2xl";
 
 export const adminSidebarSectionCardClass = `${adminSidebarChromeCardClass} p-4`;
 
 export const adminSidebarIconButtonClass =
-  "h-9 w-9 rounded-full border border-sidebar-border bg-white/80 text-sidebar-foreground shadow-sm backdrop-blur-md transition-all hover:border-sky-300 hover:bg-slate-50 active:scale-95 dark:bg-slate-950 dark:hover:border-sky-700 dark:hover:bg-slate-900";
+  "h-9 w-9 rounded-full border border-[var(--cm-sidebar-border)] bg-[var(--cm-control-bg)] text-sidebar-foreground shadow-sm backdrop-blur-md outline-none transition-[border-color,background-color,color,transform] hover:border-sky-300 hover:bg-[var(--cm-control-hover)] focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-95 dark:hover:border-sky-700 dark:focus-visible:border-sky-700";
 
 export const adminThemeToggleButtonClass =
-  "h-10 w-10 rounded-full border border-slate-200/80 bg-white/80 text-slate-600 shadow-sm backdrop-blur-md transition-all hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 active:scale-95 dark:border-slate-800/80 dark:bg-slate-950/80 dark:text-slate-400 dark:hover:border-sky-700 dark:hover:text-sky-400";
+  "h-10 w-10 rounded-full border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] text-slate-600 shadow-sm backdrop-blur-md outline-none transition-[border-color,background-color,color,transform] hover:border-sky-300 hover:bg-[var(--cm-control-hover)] hover:text-sky-700 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-95 dark:text-slate-300 dark:hover:border-sky-700 dark:hover:text-sky-300 dark:focus-visible:border-sky-700";
 
 export const adminSidebarStatusTileClass =
   "flex min-h-[96px] flex-col items-center justify-center gap-2 rounded-[1.25rem] border border-sidebar-border bg-white/80 px-4 py-4 text-center backdrop-blur-md dark:bg-slate-950/80";
 
 export const adminSidebarSecondaryButtonClass =
-  "w-full justify-start rounded-xl border border-sidebar-border/60 bg-transparent px-3.5 py-5 text-[13px] font-bold text-sidebar-foreground transition-all hover:border-sky-300 hover:bg-sidebar-accent hover:text-sky-700 dark:hover:border-sky-700 dark:hover:text-sky-400";
+  "w-full justify-start rounded-xl border border-[var(--cm-sidebar-border)] bg-transparent px-3.5 py-5 text-[13px] font-bold text-sidebar-foreground outline-none transition-[border-color,background-color,color] hover:border-sky-300 hover:bg-[var(--cm-control-bg)] hover:text-sky-700 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:hover:border-sky-700 dark:hover:text-sky-300 dark:focus-visible:border-sky-700";
 
 export const adminSummaryRowClass =
-  "flex flex-col items-start gap-3 rounded-[1.25rem] border border-slate-200/60 bg-white/40 p-3.5 transition-all hover:border-sky-200 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800/60 dark:bg-slate-950/40 dark:hover:border-sky-900";
+  "flex flex-col items-start gap-3 rounded-[1.25rem] border border-slate-200/60 bg-white/40 p-3.5 transition-[border-color,background-color,box-shadow] hover:border-sky-200 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800/60 dark:bg-slate-950/40 dark:hover:border-sky-900";
 
 export const adminSummaryIconChipClass = "rounded-xl p-2.5 shadow-sm";
 
@@ -268,10 +269,10 @@ export const adminSummaryWarningTextClass =
   "mt-0.5 text-xs leading-relaxed text-amber-700/80 dark:text-amber-200/70";
 
 export const adminWarningOutlineButtonClass =
-  "h-9 rounded-full border border-amber-200 bg-white/80 text-amber-700 px-4 text-xs font-bold transition-all hover:bg-amber-50 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-200 dark:hover:bg-amber-900";
+  "h-9 rounded-full border border-amber-200 bg-white/80 text-amber-700 px-4 text-xs font-bold outline-none transition-[border-color,background-color,color] hover:bg-amber-50 focus-visible:border-amber-300 focus-visible:ring-2 focus-visible:ring-amber-300/60 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-200 dark:hover:bg-amber-900 dark:focus-visible:border-amber-700";
 
 export const adminQuickActionButtonClass =
-  "h-11 w-full justify-start rounded-xl border border-slate-200 bg-white/60 px-4 text-sm font-bold text-slate-800 transition-all hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 active:scale-[0.98] dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-200 dark:hover:border-sky-700 dark:hover:text-sky-400";
+  "inline-flex h-11 w-full items-center justify-start gap-3 rounded-xl border border-slate-200 bg-white/60 px-4 text-sm font-bold text-slate-800 outline-none transition-[border-color,background-color,color,transform] hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-[0.98] dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-200 dark:hover:border-sky-700 dark:hover:text-sky-400 dark:focus-visible:border-sky-700";
 
 export const adminWorkspaceMetaGridClass =
   "grid gap-3 text-xs text-slate-500 dark:text-slate-400 md:grid-cols-2 xl:grid-cols-4";
@@ -288,7 +289,7 @@ export const adminWorkspaceNestedItemClass =
   "rounded-[1.25rem] border border-slate-200 bg-white/50 p-4 dark:border-slate-800 dark:bg-slate-900/50";
 
 export const adminEmptyStateClass =
-  "rounded-[2rem] border-2 border-dashed border-slate-200 bg-white/40 px-6 py-12 text-center dark:border-slate-800 dark:bg-slate-950/40";
+  "rounded-[2rem] border-2 border-dashed border-[var(--cm-panel-border)] bg-[var(--cm-muted-surface)] px-6 py-12 text-center";
 
 export const adminInlineEmptyStateClass =
   "rounded-xl border border-dashed border-slate-200 bg-slate-50/40 px-4 py-6 text-center text-xs text-slate-400 dark:border-slate-800 dark:bg-slate-900/40";
@@ -297,7 +298,7 @@ export const adminSubtleOutlineBadgeClass =
   "border-slate-200/80 text-slate-500 dark:border-slate-700/80 dark:text-slate-400";
 
 export const adminDangerIconButtonClass =
-  "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-rose-100 bg-rose-50/80 text-rose-500 transition-all hover:border-rose-300 hover:bg-rose-100 hover:text-rose-600 active:scale-90 dark:border-rose-900/40 dark:bg-rose-950/40 dark:text-rose-400 dark:hover:bg-rose-900/60";
+  "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-rose-100 bg-rose-50/80 text-rose-500 transition-[border-color,background-color,color,transform] hover:border-rose-300 hover:bg-rose-100 hover:text-rose-600 active:scale-90 dark:border-rose-900/40 dark:bg-rose-950/40 dark:text-rose-400 dark:hover:bg-rose-900/60";
 
 export const adminInfoAlertClass =
   "rounded-xl border border-sky-100 bg-sky-50/60 p-4 text-sky-900 dark:border-sky-900/40 dark:bg-sky-950/40 dark:text-sky-100";

@@ -280,11 +280,13 @@ export default function Login({
                   <Input
                     id="username"
                     autoComplete="username"
-                    placeholder="admin"
+                    name="username"
+                    placeholder="例如：admin…"
                     className={cn(adminInputClass, "pl-10")}
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
                     disabled={errorType === "locked" && lockTimeLeft > 0}
+                    spellCheck={false}
                   />
                 </div>
               </div>
@@ -297,6 +299,7 @@ export default function Login({
                     id="password"
                     type="password"
                     autoComplete="current-password"
+                    name="password"
                     className={cn(adminInputClass, "pl-10")}
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
@@ -312,7 +315,7 @@ export default function Login({
                     <div ref={turnstileContainerRef} />
                   </div>
                   {turnstileError ? (
-                    <p className="text-sm text-rose-600 dark:text-rose-300">{turnstileError}</p>
+                    <p className="text-sm text-rose-600 dark:text-rose-300" aria-live="polite">{turnstileError}</p>
                   ) : (
                     <p className="text-xs text-slate-500 dark:text-slate-400">
                       完成验证后再提交管理员凭证。
@@ -324,10 +327,13 @@ export default function Login({
             <CardFooter className="border-t border-slate-200/40 bg-white/40 px-8 py-6 dark:border-slate-800/40 dark:bg-slate-950/40">
               <Button
                 type="submit"
-                className={cn(adminPrimaryButtonClass, "h-12 w-full font-black tracking-tight shadow-xl shadow-sky-500/20 active:scale-95 transition-all duration-300")}
+                className={cn(
+                  adminPrimaryButtonClass,
+                  "h-12 w-full font-black tracking-tight shadow-xl shadow-sky-500/20 active:scale-95 transition-[background-color,color,box-shadow,transform] duration-300",
+                )}
                 disabled={submitting || (errorType === "locked" && lockTimeLeft > 0)}
               >
-                {submitting ? "正在验证身份..." : "确 认 登 录"}
+                {submitting ? "正在验证身份…" : "确 认 登 录"}
               </Button>
             </CardFooter>
           </form>

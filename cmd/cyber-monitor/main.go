@@ -44,6 +44,8 @@ func main() {
 	nodeName := flag.String("node-name", cmdutil.EnvOrDefault("CM_NODE_NAME", ""), "节点名称")
 	nodeAlias := flag.String("node-alias", cmdutil.EnvOrDefault("CM_NODE_ALIAS", ""), "节点显示名称")
 	nodeGroup := flag.String("node-group", cmdutil.EnvOrDefault("CM_NODE_GROUP", ""), "节点分组")
+	nodeIDFile := flag.String("node-id-file", cmdutil.EnvOrDefault("CM_NODE_ID_FILE", ""), "节点 ID 持久化文件")
+	agentTokenFile := flag.String("agent-token-file", cmdutil.EnvOrDefault("CM_AGENT_TOKEN_FILE", ""), "Agent 专属凭据持久化文件")
 	netIface := flag.String("net-iface", cmdutil.EnvOrDefault("CM_NET_IFACE", ""), "采集指定网卡(逗号分隔)")
 	netTestsRaw := flag.String("net-tests", cmdutil.EnvOrDefault("CM_NET_TESTS", ""), "网络测试目标列表")
 	testInterval := flag.Duration("test-interval", cmdutil.EnvDuration("CM_TEST_INTERVAL", 5*time.Second), "网络测试间隔")
@@ -88,12 +90,22 @@ func main() {
 			log.Fatalf("服务启动失败: %v", err)
 		}
 	case "agent":
-		hostname := cmdutil.DefaultHostname()
-		if *nodeID == "" {
-			*nodeID = hostname
+		resolvedNodeIDFile, err := agent.ResolveStateFilePath(*nodeIDFile, agent.DefaultNodeIDFileName())
+		if err != nil {
+			log.Fatalf("解析节点 ID 文件失败: %v", err)
 		}
+		resolvedNodeID, err := agent.ResolveOrCreateNodeID(*nodeID, resolvedNodeIDFile)
+		if err != nil {
+			log.Fatalf("初始化节点 ID 失败: %v", err)
+		}
+		*nodeID = resolvedNodeID
+		hostname := cmdutil.DefaultHostname()
 		if *nodeName == "" {
 			*nodeName = hostname
+		}
+		resolvedTokenFile, err := agent.ResolveStateFilePath(*agentTokenFile, agent.DefaultAgentTokenFileName())
+		if err != nil {
+			log.Fatalf("解析 Agent 凭据文件失败: %v", err)
 		}
 		cfg := agent.Config{
 			ServerURL:    *serverURL,
@@ -107,6 +119,7 @@ func main() {
 			NetTests:     agent.ParseNetTests(*netTestsRaw),
 			TestInterval: *testInterval,
 			NetIfaces:    cmdutil.ParseCommaList(*netIface),
+			TokenFile:    resolvedTokenFile,
 		}
 		if err := agent.Run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("Agent 运行失败: %v", err)

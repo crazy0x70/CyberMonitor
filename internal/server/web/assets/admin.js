@@ -77,7 +77,7 @@ const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 
 const state = {
-  token: localStorage.getItem(TOKEN_KEY) || "",
+  token: sessionStorage.getItem(TOKEN_KEY) || "",
   settings: {
     adminUser: "",
     groups: [],
@@ -215,9 +215,9 @@ function setAdminSecretFieldsEnabled(enabled) {
 function setToken(token) {
   state.token = token;
   if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
+    sessionStorage.setItem(TOKEN_KEY, "session");
   } else {
-    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
   }
 }
 
@@ -253,15 +253,9 @@ function isEnterSubmitTarget(target) {
   return target.tagName === "INPUT";
 }
 
-function authHeaders() {
-  return state.token ? { Authorization: `Bearer ${state.token}` } : {};
-}
-
 async function apiFetch(url, options = {}) {
   const headers = options.headers ? { ...options.headers } : {};
-  const auth = authHeaders();
-  Object.assign(headers, auth);
-  const resp = await fetch(url, { ...options, headers });
+  const resp = await fetch(url, { ...options, headers, credentials: "same-origin" });
   if (resp.status === 401) {
     setToken("");
     setView(false);
@@ -275,6 +269,7 @@ async function login(username, password) {
   const resp = await fetch("/api/v1/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ username, password }),
   });
   if (!resp.ok) {
@@ -289,11 +284,8 @@ async function login(username, password) {
     }
     throw new Error(message);
   }
-  const data = await resp.json();
-  if (!data.token) {
-    throw new Error("未返回 token");
-  }
-  setToken(data.token);
+  await resp.json();
+  setToken("session");
   setView(true);
   await loadSettings();
   await loadNodes();
@@ -317,7 +309,7 @@ function updateAdminBrand(settings) {
   if (brandTitle) {
     brandTitle.textContent = resolvedTitle;
   }
-  document.title = `${resolvedTitle} 管理后台`;
+  document.title = `${siteTitle || "CyberMonitor"} 管理后台`;
 }
 
 function applySettingsView(data) {
@@ -497,9 +489,7 @@ async function saveSettingsPayload(payload) {
     throw new Error(message);
   }
   const data = await resp.json();
-  if (data && data.session_token) {
-    setToken(data.session_token);
-  }
+  setToken("session");
   applySettingsView(data);
   await loadNodes();
   return data;
@@ -572,9 +562,7 @@ async function importConfigPayload(payload) {
   }
   const data = await resp.json();
   if (data && data.settings) {
-    if (data.settings.session_token) {
-      setToken(data.settings.session_token);
-    }
+    setToken("session");
     applySettingsView(data.settings);
     await loadNodes();
   }
@@ -1294,9 +1282,7 @@ function updateInstallCommands() {
 function connectAdminSocket() {
   if (!state.token || adminSocket) return;
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = `${protocol}://${window.location.host}/ws?token=${encodeURIComponent(
-    state.token
-  )}`;
+  const url = `${protocol}://${window.location.host}/ws`;
   adminSocket = new WebSocket(url);
   adminSocket.addEventListener("message", (event) => {
     try {
@@ -2657,14 +2643,7 @@ if (importConfigBtn && importConfigFile) {
               window.history.replaceState({}, "", nextPath);
             }
             if (data && data.reauth_required) {
-              if (data.settings && data.settings.session_token) {
-                messages.push("管理员账号已变更，当前登录态已自动刷新");
-              } else {
-                messages.push("管理员账号已变更，请重新登录");
-                setToken("");
-                setView(false);
-                loginError.textContent = messages.join("；");
-              }
+              messages.push("管理员账号已变更，当前登录态已自动刷新");
             }
             if (!loginPanel.classList.contains("hidden")) {
               return;
@@ -2705,14 +2684,7 @@ async function handleSaveSettings() {
       window.history.replaceState({}, "", nextPath);
     }
     if (data && data.admin_user && data.admin_user !== previousUser) {
-      if (data.session_token) {
-        messages.push("管理员账号已变更，当前登录态已自动刷新");
-      } else {
-        messages.push("管理员账号已变更，请重新登录");
-        setToken("");
-        setView(false);
-        loginError.textContent = messages.join("；");
-      }
+      messages.push("管理员账号已变更，当前登录态已自动刷新");
     }
     if (loginPanel.classList.contains("hidden")) {
       setHintMessage(settingsHint, messages.join("；"), "success");
@@ -2912,7 +2884,15 @@ saveTestsBtn.addEventListener("click", async () => {
 });
 
 if (logoutLink) {
-  logoutLink.addEventListener("click", () => {
+  logoutLink.addEventListener("click", async () => {
+    try {
+      await fetch("/api/v1/logout", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+    } catch (error) {
+      // ignore
+    }
     setToken("");
     setView(false);
   });
@@ -2942,5 +2922,19 @@ if (state.token) {
     .catch((error) => {
       loginError.textContent = error.message;
       setView(false);
+    });
+} else {
+  apiFetch("/api/v1/admin/settings")
+    .then(async (resp) => {
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setToken("session");
+      setView(true);
+      applySettingsView(data);
+      await loadNodes();
+      connectAdminSocket();
+    })
+    .catch(() => {
+      // ignore missing cookie session
     });
 }

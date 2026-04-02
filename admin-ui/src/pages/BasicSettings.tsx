@@ -67,6 +67,7 @@ import { cn } from "@/lib/utils";
 
 export interface BasicSettingsProps {
   settings: SettingsView | null;
+  onDirtyChange?: (dirty: boolean) => void;
   onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
   onExport: () => Promise<void>;
   onImport: (payload: Record<string, unknown>) => Promise<ConfigImportResponse>;
@@ -93,8 +94,17 @@ const compactConfirmHeaderClass = cn(adminDialogHeaderClass, "border-b-0 pb-3");
 
 const compactConfirmFooterClass = cn(adminDialogFooterClass, "border-t-0 bg-transparent pt-0");
 
+function formatVersionText(value?: string) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return "--";
+  }
+  return normalized.startsWith("v") ? normalized : `v${normalized}`;
+}
+
 export default function BasicSettings({
   settings,
+  onDirtyChange,
   onSave,
   onExport,
   onImport,
@@ -146,6 +156,16 @@ export default function BasicSettings({
     setIsConfirmOpen(false);
   }, [settings]);
 
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
+
   const buildPayload = () => {
     const payload: Record<string, unknown> = {
       agent_token: agentToken.trim(),
@@ -188,10 +208,10 @@ export default function BasicSettings({
         }
       }
       if (next.admin_user && next.admin_user !== previousUser) {
-        messages.push(next.session_token ? "管理员账号已变更，登录态已自动刷新" : "管理员账号已变更，请重新登录");
+        messages.push("管理员账号已变更，登录态已自动刷新");
       }
       if (adminPass.trim()) {
-        messages.push(next.session_token ? "密码已更新，登录态已自动刷新" : "密码已更新，请重新登录");
+        messages.push("密码已更新，登录态已自动刷新");
       }
       toast.success(messages.join("；"));
       setIsDirty(false);
@@ -212,7 +232,7 @@ export default function BasicSettings({
         messages.push(`后台路径已更新为 ${response.settings.admin_path}`);
       }
       if (response.reauth_required) {
-        messages.push(response.settings?.session_token ? "管理员登录态已自动刷新" : "管理员凭证已变化，请重新登录");
+        messages.push("管理员登录态已自动刷新");
       }
       toast.success(messages.join("；"));
       setIsDirty(false);
@@ -230,7 +250,7 @@ export default function BasicSettings({
     <div className={adminPageShellClass}>
       <div className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>基础设置</h2>
+          <h1 className={adminPageTitleClass}>基础设置</h1>
         </div>
         <div className={adminPageActionsClass}>
           {isDirty ? (
@@ -241,7 +261,7 @@ export default function BasicSettings({
             disabled={!isDirty || isSaving}
             onClick={() => setIsConfirmOpen(true)}
           >
-              {isSaving ? "保存中..." : "保存更改"}
+              {isSaving ? "保存中…" : "保存更改"}
           </Button>
           <AlertDialog open={isConfirmOpen} onOpenChange={setIsConfirmOpen}>
             <AlertDialogContent className={compactConfirmContentClass}>
@@ -292,13 +312,15 @@ export default function BasicSettings({
                   <Label htmlFor="admin-path">后台路径</Label>
                   <Input
                     id="admin-path"
+                    name="admin-path"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={adminPath}
                     onChange={(event) => {
                       setAdminPath(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="/cm-admin"
+                    placeholder="例如：/cm-admin…"
                   />
                 </div>
                 <div className="grid gap-4 md:grid-cols-2">
@@ -306,6 +328,7 @@ export default function BasicSettings({
                     <Label htmlFor="admin-user">管理员账号</Label>
                     <Input
                       id="admin-user"
+                      name="admin-user"
                       className={adminInputClass}
                       autoComplete="username"
                       value={adminUser}
@@ -319,16 +342,19 @@ export default function BasicSettings({
                     <Label htmlFor="admin-pass">新密码</Label>
                     <Input
                       id="admin-pass"
+                      name="admin-pass"
                       type="password"
                       className={adminInputClass}
                       autoComplete="new-password"
-                      placeholder="留空则不修改"
                       value={adminPass}
                       onChange={(event) => {
                         setAdminPass(event.target.value);
                         setIsDirty(true);
                       }}
                     />
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      留空则不修改当前密码。
+                    </p>
                   </div>
                 </div>
               </CardContent>
@@ -346,8 +372,10 @@ export default function BasicSettings({
                   <Label htmlFor="login-fail-limit">失败次数上限</Label>
                   <Input
                     id="login-fail-limit"
+                    name="login-fail-limit"
                     type="number"
                     min={0}
+                    autoComplete="off"
                     className={adminInputClass}
                     value={loginFailLimit}
                     onChange={(event) => {
@@ -360,8 +388,10 @@ export default function BasicSettings({
                   <Label htmlFor="login-fail-window">统计窗口（分钟）</Label>
                   <Input
                     id="login-fail-window"
+                    name="login-fail-window"
                     type="number"
                     min={1}
+                    autoComplete="off"
                     className={adminInputClass}
                     value={loginFailWindow}
                     onChange={(event) => {
@@ -374,8 +404,10 @@ export default function BasicSettings({
                   <Label htmlFor="login-lock-minutes">锁定时长（分钟）</Label>
                   <Input
                     id="login-lock-minutes"
+                    name="login-lock-minutes"
                     type="number"
                     min={1}
+                    autoComplete="off"
                     className={adminInputClass}
                     value={loginLockMinutes}
                     onChange={(event) => {
@@ -399,27 +431,31 @@ export default function BasicSettings({
                   <Label htmlFor="turnstile-site-key">Site Key</Label>
                   <Input
                     id="turnstile-site-key"
+                    name="turnstile-site-key"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={turnstileSiteKey}
                     onChange={(event) => {
                       setTurnstileSiteKey(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="0x4AAAAA..."
+                    placeholder="0x4AAAAA…"
                   />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="turnstile-secret-key">Secret Key</Label>
                   <Input
                     id="turnstile-secret-key"
+                    name="turnstile-secret-key"
                     type="password"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={turnstileSecretKey}
                     onChange={(event) => {
                       setTurnstileSecretKey(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="0x4AAAAA..."
+                    placeholder="0x4AAAAA…"
                   />
                 </div>
               </CardContent>
@@ -441,13 +477,18 @@ export default function BasicSettings({
                   <Label htmlFor="agent-endpoint">Agent 对接地址</Label>
                   <Input
                     id="agent-endpoint"
+                    name="agent-endpoint"
+                    type="url"
+                    autoComplete="off"
+                    inputMode="url"
+                    spellCheck={false}
                     className={adminInputClass}
                     value={agentEndpoint}
                     onChange={(event) => {
                       setAgentEndpoint(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="https://monitor.example.com"
+                    placeholder="例如：https://monitor.example.com…"
                   />
                 </div>
 
@@ -455,14 +496,19 @@ export default function BasicSettings({
                   <Label htmlFor="agent-token">Agent Token</Label>
                   <Input
                     id="agent-token"
+                    name="agent-token"
+                    autoComplete="off"
                     className={cn(adminInputClass, "font-mono")}
                     value={agentToken}
                     onChange={(event) => {
                       setAgentToken(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="输入新的 Agent Token"
+                    placeholder="例如：cm-agent-token-abc123…"
                   />
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    建议使用高强度随机 Token，修改后新接入 Agent 需使用新 Token。
+                  </p>
                 </div>
               </CardContent>
             </Card>
@@ -483,6 +529,8 @@ export default function BasicSettings({
                   <Label htmlFor="site-title">站点 Title</Label>
                   <Input
                     id="site-title"
+                    name="site-title"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={siteTitle}
                     onChange={(event) => {
@@ -495,19 +543,26 @@ export default function BasicSettings({
                   <Label htmlFor="site-icon">站点 Icon</Label>
                   <Input
                     id="site-icon"
+                    name="site-icon"
+                    type="url"
+                    autoComplete="off"
+                    inputMode="url"
+                    spellCheck={false}
                     className={adminInputClass}
                     value={siteIcon}
                     onChange={(event) => {
                       setSiteIcon(event.target.value);
                       setIsDirty(true);
                     }}
-                    placeholder="https://..."
+                    placeholder="https://…"
                   />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="home-title">首页标题</Label>
                   <Input
                     id="home-title"
+                    name="home-title"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={homeTitle}
                     onChange={(event) => {
@@ -520,6 +575,8 @@ export default function BasicSettings({
                   <Label htmlFor="home-subtitle">首页副标题</Label>
                   <Input
                     id="home-subtitle"
+                    name="home-subtitle"
+                    autoComplete="off"
                     className={adminInputClass}
                     value={homeSubtitle}
                     onChange={(event) => {
@@ -570,16 +627,16 @@ export default function BasicSettings({
                   <div className={adminPreviewPanelClass}>
                     <p className={overviewLabelClass}>当前版本</p>
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
-                      v{systemUpdateInfo?.current_version || settings?.version || "dev"}
+                      {formatVersionText(systemUpdateInfo?.current_version || settings?.version)}
                     </p>
                   </div>
                   <div className={adminPreviewPanelClass}>
                     <p className={overviewLabelClass}>最新版本</p>
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                       {refreshingSystemUpdate && !systemUpdateInfo
-                        ? "检查中..."
+                        ? "检查中…"
                         : systemUpdateInfo?.latest_version
-                          ? `v${systemUpdateInfo.latest_version}`
+                          ? formatVersionText(systemUpdateInfo.latest_version)
                           : "未检查"}
                     </p>
                   </div>
@@ -626,8 +683,13 @@ export default function BasicSettings({
                   </Button>
                   {systemUpdateInfo?.html_url ? (
                     <Button asChild type="button" variant="outline" className={cn(adminActionButtonClass, "h-11 px-5")}>
-                      <a href={systemUpdateInfo.html_url} rel="noreferrer" target="_blank">
-                        <ExternalLink className="mr-2 h-4 w-4" />
+                      <a
+                        className="inline-flex items-center gap-2"
+                        href={systemUpdateInfo.html_url}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        <ExternalLink className="h-4 w-4 shrink-0" />
                         查看发布说明
                       </a>
                     </Button>
@@ -685,7 +747,7 @@ export default function BasicSettings({
                         onClick={() => fileInputRef.current?.click()}
                         disabled={isImporting}
                       >
-                        {isImporting ? "导入中..." : "确认覆盖"}
+                        {isImporting ? "导入中…" : "确认覆盖"}
                       </AlertDialogAction>
                     </AlertDialogFooter>
                   </AlertDialogContent>

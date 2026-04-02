@@ -94,6 +94,7 @@ func (m *systemUpdateManager) Start(info updater.ReleaseInfo, apply func() error
 			m.message = err.Error()
 			return
 		}
+		m.updating = false
 		m.message = "更新包已写入，服务正在重启"
 	}()
 
@@ -111,8 +112,8 @@ func (m *systemUpdateManager) snapshotLocked() SystemUpdateView {
 		Available:      m.lastInfo.HasUpdate,
 		Updating:       m.updating,
 		Supported:      updater.CanSelfUpdate(),
-		Mode:           "binary",
-		Message:        strings.TrimSpace(m.message),
+		Mode:           string(updater.DetectDeployMode()),
+		Message:        systemUpdateMessage(strings.TrimSpace(m.message)),
 		HTMLURL:        strings.TrimSpace(m.lastInfo.HTMLURL),
 		PublishedAt:    strings.TrimSpace(m.lastInfo.PublishedAt),
 		LastCheckedAt:  m.lastCheckedAt.Unix(),
@@ -140,6 +141,13 @@ func unixOrZero(value time.Time) int64 {
 		return 0
 	}
 	return value.Unix()
+}
+
+func systemUpdateMessage(message string) string {
+	if message != "" {
+		return message
+	}
+	return updater.DefaultUnsupportedUpdateMessage()
 }
 
 func buildAgentUpdateView(stats metrics.NodeStats, info updater.ReleaseInfo, message string) AgentUpdateView {

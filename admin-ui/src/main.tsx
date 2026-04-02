@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
 import "./index.css";
 
-const THEME_STORAGE_KEY = "cm-admin-theme";
+const THEME_STORAGE_KEY = "cm_theme_mode";
 
 function resolveBootTheme() {
   const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -15,6 +15,7 @@ function resolveBootTheme() {
 
 const bootTheme = resolveBootTheme();
 document.documentElement.classList.toggle("dark", bootTheme === "dark");
+document.documentElement.setAttribute("data-theme", bootTheme);
 document.documentElement.style.colorScheme = bootTheme;
 
 createRoot(document.getElementById("root")!).render(

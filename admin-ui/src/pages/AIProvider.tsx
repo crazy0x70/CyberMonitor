@@ -51,6 +51,7 @@ import type { AIProviderConfig, SettingsView } from "@/lib/admin-types";
 
 export interface AIProviderProps {
   settings: SettingsView | null;
+  onDirtyChange?: (dirty: boolean) => void;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
   onTestProvider: (provider: string, config: AIProviderConfig) => Promise<void>;
   onFetchModels: (provider: string, config: AIProviderConfig) => Promise<string[]>;
@@ -183,6 +184,7 @@ function renderStatusBadge(status: ProviderStatus) {
 
 export default function AIProvider({
   settings,
+  onDirtyChange,
   onSave,
   onTestProvider,
   onFetchModels,
@@ -203,6 +205,16 @@ export default function AIProvider({
     setPrompt(settings?.ai_settings?.prompt || "");
     setIsDirty(false);
   }, [settings]);
+
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
 
   const providerOptions = useMemo(() => {
     return providers.map((item) => ({
@@ -319,7 +331,7 @@ export default function AIProvider({
     <div className={adminPageShellClass}>
       <div className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>AI 服务商</h2>
+          <h1 className={adminPageTitleClass}>AI 服务商</h1>
         </div>
         <div className={adminPageActionsClass}>
           {isDirty && (
@@ -330,7 +342,7 @@ export default function AIProvider({
             onClick={handleSave}
             disabled={!isDirty || saving}
           >
-            {saving ? "保存中..." : "保存更改"}
+            {saving ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>
@@ -355,7 +367,7 @@ export default function AIProvider({
               }}
             >
               <SelectTrigger id="ai-command-provider" className={`w-full ${adminSelectTriggerClass}`}>
-                <SelectValue placeholder="选择命令服务商" />
+                <SelectValue placeholder="选择命令服务商…" />
               </SelectTrigger>
               <SelectContent className={adminSelectContentClass}>
                 {providerOptions.map((item) => (
@@ -388,7 +400,7 @@ export default function AIProvider({
               setPrompt(event.target.value);
               setIsDirty(true);
             }}
-            placeholder="例如：请重点关注网络流量、下载量与离线情况"
+            placeholder="例如：请重点关注网络流量、下载量与离线情况…"
           />
         </CardContent>
       </Card>
@@ -431,6 +443,7 @@ export default function AIProvider({
                       <Input
                         id={`${item.id}-display-name`}
                         className={adminInputClass}
+                        autoComplete="off"
                         value={item.name}
                         onChange={(event) =>
                           updateProvider(item.id, (current) => ({
@@ -447,6 +460,7 @@ export default function AIProvider({
                         className={adminInputClass}
                         type="password"
                         autoComplete="new-password"
+                        spellCheck={false}
                         value={item.apiKey}
                         onChange={(event) =>
                           updateProvider(item.id, (current) => ({
@@ -462,6 +476,10 @@ export default function AIProvider({
                       <Input
                         id={`${item.id}-base-url`}
                         className={adminInputClass}
+                        type="url"
+                        autoComplete="off"
+                        inputMode="url"
+                        spellCheck={false}
                         value={item.baseURL}
                         onChange={(event) =>
                           updateProvider(item.id, (current) => ({
@@ -478,6 +496,8 @@ export default function AIProvider({
                         id={`${item.id}-model`}
                         className={adminInputClass}
                         list={`models-${item.id}`}
+                        autoComplete="off"
+                        spellCheck={false}
                         value={item.model}
                         onChange={(event) =>
                           updateProvider(item.id, (current) => ({
@@ -511,7 +531,7 @@ export default function AIProvider({
                         {fetchingModelsId === item.id ? (
                           <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            获取中...
+                            获取中…
                           </>
                         ) : (
                           "获取模型列表"
@@ -526,7 +546,7 @@ export default function AIProvider({
                         {testingId === item.id ? (
                           <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            验证中...
+                            验证中…
                           </>
                         ) : (
                           "测试连接"

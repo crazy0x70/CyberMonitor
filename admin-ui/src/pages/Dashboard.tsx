@@ -1,3 +1,4 @@
+import type { MouseEvent } from "react";
 import {
   Activity,
   AlertCircle,
@@ -17,17 +18,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import {
-  adminActionButtonClass,
   adminCompactActionButtonClass,
   adminQuickActionButtonClass,
   adminMutedTextClass,
-  adminPageActionsClass,
   adminPageHeaderClass,
   adminPageShellClass,
   adminPageTitleClass,
-  adminPrimaryButtonClass,
   adminSurfaceCardClass,
   adminSectionHeaderClass,
   adminStatCardClass,
@@ -55,6 +52,30 @@ export interface DashboardProps {
   settings: SettingsView | null;
   nodes: NodeView[];
   onNavigate: (page: Page) => void;
+}
+
+function dashboardPageHref(page: Page) {
+  if (typeof window === "undefined") {
+    return page === "dashboard" ? "/" : `/?page=${page}`;
+  }
+  const nextURL = new URL(window.location.href);
+  if (page === "dashboard") {
+    nextURL.searchParams.delete("page");
+  } else {
+    nextURL.searchParams.set("page", page);
+  }
+  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
+}
+
+function shouldHandleDashboardNavigation(event: MouseEvent<HTMLAnchorElement>) {
+  return !(
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
 }
 
 function summarizeChannels(settings: SettingsView | null) {
@@ -139,11 +160,19 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
     },
   ];
 
+  const handleNavigateLink = (event: MouseEvent<HTMLAnchorElement>, page: Page) => {
+    if (!shouldHandleDashboardNavigation(event)) {
+      return;
+    }
+    event.preventDefault();
+    onNavigate(page);
+  };
+
   return (
     <div className={adminPageShellClass}>
       <section className={adminPageHeaderClass}>
         <div>
-          <h2 className={adminPageTitleClass}>首页</h2>
+          <h1 className={adminPageTitleClass}>首页</h1>
         </div>
       </section>
 
@@ -199,13 +228,13 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
                       <p className={`mt-1 line-clamp-1 text-[13px] font-medium leading-relaxed ${adminMutedTextClass}`}>{item.description}</p>
                     </div>
                   </div>
-                  <Button
-                    variant="outline"
+                  <a
+                    href={dashboardPageHref(item.page)}
                     className={cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")}
-                    onClick={() => onNavigate(item.page)}
+                    onClick={(event) => handleNavigateLink(event, item.page)}
                   >
                     管理 <ChevronRight className="ml-1 h-4 w-4" />
-                  </Button>
+                  </a>
                 </div>
               );
             })}
@@ -242,17 +271,17 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
                   </p>
                 </div>
               </div>
-              <Button
-                variant="outline"
+              <a
+                href={dashboardPageHref("settings")}
                 className={
                   adminPathRisk
                     ? `${adminWarningOutlineButtonClass} self-start h-10 px-5 sm:self-auto`
                     : cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")
                 }
-                onClick={() => onNavigate("settings")}
+                onClick={(event) => handleNavigateLink(event, "settings")}
               >
                 配置 <ChevronRight className="ml-1 h-4 w-4" />
-              </Button>
+              </a>
             </div>
           </CardContent>
         </Card>
@@ -267,30 +296,30 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4 p-6">
-            <Button
-              variant="outline"
+            <a
+              href={dashboardPageHref("probes")}
               className={`${adminQuickActionButtonClass} group`}
-              onClick={() => onNavigate("probes")}
+              onClick={(event) => handleNavigateLink(event, "probes")}
             >
               <Activity className="mr-3 h-5 w-5 text-emerald-500 transition-transform group-hover:scale-110" />
               探测设置
-            </Button>
-            <Button
-              variant="outline"
+            </a>
+            <a
+              href={dashboardPageHref("groups")}
               className={`${adminQuickActionButtonClass} group`}
-              onClick={() => onNavigate("groups")}
+              onClick={(event) => handleNavigateLink(event, "groups")}
             >
               <FolderTree className="mr-3 h-5 w-5 text-amber-500 transition-transform group-hover:scale-110" />
               分组管理
-            </Button>
-            <Button
-              variant="outline"
+            </a>
+            <a
+              href={dashboardPageHref("alerts")}
               className={`${adminQuickActionButtonClass} group`}
-              onClick={() => onNavigate("alerts")}
+              onClick={(event) => handleNavigateLink(event, "alerts")}
             >
               <Bell className="mr-3 h-5 w-5 text-sky-500 transition-transform group-hover:scale-110" />
               通知告警
-            </Button>
+            </a>
           </CardContent>
         </Card>
       </section>
