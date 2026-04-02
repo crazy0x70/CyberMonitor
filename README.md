@@ -73,7 +73,9 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.s
 ```
 **Windows**
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'"
+$script = Join-Path $env:TEMP 'agent.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+& $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
 ```
 
 如果需要手动指定 `Node ID`：
@@ -85,7 +87,9 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.s
 
 **Windows**
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -NodeId 'my-node-id'"
+$script = Join-Path $env:TEMP 'agent.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+& $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -NodeId 'my-node-id'
 ```
 
 如果你希望该节点拒绝服务端下发的远程更新，可以在部署时显式追加 `disable-update`：
@@ -97,7 +101,9 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.s
 
 **Windows**
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\agent.ps1'); & ($env:TEMP + '\agent.ps1') -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -DisableUpdate"
+$script = Join-Path $env:TEMP 'agent.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+& $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -DisableUpdate
 ```
 
 手工运行二进制时，也可以使用：
@@ -191,7 +197,9 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-u
 
 **Windows**
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1 -OutFile ($env:TEMP + '\agent-uninstall.ps1'); & ($env:TEMP + '\agent-uninstall.ps1')"
+$script = Join-Path $env:TEMP 'agent-uninstall.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1' -OutFile $script
+& $script
 ```
 
 Unix 卸载脚本会清理以下内容：

@@ -1732,7 +1732,8 @@ function renderCardDetails(card, node, nodeId) {
 }
 
 function updateNetworkTests(fields, tests, nodeId) {
-  if (!tests.length) {
+  const historyMap = state.testHistory.get(nodeId) || new Map();
+  if (!tests.length && historyMap.size === 0) {
     fields.testLegend.innerHTML = '<div class="form-hint">未配置测试</div>';
     fields.testChart.innerHTML = "";
     fields.testCards.innerHTML = "";
@@ -1748,7 +1749,9 @@ function updateNetworkTests(fields, tests, nodeId) {
     return;
   }
 
-  updateTestHistory(nodeId, tests);
+  if (tests.length) {
+    updateTestHistory(nodeId, tests);
+  }
   fields._tests = tests;
   renderNetworkSection(fields, nodeId);
 }
@@ -1757,7 +1760,7 @@ function renderNetworkSection(fields, nodeId) {
   const historyMap = state.testHistory.get(nodeId) || new Map();
   const baseTests = fields._tests || [];
   const tests = baseTests.length > 0 ? baseTests : buildTestsFromHistory(historyMap);
-  const activeRange = state.testRange.get(nodeId) || "1h";
+  const activeRange = state.testRange.get(nodeId) || defaultTestRangeForHistory(historyMap);
   renderRangeTabs(fields, nodeId, activeRange);
 
   fields.testLegend.innerHTML = "";
@@ -1889,6 +1892,38 @@ function buildTestsFromHistory(historyMap) {
     .sort()
     .map((key) => testFromHistoryKey(key))
     .filter(Boolean);
+}
+
+function defaultTestRangeForHistory(historyMap) {
+  const spanSec = historySpanSeconds(historyMap);
+  if (spanSec > 60 * 60 * 24 * 90) return "1y";
+  if (spanSec > 60 * 60 * 24 * 14) return "30d";
+  if (spanSec > 60 * 60 * 24) return "7d";
+  if (spanSec > 60 * 60) return "24h";
+  return "1h";
+}
+
+function historySpanSeconds(historyMap) {
+  if (!historyMap || historyMap.size === 0) return 0;
+  let minTs = 0;
+  let maxTs = 0;
+  historyMap.forEach((entry) => {
+    if (!entry || !Array.isArray(entry.times) || entry.times.length === 0) {
+      return;
+    }
+    const first = Number(entry.times[0]);
+    const last = Number(entry.times[entry.times.length - 1]);
+    if (Number.isFinite(first) && first > 0 && (minTs === 0 || first < minTs)) {
+      minTs = first;
+    }
+    if (Number.isFinite(last) && last > maxTs) {
+      maxTs = last;
+    }
+  });
+  if (!minTs || !maxTs || maxTs <= minTs) {
+    return 0;
+  }
+  return maxTs - minTs;
 }
 
 function testFromHistoryKey(key) {

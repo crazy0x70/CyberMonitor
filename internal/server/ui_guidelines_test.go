@@ -347,6 +347,25 @@ func TestAdminAppUsesSessionProbeForAnonymousRestore(t *testing.T) {
 	}
 }
 
+func TestTaggedNodeCardsUseCompactFlatStyling(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	requiredSnippets := []string{
+		".tag-section {\n  display: grid;\n  gap: 10px;",
+		".tag-list {\n  display: grid;\n  gap: 10px;",
+		".tag-list .node-card {\n  box-shadow: none;",
+		".tag-list .node-card:hover {\n  transform: none;\n  box-shadow: none;",
+		".tag-list .node-card[open] {\n  box-shadow: none;",
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("tagged node card styling regression: missing %q", snippet)
+		}
+	}
+}
+
 func TestAdminPlaceholderCopyAvoidsInstructionalText(t *testing.T) {
 	t.Parallel()
 
@@ -369,6 +388,47 @@ func TestAdminPlaceholderCopyAvoidsInstructionalText(t *testing.T) {
 			if strings.Contains(content, snippet) {
 				t.Fatalf("%s still contains instructional placeholder: %s", relativePath, snippet)
 			}
+		}
+	}
+}
+
+func TestPublicMonitorPreservesLegacyHistoryCharts(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		"const historyMap = state.testHistory.get(nodeId) || new Map();",
+		"if (!tests.length && historyMap.size === 0) {",
+		`const activeRange = state.testRange.get(nodeId) || defaultTestRangeForHistory(historyMap);`,
+		`if (spanSec > 60 * 60 * 24) return "7d";`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor legacy history regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestReadmeWindowsExamplesUseDirectPowerShellCommands(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "README.md")
+	disallowed := `powershell -ExecutionPolicy Bypass -Command`
+	if strings.Contains(content, disallowed) {
+		t.Fatalf("README Windows examples should avoid nested PowerShell invocation: %q", disallowed)
+	}
+
+	requiredSnippets := []string{
+		`$script = Join-Path $env:TEMP 'agent.ps1'`,
+		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script`,
+		`$script = Join-Path $env:TEMP 'agent-uninstall.ps1'`,
+		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1' -OutFile $script`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("README Windows example regression: missing %q", snippet)
 		}
 	}
 }
