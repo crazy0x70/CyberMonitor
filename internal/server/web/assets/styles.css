@@ -525,20 +525,6 @@ html[data-theme="dark"] .theme-toggle:hover {
   gap: 10px;
 }
 
-.tag-list .node-card {
-  box-shadow: none;
-}
-
-.tag-list .node-card:hover {
-  transform: none;
-  box-shadow: none;
-  border-color: rgba(148, 163, 184, 0.32);
-}
-
-.tag-list .node-card[open] {
-  box-shadow: none;
-}
-
 .tag-header {
   display: inline-flex;
   align-items: center;

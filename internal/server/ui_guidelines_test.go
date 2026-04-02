@@ -347,21 +347,30 @@ func TestAdminAppUsesSessionProbeForAnonymousRestore(t *testing.T) {
 	}
 }
 
-func TestTaggedNodeCardsUseCompactFlatStyling(t *testing.T) {
+func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 	t.Parallel()
 
 	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
 	requiredSnippets := []string{
 		".tag-section {\n  display: grid;\n  gap: 10px;",
 		".tag-list {\n  display: grid;\n  gap: 10px;",
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("tagged node section regression: missing %q", snippet)
+		}
+	}
+
+	disallowedSnippets := []string{
 		".tag-list .node-card {\n  box-shadow: none;",
 		".tag-list .node-card:hover {\n  transform: none;\n  box-shadow: none;",
 		".tag-list .node-card[open] {\n  box-shadow: none;",
 	}
 
-	for _, snippet := range requiredSnippets {
-		if !strings.Contains(content, snippet) {
-			t.Fatalf("tagged node card styling regression: missing %q", snippet)
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("tagged node cards should share the default surface styling: found %q", snippet)
 		}
 	}
 }
