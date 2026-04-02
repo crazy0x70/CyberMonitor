@@ -515,14 +515,14 @@ html[data-theme="dark"] .theme-toggle:hover {
 
 .tag-section {
   display: grid;
-  gap: 10px;
+  gap: 16px;
   content-visibility: auto;
   contain-intrinsic-size: 120px;
 }
 
 .tag-list {
   display: grid;
-  gap: 10px;
+  gap: 16px;
 }
 
 .tag-header {

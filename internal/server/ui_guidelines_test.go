@@ -291,6 +291,7 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: actions/checkout@v5",
 		"uses: actions/setup-go@v6",
 		"uses: actions/setup-node@v5",
+		"uses: actions/download-artifact@v7",
 		"uses: actions/upload-artifact@v6",
 		`pattern: "!*.dockerbuild"`,
 		"needs: [version, build-server, build-agent, build-web, docker-server, docker-agent]",
@@ -299,6 +300,8 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: actions/checkout@v4",
 		"uses: actions/setup-go@v5",
 		"uses: actions/setup-node@v4",
+		"uses: actions/download-artifact@v5",
+		"uses: actions/download-artifact@v6",
 		"uses: actions/upload-artifact@v4",
 	}
 
@@ -352,8 +355,9 @@ func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 
 	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
 	requiredSnippets := []string{
-		".tag-section {\n  display: grid;\n  gap: 10px;",
-		".tag-list {\n  display: grid;\n  gap: 10px;",
+		".node-list {\n  display: grid;\n  gap: 16px;",
+		".tag-section {\n  display: grid;\n  gap: 16px;",
+		".tag-list {\n  display: grid;\n  gap: 16px;",
 	}
 
 	for _, snippet := range requiredSnippets {
@@ -438,6 +442,49 @@ func TestReadmeWindowsExamplesUseDirectPowerShellCommands(t *testing.T) {
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("README Windows example regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestWindowsAgentInstallCommandsAvoidNestedPowerShell(t *testing.T) {
+	t.Parallel()
+
+	files := []string{
+		"README.md",
+		"admin-ui/lib/agent-install.ts",
+		"internal/server/web/assets/admin.js",
+	}
+
+	for _, relativePath := range files {
+		content := readRepoFileForUITest(t, relativePath)
+		if strings.Contains(content, `powershell -ExecutionPolicy Bypass -Command`) {
+			t.Fatalf("%s should not emit nested PowerShell install commands", relativePath)
+		}
+		if !strings.Contains(content, "Join-Path $env:TEMP 'agent.ps1'") {
+			t.Fatalf("%s should build Windows install commands via Join-Path temp script", relativePath)
+		}
+	}
+}
+
+func TestWindowsAgentScriptBuildsServiceArgsWithoutInlineEscapes(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "agent.ps1")
+	if strings.Contains(content, `$args = "--server-url `+"`"+`"$ServerUrl`) {
+		t.Fatal("agent.ps1 should not build service arguments using fragile inline quote escapes")
+	}
+
+	requiredSnippets := []string{
+		"$serviceArgs = @(",
+		`('"{0}"' -f $ServerUrl)`,
+		`('"{0}"' -f $NodeId)`,
+		`('"{0}"' -f $nodeToken)`,
+		`$serviceBinPath = ('"{0}" {1}' -f $binary, ($serviceArgs -join ' '))`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("agent.ps1 Windows service argument regression: missing %q", snippet)
 		}
 	}
 }

@@ -1275,7 +1275,11 @@ function updateInstallCommands() {
   if (installWindows) {
     const safeEndpoint = escapePwsh(endpoint);
     const safeToken = escapePwsh(token);
-    installWindows.textContent = `powershell -ExecutionPolicy Bypass -Command 'iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile "$env:TEMP\\agent.ps1"; & "$env:TEMP\\agent.ps1" -ServerUrl "${safeEndpoint}" -AgentToken "${safeToken}"'`;
+    installWindows.textContent = [
+      `$script = Join-Path $env:TEMP 'agent.ps1'`,
+      `Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script`,
+      `& $script -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'`,
+    ].join("\n");
   }
 }
 

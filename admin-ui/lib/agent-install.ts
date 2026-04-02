@@ -13,5 +13,9 @@ export function buildAgentWindowsInstallCommand(endpoint: string, token: string)
   const escapePwsh = (value: string) => String(value).replace(/'/g, "''");
   const safeEndpoint = escapePwsh(normalizedEndpoint);
   const safeToken = escapePwsh(normalizedToken);
-  return `powershell -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1 -OutFile ($env:TEMP + '\\agent.ps1'); & ($env:TEMP + '\\agent.ps1') -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'"`;
+  return [
+    `$script = Join-Path $env:TEMP 'agent.ps1'`,
+    `Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script`,
+    `& $script -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'`,
+  ].join("\n");
 }

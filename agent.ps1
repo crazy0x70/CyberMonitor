@@ -155,17 +155,25 @@ Invoke-WebRequestCompat -Uri $url -OutFile $binary
 [System.IO.File]::WriteAllText((Join-Path $installDir ".cybermonitor-agent-token"), $nodeToken + [Environment]::NewLine)
 
 $serviceName = "CyberMonitorAgent"
-$args = "--server-url `"$ServerUrl`" --node-id `"$NodeId`" --agent-token `"$nodeToken`""
+$serviceArgs = @(
+  "--server-url"
+  ('"{0}"' -f $ServerUrl)
+  "--node-id"
+  ('"{0}"' -f $NodeId)
+  "--agent-token"
+  ('"{0}"' -f $nodeToken)
+)
 if ($DisableUpdate) {
-  $args += " --disable-update"
+  $serviceArgs += "--disable-update"
 }
+$serviceBinPath = ('"{0}" {1}' -f $binary, ($serviceArgs -join ' '))
 
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
   Stop-Service -Name $serviceName -Force
   sc.exe delete $serviceName | Out-Null
 }
 
-sc.exe create $serviceName binPath= "`"$binary`" $args" start= auto | Out-Null
+sc.exe create $serviceName binPath= $serviceBinPath start= auto | Out-Null
 sc.exe failure $serviceName reset= 0 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 sc.exe failureflag $serviceName 1 | Out-Null
 sc.exe start $serviceName | Out-Null
