@@ -47,7 +47,7 @@ func TestAgentRegisterIssuesDedicatedNodeToken(t *testing.T) {
 	}
 }
 
-func TestAgentConfigRejectsBootstrapTokenAfterRegistration(t *testing.T) {
+func TestAgentConfigAcceptsBootstrapTokenForLegacyAgentAndReturnsDedicatedToken(t *testing.T) {
 	t.Parallel()
 
 	baseURL, _ := startTestServer(t, Config{
@@ -55,27 +55,6 @@ func TestAgentConfigRejectsBootstrapTokenAfterRegistration(t *testing.T) {
 		AdminPath:  "/cm-admin",
 		AgentToken: "bootstrap-token",
 	})
-
-	registerReq, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/agent/register?node_id=node-123", nil)
-	if err != nil {
-		t.Fatalf("create register request: %v", err)
-	}
-	registerReq.Header.Set("X-AGENT-TOKEN", "bootstrap-token")
-	registerResp, err := http.DefaultClient.Do(registerReq)
-	if err != nil {
-		t.Fatalf("register node: %v", err)
-	}
-	defer registerResp.Body.Close()
-
-	var registerPayload struct {
-		AgentToken string `json:"agent_token"`
-	}
-	if err := json.NewDecoder(registerResp.Body).Decode(&registerPayload); err != nil {
-		t.Fatalf("decode register payload: %v", err)
-	}
-	if registerPayload.AgentToken == "" {
-		t.Fatal("expected dedicated node token")
-	}
 
 	bootstrapReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/agent/config?node_id=node-123", nil)
 	if err != nil {
@@ -87,16 +66,25 @@ func TestAgentConfigRejectsBootstrapTokenAfterRegistration(t *testing.T) {
 		t.Fatalf("get config with bootstrap token: %v", err)
 	}
 	defer bootstrapResp.Body.Close()
-	if bootstrapResp.StatusCode != http.StatusUnauthorized {
+	if bootstrapResp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(bootstrapResp.Body)
-		t.Fatalf("expected bootstrap token to be rejected, got %d: %s", bootstrapResp.StatusCode, string(raw))
+		t.Fatalf("expected bootstrap token config success for legacy agent, got %d: %s", bootstrapResp.StatusCode, string(raw))
+	}
+	var bootstrapPayload struct {
+		AgentToken string `json:"agent_token"`
+	}
+	if err := json.NewDecoder(bootstrapResp.Body).Decode(&bootstrapPayload); err != nil {
+		t.Fatalf("decode bootstrap config payload: %v", err)
+	}
+	if bootstrapPayload.AgentToken == "" || bootstrapPayload.AgentToken == "bootstrap-token" {
+		t.Fatalf("expected config to return dedicated node token, got %q", bootstrapPayload.AgentToken)
 	}
 
 	nodeReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/agent/config?node_id=node-123", nil)
 	if err != nil {
 		t.Fatalf("create node config request: %v", err)
 	}
-	nodeReq.Header.Set("X-AGENT-TOKEN", registerPayload.AgentToken)
+	nodeReq.Header.Set("X-AGENT-TOKEN", bootstrapPayload.AgentToken)
 	nodeResp, err := http.DefaultClient.Do(nodeReq)
 	if err != nil {
 		t.Fatalf("get config with node token: %v", err)
@@ -165,5 +153,47 @@ func TestIngestRejectsDedicatedNodeMismatch(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected mismatched node token to be rejected, got %d: %s", resp.StatusCode, string(raw))
+	}
+}
+
+func TestLegacyBootstrapTokenCanIngestWithoutManualRegistration(t *testing.T) {
+	t.Parallel()
+
+	baseURL, _ := startTestServer(t, Config{
+		Addr:       reserveTCPAddr(t),
+		AdminPath:  "/cm-admin",
+		AgentToken: "bootstrap-token",
+	})
+
+	body, err := json.Marshal(map[string]any{
+		"node_id":   "legacy-node",
+		"node_name": "legacy-node",
+		"hostname":  "legacy-host",
+		"os":        "linux",
+		"arch":      "amd64",
+		"timestamp": 1710000000,
+		"cpu":       map[string]any{"usage_percent": 1},
+		"memory":    map[string]any{"total": 1, "used": 1, "free": 0, "used_percent": 100},
+		"disk":      []map[string]any{},
+		"disk_io":   map[string]any{},
+		"network":   map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("marshal ingest payload: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/ingest", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create ingest request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-AGENT-TOKEN", "bootstrap-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post legacy ingest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected legacy bootstrap ingest to succeed, got %d: %s", resp.StatusCode, string(raw))
 	}
 }

@@ -19,6 +19,16 @@ func TestEnvOrDefault(t *testing.T) {
 	}
 }
 
+func TestEnvOrDefaultSupportsLegacyDockerKeys(t *testing.T) {
+	t.Setenv("CM_NODE_ID", "")
+	t.Setenv("NODE_ID", "")
+	t.Setenv("node-id", " legacy-node ")
+
+	if got := EnvOrDefault("CM_NODE_ID", "fallback"); got != "legacy-node" {
+		t.Fatalf("expected legacy docker env to win, got %q", got)
+	}
+}
+
 func TestEnvDuration(t *testing.T) {
 	t.Setenv("CM_TEST_DURATION", "15s")
 	t.Setenv("CM_TEST_BAD_DURATION", "abc")
@@ -28,6 +38,15 @@ func TestEnvDuration(t *testing.T) {
 	}
 	if got := EnvDuration("CM_TEST_BAD_DURATION", 3*time.Second); got != 3*time.Second {
 		t.Fatalf("expected fallback duration, got %s", got)
+	}
+}
+
+func TestEnvDurationSupportsLegacyDockerKeys(t *testing.T) {
+	t.Setenv("CM_TEST_INTERVAL", "")
+	t.Setenv("test-interval", "12s")
+
+	if got := EnvDuration("CM_TEST_INTERVAL", time.Second); got != 12*time.Second {
+		t.Fatalf("expected legacy duration env, got %s", got)
 	}
 }
 
@@ -44,6 +63,15 @@ func TestEnvBool(t *testing.T) {
 	}
 	if got := EnvBool("CM_TEST_BAD_BOOL", true); !got {
 		t.Fatal("expected fallback bool value for invalid input")
+	}
+}
+
+func TestEnvBoolSupportsLegacyDockerKeys(t *testing.T) {
+	t.Setenv("CM_DISABLE_UPDATE", "")
+	t.Setenv("disable-update", "true")
+
+	if got := EnvBool("CM_DISABLE_UPDATE", false); !got {
+		t.Fatal("expected legacy bool env value")
 	}
 }
 

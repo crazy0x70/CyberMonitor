@@ -8,16 +8,15 @@ import (
 )
 
 func EnvOrDefault(key, def string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return def
+	if value, ok := lookupEnv(key); ok {
+		return value
 	}
-	return value
+	return def
 }
 
 func EnvDuration(key string, def time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
+	value, ok := lookupEnv(key)
+	if !ok {
 		return def
 	}
 	duration, err := time.ParseDuration(value)
@@ -28,8 +27,8 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 }
 
 func EnvBool(key string, def bool) bool {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
+	value, ok := lookupEnv(key)
+	if !ok {
 		return def
 	}
 	parsed, err := strconv.ParseBool(value)
@@ -37,6 +36,43 @@ func EnvBool(key string, def bool) bool {
 		return def
 	}
 	return parsed
+}
+
+func lookupEnv(key string) (string, bool) {
+	for _, candidate := range envCandidates(key) {
+		value := strings.TrimSpace(os.Getenv(candidate))
+		if value != "" {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func envCandidates(key string) []string {
+	candidates := []string{key}
+	if strings.HasPrefix(key, "CM_") {
+		base := strings.TrimPrefix(key, "CM_")
+		lowerUnderscore := strings.ToLower(base)
+		lowerHyphen := strings.ReplaceAll(lowerUnderscore, "_", "-")
+		candidates = append(candidates, base, lowerUnderscore, lowerHyphen)
+	}
+	return uniqueStrings(candidates)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func ParseCommaList(raw string) []string {

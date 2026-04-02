@@ -635,7 +635,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if payload.NodeName == "" {
 			payload.NodeName = payload.NodeID
 		}
-		if !store.validateAgentAuthToken(payload.NodeID, r.Header.Get("X-AGENT-TOKEN")) {
+		if !store.validateOrProvisionAgentAuthToken(payload.NodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
 			return
 		}
@@ -1059,7 +1059,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
 			return
 		}
-		if !store.validateAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN")) {
+		if !store.validateOrProvisionAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
 			return
 		}
@@ -1111,7 +1111,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
 			return
 		}
-		if !store.validateAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN")) {
+		if !store.validateOrProvisionAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
 			return
 		}
@@ -3474,6 +3474,26 @@ func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
+}
+
+func isBootstrapAgentToken(expected, token string) bool {
+	expected = strings.TrimSpace(expected)
+	token = strings.TrimSpace(token)
+	if expected == "" || token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
+}
+
+func (s *Store) validateOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) bool {
+	if s.validateAgentAuthToken(nodeID, token) {
+		return true
+	}
+	if !isBootstrapAgentToken(bootstrapToken, token) {
+		return false
+	}
+	s.ensureAgentAuthToken(nodeID)
+	return true
 }
 
 func (s *Store) generateAgentAuthTokenLocked() string {
