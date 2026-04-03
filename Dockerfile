@@ -18,6 +18,7 @@ RUN --mount=type=cache,target=/root/.npm \
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
+ARG GO_IMAGE_VERSION
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
