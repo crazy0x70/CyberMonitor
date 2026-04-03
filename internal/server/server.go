@@ -19,15 +19,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/updater"
-	"cyber_monitor/internal/agentrpc"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -1163,7 +1165,7 @@ func Run(ctx context.Context, cfg Config) error {
 			snapshot := storeSnapshot(store, true)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if ok := client.enqueue(websocket.TextMessage, append([]byte(nil), payload...)); !ok {
+				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
 					hub.Remove(conn)
 					return
 				}
@@ -1660,7 +1662,16 @@ func buildTestHistoryKey(test metrics.NetworkTestResult) string {
 	if host == "" && name == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%d|%s", kind, host, test.Port, name)
+	var builder strings.Builder
+	builder.Grow(len(kind) + len(host) + len(name) + 16)
+	builder.WriteString(kind)
+	builder.WriteByte('|')
+	builder.WriteString(host)
+	builder.WriteByte('|')
+	builder.WriteString(strconv.Itoa(test.Port))
+	builder.WriteByte('|')
+	builder.WriteString(name)
+	return builder.String()
 }
 
 func normalizeHistoryEntry(entry *TestHistoryEntry) {
@@ -1836,7 +1847,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	targets := AlertTargets{
 		FeishuWebhook:   strings.TrimSpace(s.settings.AlertWebhook),
 		TelegramToken:   strings.TrimSpace(s.settings.AlertTelegramToken),
-		TelegramUserIDs: normalizeTelegramUserIDs(append([]int64(nil), s.settings.AlertTelegramUserIDs...)),
+		TelegramUserIDs: normalizeTelegramUserIDs(slices.Clone(s.settings.AlertTelegramUserIDs)),
 		SiteTitle:       normalizeSiteTitle(s.settings.SiteTitle),
 	}
 	if targets.TelegramToken == "" || len(targets.TelegramUserIDs) == 0 {
@@ -2285,9 +2296,9 @@ func cloneTestHistory(
 				continue
 			}
 			copiedTests[key] = &TestHistoryEntry{
-				Latency:        append([]*float64(nil), entry.Latency...),
-				Loss:           append([]*float64(nil), entry.Loss...),
-				Times:          append([]int64(nil), entry.Times...),
+				Latency:        slices.Clone(entry.Latency),
+				Loss:           slices.Clone(entry.Loss),
+				Times:          slices.Clone(entry.Times),
 				LastAt:         entry.LastAt,
 				MinIntervalSec: entry.MinIntervalSec,
 				AvgIntervalSec: entry.AvgIntervalSec,
@@ -2475,7 +2486,7 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 func (h *Hub) Broadcast(payload []byte) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
-		copied := append([]byte(nil), payload...)
+		copied := bytes.Clone(payload)
 		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
@@ -2488,7 +2499,7 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 		if client == nil || client.variant != variant {
 			continue
 		}
-		copied := append([]byte(nil), payload...)
+		copied := bytes.Clone(payload)
 		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
@@ -3025,7 +3036,7 @@ func (s *Store) AlertWebhook() string {
 func (s *Store) TelegramSettings() (string, []int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return strings.TrimSpace(s.settings.AlertTelegramToken), append([]int64(nil), s.settings.AlertTelegramUserIDs...)
+	return strings.TrimSpace(s.settings.AlertTelegramToken), slices.Clone(s.settings.AlertTelegramUserIDs)
 }
 
 func (s *Store) SiteTitle() string {

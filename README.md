@@ -15,7 +15,7 @@
 ### 1. 一键安装 (推荐)
 自动配置 systemd 服务（按提示可选择安装主控 Server 或探针 Agent）：
 ```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/one-click.sh)" @ install
+bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh)" @ install
 ```
 
 ### 2. Docker 部署主控
@@ -133,12 +133,12 @@ docker run -d \
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token>
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token>
 ```
 **Windows**
 ```powershell
 $script = Join-Path $env:TEMP 'agent.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script
 & $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
 ```
 
@@ -146,13 +146,13 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --node-id my-node-id
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --node-id my-node-id
 ```
 
 **Windows**
 ```powershell
 $script = Join-Path $env:TEMP 'agent.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script
 & $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -NodeId 'my-node-id'
 ```
 
@@ -160,13 +160,13 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --disable-update
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token> --disable-update
 ```
 
 **Windows**
 ```powershell
 $script = Join-Path $env:TEMP 'agent.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script
 & $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>' -DisableUpdate
 ```
 
@@ -263,13 +263,13 @@ docker run -d \
 ### 5. 卸载探针 (Agent)
 **Linux / macOS**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
 ```
 
 **Windows**
 ```powershell
 $script = Join-Path $env:TEMP 'agent-uninstall.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1' -OutFile $script
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.ps1' -OutFile $script
 & $script
 ```
 

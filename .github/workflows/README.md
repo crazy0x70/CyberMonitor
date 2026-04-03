@@ -38,11 +38,12 @@
 
 执行内容：
 
-- 校验 `admin-ui/` 与 `scripts/` 是否存在且已被 Git 跟踪
+- 校验 `admin-ui/` 与 `internal/server/web/index.html` 是否存在且已被 Git 跟踪
+- 校验 `go.mod` 与 `Dockerfile` 中声明的 Go 版本完全一致
 - 使用 Node `22`
 - 执行 `npm --prefix admin-ui ci`
 - 执行 `npm --prefix admin-ui run lint`
-- 执行 `./scripts/build-admin.sh`
+- 执行 `npm --prefix admin-ui run build:admin`
 - 将生成的 `internal/server/web/admin-app/` 与 `internal/server/web/admin-assets/` 打包为 `admin-web-sync.tar.gz`
 - 上传为 artifact：`admin-web-sync`
 
@@ -168,6 +169,8 @@
 - `build-server`
 - `build-agent`
 - `build-web`
+- `docker-server`
+- `docker-agent`
 
 执行内容：
 
@@ -205,8 +208,7 @@
 要让这套 workflow 正常运行，以下源码必须同步到 GitHub：
 
 - `admin-ui/`
-- `scripts/build-admin.sh`
-- `scripts/verify-admin-build-inputs.sh`
+- `scripts/docker-entrypoint.sh`
 - `internal/server/web/index.html`
 - `cmd/`
 - `internal/`

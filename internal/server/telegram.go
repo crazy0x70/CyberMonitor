@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -622,7 +623,7 @@ func buildTelegramUserKey(ids []int64) string {
 	if len(ids) == 0 {
 		return ""
 	}
-	sorted := append([]int64(nil), ids...)
+	sorted := slices.Clone(ids)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	parts := make([]string, 0, len(sorted))
 	for _, id := range sorted {

@@ -63,6 +63,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Verify Go version sync
+        run: |
+          GO_VERSION="$(awk '/^go / { print $2; exit }' go.mod)"
+          DOCKER_GO_VERSION="$(awk -F= '/^ARG GO_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
+          if [ -z "$GO_VERSION" ] || [ -z "$DOCKER_GO_VERSION" ]; then
+            echo "Unable to resolve Go version from go.mod or Dockerfile" >&2
+            exit 1
+          fi
+          if [ "$GO_VERSION" != "$DOCKER_GO_VERSION" ]; then
+            echo "Go version drift detected: go.mod=$GO_VERSION, Dockerfile GO_IMAGE_VERSION=$DOCKER_GO_VERSION" >&2
+            exit 1
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -259,8 +272,29 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Verify admin build inputs
-        run: ./scripts/verify-admin-build-inputs.sh --require-tracked
+      - name: Verify build inputs
+        run: |
+          GO_VERSION="$(awk '/^go / { print $2; exit }' go.mod)"
+          DOCKER_GO_VERSION="$(awk -F= '/^ARG GO_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
+          if [ -z "$GO_VERSION" ] || [ -z "$DOCKER_GO_VERSION" ]; then
+            echo "Unable to resolve Go version from go.mod or Dockerfile" >&2
+            exit 1
+          fi
+          if [ "$GO_VERSION" != "$DOCKER_GO_VERSION" ]; then
+            echo "Go version drift detected: go.mod=$GO_VERSION, Dockerfile GO_IMAGE_VERSION=$DOCKER_GO_VERSION" >&2
+            exit 1
+          fi
+          for path in \
+            admin-ui/package.json \
+            admin-ui/package-lock.json \
+            admin-ui/src/App.tsx \
+            admin-ui/lib/admin-ui.ts \
+            admin-ui/scripts/sync-admin.mjs \
+            internal/server/web/index.html
+          do
+            test -e "$path"
+            git ls-files --error-unmatch "$path" >/dev/null 2>&1
+          done
 
       - name: Set up Node
         uses: actions/setup-node@v5
@@ -273,7 +307,7 @@ jobs:
         run: |
           npm --prefix admin-ui ci
           npm --prefix admin-ui run lint
-          ./scripts/build-admin.sh
+          npm --prefix admin-ui run build:admin
 
       - name: Package synced admin assets
         run: |
@@ -338,7 +372,18 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Verify admin build inputs
-        run: ./scripts/verify-admin-build-inputs.sh --require-tracked
+        run: |
+          for path in \
+            admin-ui/package.json \
+            admin-ui/package-lock.json \
+            admin-ui/src/App.tsx \
+            admin-ui/lib/admin-ui.ts \
+            admin-ui/scripts/sync-admin.mjs \
+            internal/server/web/index.html
+          do
+            test -e "$path"
+            git ls-files --error-unmatch "$path" >/dev/null 2>&1
+          done
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4

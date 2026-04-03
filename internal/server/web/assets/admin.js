@@ -1270,14 +1270,14 @@ function updateInstallCommands() {
   const token = state.settings.agentToken || "<your_token>";
   const escapePwsh = (value) => String(value).replace(/'/g, "''");
   if (installLinux) {
-    installLinux.textContent = `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url ${endpoint} --agent-token ${token}`;
+    installLinux.textContent = `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url ${endpoint} --agent-token ${token}`;
   }
   if (installWindows) {
     const safeEndpoint = escapePwsh(endpoint);
     const safeToken = escapePwsh(token);
     installWindows.textContent = [
       `$script = Join-Path $env:TEMP 'agent.ps1'`,
-      `Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script`,
+      `Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script`,
       `& $script -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'`,
     ].join("\n");
   }

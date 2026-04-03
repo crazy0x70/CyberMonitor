@@ -1,16 +1,22 @@
-# syntax=docker/dockerfile:1.7
+ARG GO_IMAGE_VERSION=1.26.1
 
 FROM --platform=$BUILDPLATFORM node:22-alpine AS admin-build
 
 WORKDIR /src
 COPY admin-ui ./admin-ui
 COPY internal/server/web ./internal/server/web
-COPY scripts ./scripts
-RUN --mount=type=cache,target=/root/.npm npm --prefix admin-ui ci
-RUN npm --prefix admin-ui run lint
-RUN ./scripts/build-admin.sh
+RUN test -f admin-ui/package.json && \
+    test -f admin-ui/package-lock.json && \
+    test -f admin-ui/src/App.tsx && \
+    test -f admin-ui/lib/admin-ui.ts && \
+    test -f admin-ui/scripts/sync-admin.mjs && \
+    test -f internal/server/web/index.html
+RUN --mount=type=cache,target=/root/.npm \
+    npm --prefix admin-ui ci && \
+    npm --prefix admin-ui run lint && \
+    npm --prefix admin-ui run build:admin
 
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build-base
+FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -19,7 +25,17 @@ ARG TARGETVARIANT
 WORKDIR /src
 COPY go.mod ./
 COPY go.sum ./
-RUN go mod download
+RUN set -eu; \
+    go_version="$(awk '/^go / { print $2; exit }' go.mod)"; \
+    if [ -z "${go_version}" ]; then \
+      echo "Unable to resolve Go version from go.mod" >&2; \
+      exit 1; \
+    fi; \
+    if [ "${go_version}" != "${GO_IMAGE_VERSION}" ]; then \
+      echo "Go version drift detected: go.mod=${go_version}, Dockerfile GO_IMAGE_VERSION=${GO_IMAGE_VERSION}" >&2; \
+      exit 1; \
+    fi; \
+    go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 

@@ -668,9 +668,9 @@ func TestReadmeWindowsExamplesUseDirectPowerShellCommands(t *testing.T) {
 
 	requiredSnippets := []string{
 		`$script = Join-Path $env:TEMP 'agent.ps1'`,
-		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent.ps1' -OutFile $script`,
+		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script`,
 		`$script = Join-Path $env:TEMP 'agent-uninstall.ps1'`,
-		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/agent-uninstall.ps1' -OutFile $script`,
+		`Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.ps1' -OutFile $script`,
 	}
 
 	for _, snippet := range requiredSnippets {
@@ -703,7 +703,7 @@ func TestWindowsAgentInstallCommandsAvoidNestedPowerShell(t *testing.T) {
 func TestWindowsAgentScriptBuildsServiceArgsWithoutInlineEscapes(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "agent.ps1")
+	content := readRepoFileForUITest(t, "scripts/agent.ps1")
 	disallowedSnippets := []string{
 		`$args = "--server-url ` + "`" + `"$ServerUrl`,
 		`$([Uri]::EscapeDataString($CurrentNodeId))`,
@@ -739,8 +739,8 @@ func TestWindowsPowerShellScriptsStayASCIIOnly(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"agent.ps1",
-		"agent-uninstall.ps1",
+		"scripts/agent.ps1",
+		"scripts/agent-uninstall.ps1",
 	}
 
 	for _, relativePath := range files {
