@@ -59,7 +59,12 @@ RUN set -eux; \
 
 FROM alpine:3.20 AS runtime-base
 WORKDIR /app
-RUN addgroup -S cm && adduser -S -G cm cm && chown -R cm:cm /app
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN apk add --no-cache su-exec && \
+    addgroup -S cm && \
+    adduser -S -G cm cm && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh && \
+    chown -R cm:cm /app
 
 FROM runtime-base AS release-server
 ARG VERSION=dev
@@ -74,8 +79,7 @@ EXPOSE 25012
 EXPOSE 25013
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -q -O - http://127.0.0.1:25012/api/v1/health || exit 1
-USER cm
-ENTRYPOINT ["/app/cyber-monitor"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 FROM runtime-base AS release-agent
 ARG VERSION=dev
@@ -90,5 +94,4 @@ RUN apk add --no-cache iputils libcap-utils && \
 ENV CM_DEPLOY_MODE=docker \
     CM_VERSION=${VERSION} \
     CM_COMMIT=${COMMIT}
-USER cm
-ENTRYPOINT ["/app/cyber-monitor"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -2,26 +2,46 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"cyber_monitor/internal/metrics"
 )
+
+type stubControlPlane struct {
+	reports []map[string]string
+}
+
+func (s *stubControlPlane) RegisterNodeToken(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s *stubControlPlane) FetchConfig(context.Context, string, string) (RemoteConfig, error) {
+	return RemoteConfig{}, nil
+}
+
+func (s *stubControlPlane) ReportStats(context.Context, metrics.NodeStats, string) error {
+	return nil
+}
+
+func (s *stubControlPlane) ReportUpdate(_ context.Context, nodeID, token, state, version, message string) error {
+	s.reports = append(s.reports, map[string]string{
+		"node_id": nodeID,
+		"token":   token,
+		"state":   state,
+		"version": version,
+		"message": message,
+	})
+	return nil
+}
+
+func (s *stubControlPlane) Close() error {
+	return nil
+}
 
 func TestMaybeApplyRemoteUpdateHonorsDisableUpdate(t *testing.T) {
 	t.Parallel()
 
-	var reports []map[string]string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		var payload map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode update report: %v", err)
-		}
-		reports = append(reports, payload)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+	transport := &stubControlPlane{}
 
 	cfg := Config{
 		NodeID:        "node-1",
@@ -30,23 +50,23 @@ func TestMaybeApplyRemoteUpdateHonorsDisableUpdate(t *testing.T) {
 		DisableUpdate: true,
 	}
 
-	err := maybeApplyRemoteUpdate(context.Background(), server.Client(), server.URL, cfg, &RemoteUpdateInstruction{
+	err := maybeApplyRemoteUpdate(context.Background(), transport, cfg, &RemoteUpdateInstruction{
 		Version:     "1.1.0",
 		DownloadURL: "https://example.com/cyber-monitor-agent",
 	})
 	if err != nil {
 		t.Fatalf("maybe apply remote update: %v", err)
 	}
-	if len(reports) != 1 {
-		t.Fatalf("expected exactly one update report, got %d", len(reports))
+	if len(transport.reports) != 1 {
+		t.Fatalf("expected exactly one update report, got %d", len(transport.reports))
 	}
-	if reports[0]["state"] != "failed" {
-		t.Fatalf("expected failed report state, got %q", reports[0]["state"])
+	if transport.reports[0]["state"] != "failed" {
+		t.Fatalf("expected failed report state, got %q", transport.reports[0]["state"])
 	}
-	if reports[0]["version"] != "1.1.0" {
-		t.Fatalf("expected target version 1.1.0, got %q", reports[0]["version"])
+	if transport.reports[0]["version"] != "1.1.0" {
+		t.Fatalf("expected target version 1.1.0, got %q", transport.reports[0]["version"])
 	}
-	if reports[0]["message"] != "当前 Agent 已禁用远程更新" {
-		t.Fatalf("unexpected disable update message: %q", reports[0]["message"])
+	if transport.reports[0]["message"] != "当前 Agent 已禁用远程更新" {
+		t.Fatalf("unexpected disable update message: %q", transport.reports[0]["message"])
 	}
 }

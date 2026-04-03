@@ -53,6 +53,9 @@ const state = {
   wsConnections: new Map(),
   nodes: new Map(),
   reconnectTimers: new Map(),
+  wsReconnectAttempts: new Map(),
+  wsWatchdogs: new Map(),
+  wsLastMessageAt: new Map(),
   snapshotFailures: new Map(),
   selectedGroup: readViewStateFromURL().selectedGroup,
   statusFilter: readViewStateFromURL().statusFilter,
@@ -61,6 +64,7 @@ const state = {
   testHistory: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
+  testSmooth: new Map(),
   renderMode: "flat",
   tagSections: new Map(),
   historyCacheTimer: null,
@@ -81,6 +85,10 @@ const HISTORY_CACHE_MAX_POINTS = 5000;
 const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
 const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 const HISTORY_CACHE_SAVE_DELAY = 1500;
+const WS_RECONNECT_BASE_DELAY = 500;
+const WS_RECONNECT_MAX_DELAY = 8000;
+const WS_WATCHDOG_MS = 15000;
+const LATENCY_SMOOTH_ALPHA = 0.35;
 
 function buildVariantURL(variant) {
   const next = new URL(window.location.href);
@@ -140,37 +148,6 @@ function appendVariantToSocketURL(value) {
   }
 }
 
-function ensureVariantBanner() {
-  if (!state.demoEnabled) return;
-  if (document.querySelector(".demo-variant-banner")) return;
-  const topbar = document.querySelector(".topbar");
-  if (!topbar || !topbar.parentElement) return;
-
-  const banner = document.createElement("section");
-  banner.className = "demo-variant-banner";
-  banner.innerHTML = `
-    <div class="demo-variant-copy">
-      <span class="demo-variant-eyebrow">本地对比</span>
-      <strong>${state.variant === VARIANT_BALANCED ? "平衡方案" : "保守方案"}</strong>
-      <span class="demo-variant-desc">${
-        state.variant === VARIANT_BALANCED
-          ? "WS 增量推送 + 静默 full snapshot"
-          : "保留 full snapshot，前台做增量渲染"
-      }</span>
-      <span class="demo-variant-live" data-field="demo-variant-live">等待首帧数据…</span>
-    </div>
-    <div class="demo-variant-actions">
-      <a class="demo-variant-link${
-        state.variant === VARIANT_CONSERVATIVE ? " active" : ""
-      }" href="${buildVariantURL(VARIANT_CONSERVATIVE)}">保守版</a>
-      <a class="demo-variant-link${
-        state.variant === VARIANT_BALANCED ? " active" : ""
-      }" href="${buildVariantURL(VARIANT_BALANCED)}">平衡版</a>
-    </div>
-  `;
-  topbar.insertAdjacentElement("afterend", banner);
-}
-
 function scheduleRender() {
   if (state.renderFrame) return;
   state.renderFrame = window.requestAnimationFrame(() => {
@@ -208,8 +185,15 @@ function connectWSForTarget(target) {
   if (!target || !target.socketURL) {
     return;
   }
-  if (state.wsConnections.has(target.key)) {
-    return;
+  const existing = state.wsConnections.get(target.key);
+  if (existing) {
+    if (
+      existing.readyState !== WebSocket.CLOSING &&
+      existing.readyState !== WebSocket.CLOSED
+    ) {
+      return;
+    }
+    state.wsConnections.delete(target.key);
   }
 
   let ws;
@@ -218,12 +202,26 @@ function connectWSForTarget(target) {
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
     dropSourceSnapshot(target.key);
+    scheduleReconnect(target);
     return;
   }
   state.wsConnections.set(target.key, ws);
 
+  ws.onopen = () => {
+    clearReconnectTimer(target.key);
+    state.wsReconnectAttempts.delete(target.key);
+    state.snapshotFailures.delete(target.key);
+    state.wsLastMessageAt.set(target.key, Date.now());
+    armWSWatchdog(target, ws);
+    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
+  };
+
   ws.onclose = () => {
-    state.wsConnections.delete(target.key);
+    clearWSWatchdog(target.key);
+    state.wsLastMessageAt.delete(target.key);
+    if (state.wsConnections.get(target.key) === ws) {
+      state.wsConnections.delete(target.key);
+    }
     dropSourceSnapshot(target.key);
     scheduleReconnect(target);
   };
@@ -235,6 +233,8 @@ function connectWSForTarget(target) {
   ws.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data);
+      state.wsLastMessageAt.set(target.key, Date.now());
+      armWSWatchdog(target, ws);
       if (payload.type === "snapshot") {
         handleSnapshot(payload, target.key);
       } else if (payload.type === "node_delta") {
@@ -341,42 +341,113 @@ async function loadRemoteConfig() {
   }
 }
 
+async function fetchPublicSnapshotForTarget(target, options = {}) {
+  const { dropOnFailure = true } = options;
+  const base = target?.apiBase;
+  if (!base || !target?.key) return false;
+  try {
+    const resp = await fetch(`${base}/api/v1/public/snapshot`, {
+      cache: "no-store",
+    });
+    if (!resp.ok) {
+      state.snapshotFailures.set(
+        target.key,
+        (state.snapshotFailures.get(target.key) || 0) + 1
+      );
+      if (dropOnFailure) {
+        dropSourceSnapshot(target.key);
+      }
+      return false;
+    }
+    const payload = await resp.json();
+    if (payload && payload.type === "snapshot") {
+      state.snapshotFailures.delete(target.key);
+      state.wsLastMessageAt.set(target.key, Date.now());
+      handleSnapshot(payload, target.key);
+      return true;
+    }
+  } catch (error) {
+    state.snapshotFailures.set(
+      target.key,
+      (state.snapshotFailures.get(target.key) || 0) + 1
+    );
+    if (dropOnFailure) {
+      dropSourceSnapshot(target.key);
+    }
+  }
+  return false;
+}
+
 async function fetchPublicSnapshot() {
   const targets = resolveTargets();
-  await Promise.all(
-    targets.map(async (target) => {
-      const base = target.apiBase;
-      if (!base) return;
-      try {
-        const resp = await fetch(`${base}/api/v1/public/snapshot`, {
-          cache: "no-store",
-        });
-        if (!resp.ok) {
-          state.snapshotFailures.set(target.key, (state.snapshotFailures.get(target.key) || 0) + 1);
-          dropSourceSnapshot(target.key);
-          return;
-        }
-        const payload = await resp.json();
-        if (payload && payload.type === "snapshot") {
-          state.snapshotFailures.delete(target.key);
-          handleSnapshot(payload, target.key);
-        }
-      } catch (error) {
-        state.snapshotFailures.set(target.key, (state.snapshotFailures.get(target.key) || 0) + 1);
-        dropSourceSnapshot(target.key);
-        return;
-      }
-    })
-  );
+  await Promise.all(targets.map((target) => fetchPublicSnapshotForTarget(target)));
+}
+
+function clearReconnectTimer(targetKey) {
+  const timer = state.reconnectTimers.get(targetKey);
+  if (timer) {
+    clearTimeout(timer);
+    state.reconnectTimers.delete(targetKey);
+  }
+}
+
+function clearWSWatchdog(targetKey) {
+  const timer = state.wsWatchdogs.get(targetKey);
+  if (timer) {
+    clearTimeout(timer);
+    state.wsWatchdogs.delete(targetKey);
+  }
+}
+
+function armWSWatchdog(target, socket) {
+  if (!target?.key || !socket) return;
+  clearWSWatchdog(target.key);
+  const timer = window.setTimeout(() => {
+    handleTargetSocketSilence(target, socket);
+  }, WS_WATCHDOG_MS);
+  state.wsWatchdogs.set(target.key, timer);
+}
+
+function handleTargetSocketSilence(target, socket) {
+  if (!target?.key || !socket) return;
+  clearWSWatchdog(target.key);
+  if (state.wsConnections.get(target.key) !== socket) {
+    return;
+  }
+  void fetchPublicSnapshotForTarget(target, { dropOnFailure: false }).then((ok) => {
+    if (state.wsConnections.get(target.key) !== socket) {
+      return;
+    }
+    if (ok && socket.readyState === WebSocket.OPEN) {
+      state.wsLastMessageAt.set(target.key, Date.now());
+      armWSWatchdog(target, socket);
+      return;
+    }
+    state.wsConnections.delete(target.key);
+    state.wsLastMessageAt.delete(target.key);
+    dropSourceSnapshot(target.key);
+    try {
+      socket.close();
+    } catch (error) {
+      console.warn("关闭静默 WebSocket 失败", error);
+    }
+    scheduleReconnect(target);
+  });
 }
 
 function scheduleReconnect(target) {
   if (!target || !target.key) return;
   if (state.reconnectTimers.has(target.key)) return;
+  const attempt = state.wsReconnectAttempts.get(target.key) || 0;
+  const delay = Math.min(
+    WS_RECONNECT_MAX_DELAY,
+    WS_RECONNECT_BASE_DELAY * Math.pow(2, attempt)
+  );
   const timer = setTimeout(() => {
     state.reconnectTimers.delete(target.key);
+    state.wsReconnectAttempts.set(target.key, attempt + 1);
     connectWSForTarget(target);
-  }, 2000);
+  }, delay);
   state.reconnectTimers.set(target.key, timer);
 }
 
@@ -582,9 +653,9 @@ function updateEmptyState(visibleCount, totalCount) {
 
 const RANGE_OPTIONS = [
   { key: "1h", label: "1H", seconds: 60 * 60 },
-  { key: "24h", label: "24H", seconds: 60 * 60 * 24 },
-  { key: "7d", label: "7D", seconds: 60 * 60 * 24 * 7 },
-  { key: "30d", label: "30D", seconds: 60 * 60 * 24 * 30 },
+  { key: "24h", label: "1D", seconds: 60 * 60 * 24 },
+  { key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },
+  { key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },
   { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 365 },
 ];
 
@@ -933,7 +1004,7 @@ function rangeSeconds(key) {
 
 const TEST_RANGE_INTERVALS = {
   "1h": 5,
-  "24h": 60 * 2,
+  "24h": 30,
   "7d": 60 * 15,
   "30d": 60 * 60,
   "1y": 60 * 60 * 12,
@@ -1404,8 +1475,8 @@ function createCard() {
           <div class="info-row"><span>系统信息</span><strong data-field="detail-os">--</strong></div>
           <div class="info-row"><span>CPU</span><strong data-field="detail-cpu">--</strong></div>
           <div class="info-row"><span>负载</span><strong data-field="detail-load">--</strong></div>
-          <div class="info-row"><span>上传量</span><strong data-field="detail-upload">--</strong></div>
-          <div class="info-row"><span>下载量</span><strong data-field="detail-download">--</strong></div>
+          <div class="info-row"><span>累计上传</span><strong data-field="detail-upload">--</strong></div>
+          <div class="info-row"><span>累计下载</span><strong data-field="detail-download">--</strong></div>
           <div class="info-row"><span>首次上报</span><strong data-field="detail-first">--</strong></div>
           <div class="info-row"><span>末次上报</span><strong data-field="detail-last">--</strong></div>
         </div>
@@ -1465,10 +1536,26 @@ function createCard() {
           </div>
         </div>
       </div>
-      <div class="network-section">
+        <div class="network-section">
         <div class="network-chart">
-          <div class="network-range" data-field="test-range"></div>
-          <div class="network-legend" data-field="test-legend"></div>
+          <div class="network-chart-toolbar">
+            <div class="network-controls">
+              <div class="smooth-control">
+                <span class="smooth-control-label">平滑</span>
+                <button
+                  type="button"
+                  class="smooth-toggle"
+                  data-field="test-smooth"
+                  aria-label="切换平滑"
+                >
+                  <span class="smooth-toggle-track">
+                    <span class="smooth-toggle-thumb"></span>
+                  </span>
+                </button>
+              </div>
+            </div>
+            <div class="network-range" data-field="test-range"></div>
+          </div>
           <div class="network-canvas" data-field="test-chart"></div>
           <div class="network-crosshair" data-field="test-crosshair"></div>
           <div class="network-tooltip" data-field="test-tooltip"></div>
@@ -1521,7 +1608,7 @@ function createCard() {
     connValue: card.querySelector('[data-field="conn-value"]'),
     connDetail: card.querySelector('[data-field="conn-detail"]'),
     connChart: card.querySelector('[data-field="conn-chart"]'),
-    testLegend: card.querySelector('[data-field="test-legend"]'),
+    testSmooth: card.querySelector('[data-field="test-smooth"]'),
     testRange: card.querySelector('[data-field="test-range"]'),
     testChart: card.querySelector('[data-field="test-chart"]'),
     testCrosshair: card.querySelector('[data-field="test-crosshair"]'),
@@ -1626,11 +1713,9 @@ function updateCard(card, node, nodeId) {
   fields.netMeta.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
     net.rx_bytes_per_sec
   )}`;
-  fields.netTotal.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
+  fields.netTotal.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : "--";
+  fields.netDetail.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
     net.rx_bytes_per_sec
-  )}`;
-  fields.netDetail.textContent = `累计 ${formatBytes(net.bytes_sent)} / ${formatBytes(
-    net.bytes_recv
   )}`;
 
   const tcpCount = stats.tcp_conns || 0;
@@ -1734,11 +1819,15 @@ function renderCardDetails(card, node, nodeId) {
 function updateNetworkTests(fields, tests, nodeId) {
   const historyMap = state.testHistory.get(nodeId) || new Map();
   if (!tests.length && historyMap.size === 0) {
-    fields.testLegend.innerHTML = '<div class="form-hint">未配置测试</div>';
     fields.testChart.innerHTML = "";
     fields.testCards.innerHTML = "";
     if (fields.testRange) {
       fields.testRange.innerHTML = "";
+    }
+    if (fields.testSmooth) {
+      fields.testSmooth.disabled = true;
+      fields.testSmooth.classList.remove("active");
+      fields.testSmooth.setAttribute("aria-pressed", "false");
     }
     if (fields.testTooltip) {
       fields.testTooltip.classList.remove("visible");
@@ -1761,9 +1850,9 @@ function renderNetworkSection(fields, nodeId) {
   const baseTests = fields._tests || [];
   const tests = baseTests.length > 0 ? baseTests : buildTestsFromHistory(historyMap);
   const activeRange = state.testRange.get(nodeId) || defaultTestRangeForHistory(historyMap);
+  const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
   renderRangeTabs(fields, nodeId, activeRange);
-
-  fields.testLegend.innerHTML = "";
+  renderSmoothToggle(fields, nodeId, smoothEnabled);
   fields.testCards.innerHTML = "";
 
   const seriesList = [];
@@ -1812,26 +1901,14 @@ function renderNetworkSection(fields, nodeId) {
 
   testEntries.forEach((entry) => {
     const sampled = resampleHistoryForGrid(entry.history, grid);
-    if (hasSeriesData(sampled.latency)) {
-      seriesList.push(sampled.latency);
+    const latencySeries = smoothEnabled
+      ? applyEWMA(sampled.latency, LATENCY_SMOOTH_ALPHA)
+      : sampled.latency.slice();
+    if (hasSeriesData(latencySeries)) {
+      seriesList.push(latencySeries);
       colors.push(entry.color);
       labels.push(entry.label);
     }
-
-    const legend = document.createElement("div");
-    legend.className = "legend-item compact";
-
-    const dot = document.createElement("span");
-    dot.className = "legend-dot";
-    dot.style.background = entry.color;
-
-    const label = document.createElement("span");
-    label.className = "legend-title";
-    label.textContent = entry.label;
-
-    legend.appendChild(dot);
-    legend.appendChild(label);
-    fields.testLegend.appendChild(legend);
 
     const card = document.createElement("div");
     card.className = "network-card";
@@ -1863,6 +1940,23 @@ function renderNetworkSection(fields, nodeId) {
   const chart = buildLatencyChart(seriesList, colors, timeSeries, rangeSec);
   fields.testChart.innerHTML = chart.svg;
   setupLatencyHover(fields, chart.meta, labels);
+}
+
+function renderSmoothToggle(fields, nodeId, enabled) {
+  const button = fields.testSmooth;
+  if (!button) return;
+  button.disabled = false;
+  button.classList.toggle("active", enabled);
+  button.setAttribute("aria-pressed", enabled ? "true" : "false");
+  button.onclick = () => {
+    const next = !Boolean(state.testSmooth.get(nodeId));
+    if (next) {
+      state.testSmooth.set(nodeId, true);
+    } else {
+      state.testSmooth.delete(nodeId);
+    }
+    renderNetworkSection(fields, nodeId);
+  };
 }
 
 function renderRangeTabs(fields, nodeId, active) {
@@ -2017,6 +2111,26 @@ function resampleHistoryForGrid(history, grid) {
     loss[index] = normalizeNumber(srcLoss[i]);
   }
   return { latency, loss, times: grid.times || [] };
+}
+
+function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
+  if (!Array.isArray(series) || series.length === 0) {
+    return [];
+  }
+  const normalizedAlpha = Math.min(Math.max(Number(alpha) || 0, 0.05), 1);
+  const result = [];
+  let carry = null;
+  series.forEach((value) => {
+    const numeric = normalizeNumber(value);
+    if (numeric === null) {
+      result.push(null);
+      carry = null;
+      return;
+    }
+    carry = carry === null ? numeric : carry + normalizedAlpha * (numeric - carry);
+    result.push(carry);
+  });
+  return result;
 }
 
 function buildSummaryExtra(stats, tests) {
@@ -2205,7 +2319,7 @@ function renderSparklineMulti(seriesList, colors, maxValueOverride) {
 function buildLatencyChart(seriesList, colors, times, rangeSec) {
   const width = 680;
   const height = 220;
-  const padding = { top: 28, right: 20, bottom: 18, left: 44 };
+  const padding = { top: 20, right: 18, bottom: 18, left: 46 };
   const normalized = seriesList
     .map((series) => (Array.isArray(series) ? series : []))
     .filter((series) => series.length > 0);
@@ -2239,7 +2353,7 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
       )}" y2="${y.toFixed(1)}" />`
     );
     yLabels.push(
-      `<text x="${padding.left - 8}" y="${y.toFixed(
+      `<text x="${padding.left - 4}" y="${y.toFixed(
         1
       )}" text-anchor="end" dominant-baseline="middle">${formatLatencyTick(
         value
@@ -2282,6 +2396,10 @@ function setupLatencyHover(fields, meta, labels) {
   const tooltip = fields.testTooltip;
   const crosshair = fields.testCrosshair;
   if (!container || !tooltip || !crosshair) return;
+  const host = fields.testChart.parentElement;
+  if (typeof container.__latencyHoverCleanup === "function") {
+    container.__latencyHoverCleanup();
+  }
   if (!meta || !meta.maxLen || !meta.paddedTimes.length) {
     tooltip.classList.remove("visible");
     crosshair.classList.remove("visible");
@@ -2295,10 +2413,47 @@ function setupLatencyHover(fields, meta, labels) {
     crosshair.classList.remove("visible");
   };
 
-  container.onmouseleave = hide;
+  const handleLeave = () => hide();
+  const handleGlobalPointerMove = (event) => {
+    if (!tooltip.classList.contains("visible") && !crosshair.classList.contains("visible")) {
+      return;
+    }
+    const hostRect = host ? host.getBoundingClientRect() : svg.getBoundingClientRect();
+    if (
+      event.clientX < hostRect.left ||
+      event.clientX > hostRect.right ||
+      event.clientY < hostRect.top ||
+      event.clientY > hostRect.bottom
+    ) {
+      hide();
+    }
+  };
+  const handleScrollOrBlur = () => hide();
+
+  container.addEventListener("mouseleave", handleLeave);
+  container.addEventListener("pointerleave", handleLeave);
+  if (host) {
+    host.addEventListener("mouseleave", handleLeave);
+    host.addEventListener("pointerleave", handleLeave);
+  }
+  window.addEventListener("pointermove", handleGlobalPointerMove, true);
+  window.addEventListener("scroll", handleScrollOrBlur, true);
+  window.addEventListener("blur", handleScrollOrBlur);
+  container.__latencyHoverCleanup = () => {
+    container.removeEventListener("mouseleave", handleLeave);
+    container.removeEventListener("pointerleave", handleLeave);
+    if (host) {
+      host.removeEventListener("mouseleave", handleLeave);
+      host.removeEventListener("pointerleave", handleLeave);
+    }
+    window.removeEventListener("pointermove", handleGlobalPointerMove, true);
+    window.removeEventListener("scroll", handleScrollOrBlur, true);
+    window.removeEventListener("blur", handleScrollOrBlur);
+  };
+
   container.onmousemove = (event) => {
     const rect = svg.getBoundingClientRect();
-    const hostRect = fields.testChart.parentElement.getBoundingClientRect();
+    const hostRect = (host || fields.testChart).getBoundingClientRect();
     const offsetX = rect.left - hostRect.left;
     const scaleX = rect.width / 680;
     const paddingLeft = meta.padding.left * scaleX;
@@ -2602,7 +2757,29 @@ function flagEmoji(code) {
 function formatRegion(code) {
   const normalized = (code || "").trim().toUpperCase();
   if (!normalized) return "--";
-  return `${flagEmoji(normalized)}${normalized}`.trim();
+  const regionNames = typeof Intl !== "undefined" && Intl.DisplayNames
+    ? new Intl.DisplayNames(["en"], { type: "region" })
+    : null;
+  const fallbackRegionNames = {
+    CA: "Canada",
+    CN: "China",
+    DE: "Germany",
+    FR: "France",
+    HK: "Hong Kong",
+    JP: "Japan",
+    NL: "Netherlands",
+    SG: "Singapore",
+    TW: "Taiwan",
+    UK: "United Kingdom",
+    US: "United States",
+  };
+  const resolved =
+    (regionNames && typeof regionNames.of === "function"
+      ? regionNames.of(normalized)
+      : "") ||
+    fallbackRegionNames[normalized] ||
+    normalized;
+  return `${flagEmoji(normalized)}${resolved}`.trim();
 }
 
 function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
@@ -2719,7 +2896,6 @@ function aggregateDisk(list) {
 }
 
 updateFooter("");
-ensureVariantBanner();
 loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);
 

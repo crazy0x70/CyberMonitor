@@ -19,6 +19,16 @@ func loadPersistedSettingsForTest(t *testing.T, dataDir string) Settings {
 	return payload.Settings
 }
 
+func loadPersistedTestHistoryForTest(t *testing.T, dataDir string) TestHistoryData {
+	t.Helper()
+
+	payload, _, _, err := loadTestHistoryData(filepath.Join(dataDir, testHistoryFileName))
+	if err != nil {
+		t.Fatalf("load persisted test history: %v", err)
+	}
+	return payload
+}
+
 func TestMergeSettingsBackfillsMissingValuesWithoutOverwritingExisting(t *testing.T) {
 	t.Parallel()
 
@@ -191,6 +201,78 @@ func TestRunPreservesPersistedSettingsOnRestart(t *testing.T) {
 	}
 	if persisted.AISettings.OpenAI.Model != settings.AISettings.OpenAI.Model {
 		t.Fatalf("expected AI settings to be preserved, got %+v", persisted.AISettings)
+	}
+}
+
+func TestRunPreservesPersistedTestHistoryOnRestart(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	cfg := Config{
+		Addr:      reserveTCPAddr(t),
+		DataDir:   dataDir,
+		AdminPath: "/cm-admin",
+		AdminUser: "admin",
+		AdminPass: "admin123",
+	}
+
+	settings := initSettings(cfg)
+	if err := savePersistedData(filepath.Join(dataDir, "state.json"), PersistedData{
+		Settings: settings,
+		Profiles: map[string]*NodeProfile{},
+		Nodes:    map[string]NodeState{},
+	}); err != nil {
+		t.Fatalf("save persisted data: %v", err)
+	}
+
+	latencyA := 12.5
+	latencyB := 28.8
+	lossA := 0.0
+	lossB := 2.5
+	history := TestHistoryData{
+		Version:   testHistoryVersion,
+		UpdatedAt: 1_777_000_123,
+		Nodes: map[string]map[string]*TestHistoryEntry{
+			"node-a": {
+				"icmp|1.1.1.1|0|Cloudflare": {
+					Latency:        []*float64{&latencyA, &latencyB},
+					Loss:           []*float64{&lossA, &lossB},
+					Times:          []int64{1_777_000_000, 1_777_000_030},
+					LastAt:         1_777_000_030,
+					MinIntervalSec: 30,
+					AvgIntervalSec: 30,
+				},
+			},
+		},
+	}
+	if err := saveTestHistoryData(filepath.Join(dataDir, testHistoryFileName), history); err != nil {
+		t.Fatalf("save test history: %v", err)
+	}
+
+	startTestServer(t, cfg)
+
+	persisted := loadPersistedTestHistoryForTest(t, dataDir)
+	entry := persisted.Nodes["node-a"]["icmp|1.1.1.1|0|Cloudflare"]
+	if entry == nil {
+		t.Fatal("expected persisted test history entry to survive restart")
+	}
+	if len(entry.Times) != 2 || entry.Times[0] != 1_777_000_000 || entry.Times[1] != 1_777_000_030 {
+		t.Fatalf("expected test history timestamps to be preserved, got %+v", entry.Times)
+	}
+	if entry.LastAt != 1_777_000_030 {
+		t.Fatalf("expected last_at to be preserved, got %d", entry.LastAt)
+	}
+	if entry.MinIntervalSec != 30 {
+		t.Fatalf("expected min interval to be preserved, got %d", entry.MinIntervalSec)
+	}
+	if entry.AvgIntervalSec != 30 {
+		t.Fatalf("expected average interval to be preserved, got %v", entry.AvgIntervalSec)
+	}
+	if len(entry.Latency) != 2 || entry.Latency[0] == nil || entry.Latency[1] == nil {
+		t.Fatalf("expected latency samples to be preserved, got %+v", entry.Latency)
+	}
+	if *entry.Latency[0] != latencyA || *entry.Latency[1] != latencyB {
+		t.Fatalf("expected latency values to be preserved, got %+v", entry.Latency)
 	}
 }
 

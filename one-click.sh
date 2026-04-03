@@ -124,6 +124,7 @@ register_agent() {
   local server_url="$1"
   local bootstrap_token="$2"
   local node_id="$3"
+  # 安装阶段首次注册仍走 HTTP；安装完成后的 Agent 运行态会对同一 server-url 优先尝试 gRPC。
   local endpoint="${server_url%/}/api/v1/agent/register?node_id=${node_id}"
   local response
   response="$(curl -fsSL -X POST -H "X-AGENT-TOKEN: ${bootstrap_token}" "${endpoint}")" || \
@@ -384,7 +385,7 @@ run_install_menu() {
         install_server "${listen}" "${data_dir}" "${version}"
         ;;
       2)
-        read -r -p "Server 地址(例如 http://1.2.3.4:25012): " server_url
+        read -r -p "Server 地址(统一接入地址，例如 http://1.2.3.4:25012；运行态会优先尝试 gRPC): " server_url
         read -r -p "Agent Token: " token
         read -r -p "Node ID（可空，留空则随机生成）: " node_id
         read -r -p "指定网卡(可空): " net_iface

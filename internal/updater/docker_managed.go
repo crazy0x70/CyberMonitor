@@ -10,10 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/api/types/mount"
-	"github.com/moby/moby/api/types/network"
-	"github.com/moby/moby/client"
+	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 )
 
 const (
@@ -140,11 +143,10 @@ func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
 	if err != nil {
 		return nil, err
 	}
-	inspectResult, err := cli.ContainerInspect(context.Background(), containerID, client.ContainerInspectOptions{})
+	inspect, err := cli.ContainerInspect(context.Background(), containerID)
 	if err != nil {
 		return nil, fmt.Errorf("读取当前容器信息失败: %w", err)
 	}
-	inspect := inspectResult.Container
 	if inspect.Config == nil {
 		return nil, fmt.Errorf("当前容器缺少 Config 信息")
 	}
@@ -200,15 +202,11 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 		},
 		RestartPolicy: container.RestartPolicy{Name: "no"},
 	}
-	resp, err := u.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config:     config,
-		HostConfig: hostConfig,
-		Name:       helperName,
-	})
+	resp, err := u.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, helperName)
 	if err != nil {
 		return fmt.Errorf("创建 Docker 更新 helper 失败: %w", err)
 	}
-	if _, err := u.cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
+	if err := u.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("启动 Docker 更新 helper 失败: %w", err)
 	}
 	return nil
@@ -231,11 +229,10 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	inspectResult, err := cli.ContainerInspect(ctx, targetContainerID, client.ContainerInspectOptions{})
+	inspect, err := cli.ContainerInspect(ctx, targetContainerID)
 	if err != nil {
 		return fmt.Errorf("读取目标容器信息失败: %w", err)
 	}
-	inspect := inspectResult.Container
 	if inspect.Config == nil {
 		return fmt.Errorf("目标容器缺少 Config 信息")
 	}
@@ -247,45 +244,37 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	}
 	tempName := fmt.Sprintf("%s-next-%d", sanitizeContainerName(strings.TrimPrefix(inspect.Name, "/")), time.Now().Unix())
 	cfg, hostCfg, netCfg, extraNetworks := buildReplacementSpec(inspect, targetImage)
-	created, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config:           cfg,
-		HostConfig:       hostCfg,
-		NetworkingConfig: netCfg,
-		Name:             tempName,
-	})
+	created, err := cli.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, tempName)
 	if err != nil {
 		return fmt.Errorf("创建替换容器失败: %w", err)
 	}
 	defer func() {
 		if err != nil {
-			_, _ = cli.ContainerRemove(context.Background(), created.ID, client.ContainerRemoveOptions{Force: true})
+			_ = cli.ContainerRemove(context.Background(), created.ID, container.RemoveOptions{Force: true})
 		}
 	}()
 	for networkName, endpoint := range extraNetworks {
-		if _, connectErr := cli.NetworkConnect(ctx, networkName, client.NetworkConnectOptions{
-			Container:      created.ID,
-			EndpointConfig: endpoint,
-		}); connectErr != nil {
+		if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
 			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
 			return err
 		}
 	}
 	timeout := 20
-	_, _ = cli.ContainerStop(ctx, inspect.ID, client.ContainerStopOptions{Timeout: &timeout})
-	if _, removeErr := cli.ContainerRemove(ctx, inspect.ID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
+	_ = cli.ContainerStop(ctx, inspect.ID, container.StopOptions{Timeout: &timeout})
+	if removeErr := cli.ContainerRemove(ctx, inspect.ID, container.RemoveOptions{Force: true}); removeErr != nil {
 		return fmt.Errorf("移除旧容器失败: %w", removeErr)
 	}
 	originalName := strings.TrimPrefix(inspect.Name, "/")
-	if _, renameErr := cli.ContainerRename(ctx, created.ID, client.ContainerRenameOptions{NewName: originalName}); renameErr != nil {
+	if renameErr := cli.ContainerRename(ctx, created.ID, originalName); renameErr != nil {
 		return fmt.Errorf("恢复容器名称失败: %w", renameErr)
 	}
-	if _, startErr := cli.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); startErr != nil {
+	if startErr := cli.ContainerStart(ctx, created.ID, container.StartOptions{}); startErr != nil {
 		return fmt.Errorf("启动新容器失败: %w", startErr)
 	}
 	return nil
 }
 
-func buildReplacementSpec(inspect container.InspectResponse, targetImage string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
+func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
 	hostname := strings.TrimSpace(inspect.Config.Hostname)
 	shortID := strings.TrimSpace(inspect.ID)
 	if len(shortID) > 12 {
@@ -350,7 +339,7 @@ func newDockerClient(socketPath string) (*client.Client, error) {
 }
 
 func pullDockerImage(ctx context.Context, cli *client.Client, targetImage string) error {
-	reader, err := cli.ImagePull(ctx, targetImage, client.ImagePullOptions{})
+	reader, err := cli.ImagePull(ctx, targetImage, image.PullOptions{})
 	if err != nil {
 		return fmt.Errorf("拉取目标镜像失败: %w", err)
 	}
@@ -392,11 +381,11 @@ func cloneStringMap(input map[string]string) map[string]string {
 	return cloned
 }
 
-func clonePortSet(input network.PortSet) network.PortSet {
+func clonePortSet(input nat.PortSet) nat.PortSet {
 	if len(input) == 0 {
 		return nil
 	}
-	cloned := make(network.PortSet, len(input))
+	cloned := make(nat.PortSet, len(input))
 	for key, value := range input {
 		cloned[key] = value
 	}

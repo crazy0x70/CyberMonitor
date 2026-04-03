@@ -75,6 +75,15 @@ func TestEnvBoolSupportsLegacyDockerKeys(t *testing.T) {
 	}
 }
 
+func TestEnvBoolPrefersExplicitZeroOverLegacyTrue(t *testing.T) {
+	t.Setenv("CM_DISABLE_UPDATE", "0")
+	t.Setenv("disable-update", "true")
+
+	if got := EnvBool("CM_DISABLE_UPDATE", true); got {
+		t.Fatal("expected explicit CM_DISABLE_UPDATE=0 to win over legacy true value")
+	}
+}
+
 func TestParseCommaList(t *testing.T) {
 	got := ParseCommaList(" eth0, ,en0, lo0 ")
 	want := []string{"eth0", "en0", "lo0"}

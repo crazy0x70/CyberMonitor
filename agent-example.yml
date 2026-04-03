@@ -9,6 +9,7 @@ services:
       # 兜底：某些环境可能不支持镜像内 setcap，此时需要显式开启 NET_RAW 才能执行 ping。
       - NET_RAW
     environment:
+      # Agent 统一接入地址。运行时会优先尝试 gRPC，不可用时自动回退到 HTTP。
       CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
       CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"
       # 可选：设置为 "1" 后，拒绝服务端下发的远程更新任务。

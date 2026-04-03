@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"cyber_monitor/internal/metrics"
@@ -152,5 +153,25 @@ func TestResolveAgentUpdateModeReturnsDockerManagedWhenAvailable(t *testing.T) {
 	})
 	if mode != "docker-managed" {
 		t.Fatalf("expected docker-managed mode, got %q", mode)
+	}
+}
+
+func TestResolveAgentUpdateViewUsesUnsupportedReasonWhenMessageIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	supported, mode, _, _, message := resolveAgentUpdateView(&NodeProfile{}, metrics.NodeStats{
+		OS:                  "Linux",
+		DeployMode:          "docker",
+		DockerManagedUpdate: false,
+		AgentUpdateDisabled: false,
+	})
+	if supported {
+		t.Fatal("expected docker unmanaged node to be unsupported")
+	}
+	if mode != "docker" {
+		t.Fatalf("expected docker mode, got %q", mode)
+	}
+	if message == "" || !strings.Contains(message, "docker.sock") {
+		t.Fatalf("expected docker socket guidance, got %q", message)
 	}
 }

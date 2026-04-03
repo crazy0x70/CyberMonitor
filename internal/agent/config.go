@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/metrics"
 )
 
@@ -103,6 +104,7 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	if token != "" {
 		req.Header.Set("X-AGENT-TOKEN", token)
 	}
+	req.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
 
 	resp, err := client.Do(req)
 	if err != nil {

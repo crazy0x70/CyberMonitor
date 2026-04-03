@@ -27,6 +27,7 @@ import (
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/updater"
+	"cyber_monitor/internal/agentrpc"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -477,6 +478,7 @@ func Run(ctx context.Context, cfg Config) error {
 		store.persistHistory(historyData)
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
+	agentAPI := newAgentAPI(store, hub, &cfg)
 	systemUpdater := newSystemUpdateManager(version)
 	splitMode := strings.TrimSpace(cfg.PublicAddr) != "" && cfg.PublicAddr != cfg.Addr
 
@@ -621,31 +623,10 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		if payload.NodeID == "" {
-			if payload.NodeName != "" {
-				payload.NodeID = payload.NodeName
-			} else if payload.Hostname != "" {
-				payload.NodeID = payload.Hostname
-			}
-		}
-		if payload.NodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+		if err := agentAPI.ingest(r.RemoteAddr, payload, r.Header.Get("X-AGENT-TOKEN")); err != nil {
+			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		if payload.NodeName == "" {
-			payload.NodeName = payload.NodeID
-		}
-		if !store.validateOrProvisionAgentAuthToken(payload.NodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
-			return
-		}
-		store.Update(payload)
-		if delta, ok := store.PublicNodeDelta(payload.NodeID); ok {
-			if data, err := json.Marshal(delta); err == nil {
-				hub.BroadcastVariant(data, publicVariantBalanced)
-			}
-		}
-		reportLogger.Printf("Agent 上报: %s (%s)", payload.NodeID, r.RemoteAddr)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -1062,17 +1043,12 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		nodeID := r.URL.Query().Get("node_id")
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+		config, err := agentAPI.config(r.URL.Query().Get("node_id"), r.Header.Get("X-AGENT-TOKEN"))
+		if err != nil {
+			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		if !store.validateOrProvisionAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
-			return
-		}
-		config := store.AgentConfig(nodeID)
-		writeJSON(w, http.StatusOK, config)
+		writeJSON(w, http.StatusOK, httpAgentConfigResponse(config, r.Header.Get(agentrpc.AgentCapabilitiesHeader)))
 	})
 
 	publicMux.HandleFunc("/api/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
@@ -1080,19 +1056,12 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		if cfg.AgentToken != "" {
-			token := strings.TrimSpace(r.Header.Get("X-AGENT-TOKEN"))
-			if token != strings.TrimSpace(cfg.AgentToken) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid bootstrap token"})
-				return
-			}
-		}
 		nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
+		agentToken, err := agentAPI.register(nodeID, r.Header.Get("X-AGENT-TOKEN"))
+		if err != nil {
+			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		agentToken := store.ensureAgentAuthToken(nodeID)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"node_id":     nodeID,
 			"agent_token": agentToken,
@@ -1114,23 +1083,14 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		nodeID := strings.TrimSpace(req.NodeID)
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id required"})
-			return
-		}
-		if !store.validateOrProvisionAgentAuthToken(nodeID, r.Header.Get("X-AGENT-TOKEN"), cfg.AgentToken) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid agent token"})
-			return
-		}
-		store.ApplyAgentUpdateReport(nodeID, AgentUpdateReport{
+		if err := agentAPI.reportUpdate(req.NodeID, r.Header.Get("X-AGENT-TOKEN"), AgentUpdateReport{
 			State:   req.State,
 			Version: req.Version,
 			Message: req.Message,
-		})
-		snapshot := storeSnapshot(store, false)
-		payload, _ := json.Marshal(snapshot)
-		hub.Broadcast(payload)
+		}); err != nil {
+			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -1373,9 +1333,11 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	}
 
+	grpcServer := newAgentRPCServer(agentAPI)
+	publicHandler := wrapPublicHandler(publicMux, grpcServer)
 	publicServer := &http.Server{
 		Addr:              cfg.PublicAddr,
-		Handler:           withSecurityHeaders(publicMux),
+		Handler:           withSecurityHeaders(publicHandler),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -2217,9 +2179,19 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 
 func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
 	if profile == nil {
-		return resolveAgentUpdateSupported(stats), resolveAgentUpdateMode(stats), "", "", ""
+		supported := resolveAgentUpdateSupported(stats)
+		message := ""
+		if !supported {
+			message = resolveAgentUpdateUnsupportedReason(stats)
+		}
+		return supported, resolveAgentUpdateMode(stats), "", "", message
 	}
-	return resolveAgentUpdateSupported(stats), resolveAgentUpdateMode(stats), strings.TrimSpace(profile.AgentUpdateState), strings.TrimSpace(profile.AgentUpdateTargetVersion), strings.TrimSpace(profile.AgentUpdateMessage)
+	supported := resolveAgentUpdateSupported(stats)
+	message := strings.TrimSpace(profile.AgentUpdateMessage)
+	if !supported && message == "" {
+		message = resolveAgentUpdateUnsupportedReason(stats)
+	}
+	return supported, resolveAgentUpdateMode(stats), strings.TrimSpace(profile.AgentUpdateState), strings.TrimSpace(profile.AgentUpdateTargetVersion), message
 }
 
 func normalizeTelegramUserIDs(ids []int64) []int64 {

@@ -7,14 +7,15 @@ services:
     user: "0:0"
     network_mode: bridge
     ports:
-      # 管理后台端口（Admin API / Agent 上报 / 管理后台页面）
+      # 管理后台端口（Admin API / 管理后台页面）
       - "25012:25012"
-      # 展示接口端口（Agent 上报 / Public API / Public WS）
+      # 展示接口端口（Agent 上报 / Agent gRPC / Public API / Public WS）
       # 如不需要分离，可不暴露此端口，并保持 CM_PUBLIC_LISTEN 为空。
       - "25013:25013"
     environment:
       # 可选：启用“硬隔离”模式后，展示页与管理后台分别监听不同端口。
       # 例如：CM_PUBLIC_LISTEN=25013
+      # 新版 Agent 默认优先尝试 gRPC；如果前置代理不支持 HTTP/2 / h2c，会自动回退到 HTTP。
       - CM_PUBLIC_LISTEN=
       - CM_DATA_DIR=/data
     volumes:

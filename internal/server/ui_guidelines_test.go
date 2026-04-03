@@ -293,6 +293,10 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: actions/setup-node@v5",
 		"uses: actions/download-artifact@v7",
 		"uses: actions/upload-artifact@v6",
+		"uses: docker/setup-qemu-action@v4",
+		"uses: docker/setup-buildx-action@v4",
+		"uses: docker/login-action@v4",
+		"uses: docker/build-push-action@v7",
 		`pattern: "!*.dockerbuild"`,
 		"needs: [version, build-server, build-agent, build-web, docker-server, docker-agent]",
 	}
@@ -303,6 +307,10 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: actions/download-artifact@v5",
 		"uses: actions/download-artifact@v6",
 		"uses: actions/upload-artifact@v4",
+		"uses: docker/setup-qemu-action@v3",
+		"uses: docker/setup-buildx-action@v3",
+		"uses: docker/login-action@v3",
+		"uses: docker/build-push-action@v5",
 	}
 
 	for _, snippet := range requiredSnippets {
@@ -402,6 +410,205 @@ func TestLatencyAxisUsesCompactWholeMillisecondLabels(t *testing.T) {
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("latency formatting regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestLatencyHoverAddsLeaveFallbacks(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`container.addEventListener("pointerleave", handleLeave);`,
+		`window.addEventListener("pointermove", handleGlobalPointerMove, true);`,
+		`window.addEventListener("scroll", handleScrollOrBlur, true);`,
+		`container.__latencyHoverCleanup = () => {`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency hover dismissal regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorAddsSmoothToggleAndEWMA(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`testSmooth: new Map(),`,
+		`<div class="smooth-control">`,
+		`<span class="smooth-control-label">平滑</span>`,
+		`class="smooth-toggle"`,
+		`data-field="test-smooth"`,
+		`aria-label="切换平滑"`,
+		`<span class="smooth-toggle-track">`,
+		`<span class="smooth-toggle-thumb"></span>`,
+		`function renderSmoothToggle(fields, nodeId, enabled) {`,
+		`const smoothEnabled = Boolean(state.testSmooth.get(nodeId));`,
+		`const latencySeries = smoothEnabled`,
+		`function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {`,
+	}
+	disallowedSnippets := []string{
+		`data-field="test-legend"`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor smoothing regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor smoothing regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorUsesUpdatedRangeLabelsAndDailyInterval(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`{ key: "24h", label: "1D", seconds: 60 * 60 * 24 },`,
+		`{ key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },`,
+		`{ key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },`,
+		`"24h": 30,`,
+	}
+	disallowedSnippets := []string{
+		`{ key: "24h", label: "24H", seconds: 60 * 60 * 24 },`,
+		`{ key: "7d", label: "7D", seconds: 60 * 60 * 24 * 7 },`,
+		`{ key: "30d", label: "30D", seconds: 60 * 60 * 24 * 30 },`,
+		`"24h": 60 * 2,`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor range label regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor range label regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorHidesVariantSwitcherBanner(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	disallowedSnippets := []string{
+		`class="demo-variant-banner"`,
+		`>保守版<`,
+		`>平衡版<`,
+		`ensureVariantBanner();`,
+	}
+
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor should not expose variant switcher banner: found %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorLatencyAxisUsesJetBrainsMonoAndGreenToggle(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	requiredSnippets := []string{
+		`.latency-chart-svg .latency-axis text {`,
+		`font-family: "Inter", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;`,
+		`font-size: 8px;`,
+		`font-weight: 300;`,
+		`font-variant-numeric: tabular-nums;`,
+		`font-feature-settings: "tnum" 1, "lnum" 1;`,
+		`.smooth-toggle.active .smooth-toggle-track {`,
+		`background: #16a34a;`,
+		`border-color: #15803d;`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency chart visual regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorUsesSystemFirstFontStackAndDarkNetworkCards(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	requiredSnippets := []string{
+		`--font-base: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;`,
+		`.network-card {`,
+		`background: var(--card-bg);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor font and dark card regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestExpandedNodeNetworkUsesRealtimeRatesAndPercent(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`<div class="info-row"><span>累计上传</span><strong data-field="detail-upload">--</strong></div>`,
+		`<div class="info-row"><span>累计下载</span><strong data-field="detail-download">--</strong></div>`,
+		"fields.netTotal.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : \"--\";",
+		"fields.netDetail.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(",
+		`fields.detailUpload.textContent = formatBytes(net.bytes_sent);`,
+		`fields.detailDownload.textContent = formatBytes(net.bytes_recv);`,
+		`const padding = { top: 20, right: 18, bottom: 18, left: 46 };`,
+		"`<text x=\"${padding.left - 4}\" y=\"${y.toFixed(",
+		`const regionNames = typeof Intl !== "undefined" && Intl.DisplayNames`,
+		`const fallbackRegionNames = {`,
+		`CN: "China",`,
+		`CA: "Canada",`,
+		"return `${flagEmoji(normalized)}${resolved}`.trim();",
+	}
+	disallowedSnippets := []string{
+		"fields.netDetail.textContent = `累计 ${formatBytes(net.bytes_sent)} / ${formatBytes(",
+		`fields.detailUpload.textContent = formatRate(net.tx_bytes_per_sec);`,
+		`fields.detailDownload.textContent = formatRate(net.rx_bytes_per_sec);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("expanded node network regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("expanded node network regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorReconnectsRealtimeFeedAggressively(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`wsReconnectAttempts: new Map(),`,
+		`wsWatchdogs: new Map(),`,
+		`wsLastMessageAt: new Map(),`,
+		`function fetchPublicSnapshotForTarget(target, options = {}) {`,
+		`function armWSWatchdog(target, socket) {`,
+		`function handleTargetSocketSilence(target, socket) {`,
+		`const delay = Math.min(`,
+		`WS_RECONNECT_BASE_DELAY * Math.pow(2, attempt)`,
+		`fetchPublicSnapshotForTarget(target, { dropOnFailure: false });`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor realtime reconnect regression: missing %q", snippet)
 		}
 	}
 }

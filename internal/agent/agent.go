@@ -45,11 +45,9 @@ func Run(ctx context.Context, cfg Config) error {
 	configureHostEnv(cfg.HostRoot)
 
 	client := &http.Client{Timeout: 6 * time.Second}
+	transport := newControlPlaneTransport(cfg, client)
+	defer transport.Close()
 	collector := metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces)
-	endpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/ingest"
-	configEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/config"
-	registerEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/register"
-	updateReportEndpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/v1/agent/update/report"
 
 	runtimeCfg := newRuntimeConfig(cfg)
 	testCache := make(map[string]cachedTest)
@@ -64,7 +62,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	if cfg.AgentToken != "" && agentToken == strings.TrimSpace(cfg.AgentToken) {
-		if issuedToken, err := registerNodeToken(ctx, client, registerEndpoint, cfg.NodeID, cfg.AgentToken); err == nil && issuedToken != "" {
+		if issuedToken, err := transport.RegisterNodeToken(ctx, cfg.NodeID, cfg.AgentToken); err == nil && issuedToken != "" {
 			agentToken = issuedToken
 			if cfg.TokenFile != "" {
 				if err := persistAgentToken(cfg.TokenFile, issuedToken); err != nil {
@@ -77,7 +75,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	fetchConfig := func() {
-		remote, err := fetchRemoteConfig(ctx, client, configEndpoint, cfg.NodeID, agentToken)
+		remote, err := transport.FetchConfig(ctx, cfg.NodeID, agentToken)
 		if err != nil {
 			log.Printf("拉取远程配置失败: %v", err)
 			return
@@ -93,7 +91,7 @@ func Run(ctx context.Context, cfg Config) error {
 		runtimeCfg.Update(remote)
 		runtimeCfgConfig := cfg
 		runtimeCfgConfig.AgentToken = agentToken
-		if err := maybeApplyRemoteUpdate(ctx, client, updateReportEndpoint, runtimeCfgConfig, remote.Update); err != nil {
+		if err := maybeApplyRemoteUpdate(ctx, transport, runtimeCfgConfig, remote.Update); err != nil {
 			log.Printf("执行远程更新失败: %v", err)
 		}
 	}
@@ -127,30 +125,8 @@ func Run(ctx context.Context, cfg Config) error {
 			sample.NetworkTests = runNetworkTestsWithCache(ctx, tests, interval, testCache)
 		}
 
-		payload, err := json.Marshal(sample)
-		if err != nil {
-			log.Printf("编码失败: %v", err)
-			return
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-		if err != nil {
-			log.Printf("请求创建失败: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if agentToken != "" {
-			req.Header.Set("X-AGENT-TOKEN", agentToken)
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
+		if err := transport.ReportStats(ctx, sample, agentToken); err != nil {
 			log.Printf("上报失败: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 300 {
-			log.Printf("上报失败: 状态码 %d", resp.StatusCode)
 		}
 	}
 
@@ -175,8 +151,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 func maybeApplyRemoteUpdate(
 	ctx context.Context,
-	client *http.Client,
-	reportEndpoint string,
+	transport agentControlPlane,
 	cfg Config,
 	update *RemoteUpdateInstruction,
 ) error {
@@ -189,47 +164,47 @@ func maybeApplyRemoteUpdate(
 	}
 	currentVersion := strings.TrimSpace(cfg.AgentVersion)
 	if currentVersion == targetVersion {
-		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
+		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
 	}
 	if cfg.DisableUpdate {
-		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
 	}
 	if updater.CanDockerManagedUpdate() {
 		dockerUpdater, err := updater.NewDockerManagedUpdater()
 		if err != nil {
-			return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+			return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
 		}
-		if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
 			return err
 		}
 		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
 		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage); err != nil {
-			reportErr := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+			reportErr := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 			}
 			return err
 		}
-		if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
 			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
 		}
 		return nil
 	}
 	if !updater.CanSelfUpdate() {
-		return postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())
+		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
-	if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
+	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
 	}
 	clientUpdater := updater.NewClient(updater.DefaultRepo, updater.KindAgent, currentVersion)
 	if err := clientUpdater.ApplyAsset(ctx, update.DownloadURL, update.ChecksumURL); err != nil {
-		reportErr := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+		reportErr := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
 		if reportErr != nil {
 			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 		}
 		return err
 	}
-	if err := postAgentUpdateReport(ctx, client, reportEndpoint, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
+	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)

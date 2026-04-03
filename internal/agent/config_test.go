@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"cyber_monitor/internal/agentrpc"
 )
 
 func TestFetchRemoteConfigIncludesNodeIDAndToken(t *testing.T) {
@@ -18,6 +20,9 @@ func TestFetchRemoteConfigIncludesNodeIDAndToken(t *testing.T) {
 		}
 		if got := r.Header.Get("X-AGENT-TOKEN"); got != expectedToken {
 			t.Fatalf("expected agent token header, got %q", got)
+		}
+		if got := r.Header.Get(agentrpc.AgentCapabilitiesHeader); !strings.Contains(got, agentrpc.AgentCapabilityDedicatedToken) || !strings.Contains(got, agentrpc.AgentCapabilityRemoteUpdate) {
+			t.Fatalf("expected capability header to advertise dedicated token and update support, got %q", got)
 		}
 		_, _ = w.Write([]byte(`{"alias":"edge-a","group":"cn","agent_token":"node-token-001","tests":[{"name":"probe","type":"tcp","host":"example.com","port":443}],"test_interval_sec":12,"update":{"version":"1.2.3","download_url":"https://example.com/agent","checksum_url":"https://example.com/checksums.txt"}}`))
 	}))

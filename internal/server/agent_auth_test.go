@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"testing"
+
+	"cyber_monitor/internal/agentrpc"
 )
 
 func TestAgentRegisterIssuesDedicatedNodeToken(t *testing.T) {
@@ -47,7 +49,7 @@ func TestAgentRegisterIssuesDedicatedNodeToken(t *testing.T) {
 	}
 }
 
-func TestAgentConfigAcceptsBootstrapTokenForLegacyAgentAndReturnsDedicatedToken(t *testing.T) {
+func TestLegacyAgentConfigAcceptsBootstrapTokenWithLegacySchema(t *testing.T) {
 	t.Parallel()
 
 	baseURL, _ := startTestServer(t, Config{
@@ -70,6 +72,43 @@ func TestAgentConfigAcceptsBootstrapTokenForLegacyAgentAndReturnsDedicatedToken(
 		raw, _ := io.ReadAll(bootstrapResp.Body)
 		t.Fatalf("expected bootstrap token config success for legacy agent, got %d: %s", bootstrapResp.StatusCode, string(raw))
 	}
+	var legacyPayload struct {
+		Alias           string `json:"alias"`
+		Group           string `json:"group"`
+		Tests           []map[string]any `json:"tests"`
+		TestIntervalSec int    `json:"test_interval_sec"`
+	}
+	decoder := json.NewDecoder(bootstrapResp.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&legacyPayload); err != nil {
+		t.Fatalf("expected legacy schema to decode without unknown fields, got %v", err)
+	}
+}
+
+func TestAgentConfigReturnsDedicatedTokenWhenCapabilitiesDeclared(t *testing.T) {
+	t.Parallel()
+
+	baseURL, _ := startTestServer(t, Config{
+		Addr:       reserveTCPAddr(t),
+		AdminPath:  "/cm-admin",
+		AgentToken: "bootstrap-token",
+	})
+
+	bootstrapReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/agent/config?node_id=node-123", nil)
+	if err != nil {
+		t.Fatalf("create bootstrap config request: %v", err)
+	}
+	bootstrapReq.Header.Set("X-AGENT-TOKEN", "bootstrap-token")
+	bootstrapReq.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
+	bootstrapResp, err := http.DefaultClient.Do(bootstrapReq)
+	if err != nil {
+		t.Fatalf("get config with bootstrap token: %v", err)
+	}
+	defer bootstrapResp.Body.Close()
+	if bootstrapResp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(bootstrapResp.Body)
+		t.Fatalf("expected capability-aware config success, got %d: %s", bootstrapResp.StatusCode, string(raw))
+	}
 	var bootstrapPayload struct {
 		AgentToken string `json:"agent_token"`
 	}
@@ -79,12 +118,12 @@ func TestAgentConfigAcceptsBootstrapTokenForLegacyAgentAndReturnsDedicatedToken(
 	if bootstrapPayload.AgentToken == "" || bootstrapPayload.AgentToken == "bootstrap-token" {
 		t.Fatalf("expected config to return dedicated node token, got %q", bootstrapPayload.AgentToken)
 	}
-
 	nodeReq, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/agent/config?node_id=node-123", nil)
 	if err != nil {
 		t.Fatalf("create node config request: %v", err)
 	}
 	nodeReq.Header.Set("X-AGENT-TOKEN", bootstrapPayload.AgentToken)
+	nodeReq.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
 	nodeResp, err := http.DefaultClient.Do(nodeReq)
 	if err != nil {
 		t.Fatalf("get config with node token: %v", err)
