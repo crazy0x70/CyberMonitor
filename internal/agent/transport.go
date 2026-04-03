@@ -20,13 +20,19 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
-const grpcFallbackBackoff = 30 * time.Second
+var (
+	grpcFallbackBackoff = 30 * time.Second
+	grpcDialTimeout     = 4 * time.Second
+	grpcCallTimeout     = 5 * time.Second
+	grpcReadyTimeout    = 250 * time.Millisecond
+)
 
 type agentControlPlane interface {
 	RegisterNodeToken(context.Context, string, string) (string, error)
@@ -40,17 +46,17 @@ type controlPlaneTransport struct {
 	http *httpControlPlane
 	grpc *grpcControlPlane
 
-	mu              sync.Mutex
+	mu               sync.Mutex
 	grpcBackoffUntil time.Time
-	lastMode        string
+	lastMode         string
 }
 
 type httpControlPlane struct {
-	client          *http.Client
-	configEndpoint  string
+	client           *http.Client
+	configEndpoint   string
 	registerEndpoint string
-	statsEndpoint   string
-	updateEndpoint  string
+	statsEndpoint    string
+	updateEndpoint   string
 }
 
 type grpcControlPlane struct {
@@ -145,7 +151,7 @@ func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token s
 }
 
 func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) error {
-	if t.grpc != nil && t.canUseGRPC() {
+	if t.grpc != nil && t.shouldProbeGRPCForStats() {
 		err := t.grpc.ReportStats(ctx, stats, token)
 		if err == nil {
 			t.noteMode("grpc")
@@ -192,6 +198,15 @@ func (t *controlPlaneTransport) Close() error {
 func (t *controlPlaneTransport) canUseGRPC() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return time.Now().After(t.grpcBackoffUntil)
+}
+
+func (t *controlPlaneTransport) shouldProbeGRPCForStats() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastMode == "http" {
+		return false
+	}
 	return time.Now().After(t.grpcBackoffUntil)
 }
 
@@ -341,7 +356,35 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+	if conn == nil {
+		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport not ready")
+	}
+	state := conn.GetState()
+	if state == connectivity.Idle {
+		conn.Connect()
+		state = conn.GetState()
+	}
+	switch state {
+	case connectivity.Connecting, connectivity.TransientFailure:
+		waitCtx, cancel := context.WithTimeout(ctx, grpcReadyTimeout)
+		defer cancel()
+		for state == connectivity.Connecting || state == connectivity.TransientFailure || state == connectivity.Idle {
+			if !conn.WaitForStateChange(waitCtx, state) {
+				return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport connecting")
+			}
+			state = conn.GetState()
+		}
+	case connectivity.Shutdown:
+		_ = g.Close()
+		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport shutdown")
+	}
+	if state != connectivity.Ready {
+		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport not ready")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, grpcCallTimeout)
 	return client, callCtx, cancel, nil
 }
 
@@ -354,7 +397,7 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 	}
 	g.mu.Unlock()
 
-	dialCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, grpcDialTimeout)
 	defer cancel()
 
 	opts := []grpc.DialOption{
@@ -371,7 +414,7 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 				Jitter:     0.2,
 				MaxDelay:   10 * time.Second,
 			},
-			MinConnectTimeout: 4 * time.Second,
+			MinConnectTimeout: grpcDialTimeout,
 		}),
 	}
 	if g.secure {

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,6 +202,103 @@ func TestControlPlaneTransportFallsBackToHTTPStatsReport(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Fatalf("expected one HTTP ingest request after grpc fallback, got %d", hits)
+	}
+}
+
+func TestControlPlaneTransportKeepsStatsOnHTTPAfterFallback(t *testing.T) {
+	t.Parallel()
+
+	previousDialTimeout := grpcDialTimeout
+	previousCallTimeout := grpcCallTimeout
+	grpcDialTimeout = 80 * time.Millisecond
+	grpcCallTimeout = 80 * time.Millisecond
+	defer func() {
+		grpcDialTimeout = previousDialTimeout
+		grpcCallTimeout = previousCallTimeout
+	}()
+
+	var httpHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/ingest" {
+			http.NotFound(w, r)
+			return
+		}
+		httpHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	hangingListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen hanging grpc target: %v", err)
+	}
+	defer hangingListener.Close()
+
+	var grpcAccepts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		for {
+			conn, acceptErr := hangingListener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			grpcAccepts.Add(1)
+			go func(c net.Conn) {
+				defer c.Close()
+				<-done
+			}(conn)
+		}
+	}()
+	defer close(done)
+
+	transport := &controlPlaneTransport{
+		http: &httpControlPlane{
+			client:        server.Client(),
+			statsEndpoint: server.URL + "/api/v1/ingest",
+		},
+		grpc: &grpcControlPlane{
+			target: hangingListener.Addr().String(),
+		},
+	}
+	defer transport.Close()
+
+	stats := metrics.NodeStats{
+		NodeID:    "node-1",
+		NodeName:  "node-1",
+		Hostname:  "node-1",
+		OS:        "linux",
+		Arch:      "amd64",
+		Timestamp: time.Now().Unix(),
+	}
+
+	if err := transport.ReportStats(context.Background(), stats, "node-token"); err != nil {
+		t.Fatalf("first report stats through fallback transport: %v", err)
+	}
+	if got := httpHits.Load(); got != 1 {
+		t.Fatalf("expected one HTTP ingest request after initial fallback, got %d", got)
+	}
+	firstAccepts := grpcAccepts.Load()
+	if firstAccepts == 0 {
+		t.Fatal("expected initial stats report to probe grpc once before fallback")
+	}
+
+	transport.mu.Lock()
+	transport.grpcBackoffUntil = time.Now().Add(-time.Second)
+	transport.mu.Unlock()
+
+	start := time.Now()
+	if err := transport.ReportStats(context.Background(), stats, "node-token"); err != nil {
+		t.Fatalf("second report stats after fallback: %v", err)
+	}
+	if got := httpHits.Load(); got != 2 {
+		t.Fatalf("expected second stats report to use HTTP directly, got %d HTTP hits", got)
+	}
+	if got := grpcAccepts.Load(); got != firstAccepts {
+		t.Fatalf("expected no new grpc probe while stats path is pinned to HTTP fallback, accepts before=%d after=%d", firstAccepts, got)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("expected second stats report to avoid grpc timeout path, took %s", elapsed)
 	}
 }
 
