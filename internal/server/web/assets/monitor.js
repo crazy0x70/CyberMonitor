@@ -22,7 +22,6 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
 });
 
 const CONFIG_PATH = "/config.json";
-const PUBLIC_REQUEST_HEADER = "X-CM-Public-Request";
 const VARIANT_CONSERVATIVE = "conservative";
 const VARIANT_BALANCED = "balanced";
 const DEFAULT_GROUP = "全部";
@@ -201,7 +200,8 @@ function connectWSForTarget(target) {
 
   let ws;
   try {
-    ws = new WebSocket(appendVariantToSocketURL(target.socketURL));
+    const socketURL = appendVariantToSocketURL(target.socketURL);
+    ws = new WebSocket(socketURL);
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
     dropSourceSnapshot(target.key);
@@ -289,6 +289,10 @@ function normalizeSocketURL(value) {
   }
 }
 
+function buildPublicRequestHeaders() {
+  return {};
+}
+
 function pickConfigEntry(entry, key = "") {
   if (!entry || typeof entry !== "object") {
     return null;
@@ -351,9 +355,7 @@ async function fetchPublicSnapshotForTarget(target, options = {}) {
   try {
     const resp = await fetch(`${base}/api/v1/public/snapshot`, {
       cache: "no-store",
-      headers: {
-        [PUBLIC_REQUEST_HEADER]: "1",
-      },
+      headers: buildPublicRequestHeaders(),
     });
     if (!resp.ok) {
       state.snapshotFailures.set(
@@ -1214,11 +1216,8 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     )}/history?range=${encodeURIComponent(normalizedRange)}`,
     {
       cache: "no-store",
-      headers: {
-        [PUBLIC_REQUEST_HEADER]: "1",
-      },
-    }
-  )
+      headers: buildPublicRequestHeaders(),
+  })
     .then(async (resp) => {
       if (!resp.ok) {
         throw new Error(`history request failed: ${resp.status}`);
@@ -2235,7 +2234,6 @@ function renderNetworkSection(fields, nodeId) {
     cardStats.className = "network-card-stats";
     const snapshot = summarizeTestSnapshot(entry.test, entry.history);
     cardStats.innerHTML = `
-      <span>${snapshot.target}</span>
       <span>${snapshot.latency}</span>
     `;
 
@@ -3238,7 +3236,6 @@ function summarizeTestSnapshot(test, history) {
     latestLoss = latestLatency === null ? 100 : 0;
   }
   return {
-    target: formatTestTarget(test),
     latency:
       latestLatency === null
         ? "当前 --"
@@ -3293,14 +3290,6 @@ function formatTestName(test) {
   const name = (test.name || "").trim();
   if (name) return name;
   return "未命名";
-}
-
-function formatTestTarget(test) {
-  const type = (test?.type || "icmp").toUpperCase();
-  const host = String(test?.host || "").trim();
-  const port = Number(test?.port) || 0;
-  const address = host ? (port ? `${host}:${port}` : host) : "--";
-  return `${type} · ${address}`;
 }
 
 function formatLatencyValue(test) {

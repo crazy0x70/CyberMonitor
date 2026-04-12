@@ -1,0 +1,10 @@
+.git
+.gitignore
+.serena
+output
+dist
+admin-ui/node_modules
+admin-ui/dist
+admin-ui/.DS_Store
+**/.DS_Store
+tmp

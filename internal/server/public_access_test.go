@@ -6,14 +6,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/gorilla/websocket"
 )
 
-const testPublicViewCookieName = "cm_public_view"
-
-func TestPublicSnapshotRequiresBootstrapPageAccess(t *testing.T) {
+func TestPublicSnapshotAccessibleWithoutBootstrapAndOmitsHistory(t *testing.T) {
 	baseURL, _ := startTestServer(t, Config{
 		Addr:      reserveTCPAddr(t),
 		AdminPath: "/cm-admin",
@@ -21,38 +20,13 @@ func TestPublicSnapshotRequiresBootstrapPageAccess(t *testing.T) {
 
 	resp, err := http.Get(baseURL + "/api/v1/public/snapshot")
 	if err != nil {
-		t.Fatalf("get public snapshot without bootstrap: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusUnauthorized {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected public snapshot without bootstrap to return 401, got %d: %s", resp.StatusCode, string(raw))
-	}
-
-	client, publicURL := bootstrapPublicPageClient(t, baseURL)
-	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/public/snapshot", nil)
-	if err != nil {
-		t.Fatalf("create public snapshot request: %v", err)
-	}
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-
-	resp, err = client.Do(req)
-	if err != nil {
-		t.Fatalf("get public snapshot after bootstrap: %v", err)
+		t.Fatalf("get public snapshot: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected public snapshot after bootstrap to return 200, got %d: %s", resp.StatusCode, string(raw))
-	}
-
-	cookies := client.Jar.Cookies(publicURL)
-	if !hasCookieNamed(cookies, testPublicViewCookieName) {
-		t.Fatalf("expected bootstrap page to set %s cookie", testPublicViewCookieName)
+		t.Fatalf("expected public snapshot to return 200, got %d: %s", resp.StatusCode, string(raw))
 	}
 
 	var payload map[string]any
@@ -76,7 +50,7 @@ func TestPublicSnapshotRequiresBootstrapPageAccess(t *testing.T) {
 	}
 }
 
-func TestSplitModePublicPageServesIndexAndSetsCookie(t *testing.T) {
+func TestSplitModePublicPageServesIndexAndConfigOmitsPublicToken(t *testing.T) {
 	publicAddr := reserveTCPAddr(t)
 	baseURL, _ := startTestServer(t, Config{
 		Addr:       reserveTCPAddr(t),
@@ -86,12 +60,9 @@ func TestSplitModePublicPageServesIndexAndSetsCookie(t *testing.T) {
 	_ = baseURL
 
 	publicBaseURL := "http://" + publicAddr
-	client, publicURL := bootstrapPublicPageClient(t, publicBaseURL)
+	client, _ := bootstrapPublicPageClient(t, publicBaseURL)
 	if client == nil {
 		t.Fatal("expected public bootstrap client")
-	}
-	if !hasCookieNamed(client.Jar.Cookies(publicURL), testPublicViewCookieName) {
-		t.Fatalf("expected split public page to set %s cookie", testPublicViewCookieName)
 	}
 
 	resp, err := client.Get(publicBaseURL + "/config.json")
@@ -102,9 +73,16 @@ func TestSplitModePublicPageServesIndexAndSetsCookie(t *testing.T) {
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("expected public config Cache-Control no-store, got %q", got)
 	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode public config payload: %v", err)
+	}
+	if _, ok := payload["publicToken"]; ok {
+		t.Fatal("expected public config to omit publicToken")
+	}
 }
 
-func TestPublicWebSocketRequiresBootstrapPageAccessAndOmitsHistory(t *testing.T) {
+func TestPublicWebSocketAccessibleWithoutBootstrapAndOmitsHistory(t *testing.T) {
 	baseURL, _ := startTestServer(t, Config{
 		Addr:       reserveTCPAddr(t),
 		AdminPath:  "/cm-admin",
@@ -114,39 +92,12 @@ func TestPublicWebSocketRequiresBootstrapPageAccessAndOmitsHistory(t *testing.T)
 
 	wsURL := websocketURLForBase(t, baseURL) + "/ws"
 	dialer := websocket.Dialer{}
-
-	resp, err := dialPublicWebSocket(&dialer, wsURL, nil, baseURL)
-	if err == nil {
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		t.Fatal("expected public websocket without bootstrap to fail")
-	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected public websocket without bootstrap to return 401, got resp=%v err=%v", statusCode(resp), err)
-	}
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
-
-	client, publicURL := bootstrapPublicPageClient(t, baseURL)
-	cookies := client.Jar.Cookies(publicURL)
-	if !hasCookieNamed(cookies, testPublicViewCookieName) {
-		t.Fatalf("expected bootstrap page to set %s cookie", testPublicViewCookieName)
-	}
-
-	headers := http.Header{}
-	headers.Set("Origin", baseURL)
-	for _, cookie := range cookies {
-		headers.Add("Cookie", cookie.String())
-	}
-
-	conn, resp, err := dialer.Dial(wsURL, headers)
+	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		t.Fatalf("dial public websocket after bootstrap: %v", err)
+		t.Fatalf("dial public websocket: %v", err)
 	}
 	defer conn.Close()
 
@@ -171,37 +122,62 @@ func TestPublicWebSocketRequiresBootstrapPageAccessAndOmitsHistory(t *testing.T)
 	}
 }
 
-func TestPublicSnapshotRejectsExplicitTokenBypassWithoutCookie(t *testing.T) {
-	const jwtSecret = "public-jwt-secret"
+func TestPublicSnapshotAllowsCrossOriginReadWithoutToken(t *testing.T) {
 	baseURL, _ := startTestServer(t, Config{
 		Addr:      reserveTCPAddr(t),
 		AdminPath: "/cm-admin",
-		JWTSecret: jwtSecret,
 	})
 
-	token, _, err := generatePublicViewToken(jwtSecret)
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/public/snapshot", nil)
 	if err != nil {
-		t.Fatalf("generate public view token: %v", err)
+		t.Fatalf("create public snapshot request: %v", err)
 	}
-
-	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/public/snapshot?public_token="+url.QueryEscape(token), nil)
-	if err != nil {
-		t.Fatalf("create explicit token request: %v", err)
-	}
-	req.Header.Set("X-CM-Public-Token", token)
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Origin", "https://pages.example")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("perform explicit token request: %v", err)
+		t.Fatalf("perform public snapshot request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUnauthorized {
+	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected explicit token bypass to return 401, got %d: %s", resp.StatusCode, string(raw))
+		t.Fatalf("expected public snapshot bootstrap to return 200, got %d: %s", resp.StatusCode, string(raw))
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected public snapshot to return CORS wildcard, got %q", got)
+	}
+}
+
+func TestPublicNodeHistoryAccessibleCrossOriginWithoutToken(t *testing.T) {
+	baseURL, _ := startTestServer(t, Config{
+		Addr:       reserveTCPAddr(t),
+		AdminPath:  "/cm-admin",
+		AgentToken: "bootstrap-token",
+	})
+	seedPublicHistory(t, baseURL, "bootstrap-token", "node-history", "1.1.1.1", "explicit-history", []int64{1735689600})
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/api/v1/public/nodes/node-history/history?range=1h", nil)
+	if err != nil {
+		t.Fatalf("create public history request: %v", err)
+	}
+	req.Header.Set("Origin", "https://pages.example")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("perform public history request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected public history bootstrap to return 200, got %d: %s", resp.StatusCode, string(raw))
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected public history bootstrap to return CORS wildcard, got %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodGet) {
+		t.Fatalf("expected public history bootstrap to allow GET, got %q", got)
 	}
 }
 

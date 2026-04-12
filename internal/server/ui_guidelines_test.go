@@ -847,6 +847,38 @@ func TestPublicMonitorSmoothingPersistsAcrossSparseBuckets(t *testing.T) {
 	}
 }
 
+func TestPublicMonitorUsesAnonymousPublicBootstrap(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		"fetch(`${base}/api/v1/public/snapshot`, {",
+		"fetch(\n    `${apiBase}/api/v1/public/nodes/${encodeURIComponent(",
+		`headers: buildPublicRequestHeaders(),`,
+		`return {};`,
+	}
+	disallowedSnippets := []string{
+		`function appendPublicTokenToAPIURL(value, publicToken) {`,
+		`function appendPublicTokenToSocketURL(value, publicToken) {`,
+		`publicToken: String(entry.publicToken || entry.public_token || "").trim(),`,
+		`headers["X-CM-Public-Token"] = target.publicToken;`,
+		`headers["X-CM-Public-Token"] = token;`,
+		`parsed.searchParams.set("public_token", token);`,
+		`[PUBLIC_REQUEST_HEADER]: "1",`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("pages public token regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("pages public token regression: found stale header snippet %q", snippet)
+		}
+	}
+}
+
 func TestPublicMonitorNetworkCardsStayStaticAcrossRange(t *testing.T) {
 	t.Parallel()
 
@@ -854,17 +886,17 @@ func TestPublicMonitorNetworkCardsStayStaticAcrossRange(t *testing.T) {
 	requiredSnippets := []string{
 		`const snapshot = summarizeTestSnapshot(entry.test, entry.history);`,
 		`cardStats.innerHTML = `,
-		`${snapshot.target}`,
 		`${snapshot.latency}`,
 		`loss.textContent = snapshot.loss;`,
 		`function summarizeTestSnapshot(test, history) {`,
 		`function resolveLatestHistoryValue(series) {`,
-		`function formatTestTarget(test) {`,
 	}
 	disallowedSnippets := []string{
+		`${snapshot.target}`,
 		`const stats = summarizeLatency(entry.filtered.latency);`,
 		`const lossAvg = summarizeLoss(entry.filtered.loss);`,
 		`loss.textContent = formatLossValue(lossAvg);`,
+		`function formatTestTarget(test) {`,
 	}
 
 	for _, snippet := range requiredSnippets {

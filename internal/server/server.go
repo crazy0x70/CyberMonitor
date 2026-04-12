@@ -51,12 +51,7 @@ const (
 	publicVariantConservative = "conservative"
 	publicVariantBalanced     = "balanced"
 	adminSessionCookieName    = "cm_admin_session"
-	publicViewCookieName      = "cm_public_view"
-	publicViewTokenSubject    = "public:view"
-	publicRequestHeader       = "X-CM-Public-Request"
 )
-
-const publicViewTokenTTL = 10 * time.Minute
 
 type sizeLimitedWriter struct {
 	path    string
@@ -645,6 +640,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	publicMux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
+		if handlePublicCORSPreflight(w, r) {
+			return
+		}
+		applyPublicCORSHeaders(w)
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
@@ -658,12 +657,12 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	publicMux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if handlePublicCORSPreflight(w, r) {
 			return
 		}
-		if err := validatePublicViewRequest(cfg.JWTSecret, r); err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		applyPublicCORSHeaders(w)
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -672,12 +671,12 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	publicMux.HandleFunc("/api/v1/public/nodes/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if handlePublicCORSPreflight(w, r) {
 			return
 		}
-		if err := validatePublicViewRequest(cfg.JWTSecret, r); err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		applyPublicCORSHeaders(w)
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -1249,26 +1248,9 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				audience = "admin"
 			case wsAuthPublic:
-				if err := validatePublicViewTokenFromRequest(cfg.JWTSecret, r); err != nil {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				if !hasExplicitPublicViewToken(r) && !isExplicitSameOrigin(r) {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
 			case wsAuthMixed:
 				if validateAdminJWT(store, cfg.JWTSecret, r) == nil {
 					audience = "admin"
-				} else {
-					if err := validatePublicViewTokenFromRequest(cfg.JWTSecret, r); err != nil {
-						writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-						return
-					}
-					if !hasExplicitPublicViewToken(r) && !isExplicitSameOrigin(r) {
-						writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-						return
-					}
 				}
 			}
 			upgrader := websocket.Upgrader{
@@ -1276,10 +1258,7 @@ func Run(ctx context.Context, cfg Config) error {
 					if audience == "admin" {
 						return isSameOrigin(request)
 					}
-					if hasExplicitPublicViewToken(request) {
-						return true
-					}
-					return isExplicitSameOrigin(request)
+					return true
 				},
 			}
 			conn, err := upgrader.Upgrade(w, r, nil)
@@ -1359,10 +1338,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
-		token, exp, err := generatePublicViewToken(cfg.JWTSecret)
-		if err == nil {
-			setPublicViewCookie(w, r, token, exp)
-		}
 		data, err := webFS.ReadFile("web/index.html")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
@@ -3301,26 +3276,6 @@ func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string,
 	http.SetCookie(w, cookie)
 }
 
-func setPublicViewCookie(w http.ResponseWriter, r *http.Request, token string, exp int64) {
-	if w == nil || strings.TrimSpace(token) == "" {
-		return
-	}
-	cookie := &http.Cookie{
-		Name:     publicViewCookieName,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	}
-	if exp > 0 {
-		cookie.Expires = time.Unix(exp, 0)
-	}
-	if requestIsSecure(r) {
-		cookie.Secure = true
-	}
-	http.SetCookie(w, cookie)
-}
-
 func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request) {
 	if w == nil {
 		return
@@ -3348,24 +3303,6 @@ func requestIsSecure(r *http.Request) bool {
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
-}
-
-func isExplicitSameOrigin(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return false
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	if parsed.Host == "" {
-		return false
-	}
-	return strings.EqualFold(parsed.Host, r.Host)
 }
 
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
@@ -4462,18 +4399,6 @@ func generateToken(secret, subject, tokenSalt string) (string, int64, error) {
 	return str, exp.Unix(), err
 }
 
-func generatePublicViewToken(secret string) (string, int64, error) {
-	exp := time.Now().Add(publicViewTokenTTL)
-	claims := jwt.RegisteredClaims{
-		Subject:   publicViewTokenSubject,
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-		ExpiresAt: jwt.NewNumericDate(exp),
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	str, err := token.SignedString([]byte(secret))
-	return str, exp.Unix(), err
-}
-
 func requireJWT(secret string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := validateJWTFromRequest(secret, r); err != nil {
@@ -4572,60 +4497,6 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-func extractPublicViewToken(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-	if cookie, err := r.Cookie(publicViewCookieName); err == nil {
-		return strings.TrimSpace(cookie.Value)
-	}
-	return ""
-}
-
-func hasExplicitPublicViewToken(r *http.Request) bool {
-	return false
-}
-
-func validatePublicViewTokenFromRequest(secret string, r *http.Request) error {
-	return validateScopedJWT(secret, extractPublicViewToken(r), publicViewTokenSubject)
-}
-
-func validatePublicViewRequest(secret string, r *http.Request) error {
-	if err := validatePublicViewTokenFromRequest(secret, r); err != nil {
-		return err
-	}
-	if hasExplicitPublicViewToken(r) {
-		return nil
-	}
-	if !isPublicFetchRequest(r) {
-		return errors.New("public fetch required")
-	}
-	return nil
-}
-
-func isPublicFetchRequest(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	if strings.TrimSpace(r.Header.Get(publicRequestHeader)) == "1" {
-		return true
-	}
-	site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
-	mode := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")))
-	dest := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")))
-
-	if site != "same-origin" && site != "same-site" {
-		return false
-	}
-	if mode == "" || mode == "navigate" {
-		return false
-	}
-	if dest != "" && dest != "empty" {
-		return false
-	}
-	return true
-}
-
 func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	decoder := json.NewDecoder(r.Body)
@@ -4670,6 +4541,21 @@ func withNoStore(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func applyPublicCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", http.MethodGet+", "+http.MethodOptions)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func handlePublicCORSPreflight(w http.ResponseWriter, r *http.Request) bool {
+	if r == nil || r.Method != http.MethodOptions {
+		return false
+	}
+	applyPublicCORSHeaders(w)
+	w.WriteHeader(http.StatusNoContent)
+	return true
 }
 
 func buildAdminBootPayload(store *Store) (string, error) {

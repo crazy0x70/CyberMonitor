@@ -20,3 +20,5 @@ services:
       - CM_DATA_DIR=/data
     volumes:
       - ./data:/data
+      # 默认挂载 docker.sock，便于管理后台直接执行 Docker 一键更新；如果明确不需要该能力，可以移除。
+      - /var/run/docker.sock:/var/run/docker.sock
