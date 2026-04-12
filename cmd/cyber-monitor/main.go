@@ -98,11 +98,12 @@ func main() {
 			log.Fatalf("服务启动失败: %v", err)
 		}
 	case "agent":
-		resolvedNodeIDFile, err := agent.ResolveStateFilePath(*nodeIDFile, agent.DefaultNodeIDFileName())
-		if err != nil {
-			log.Fatalf("解析节点 ID 文件失败: %v", err)
-		}
-		resolvedNodeID, err := agent.ResolveOrCreateNodeID(*nodeID, resolvedNodeIDFile)
+		resolvedNodeID, err := agent.ResolveOrCreateNodeIDWithOptions(agent.NodeIDOptions{
+			Explicit:     *nodeID,
+			ExplicitFile: *nodeIDFile,
+			IsDocker:     updater.DetectDeployMode() == updater.DeployModeDocker,
+			HostRoot:     *hostRoot,
+		})
 		if err != nil {
 			log.Fatalf("初始化节点 ID 失败: %v", err)
 		}

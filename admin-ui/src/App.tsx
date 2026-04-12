@@ -481,7 +481,7 @@ export default function App() {
         }
 
         setLoginState(
-          createLoginState("invalid", error.message || "用户名或密码错误，请检查后重试。"),
+          createLoginState("invalid", error.message || "账号或密码错误，请检查后重试。"),
         );
         return;
       }

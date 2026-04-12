@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -239,6 +241,58 @@ func TestBuildAISnapshotIncludesHistoryTrendWhenCurrentProbeMissing(t *testing.T
 	assertFloatPointerClose(t, "latest loss", trend.LatestLoss, 100)
 	if trend.StatusHint != "unreachable" {
 		t.Fatalf("expected unreachable status hint, got %q", trend.StatusHint)
+	}
+}
+
+func TestBuildAISnapshotIncludesOfflineSummaryFromHistoryStore(t *testing.T) {
+	t.Parallel()
+
+	store := newHistoryIntegratedStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	store.nodes["node-1"] = NodeState{
+		Stats: metrics.NodeStats{
+			NodeID:   "node-1",
+			NodeName: "sg-edge-1",
+			Hostname: "sg-edge-1.local",
+		},
+		LastSeen:  now,
+		FirstSeen: now.Add(-90 * 24 * time.Hour),
+	}
+	store.profiles["node-1"] = &NodeProfile{
+		ServerID:     "srv-sg-001",
+		Alias:        "新加坡边缘",
+		AlertEnabled: boolPointer(true),
+	}
+	seedOfflineHistoryStore(t, store, "node-1", now.Add(-40*24*time.Hour), 6*time.Minute)
+	seedOfflineHistoryStore(t, store, "node-1", now.Add(-3*24*time.Hour), 11*time.Minute)
+
+	snapshot := buildAISnapshot(store)
+	if len(snapshot.Servers) != 1 {
+		t.Fatalf("expected one server summary, got %d", len(snapshot.Servers))
+	}
+
+	server := snapshot.Servers[0]
+	if server.OfflineSummary == nil {
+		t.Fatal("expected offline summary to be included in AI snapshot")
+	}
+	if server.OfflineSummary.TotalCount != 2 {
+		t.Fatalf("expected total_count 2, got %d", server.OfflineSummary.TotalCount)
+	}
+	if server.OfflineSummary.Last30dCount != 1 {
+		t.Fatalf("expected last_30d_count 1, got %d", server.OfflineSummary.Last30dCount)
+	}
+	if server.OfflineSummary.LongestDurationSec != 660 {
+		t.Fatalf("expected longest_duration_sec 660, got %v", server.OfflineSummary.LongestDurationSec)
+	}
+	if len(server.OfflineSummary.RecentSessions) != 2 {
+		t.Fatalf("expected 2 recent sessions, got %d", len(server.OfflineSummary.RecentSessions))
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if !bytes.Contains(payload, []byte(`"offline_summary"`)) {
+		t.Fatalf("expected marshaled snapshot JSON to include offline_summary, got %s", payload)
 	}
 }
 

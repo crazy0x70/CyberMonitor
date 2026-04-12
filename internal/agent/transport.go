@@ -31,7 +31,9 @@ var (
 	grpcFallbackBackoff = 30 * time.Second
 	grpcDialTimeout     = 4 * time.Second
 	grpcCallTimeout     = 5 * time.Second
-	grpcReadyTimeout    = 250 * time.Millisecond
+	// 首次 gRPC 建连在真实 Docker / 跨主机场景下可能需要明显超过 250ms 才能进入 Ready。
+	// 这里保留快速失败，但避免把正常的慢建连过早误判成不可用。
+	grpcReadyTimeout    = 1 * time.Second
 )
 
 type agentControlPlane interface {

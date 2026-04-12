@@ -178,7 +178,7 @@ func maybeApplyRemoteUpdate(
 			return err
 		}
 		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
-		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage); err != nil {
+		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage, cfg.NodeID); err != nil {
 			reportErr := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)

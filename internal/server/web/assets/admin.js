@@ -273,7 +273,7 @@ async function login(username, password) {
     body: JSON.stringify({ username, password }),
   });
   if (!resp.ok) {
-    let message = "用户名或密码错误";
+    let message = "账号或密码错误";
     try {
       const data = await resp.json();
       if (data && data.error) {

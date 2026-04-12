@@ -18,6 +18,22 @@ import (
 	"google.golang.org/grpc"
 )
 
+type delayedAcceptListener struct {
+	net.Listener
+	delay time.Duration
+}
+
+func (l delayedAcceptListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if l.delay > 0 {
+		time.Sleep(l.delay)
+	}
+	return conn, nil
+}
+
 func TestControlPlaneTransportFallsBackToHTTPConfig(t *testing.T) {
 	t.Parallel()
 
@@ -150,6 +166,82 @@ func TestControlPlaneTransportPrefersGRPCWhenAvailable(t *testing.T) {
 	}
 	if httpHits != 0 {
 		t.Fatalf("expected no HTTP fallback request when grpc is available, got %d", httpHits)
+	}
+}
+
+func TestControlPlaneTransportWaitsForSlowGRPCReady(t *testing.T) {
+	t.Parallel()
+
+	httpHits := 0
+	grpcHits := 0
+	grpcServer := grpc.NewServer(grpc.ForceServerCodec(agentrpc.GobCodec{}))
+	agentrpc.RegisterAgentServiceServer(grpcServer, &testAgentRPCServer{
+		fetchConfig: func(_ context.Context, req *agentrpc.ConfigRequest) (*agentrpc.ConfigResponse, error) {
+			grpcHits++
+			if req.NodeID != "node-1" {
+				t.Fatalf("expected grpc node id node-1, got %q", req.NodeID)
+			}
+			return &agentrpc.ConfigResponse{
+				Alias:           "grpc-slow-ready",
+				Group:           "Latency",
+				AgentToken:      "node-token",
+				TestIntervalSec: 5,
+				Tests:           []metrics.NetworkTestConfig{},
+			}, nil
+		},
+	})
+	defer grpcServer.Stop()
+
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/api/v1/agent/config", func(w http.ResponseWriter, r *http.Request) {
+		httpHits++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"alias":             "http-fallback",
+			"group":             "fallback",
+			"agent_token":       "node-token",
+			"test_interval_sec": 5,
+			"tests":             []any{},
+		})
+	})
+
+	handler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 && r.Header.Get("Content-Type") != "" {
+			grpcServer.ServeHTTP(w, r)
+			return
+		}
+		httpMux.ServeHTTP(w, r)
+	}), &http2.Server{})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen test server: %v", err)
+	}
+	defer listener.Close()
+
+	srv := &http.Server{Handler: handler}
+	defer srv.Close()
+	go func() {
+		_ = srv.Serve(delayedAcceptListener{
+			Listener: listener,
+			delay:    600 * time.Millisecond,
+		})
+	}()
+
+	transport := newControlPlaneTransport(Config{ServerURL: "http://" + listener.Addr().String()}, &http.Client{Timeout: 3 * time.Second})
+	defer transport.Close()
+
+	resp, err := transport.FetchConfig(context.Background(), "node-1", "node-token")
+	if err != nil {
+		t.Fatalf("fetch config through slow grpc transport: %v", err)
+	}
+	if resp.Alias != "grpc-slow-ready" {
+		t.Fatalf("expected grpc response alias grpc-slow-ready, got %q", resp.Alias)
+	}
+	if grpcHits != 1 {
+		t.Fatalf("expected one grpc config request, got %d", grpcHits)
+	}
+	if httpHits != 0 {
+		t.Fatalf("expected no HTTP fallback request when grpc becomes ready, got %d", httpHits)
 	}
 }
 

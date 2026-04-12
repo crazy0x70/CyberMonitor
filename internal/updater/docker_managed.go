@@ -25,6 +25,7 @@ const (
 	dockerHelperCommand            = "docker-recreate-helper"
 	dockerHelperTargetContainerEnv = "CM_DOCKER_HELPER_TARGET_CONTAINER"
 	dockerHelperTargetImageEnv     = "CM_DOCKER_HELPER_TARGET_IMAGE"
+	dockerHelperNodeIDEnv          = "CM_DOCKER_HELPER_NODE_ID"
 	dockerHelperSocketSourceEnv    = "CM_DOCKER_HELPER_SOCKET_SOURCE"
 	dockerHelperSocketTargetEnv    = "CM_DOCKER_HELPER_SOCKET_TARGET"
 	dockerDefaultSocketPath        = "/var/run/docker.sock"
@@ -173,7 +174,7 @@ func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
 	}, nil
 }
 
-func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, targetImage string) error {
+func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, targetImage string, currentNodeID string) error {
 	if u == nil {
 		return fmt.Errorf("docker updater 未初始化")
 	}
@@ -190,6 +191,7 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 		Env: []string{
 			fmt.Sprintf("%s=%s", dockerHelperTargetContainerEnv, u.containerID),
 			fmt.Sprintf("%s=%s", dockerHelperTargetImageEnv, targetImage),
+			fmt.Sprintf("%s=%s", dockerHelperNodeIDEnv, currentNodeID),
 			fmt.Sprintf("%s=%s", dockerHelperSocketSourceEnv, u.socketSource),
 			fmt.Sprintf("%s=%s", dockerHelperSocketTargetEnv, dockerHelperMountTarget),
 		},
@@ -215,6 +217,7 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 func RunDockerRecreateHelper(ctx context.Context) error {
 	targetContainerID := strings.TrimSpace(os.Getenv(dockerHelperTargetContainerEnv))
 	targetImage := strings.TrimSpace(os.Getenv(dockerHelperTargetImageEnv))
+	currentNodeID := strings.TrimSpace(os.Getenv(dockerHelperNodeIDEnv))
 	socketPath := strings.TrimSpace(os.Getenv(dockerHelperSocketTargetEnv))
 	if socketPath == "" {
 		socketPath = dockerHelperMountTarget
@@ -243,7 +246,7 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 		return err
 	}
 	tempName := fmt.Sprintf("%s-next-%d", sanitizeContainerName(strings.TrimPrefix(inspect.Name, "/")), time.Now().Unix())
-	cfg, hostCfg, netCfg, extraNetworks := buildReplacementSpec(inspect, targetImage)
+	cfg, hostCfg, netCfg, extraNetworks := buildReplacementSpec(inspect, targetImage, currentNodeID)
 	created, err := cli.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, tempName)
 	if err != nil {
 		return fmt.Errorf("创建替换容器失败: %w", err)
@@ -274,7 +277,7 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	return nil
 }
 
-func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
+func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string, currentNodeID string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
 	hostname := strings.TrimSpace(inspect.Config.Hostname)
 	shortID := strings.TrimSpace(inspect.ID)
 	if len(shortID) > 12 {
@@ -283,10 +286,12 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string)
 	if hostname == shortID {
 		hostname = ""
 	}
+	env := append([]string{}, inspect.Config.Env...)
+	env = backfillEnvValueIfEmpty(env, "CM_NODE_ID", currentNodeID)
 	cfg := &container.Config{
 		Hostname:     hostname,
 		Image:        targetImage,
-		Env:          append([]string{}, inspect.Config.Env...),
+		Env:          env,
 		Cmd:          append([]string{}, inspect.Config.Cmd...),
 		Entrypoint:   append([]string{}, inspect.Config.Entrypoint...),
 		WorkingDir:   inspect.Config.WorkingDir,
@@ -418,4 +423,29 @@ func cloneEndpointSettings(input *network.EndpointSettings) *network.EndpointSet
 		cloned.Links = append([]string{}, input.Links...)
 	}
 	return &cloned
+}
+
+func backfillEnvValueIfEmpty(env []string, key string, value string) []string {
+	prefix := strings.TrimSpace(key) + "="
+	value = strings.TrimSpace(value)
+	if prefix == "=" || value == "" {
+		return env
+	}
+	firstEmptyIndex := -1
+	for idx, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		if strings.TrimSpace(strings.TrimPrefix(entry, prefix)) != "" {
+			return env
+		}
+		if firstEmptyIndex == -1 {
+			firstEmptyIndex = idx
+		}
+	}
+	if firstEmptyIndex >= 0 {
+		env[firstEmptyIndex] = prefix + value
+		return env
+	}
+	return append(env, prefix+value)
 }

@@ -51,6 +51,18 @@
     --cm-blue-rgb: 31, 93, 255;
     --cm-cyan-rgb: 48, 213, 200;
     --cm-warm-rgb: 255, 138, 61;
+    --bg-1: #f4f7fb;
+    --bg-2: #e7eef8;
+    --monitor-accent: #1f5dff;
+    --monitor-accent-2: #30d5c8;
+    --monitor-accent-3: #ff8a3d;
+    --text: #0f172a;
+    --page-bg: radial-gradient(120% 120% at 10% 0%, #ffffff 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+    --panel-bg: rgba(255, 255, 255, 0.7);
+    --panel-border: rgba(148, 163, 184, 0.35);
+    --input-bg: rgba(255, 255, 255, 0.9);
+    --control-bg: rgba(255, 255, 255, 0.6);
+    --control-border: rgba(148, 163, 184, 0.4);
     --background: oklch(0.986 0.004 244);
     --foreground: oklch(0.255 0.018 250);
     --card: oklch(0.992 0.004 240);
@@ -75,12 +87,12 @@
     --chart-4: oklch(0.66 0.14 45);
     --chart-5: oklch(0.62 0.09 246);
     --radius: 1rem;
-    --cm-panel-bg: rgba(255, 255, 255, 0.72);
-    --cm-panel-border: rgba(148, 163, 184, 0.35);
+    --cm-panel-bg: var(--panel-bg);
+    --cm-panel-border: var(--panel-border);
     --cm-panel-header-bg: rgba(255, 255, 255, 0.48);
     --cm-muted-surface: rgba(255, 255, 255, 0.6);
-    --cm-control-bg: rgba(255, 255, 255, 0.78);
-    --cm-control-border: rgba(148, 163, 184, 0.4);
+    --cm-control-bg: var(--input-bg);
+    --cm-control-border: var(--control-border);
     --cm-control-hover: rgba(248, 250, 252, 0.96);
     --cm-sidebar-bg: rgba(255, 255, 255, 0.74);
     --cm-sidebar-border: rgba(148, 163, 184, 0.3);
@@ -99,6 +111,18 @@
     --cm-blue-rgb: 59, 130, 246;
     --cm-cyan-rgb: 34, 211, 238;
     --cm-warm-rgb: 251, 113, 133;
+    --bg-1: #0b1220;
+    --bg-2: #0f172a;
+    --monitor-accent: #3b82f6;
+    --monitor-accent-2: #22d3ee;
+    --monitor-accent-3: #fb7185;
+    --text: #e5e7eb;
+    --page-bg: radial-gradient(120% 120% at 10% 0%, #0b1020 0%, var(--bg-1) 45%, var(--bg-2) 100%);
+    --panel-bg: rgba(15, 23, 42, 0.7);
+    --panel-border: rgba(148, 163, 184, 0.18);
+    --input-bg: rgba(15, 23, 42, 0.82);
+    --control-bg: rgba(15, 23, 42, 0.55);
+    --control-border: rgba(148, 163, 184, 0.22);
     --background: oklch(0.16 0.014 252);
     --foreground: oklch(0.96 0.004 255);
     --card: oklch(0.205 0.018 250);
@@ -122,12 +146,12 @@
     --chart-3: oklch(0.72 0.11 120);
     --chart-4: oklch(0.69 0.14 45);
     --chart-5: oklch(0.69 0.08 254);
-    --cm-panel-bg: rgba(15, 23, 42, 0.72);
-    --cm-panel-border: rgba(148, 163, 184, 0.18);
+    --cm-panel-bg: var(--panel-bg);
+    --cm-panel-border: var(--panel-border);
     --cm-panel-header-bg: rgba(15, 23, 42, 0.58);
     --cm-muted-surface: rgba(15, 23, 42, 0.58);
-    --cm-control-bg: rgba(15, 23, 42, 0.82);
-    --cm-control-border: rgba(148, 163, 184, 0.22);
+    --cm-control-bg: var(--input-bg);
+    --cm-control-border: var(--control-border);
     --cm-control-hover: rgba(30, 41, 59, 0.92);
     --cm-sidebar-bg: rgba(15, 23, 42, 0.8);
     --cm-sidebar-border: rgba(148, 163, 184, 0.22);
@@ -157,19 +181,11 @@
     @apply bg-background text-foreground;
     min-height: 100vh;
     font-feature-settings: normal;
-    background-image: radial-gradient(at 0% 0%, rgba(var(--cm-blue-rgb), 0.05) 0px, transparent 50%),
-                      radial-gradient(at 100% 0%, rgba(var(--cm-cyan-rgb), 0.05) 0px, transparent 50%),
-                      radial-gradient(at 100% 100%, rgba(var(--cm-warm-rgb), 0.03) 0px, transparent 50%),
-                      radial-gradient(at 0% 100%, rgba(var(--cm-blue-rgb), 0.03) 0px, transparent 50%);
-    background-color: rgb(244 247 251);
+    background: var(--page-bg);
     background-attachment: fixed;
     }
   .dark body {
-    background-image: radial-gradient(at 0% 0%, rgba(var(--cm-blue-rgb), 0.12) 0px, transparent 50%),
-                      radial-gradient(at 100% 0%, rgba(var(--cm-cyan-rgb), 0.08) 0px, transparent 50%),
-                      radial-gradient(at 100% 100%, rgba(var(--cm-warm-rgb), 0.05) 0px, transparent 50%),
-                      radial-gradient(at 0% 100%, rgba(var(--cm-blue-rgb), 0.08) 0px, transparent 50%);
-    background-color: rgb(10 16 28);
+    background: var(--page-bg);
     }
   #root {
     min-height: 100vh;

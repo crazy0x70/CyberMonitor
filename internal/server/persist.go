@@ -120,9 +120,14 @@ type SettingsUpdate struct {
 }
 
 type PersistedData struct {
-	Settings Settings                `json:"settings"`
-	Profiles map[string]*NodeProfile `json:"profiles"`
-	Nodes    map[string]NodeState    `json:"nodes,omitempty"`
+	Settings        Settings                       `json:"settings"`
+	Profiles        map[string]*NodeProfile        `json:"profiles"`
+	Nodes           map[string]NodeState           `json:"nodes,omitempty"`
+	OfflineSessions map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+}
+
+type OfflineSessionState struct {
+	StartedAt int64 `json:"started_at"`
 }
 
 type TestHistoryEntry struct {
@@ -256,6 +261,9 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if payload.Nodes == nil {
 		payload.Nodes = make(map[string]NodeState)
 	}
+	if payload.OfflineSessions == nil {
+		payload.OfflineSessions = make(map[string]OfflineSessionState)
+	}
 	return payload, true, nil
 }
 
@@ -371,6 +379,17 @@ func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 			copyProfile.AlertEnabled = &value
 		}
 		cloned[id] = &copyProfile
+	}
+	return cloned
+}
+
+func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]OfflineSessionState {
+	if len(sessions) == 0 {
+		return map[string]OfflineSessionState{}
+	}
+	cloned := make(map[string]OfflineSessionState, len(sessions))
+	for nodeID, session := range sessions {
+		cloned[nodeID] = session
 	}
 	return cloned
 }

@@ -10,11 +10,17 @@ services:
       - NET_RAW
     environment:
       # Agent 统一接入地址。运行时会优先尝试 gRPC，不可用时自动回退到 HTTP。
+      # 默认单端口部署时通常是 25012；如果服务端配置了 CM_PUBLIC_LISTEN=25013，则这里也必须改成 25013。
       CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
       CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"
+      # 可选：显式指定固定节点 ID。未指定时，Agent 会优先复用 ~/.cybermonitor-node-id；
+      # 如果是 Docker 且没有可复用节点文件，则会退回到宿主机指纹稳定 UUID。
+      # CM_NODE_ID: "existing-node-01"
       # 可选：设置为 "1" 后，拒绝服务端下发的远程更新任务。
       CM_DISABLE_UPDATE: "0"
     volumes:
+      # 可选：如需显式持久化默认节点身份文件，可挂载 Agent 运行用户 home（默认 /home/cm）。
+      # - ./agent-home:/home/cm
       - /:/host:ro
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro

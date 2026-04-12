@@ -2,9 +2,8 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -19,10 +20,20 @@ const (
 	defaultAgentTokenFileName = ".cybermonitor-agent-token"
 )
 
+type NodeIDOptions struct {
+	Explicit     string
+	ExplicitFile string
+	LegacyPath   string
+	IsDocker     bool
+	HostRoot     string
+}
+
 type nodeRegisterResponse struct {
 	NodeID     string `json:"node_id"`
 	AgentToken string `json:"agent_token"`
 }
+
+var newRandomNodeUUID = uuid.NewRandom
 
 func ResolveStateFilePath(explicit, fallbackName string) (string, error) {
 	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
@@ -39,8 +50,43 @@ func ResolveStateFilePath(explicit, fallbackName string) (string, error) {
 	return filepath.Join(filepath.Dir(resolved), fallbackName), nil
 }
 
+func ResolveNodeID(opts NodeIDOptions) (string, error) {
+	return resolveNodeIDWithFallbacks(opts)
+}
+
 func ResolveOrCreateNodeID(explicit, filePath string) (string, error) {
-	return resolveOrCreateNodeID(explicit, filePath, generateRandomNodeID)
+	return ResolveOrCreateNodeIDWithOptions(NodeIDOptions{
+		Explicit:     explicit,
+		ExplicitFile: filePath,
+	})
+}
+
+func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
+	nodeID, err := ResolveNodeID(opts)
+	if err == nil {
+		return nodeID, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	targetPath, err := resolveNodeIDCreatePath(opts)
+	if err != nil {
+		return "", err
+	}
+
+	nodeID, err = generateRandomNodeUUID()
+	if err != nil {
+		return "", err
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return "", fmt.Errorf("generated node id is empty")
+	}
+	if err := writeTrimmedFile(targetPath, nodeID); err != nil {
+		return "", err
+	}
+	return nodeID, nil
 }
 
 func LoadPersistedAgentToken(filePath string) (string, error) {
@@ -63,23 +109,129 @@ func DefaultAgentTokenFileName() string {
 	return defaultAgentTokenFileName
 }
 
-func resolveOrCreateNodeID(explicit, filePath string, generate func() string) (string, error) {
-	if value := strings.TrimSpace(explicit); value != "" {
-		return value, nil
+func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
+	if explicit := strings.TrimSpace(opts.Explicit); explicit != "" {
+		return explicit, nil
 	}
-	if value, err := readTrimmedFile(filePath); err == nil && value != "" {
-		return value, nil
-	} else if err != nil && !os.IsNotExist(err) {
+
+	if explicitFile := strings.TrimSpace(opts.ExplicitFile); explicitFile != "" {
+		value, err := readTrimmedFile(explicitFile)
+		switch {
+		case err == nil:
+			return value, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return "", err
+		}
+	}
+
+	homePath, homeErr := defaultNodeIDHomePath()
+	if homeErr == nil {
+		value, err := readTrimmedFile(homePath)
+		switch {
+		case err == nil:
+			return value, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return "", err
+		}
+	}
+
+	legacyPath := resolveLegacyNodeIDPath(opts.LegacyPath)
+	if legacyPath != "" {
+		value, err := readTrimmedFile(legacyPath)
+		switch {
+		case err == nil:
+			if homeErr != nil {
+				return "", homeErr
+			}
+			if err := writeTrimmedFile(homePath, value); err != nil {
+				return "", err
+			}
+			return value, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return "", err
+		}
+	}
+
+	if opts.IsDocker {
+		value, err := resolveStableDockerNodeID(opts.HostRoot)
+		switch {
+		case err == nil:
+			return value, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return "", err
+		}
+	}
+
+	return "", os.ErrNotExist
+}
+
+func resolveNodeIDCreatePath(opts NodeIDOptions) (string, error) {
+	if explicitFile := strings.TrimSpace(opts.ExplicitFile); explicitFile != "" {
+		return explicitFile, nil
+	}
+	return defaultNodeIDHomePath()
+}
+
+func defaultNodeIDHomePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", fmt.Errorf("resolve home dir: empty home dir")
+	}
+	return filepath.Join(home, defaultNodeIDFileName), nil
+}
+
+func resolveLegacyNodeIDPath(legacyPath string) string {
+	legacyPath = strings.TrimSpace(legacyPath)
+	if legacyPath != "" {
+		return legacyPath
+	}
+	defaultPath, err := ResolveStateFilePath("", defaultNodeIDFileName)
+	if err != nil {
+		return ""
+	}
+	return defaultPath
+}
+
+func resolveStableDockerNodeID(hostRoot string) (string, error) {
+	fingerprint, err := readStableHostFingerprint(hostRoot)
+	if err != nil {
 		return "", err
 	}
-	nodeID := strings.TrimSpace(generate())
-	if nodeID == "" {
-		return "", fmt.Errorf("generated node id is empty")
+	return deriveStableNodeIDFromFingerprint(fingerprint), nil
+}
+
+func readStableHostFingerprint(hostRoot string) (string, error) {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		return "", os.ErrNotExist
 	}
-	if err := writeTrimmedFile(filePath, nodeID); err != nil {
-		return "", err
+
+	candidates := []string{
+		filepath.Join(root, "etc", "machine-id"),
+		filepath.Join(root, "var", "lib", "dbus", "machine-id"),
+		filepath.Join(root, "etc", "hostname"),
 	}
-	return nodeID, nil
+	for _, candidate := range candidates {
+		value, err := readTrimmedFile(candidate)
+		switch {
+		case err == nil:
+			return value, nil
+		default:
+			continue
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+func deriveStableNodeIDFromFingerprint(fingerprint string) string {
+	return uuid.NewSHA1(
+		uuid.NameSpaceURL,
+		[]byte("cybermonitor-node:"+strings.TrimSpace(fingerprint)),
+	).String()
 }
 
 func loadPersistedAgentToken(filePath string) (string, error) {
@@ -153,7 +305,11 @@ func readTrimmedFile(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return "", os.ErrNotExist
+	}
+	return trimmed, nil
 }
 
 func writeTrimmedFile(filePath, value string) error {
@@ -161,16 +317,20 @@ func writeTrimmedFile(filePath, value string) error {
 	if trimmedPath == "" {
 		return fmt.Errorf("file path required")
 	}
+	trimmedValue := strings.TrimSpace(value)
+	if trimmedValue == "" {
+		return fmt.Errorf("file value required")
+	}
 	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(trimmedPath, []byte(strings.TrimSpace(value)+"\n"), 0o600)
+	return os.WriteFile(trimmedPath, []byte(trimmedValue+"\n"), 0o600)
 }
 
-func generateRandomNodeID() string {
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		return "node-fallback"
+func generateRandomNodeUUID() (string, error) {
+	id, err := newRandomNodeUUID()
+	if err != nil {
+		return "", fmt.Errorf("generate node uuid: %w", err)
 	}
-	return "node-" + hex.EncodeToString(buf)
+	return id.String(), nil
 }

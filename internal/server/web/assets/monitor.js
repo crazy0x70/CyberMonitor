@@ -14,7 +14,6 @@ const siteIcon = document.getElementById("site-icon");
 const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 const footerYear = document.getElementById("footer-year");
-const footerCommit = document.getElementById("footer-commit");
 const urlParams = new URLSearchParams(window.location.search);
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
@@ -23,10 +22,12 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
 });
 
 const CONFIG_PATH = "/config.json";
+const PUBLIC_REQUEST_HEADER = "X-CM-Public-Request";
 const VARIANT_CONSERVATIVE = "conservative";
 const VARIANT_BALANCED = "balanced";
 const DEFAULT_GROUP = "全部";
 const DEFAULT_STATUS_FILTER = "all";
+const DEFAULT_TEST_RANGE_KEY = "1h";
 const STATUS_FILTERS = new Set(["all", "online", "offline"]);
 
 const activeVariant =
@@ -62,6 +63,8 @@ const state = {
   lastNodes: [],
   settingsGroups: [],
   testHistory: new Map(),
+  testHistoryFetched: new Map(),
+  testHistoryInflight: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
@@ -80,15 +83,15 @@ const state = {
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
-const HISTORY_CACHE_VERSION = 1;
+const HISTORY_CACHE_VERSION = 3;
 const HISTORY_CACHE_MAX_POINTS = 5000;
 const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
-const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 366;
 const HISTORY_CACHE_SAVE_DELAY = 1500;
 const WS_RECONNECT_BASE_DELAY = 500;
 const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
-const LATENCY_SMOOTH_ALPHA = 0.35;
+const LATENCY_SMOOTH_ALPHA = 0.2;
 
 function buildVariantURL(variant) {
   const next = new URL(window.location.href);
@@ -348,6 +351,9 @@ async function fetchPublicSnapshotForTarget(target, options = {}) {
   try {
     const resp = await fetch(`${base}/api/v1/public/snapshot`, {
       cache: "no-store",
+      headers: {
+        [PUBLIC_REQUEST_HEADER]: "1",
+      },
     });
     if (!resp.ok) {
       state.snapshotFailures.set(
@@ -451,21 +457,23 @@ function scheduleReconnect(target) {
   state.reconnectTimers.set(target.key, timer);
 }
 
-function mergeByNodeID(nodesBySource) {
+function mergeByNodeID(sourceSnapshots) {
   const merged = new Map();
-  nodesBySource.forEach((sourceNodes) => {
-    (sourceNodes || []).forEach((node) => {
+  sourceSnapshots.forEach(([sourceKey, snapshot]) => {
+    const sourceNodes = Array.isArray(snapshot?.nodes) ? snapshot.nodes : [];
+    sourceNodes.forEach((node) => {
       const nodeID = resolveNodeId(node, "").trim();
       if (!nodeID) return;
+      const candidate = { ...node, __sourceKey: sourceKey };
       const existing = merged.get(nodeID);
       if (!existing) {
-        merged.set(nodeID, node);
+        merged.set(nodeID, candidate);
         return;
       }
       const existingLastSeen = existing.last_seen || 0;
-      const currentLastSeen = node.last_seen || 0;
+      const currentLastSeen = candidate.last_seen || 0;
       if (currentLastSeen >= existingLastSeen) {
-        merged.set(nodeID, node);
+        merged.set(nodeID, candidate);
       }
     });
   });
@@ -484,8 +492,9 @@ function mergeGroups(groupsBySource) {
 }
 
 function rebuildMergedSnapshotState() {
-  const snapshots = Array.from(state.sourceSnapshots.values());
-  const mergedNodes = mergeByNodeID(snapshots.map((item) => item.nodes || []));
+  const sourceSnapshots = Array.from(state.sourceSnapshots.entries());
+  const snapshots = sourceSnapshots.map(([, snapshot]) => snapshot);
+  const mergedNodes = mergeByNodeID(sourceSnapshots);
   const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
 
   state.lastNodes = mergedNodes;
@@ -589,7 +598,7 @@ function handleSnapshot(payload, sourceKey = "default") {
   state.sourceSnapshots.set(sourceKey, payload);
   state.snapshotFailures.delete(sourceKey);
   updateTransportState("snapshot", payload.generated_at);
-  applyTestHistory(payload.test_history);
+  applyTestHistory(payload.test_history, sourceKey);
   rebuildMergedSnapshotState();
 }
 
@@ -656,7 +665,7 @@ const RANGE_OPTIONS = [
   { key: "24h", label: "1D", seconds: 60 * 60 * 24 },
   { key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },
   { key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },
-  { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 365 },
+  { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 366 },
 ];
 
 function applyPublicSettings(settings) {
@@ -668,7 +677,6 @@ function applyPublicSettings(settings) {
   const resolvedTitle = title || "CyberMonitor";
   const resolvedHomeTitle = homeTitle || resolvedTitle;
   const resolvedSubtitle = homeSubtitle || "主机监控";
-  const commit = (settings.commit || "").trim();
 
   if (resolvedTitle) {
     document.title = resolvedTitle;
@@ -690,7 +698,7 @@ function applyPublicSettings(settings) {
     }
   }
 
-  updateFooter(commit);
+  updateFooter();
 }
 
 function loadTestHistoryCache() {
@@ -700,7 +708,12 @@ function loadTestHistoryCache() {
     if (!raw) return;
     const payload = JSON.parse(raw);
     if (!payload || typeof payload !== "object") return;
-    if (payload.version && payload.version !== HISTORY_CACHE_VERSION) return;
+    if (payload.version !== HISTORY_CACHE_VERSION && payload.version !== undefined) {
+      localStorage.removeItem(HISTORY_CACHE_KEY);
+    }
+    if (payload.version !== HISTORY_CACHE_VERSION) {
+      return;
+    }
     const nodes = payload.nodes;
     if (!nodes || typeof nodes !== "object") return;
     state.historyCacheLoading = true;
@@ -724,19 +737,26 @@ function scheduleHistoryCacheSave() {
 function persistHistoryCache() {
   if (!window.localStorage) return;
   const nodes = {};
-  state.testHistory.forEach((tests, nodeId) => {
-    if (!tests || tests.size === 0) return;
-    const entries = {};
-    tests.forEach((entry, key) => {
-      if (!entry) return;
-      trimTestHistoryEntry(entry);
-      const serialized = serializeTestHistoryEntry(entry);
-      if (serialized) {
-        entries[key] = serialized;
+  state.testHistory.forEach((ranges, cacheKey) => {
+    if (!ranges || ranges.size === 0) return;
+    const serializedRanges = {};
+    ranges.forEach((tests, rangeKey) => {
+      if (!tests || tests.size === 0) return;
+      const entries = {};
+      tests.forEach((entry, key) => {
+        if (!entry) return;
+        trimTestHistoryEntry(entry);
+        const serialized = serializeTestHistoryEntry(entry);
+        if (serialized) {
+          entries[key] = serialized;
+        }
+      });
+      if (Object.keys(entries).length > 0) {
+        serializedRanges[rangeKey] = entries;
       }
     });
-    if (Object.keys(entries).length > 0) {
-      nodes[nodeId] = entries;
+    if (Object.keys(serializedRanges).length > 0) {
+      nodes[cacheKey] = serializedRanges;
     }
   });
   const payload = {
@@ -768,6 +788,125 @@ function serializeTestHistoryEntry(entry) {
     min_interval_sec: entry.minIntervalSec || 0,
     avg_interval_sec: entry.avgIntervalSec || 0,
   };
+}
+
+function normalizeHistoryRangeKey(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return DEFAULT_TEST_RANGE_KEY;
+  if (raw === "1d") return "24h";
+  return RANGE_OPTIONS.some((item) => item.key === raw)
+    ? raw
+    : DEFAULT_TEST_RANGE_KEY;
+}
+
+function normalizeHistorySourceKey(sourceKey) {
+  const raw = String(sourceKey || "").trim();
+  return raw || "default";
+}
+
+function historyNodeCacheKey(nodeId, sourceKey) {
+  return `${normalizeHistorySourceKey(sourceKey)}::${String(nodeId || "").trim()}`;
+}
+
+function resolveHistoryNodeCacheKey(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return historyNodeCacheKey(nodeId, sourceKey);
+}
+
+function historyRequestKey(nodeId, sourceKey, rangeKey) {
+  return `${historyNodeCacheKey(nodeId, sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
+}
+
+function ensureNodeHistoryRangesByKey(cacheKey) {
+  if (!state.testHistory.has(cacheKey)) {
+    state.testHistory.set(cacheKey, new Map());
+  }
+  return state.testHistory.get(cacheKey);
+}
+
+function ensureNodeHistoryRanges(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return ensureNodeHistoryRangesByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+}
+
+function ensureHistoryRangeMapByKey(cacheKey, rangeKey) {
+  const normalizedRange = normalizeHistoryRangeKey(rangeKey);
+  const ranges = ensureNodeHistoryRangesByKey(cacheKey);
+  if (!ranges.has(normalizedRange)) {
+    ranges.set(normalizedRange, new Map());
+  }
+  return ranges.get(normalizedRange);
+}
+
+function ensureHistoryRangeMap(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return ensureHistoryRangeMapByKey(
+    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rangeKey
+  );
+}
+
+function getNodeHistoryRange(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges) {
+    return new Map();
+  }
+  return ranges.get(normalizeHistoryRangeKey(rangeKey)) || new Map();
+}
+
+function getFallbackHistoryMap(
+  nodeId,
+  rangeKey,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  const preferred = getNodeHistoryRange(nodeId, rangeKey, sourceKey);
+  if (preferred.size > 0) {
+    return preferred;
+  }
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges) {
+    return preferred;
+  }
+  for (const entry of ranges.values()) {
+    if (entry && entry.size > 0) {
+      return entry;
+    }
+  }
+  return preferred;
+}
+
+function hasAnyHistoryForNode(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges || ranges.size === 0) {
+    return false;
+  }
+  for (const entry of ranges.values()) {
+    if (entry && entry.size > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function trimHistoryRequestState(nodeId, sourceKey) {
+  const prefix = `${historyNodeCacheKey(nodeId, sourceKey)}::`;
+  for (const key of state.testHistoryFetched.keys()) {
+    if (String(key).startsWith(prefix)) {
+      state.testHistoryFetched.delete(key);
+    }
+  }
+  for (const key of state.testHistoryInflight.keys()) {
+    if (String(key).startsWith(prefix)) {
+      state.testHistoryInflight.delete(key);
+    }
+  }
+}
+
+function isHistoryRangeFetched(
+  nodeId,
+  rangeKey,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  return state.testHistoryFetched.has(
+    historyRequestKey(nodeId, sourceKey, rangeKey)
+  );
 }
 
 function trimTestHistoryEntry(entry) {
@@ -848,23 +987,37 @@ function trimTestHistoryEntry(entry) {
 
 function cleanupDetachedHistory(nodes) {
   if (!Array.isArray(nodes)) return;
-  const active = new Set();
+  const activeHistoryKeys = new Set();
+  const activeNodeIDs = new Set();
   nodes.forEach((node) => {
     const id = resolveNodeId(node, "");
     if (id) {
-      active.add(id);
+      activeNodeIDs.add(id);
+      activeHistoryKeys.add(historyNodeCacheKey(id, node.__sourceKey || "default"));
     }
   });
   let changed = false;
-  for (const id of state.testHistory.keys()) {
-    if (!active.has(id)) {
-      state.testHistory.delete(id);
+  for (const cacheKey of state.testHistory.keys()) {
+    if (!activeHistoryKeys.has(cacheKey)) {
+      state.testHistory.delete(cacheKey);
+      const separator = String(cacheKey).indexOf("::");
+      if (separator > -1) {
+        const sourceKey = cacheKey.slice(0, separator);
+        const nodeId = cacheKey.slice(separator + 2);
+        trimHistoryRequestState(nodeId, sourceKey);
+      }
       changed = true;
     }
   }
   for (const id of state.testRange.keys()) {
-    if (!active.has(id)) {
+    if (!activeNodeIDs.has(id)) {
       state.testRange.delete(id);
+      changed = true;
+    }
+  }
+  for (const id of state.testSmooth.keys()) {
+    if (!activeNodeIDs.has(id)) {
+      state.testSmooth.delete(id);
       changed = true;
     }
   }
@@ -873,32 +1026,24 @@ function cleanupDetachedHistory(nodes) {
   }
 }
 
-function applyTestHistory(history) {
+function applyTestHistory(history, sourceKey) {
   if (!history || typeof history !== "object") return;
   let updated = false;
-  Object.entries(history).forEach(([nodeId, tests]) => {
-    if (!tests || typeof tests !== "object") return;
-    let map = state.testHistory.get(nodeId);
-    if (!map) {
-      map = new Map();
-      state.testHistory.set(nodeId, map);
+  Object.entries(history).forEach(([nodeId, rangeBuckets]) => {
+    const cacheKey =
+      sourceKey === undefined
+        ? String(nodeId || "").trim()
+        : historyNodeCacheKey(nodeId, sourceKey);
+    if (!cacheKey) return;
+    if (!rangeBuckets || typeof rangeBuckets !== "object") return;
+    if (isLegacyHistoryBucket(rangeBuckets)) {
+      if (mergeHistoryRangeByKey(cacheKey, DEFAULT_TEST_RANGE_KEY, rangeBuckets)) {
+        updated = true;
+      }
+      return;
     }
-    Object.entries(tests).forEach(([key, entry]) => {
-      const normalized = normalizeTestHistoryEntry(entry);
-      if (!normalized) return;
-      const existing = map.get(key);
-      const incomingLast = normalized.lastAt || 0;
-      const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
-      const incomingSize = normalized.times.length;
-      const existingSize =
-        existing && Array.isArray(existing.times) ? existing.times.length : 0;
-      if (
-        !existing ||
-        incomingLast > existingLast ||
-        (incomingLast === existingLast && incomingSize > existingSize)
-      ) {
-        trimTestHistoryEntry(normalized);
-        map.set(key, normalized);
+    Object.entries(rangeBuckets).forEach(([rangeKey, tests]) => {
+      if (mergeHistoryRangeByKey(cacheKey, rangeKey, tests)) {
         updated = true;
       }
     });
@@ -906,6 +1051,82 @@ function applyTestHistory(history) {
   if (updated) {
     scheduleHistoryCacheSave();
   }
+}
+
+function isLegacyHistoryBucket(value) {
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((entry) => looksLikeTestHistoryEntry(entry));
+}
+
+function looksLikeTestHistoryEntry(entry) {
+  return (
+    entry &&
+    typeof entry === "object" &&
+    (Array.isArray(entry.times) ||
+      Array.isArray(entry.latency) ||
+      Array.isArray(entry.loss))
+  );
+}
+
+function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
+  if (!tests || typeof tests !== "object") {
+    return false;
+  }
+  const map = ensureHistoryRangeMapByKey(cacheKey, rangeKey);
+  let updated = false;
+  Object.entries(tests).forEach(([key, entry]) => {
+    const normalized = normalizeTestHistoryEntry(entry);
+    if (!normalized) return;
+    const existing = map.get(key);
+    const incomingLast = normalized.lastAt || 0;
+    const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
+    const incomingSize = normalized.times.length;
+    const existingSize =
+      existing && Array.isArray(existing.times) ? existing.times.length : 0;
+    if (
+      !existing ||
+      incomingLast > existingLast ||
+      (incomingLast === existingLast && incomingSize > existingSize)
+    ) {
+      trimTestHistoryEntry(normalized);
+      map.set(key, normalized);
+      updated = true;
+    }
+  });
+  return updated;
+}
+
+function mergeHistoryRange(nodeId, rangeKey, tests, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return mergeHistoryRangeByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey), rangeKey, tests);
+}
+
+function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
+  if (!tests || typeof tests !== "object") {
+    return false;
+  }
+  const map = new Map();
+  Object.entries(tests).forEach(([key, entry]) => {
+    const normalized = normalizeTestHistoryEntry(entry);
+    if (!normalized) return;
+    trimTestHistoryEntry(normalized);
+    map.set(key, normalized);
+  });
+  const ranges = ensureNodeHistoryRangesByKey(cacheKey);
+  ranges.set(normalizeHistoryRangeKey(rangeKey), map);
+  return true;
+}
+
+function replaceHistoryRange(
+  nodeId,
+  rangeKey,
+  tests,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  return replaceHistoryRangeByKey(
+    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rangeKey,
+    tests
+  );
 }
 
 function normalizeTestHistoryEntry(entry) {
@@ -951,13 +1172,93 @@ function normalizeTestHistorySeries(series, size) {
   return normalized;
 }
 
-function updateFooter(commit) {
+function resolveNodeSourceKey(nodeId) {
+  const targetNode = state.lastNodes.find(
+    (node) => resolveNodeId(node, "").trim() === nodeId
+  );
+  if (!targetNode) {
+    return "default";
+  }
+  return String(targetNode.__sourceKey || "default");
+}
+
+function resolveHistoryTarget(nodeId) {
+  const sourceKey = resolveNodeSourceKey(nodeId);
+  const targets = resolveTargets();
+  return targets.find((item) => item.key === sourceKey) || targets[0] || null;
+}
+
+async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
+  const normalizedRange = normalizeHistoryRangeKey(rangeKey);
+  if (!nodeId) {
+    return null;
+  }
+  const sourceKey = resolveNodeSourceKey(nodeId);
+  const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);
+  if (state.testHistoryFetched.has(requestKey)) {
+    return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
+  }
+  if (state.testHistoryInflight.has(requestKey)) {
+    return state.testHistoryInflight.get(requestKey);
+  }
+
+  const target = resolveHistoryTarget(nodeId);
+  const apiBase = target?.apiBase;
+  if (!apiBase) {
+    return null;
+  }
+
+  const request = fetch(
+    `${apiBase}/api/v1/public/nodes/${encodeURIComponent(
+      nodeId
+    )}/history?range=${encodeURIComponent(normalizedRange)}`,
+    {
+      cache: "no-store",
+      headers: {
+        [PUBLIC_REQUEST_HEADER]: "1",
+      },
+    }
+  )
+    .then(async (resp) => {
+      if (!resp.ok) {
+        throw new Error(`history request failed: ${resp.status}`);
+      }
+      return resp.json();
+    })
+    .then((payload) => {
+      const resolvedRange = normalizeHistoryRangeKey(
+        payload?.range_key || normalizedRange
+      );
+      if (resolveNodeSourceKey(nodeId) !== sourceKey) {
+        return null;
+      }
+      if (payload?.tests && typeof payload.tests === "object") {
+        replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);
+        scheduleHistoryCacheSave();
+      }
+      state.testHistoryFetched.set(
+        historyRequestKey(nodeId, sourceKey, resolvedRange),
+        true
+      );
+      scheduleRender();
+      return getNodeHistoryRange(nodeId, resolvedRange, sourceKey);
+    })
+    .catch((error) => {
+      console.warn("加载节点历史失败", nodeId, normalizedRange, error);
+      return null;
+    })
+    .finally(() => {
+      state.testHistoryInflight.delete(requestKey);
+    });
+
+  state.testHistoryInflight.set(requestKey, request);
+  return request;
+}
+
+function updateFooter() {
   if (footerYear) {
     const currentYear = new Date().getFullYear();
     footerYear.textContent = `©2025-${currentYear}`;
-  }
-  if (footerCommit && commit) {
-    footerCommit.textContent = commit;
   }
 }
 
@@ -999,7 +1300,7 @@ window.addEventListener("popstate", () => {
 
 function rangeSeconds(key) {
   const match = RANGE_OPTIONS.find((item) => item.key === key);
-  return match ? match.seconds : RANGE_OPTIONS[1].seconds;
+  return match ? match.seconds : RANGE_OPTIONS[0].seconds;
 }
 
 const TEST_RANGE_INTERVALS = {
@@ -1817,8 +2118,11 @@ function renderCardDetails(card, node, nodeId) {
 }
 
 function updateNetworkTests(fields, tests, nodeId) {
-  const historyMap = state.testHistory.get(nodeId) || new Map();
-  if (!tests.length && historyMap.size === 0) {
+  if (tests.length) {
+    updateTestHistory(nodeId, tests);
+  }
+
+  if (!tests.length && !hasAnyHistoryForNode(nodeId)) {
     fields.testChart.innerHTML = "";
     fields.testCards.innerHTML = "";
     if (fields.testRange) {
@@ -1838,18 +2142,25 @@ function updateNetworkTests(fields, tests, nodeId) {
     return;
   }
 
-  if (tests.length) {
-    updateTestHistory(nodeId, tests);
-  }
   fields._tests = tests;
   renderNetworkSection(fields, nodeId);
 }
 
 function renderNetworkSection(fields, nodeId) {
-  const historyMap = state.testHistory.get(nodeId) || new Map();
+  const activeRange = normalizeHistoryRangeKey(
+    state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
+  );
+  if (!state.testRange.has(nodeId)) {
+    state.testRange.set(nodeId, DEFAULT_TEST_RANGE_KEY);
+  }
+  void fetchNodeHistory(nodeId, activeRange);
+
+  const historyMap = getNodeHistoryRange(nodeId, activeRange);
   const baseTests = fields._tests || [];
-  const tests = baseTests.length > 0 ? baseTests : buildTestsFromHistory(historyMap);
-  const activeRange = state.testRange.get(nodeId) || defaultTestRangeForHistory(historyMap);
+  const tests =
+    baseTests.length > 0
+      ? baseTests
+      : buildTestsFromHistory(getFallbackHistoryMap(nodeId, activeRange));
   const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
   renderRangeTabs(fields, nodeId, activeRange);
   renderSmoothToggle(fields, nodeId, smoothEnabled);
@@ -1861,23 +2172,18 @@ function renderNetworkSection(fields, nodeId) {
   const now = Math.floor(Date.now() / 1000);
   const rangeSec = rangeSeconds(activeRange);
   const testEntries = [];
-  let observedIntervalSec = 0;
   let latestHistoryAt = 0;
 
   tests.forEach((test, index) => {
     const key = testKey(test);
     const history = historyMap.get(key) || { latency: [], loss: [], times: [] };
     const color = testColor(key, index);
-    const intervalHint =
-      history.avgIntervalSec || history.minIntervalSec || 0;
-    if (Number.isFinite(intervalHint) && intervalHint > observedIntervalSec) {
-      observedIntervalSec = intervalHint;
-    }
     const historyLastAt = resolveHistoryLastAt(history);
     if (historyLastAt > latestHistoryAt) {
       latestHistoryAt = historyLastAt;
     }
     testEntries.push({
+      key,
       test,
       history,
       filtered: null,
@@ -1891,19 +2197,27 @@ function renderNetworkSection(fields, nodeId) {
     entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
   });
 
-  const grid = buildTestGrid(
-    activeRange,
-    rangeSec,
-    rangeEndSec,
-    observedIntervalSec
-  );
-  const timeSeries = grid.times;
+  const mergedTimeline = buildLatencyTimeline(testEntries);
+  const timeSeries = mergedTimeline.times;
 
   testEntries.forEach((entry) => {
-    const sampled = resampleHistoryForGrid(entry.history, grid);
+    const timelineSeries = mergedTimeline.series.get(entry.key) || [];
+    const sampled = {
+      latency: timelineSeries,
+      times: timeSeries,
+    };
+    const interpolatedLatency = interpolateLatencyGaps(sampled.latency, sampled.times, {
+      multiplier: 6,
+      fallbackGapSec: Math.max(
+        entry.history?.minIntervalSec || 0,
+        60
+      ),
+      minGapSec: Math.max(entry.history?.minIntervalSec || 0, 60),
+      maxGapSecCap: Math.max((entry.history?.minIntervalSec || 60) * 6, 60),
+    });
     const latencySeries = smoothEnabled
-      ? applyEWMA(sampled.latency, LATENCY_SMOOTH_ALPHA)
-      : sampled.latency.slice();
+      ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
+      : interpolatedLatency.slice();
     if (hasSeriesData(latencySeries)) {
       seriesList.push(latencySeries);
       colors.push(entry.color);
@@ -1919,17 +2233,15 @@ function renderNetworkSection(fields, nodeId) {
 
     const cardStats = document.createElement("div");
     cardStats.className = "network-card-stats";
-    const stats = summarizeLatency(entry.filtered.latency);
-    const lossAvg = summarizeLoss(entry.filtered.loss);
+    const snapshot = summarizeTestSnapshot(entry.test, entry.history);
     cardStats.innerHTML = `
-      <span>${formatLatencyStat(stats.min)}</span>
-      <span>${formatLatencyStat(stats.avg)}</span>
-      <span>${formatLatencyStat(stats.max)}</span>
+      <span>${snapshot.target}</span>
+      <span>${snapshot.latency}</span>
     `;
 
     const loss = document.createElement("div");
     loss.className = "network-card-loss";
-    loss.textContent = formatLossValue(lossAvg);
+    loss.textContent = snapshot.loss;
 
     card.appendChild(cardName);
     card.appendChild(cardStats);
@@ -1986,38 +2298,6 @@ function buildTestsFromHistory(historyMap) {
     .sort()
     .map((key) => testFromHistoryKey(key))
     .filter(Boolean);
-}
-
-function defaultTestRangeForHistory(historyMap) {
-  const spanSec = historySpanSeconds(historyMap);
-  if (spanSec > 60 * 60 * 24 * 90) return "1y";
-  if (spanSec > 60 * 60 * 24 * 14) return "30d";
-  if (spanSec > 60 * 60 * 24) return "7d";
-  if (spanSec > 60 * 60) return "24h";
-  return "1h";
-}
-
-function historySpanSeconds(historyMap) {
-  if (!historyMap || historyMap.size === 0) return 0;
-  let minTs = 0;
-  let maxTs = 0;
-  historyMap.forEach((entry) => {
-    if (!entry || !Array.isArray(entry.times) || entry.times.length === 0) {
-      return;
-    }
-    const first = Number(entry.times[0]);
-    const last = Number(entry.times[entry.times.length - 1]);
-    if (Number.isFinite(first) && first > 0 && (minTs === 0 || first < minTs)) {
-      minTs = first;
-    }
-    if (Number.isFinite(last) && last > maxTs) {
-      maxTs = last;
-    }
-  });
-  if (!minTs || !maxTs || maxTs <= minTs) {
-    return 0;
-  }
-  return maxTs - minTs;
 }
 
 function testFromHistoryKey(key) {
@@ -2090,6 +2370,78 @@ function hasSeriesData(series) {
   );
 }
 
+function buildLatencyTimeline(testEntries) {
+  if (!Array.isArray(testEntries) || testEntries.length === 0) {
+    return { times: [], series: new Map() };
+  }
+  const toleranceSec = resolveLatencyTimelineToleranceSec(testEntries);
+  const anchors = [];
+
+  const findAnchorIndex = (timestamp) => {
+    for (let index = 0; index < anchors.length; index += 1) {
+      if (Math.abs(anchors[index] - timestamp) <= toleranceSec) {
+        return index;
+      }
+    }
+    return -1;
+  };
+
+  testEntries.forEach((entry) => {
+    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
+    times.forEach((timestamp) => {
+      const numeric = Number(timestamp);
+      if (!Number.isFinite(numeric)) return;
+      if (findAnchorIndex(numeric) === -1) {
+        anchors.push(numeric);
+      }
+    });
+  });
+
+  anchors.sort((left, right) => left - right);
+  const series = new Map();
+  testEntries.forEach((entry) => {
+    const values = Array.from({ length: anchors.length }, () => null);
+    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
+    const latency = Array.isArray(entry?.filtered?.latency) ? entry.filtered.latency : [];
+    for (let index = 0; index < times.length; index += 1) {
+      const timestamp = Number(times[index]);
+      if (!Number.isFinite(timestamp)) continue;
+      const anchorIndex = findAnchorIndex(timestamp);
+      if (anchorIndex === -1) continue;
+      values[anchorIndex] = normalizeNumber(latency[index]);
+    }
+    series.set(entry.key, values);
+  });
+
+  return { times: anchors, series };
+}
+
+function resolveLatencyTimelineToleranceSec(testEntries) {
+  const intervals = [];
+  (Array.isArray(testEntries) ? testEntries : []).forEach((entry) => {
+    const minInterval = Number(entry?.history?.minIntervalSec);
+    if (Number.isFinite(minInterval) && minInterval > 0) {
+      intervals.push(minInterval);
+      return;
+    }
+    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
+    for (let index = 1; index < times.length; index += 1) {
+      const previous = Number(times[index - 1]);
+      const current = Number(times[index]);
+      if (!Number.isFinite(previous) || !Number.isFinite(current) || current <= previous) {
+        continue;
+      }
+      intervals.push(current - previous);
+    }
+  });
+  if (!intervals.length) {
+    return 2;
+  }
+  intervals.sort((left, right) => left - right);
+  const median = intervals[Math.floor(intervals.length / 2)];
+  return Math.max(1, Math.min(5, Math.round(median * 0.4)));
+}
+
 function resampleHistoryForGrid(history, grid) {
   const latency = Array.from({ length: grid.points }, () => null);
   const loss = Array.from({ length: grid.points }, () => null);
@@ -2113,6 +2465,85 @@ function resampleHistoryForGrid(history, grid) {
   return { latency, loss, times: grid.times || [] };
 }
 
+function interpolateLatencyGaps(series, times, options = {}) {
+  if (!Array.isArray(series) || series.length === 0) {
+    return [];
+  }
+  const out = series.map((value) => normalizeNumber(value));
+  const validIndices = [];
+  for (let index = 0; index < out.length; index += 1) {
+    if (out[index] !== null && Number.isFinite(Number(times?.[index]))) {
+      validIndices.push(index);
+    }
+  }
+  if (validIndices.length < 2) {
+    return out;
+  }
+
+  const maxGapSec = resolveLatencyInterpolationGapSec(times, validIndices, options);
+  if (!Number.isFinite(maxGapSec) || maxGapSec <= 0) {
+    return out;
+  }
+
+  for (let pair = 0; pair < validIndices.length - 1; pair += 1) {
+    const leftIndex = validIndices[pair];
+    const rightIndex = validIndices[pair + 1];
+    const leftTime = Number(times?.[leftIndex]);
+    const rightTime = Number(times?.[rightIndex]);
+    const leftValue = out[leftIndex];
+    const rightValue = out[rightIndex];
+    if (
+      !Number.isFinite(leftTime) ||
+      !Number.isFinite(rightTime) ||
+      rightTime <= leftTime ||
+      leftValue === null ||
+      rightValue === null
+    ) {
+      continue;
+    }
+    if (rightTime - leftTime > maxGapSec) {
+      continue;
+    }
+    for (let fillIndex = leftIndex + 1; fillIndex < rightIndex; fillIndex += 1) {
+      const fillTime = Number(times?.[fillIndex]);
+      if (!Number.isFinite(fillTime)) continue;
+      const ratio = (fillTime - leftTime) / (rightTime - leftTime);
+      out[fillIndex] = leftValue + (rightValue - leftValue) * ratio;
+    }
+  }
+
+  return out;
+}
+
+function resolveLatencyInterpolationGapSec(times, validIndices, options = {}) {
+  const explicitMax = Number(options.maxGapSec);
+  if (Number.isFinite(explicitMax) && explicitMax > 0) {
+    return explicitMax;
+  }
+
+  const multiplier = Number(options.multiplier) || 6;
+  const fallbackGapSec = Number(options.fallbackGapSec) || 0;
+  const minGapSec = Number(options.minGapSec) || Math.max(fallbackGapSec, 60);
+  const maxGapSecCap =
+    Number(options.maxGapSecCap) ||
+    Math.max(minGapSec, fallbackGapSec > 0 ? fallbackGapSec * multiplier : minGapSec);
+
+  const gapsSec = [];
+  for (let index = 0; index < validIndices.length - 1; index += 1) {
+    const leftTime = Number(times?.[validIndices[index]]);
+    const rightTime = Number(times?.[validIndices[index + 1]]);
+    if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime) || rightTime <= leftTime) {
+      continue;
+    }
+    gapsSec.push(rightTime - leftTime);
+  }
+  gapsSec.sort((left, right) => left - right);
+  const medianGapSec =
+    gapsSec.length > 0 ? gapsSec[Math.floor(gapsSec.length / 2)] : 0;
+  const derivedGapSec = Math.max(medianGapSec, fallbackGapSec || 0, minGapSec);
+  return Math.min(derivedGapSec * multiplier, maxGapSecCap);
+}
+
 function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
   if (!Array.isArray(series) || series.length === 0) {
     return [];
@@ -2124,7 +2555,6 @@ function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
     const numeric = normalizeNumber(value);
     if (numeric === null) {
       result.push(null);
-      carry = null;
       return;
     }
     carry = carry === null ? numeric : carry + normalizedAlpha * (numeric - carry);
@@ -2216,24 +2646,39 @@ function pushHistory(list, value) {
 }
 
 function updateTestHistory(nodeId, tests) {
-  if (!state.testHistory.has(nodeId)) {
-    state.testHistory.set(nodeId, new Map());
+  if (!Array.isArray(tests) || tests.length === 0) {
+    return;
   }
-  const map = state.testHistory.get(nodeId);
+
+  const sourceKey = resolveNodeSourceKey(nodeId);
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges || ranges.size === 0) {
+    return;
+  }
+  const targetRanges = Array.from(ranges.keys()).filter((rangeKey) =>
+    isHistoryRangeFetched(nodeId, rangeKey, sourceKey)
+  );
+  if (targetRanges.length === 0) {
+    return;
+  }
   let updated = false;
-  tests.forEach((test) => {
-    const key = testKey(test);
-    if (!key) return;
-    const entry = map.get(key) || {
-      latency: [],
-      loss: [],
-      times: [],
-      lastAt: 0,
-      minIntervalSec: 0,
-      avgIntervalSec: 0,
-    };
-    const checkedAt = test.checked_at || 0;
-    if (checkedAt > entry.lastAt) {
+  targetRanges.forEach((rangeKey) => {
+    const map = ensureHistoryRangeMap(nodeId, rangeKey, sourceKey);
+    tests.forEach((test) => {
+      const key = testKey(test);
+      if (!key) return;
+      const entry = map.get(key) || {
+        latency: [],
+        loss: [],
+        times: [],
+        lastAt: 0,
+        minIntervalSec: 0,
+        avgIntervalSec: 0,
+      };
+      const checkedAt = test.checked_at || 0;
+      if (checkedAt <= entry.lastAt) {
+        return;
+      }
       const intervalSec =
         entry.lastAt > 0 && checkedAt > entry.lastAt
           ? checkedAt - entry.lastAt
@@ -2266,7 +2711,7 @@ function updateTestHistory(nodeId, tests) {
       trimTestHistoryEntry(entry);
       map.set(key, entry);
       updated = true;
-    }
+    });
   });
   if (updated) {
     scheduleHistoryCacheSave();
@@ -2363,7 +2808,14 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
 
   const lines = paddedSeries
     .map((series, idx) => {
-      const path = buildLinePath(series, stepX, padding, plotHeight, maxValue);
+      const path = buildLinePath(
+        series,
+        stepX,
+        padding,
+        plotWidth,
+        plotHeight,
+        maxValue
+      );
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
       return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
@@ -2469,30 +2921,15 @@ function setupLatencyHover(fields, meta, labels) {
       0,
       Math.min(meta.maxLen - 1, Math.round((x - paddingLeft) / stepX))
     );
-    const time = meta.paddedTimes[index];
-    if (!time) {
-      hide();
-      return;
-    }
-
-    const rows = meta.paddedSeries
-      .map((series, idx) => {
-        const value = series[index];
-        if (value === null || value === undefined) return "";
-        const color = meta.colors[idx] || "#4f7cff";
-        const name = labels[idx] || "未命名";
-        return `
-          <div class="latency-tooltip-row">
-            <span class="latency-tooltip-dot" style="background:${color}"></span>
-            <span class="latency-tooltip-name">${name}</span>
-            <strong>${formatLatencyStat(value)}</strong>
-          </div>
-        `;
-      })
-      .filter(Boolean)
-      .join("");
-
+    const hoverIndex = resolveLatencyHoverIndex(meta.paddedSeries, index);
+    let activeIndex = hoverIndex;
+    let rows = buildLatencyTooltipRows(meta, labels, activeIndex);
     if (!rows) {
+      activeIndex = resolveLatestLatencySampleIndex(meta.paddedSeries);
+      rows = buildLatencyTooltipRows(meta, labels, activeIndex);
+    }
+    const time = meta.paddedTimes[activeIndex] || meta.paddedTimes[hoverIndex];
+    if (!time || !rows) {
       hide();
       return;
     }
@@ -2516,31 +2953,158 @@ function setupLatencyHover(fields, meta, labels) {
     tooltip.style.left = `${Math.max(left, 8)}px`;
     tooltip.style.top = `${Math.max(top, 8)}px`;
 
-    const crossX = offsetX + paddingLeft + index * stepX;
+    const crossX = offsetX + paddingLeft + activeIndex * stepX;
     crosshair.style.left = `${crossX}px`;
     crosshair.classList.add("visible");
   };
 }
 
-function buildLinePath(series, stepX, padding, plotHeight, maxValue) {
-  let path = "";
-  let started = false;
+function buildLatencyTooltipRows(meta, labels, hoverIndex) {
+  if (!meta || !Array.isArray(meta.paddedSeries) || hoverIndex < 0) {
+    return "";
+  }
+  return meta.paddedSeries
+    .map((series, idx) => {
+      const value = series[hoverIndex];
+      if (value === null || value === undefined) return "";
+      const color = meta.colors[idx] || "#4f7cff";
+      const name = labels[idx] || "未命名";
+      return `
+        <div class="latency-tooltip-row">
+          <span class="latency-tooltip-dot" style="background:${color}"></span>
+          <span class="latency-tooltip-name">${name}</span>
+          <strong>${formatLatencyStat(value)}</strong>
+        </div>
+      `;
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+function resolveLatencyHoverIndex(seriesList, preferredIndex) {
+  const normalizedIndex = Number(preferredIndex);
+  if (!Array.isArray(seriesList) || seriesList.length === 0 || !Number.isFinite(normalizedIndex)) {
+    return 0;
+  }
+  const maxLen = seriesList.reduce(
+    (max, series) => Math.max(max, Array.isArray(series) ? series.length : 0),
+    0
+  );
+  if (maxLen <= 0) {
+    return 0;
+  }
+  const clampedIndex = Math.max(0, Math.min(maxLen - 1, Math.round(normalizedIndex)));
+  const hasPointAt = (targetIndex) =>
+    seriesList.some(
+      (series) =>
+        Array.isArray(series) &&
+        targetIndex >= 0 &&
+        targetIndex < series.length &&
+        series[targetIndex] !== null &&
+        series[targetIndex] !== undefined
+    );
+
+  if (hasPointAt(clampedIndex)) {
+    return clampedIndex;
+  }
+
+  for (let distance = 1; distance < maxLen; distance += 1) {
+    const left = clampedIndex - distance;
+    if (left >= 0 && hasPointAt(left)) {
+      return left;
+    }
+    const right = clampedIndex + distance;
+    if (right < maxLen && hasPointAt(right)) {
+      return right;
+    }
+  }
+  return clampedIndex;
+}
+
+function resolveLatestLatencySampleIndex(seriesList) {
+  if (!Array.isArray(seriesList) || seriesList.length === 0) {
+    return -1;
+  }
+  const maxLen = seriesList.reduce(
+    (max, series) => Math.max(max, Array.isArray(series) ? series.length : 0),
+    0
+  );
+  for (let index = maxLen - 1; index >= 0; index -= 1) {
+    const hasPoint = seriesList.some(
+      (series) =>
+        Array.isArray(series) &&
+        index >= 0 &&
+        index < series.length &&
+        series[index] !== null &&
+        series[index] !== undefined
+    );
+    if (hasPoint) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function buildLinePath(series, stepX, padding, plotWidth, plotHeight, maxValue) {
+  const plotStartX = padding.left;
+  const plotEndX = padding.left + plotWidth;
+  const segments = [];
+  let segment = [];
+
+  const flushSegment = () => {
+    if (!segment.length) {
+      return;
+    }
+    if (segment.length === 1) {
+      segments.push(buildSinglePointLatencySegment(segment[0], stepX, plotStartX, plotEndX, plotWidth));
+    } else {
+      segments.push(segment.join(" "));
+    }
+    segment = [];
+  };
+
   series.forEach((value, index) => {
     if (value === null || value === undefined) {
-      started = false;
+      flushSegment();
       return;
     }
     const clamped = Math.max(0, Math.min(maxValue, value));
     const x = padding.left + index * stepX;
     const y = padding.top + plotHeight - (clamped / maxValue) * plotHeight;
-    if (!started) {
-      path += `M${x.toFixed(1)},${y.toFixed(1)}`;
-      started = true;
-    } else {
-      path += ` L${x.toFixed(1)},${y.toFixed(1)}`;
-    }
+    const command = segment.length
+      ? `L${x.toFixed(1)},${y.toFixed(1)}`
+      : `M${x.toFixed(1)},${y.toFixed(1)}`;
+    segment.push(command);
   });
-  return path;
+  flushSegment();
+  return segments.join(" ");
+}
+
+function buildSinglePointLatencySegment(command, stepX, plotStartX, plotEndX, plotWidth) {
+  const match = /^M([0-9.]+),([0-9.]+)$/.exec(command);
+  if (!match) {
+    return command;
+  }
+  const x = Number(match[1]);
+  const y = Number(match[2]);
+  const halfSpan = Math.max(Math.min(stepX * 0.38, 10), 4);
+  const minVisibleSpan = Math.min(Math.max(stepX * 0.25, 8), plotWidth);
+  let startX = Math.max(plotStartX, x - halfSpan);
+  let endX = Math.min(plotEndX, x + halfSpan);
+  if (endX - startX < minVisibleSpan) {
+    if (x <= plotStartX + 1) {
+      endX = Math.min(plotEndX, startX + minVisibleSpan);
+    } else if (x >= plotEndX - 1) {
+      startX = Math.max(plotStartX, endX - minVisibleSpan);
+    } else {
+      startX = Math.max(plotStartX, x - minVisibleSpan / 2);
+      endX = Math.min(plotEndX, x + minVisibleSpan / 2);
+      if (endX - startX < minVisibleSpan) {
+        startX = Math.max(plotStartX, endX - minVisibleSpan);
+      }
+    }
+  }
+  return `M${startX.toFixed(1)},${y.toFixed(1)} L${endX.toFixed(1)},${y.toFixed(1)}`;
 }
 
 function padSeries(series, length) {
@@ -2652,6 +3216,37 @@ function formatLossValue(loss) {
   return `丢包 ${loss.toFixed(1)}%`;
 }
 
+function resolveLatestHistoryValue(series) {
+  if (!Array.isArray(series)) return null;
+  for (let index = series.length - 1; index >= 0; index -= 1) {
+    const value = series[index];
+    if (value !== null && value !== undefined && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function summarizeTestSnapshot(test, history) {
+  const latestLatency =
+    resolveLatestHistoryValue(history?.latency) ??
+    normalizeNumber(test?.latency_ms);
+  let latestLoss =
+    resolveLatestHistoryValue(history?.loss) ??
+    normalizeNumber(test?.packet_loss);
+  if (latestLoss === null || latestLoss === undefined || !Number.isFinite(latestLoss)) {
+    latestLoss = latestLatency === null ? 100 : 0;
+  }
+  return {
+    target: formatTestTarget(test),
+    latency:
+      latestLatency === null
+        ? "当前 --"
+        : `当前 ${formatLatencyStat(latestLatency)}`,
+    loss: formatLossValue(latestLoss),
+  };
+}
+
 function formatCPUModel(cpu) {
   if (!cpu) return "--";
   const model = stripCPUFrequency(cpu.model || "");
@@ -2698,6 +3293,14 @@ function formatTestName(test) {
   const name = (test.name || "").trim();
   if (name) return name;
   return "未命名";
+}
+
+function formatTestTarget(test) {
+  const type = (test?.type || "icmp").toUpperCase();
+  const host = String(test?.host || "").trim();
+  const port = Number(test?.port) || 0;
+  const address = host ? (port ? `${host}:${port}` : host) : "--";
+  return `${type} · ${address}`;
 }
 
 function formatLatencyValue(test) {

@@ -39,7 +39,7 @@ func main() {
 	}
 
 	showVersion := flag.Bool("version", false, "输出版本信息")
-	serverURL := flag.String("server-url", cmdutil.EnvOrDefault("CM_SERVER_URL", ""), "管理端地址")
+	serverURL := flag.String("server-url", cmdutil.EnvOrDefault("CM_SERVER_URL", ""), "Agent 接入地址（public 入口）")
 	interval := flag.Duration("interval", cmdutil.EnvDuration("CM_INTERVAL", time.Second), "采样间隔")
 	nodeID := flag.String("node-id", cmdutil.EnvOrDefault("CM_NODE_ID", ""), "节点 ID")
 	nodeName := flag.String("node-name", cmdutil.EnvOrDefault("CM_NODE_NAME", ""), "节点名称")
@@ -61,14 +61,15 @@ func main() {
 	}
 
 	if *serverURL == "" {
-		log.Fatal("必须指定管理端地址: -server-url 或 CM_SERVER_URL")
+		log.Fatal("必须指定 Agent 接入地址: -server-url 或 CM_SERVER_URL")
 	}
 
-	resolvedNodeIDFile, err := agent.ResolveStateFilePath(*nodeIDFile, agent.DefaultNodeIDFileName())
-	if err != nil {
-		log.Fatalf("解析节点 ID 文件失败: %v", err)
-	}
-	resolvedNodeID, err := agent.ResolveOrCreateNodeID(*nodeID, resolvedNodeIDFile)
+	resolvedNodeID, err := agent.ResolveOrCreateNodeIDWithOptions(agent.NodeIDOptions{
+		Explicit:     *nodeID,
+		ExplicitFile: *nodeIDFile,
+		IsDocker:     updater.DetectDeployMode() == updater.DeployModeDocker,
+		HostRoot:     *hostRoot,
+	})
 	if err != nil {
 		log.Fatalf("初始化节点 ID 失败: %v", err)
 	}

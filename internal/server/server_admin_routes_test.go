@@ -230,6 +230,9 @@ func TestAdminAssetsRouteServesAdminAssets(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected admin asset marker 200, got %d: %s", resp.StatusCode, string(body))
 	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected admin assets Cache-Control no-store, got %q", got)
+	}
 	if strings.TrimSpace(string(body)) != "CyberMonitor Admin Asset" {
 		t.Fatalf("unexpected admin asset marker body: %q", string(body))
 	}
@@ -255,7 +258,61 @@ func TestLegacyAdminAssetsRouteStillServesAdminAssets(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected legacy admin asset marker 200, got %d: %s", resp.StatusCode, string(body))
 	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected legacy admin assets Cache-Control no-store, got %q", got)
+	}
 	if strings.TrimSpace(string(body)) != "CyberMonitor Admin Asset" {
 		t.Fatalf("unexpected legacy admin asset marker body: %q", string(body))
+	}
+}
+
+
+func TestSplitModePublicAssetsRouteServesPublicAssets(t *testing.T) {
+	publicAddr := reserveTCPAddr(t)
+	startTestServer(t, Config{
+		Addr:       reserveTCPAddr(t),
+		PublicAddr: publicAddr,
+		AdminPath:  "/cm-admin",
+	})
+
+	resp, err := http.Get("http://" + publicAddr + "/assets/monitor.js")
+	if err != nil {
+		t.Fatalf("get split public monitor asset: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read split public asset body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected split public monitor asset 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected split public assets Cache-Control no-store, got %q", got)
+	}
+	if !strings.Contains(string(body), "fetchPublicSnapshot") {
+		t.Fatalf("expected split public monitor asset to include latest snapshot loader, got: %s", string(body))
+	}
+}
+
+func TestPublicAssetsRouteDisablesCaching(t *testing.T) {
+	baseURL, _ := startTestServer(t, Config{
+		Addr:      reserveTCPAddr(t),
+		AdminPath: "/cm-admin",
+	})
+
+	resp, err := http.Get(baseURL + "/assets/monitor.js")
+	if err != nil {
+		t.Fatalf("get public monitor asset: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected public monitor asset 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected public assets Cache-Control no-store, got %q", got)
 	}
 }

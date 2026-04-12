@@ -18,22 +18,23 @@ import (
 )
 
 const (
-	aiProviderOpenAI           = "openai"
-	aiProviderGemini           = "gemini"
-	aiProviderVolcengine       = "volcengine"
-	aiProviderOpenAICompatible = "openai_compatible"
-	defaultOpenAIBaseURL       = "https://api.openai.com/v1"
-	defaultOpenAIModel         = "gpt-5.2"
-	defaultGeminiBaseURL       = "https://generativelanguage.googleapis.com/v1beta"
-	defaultGeminiModel         = "gemini-2.5-flash"
-	defaultVolcengineBaseURL   = "https://ark.cn-beijing.volces.com/api/v3"
-	defaultVolcengineModel     = "doubao-seed-1-6-flash"
-	defaultAIMaxOutputTokens   = 512
-	defaultAITemperature       = 0.2
-	defaultAITestPrompt        = "请仅回复 ok"
-	maxTelegramMessageRunes    = 3500
-	maxAIPromptRunes           = 2000
-	maxHTTPErrorBodyBytes      = 4096
+	aiProviderOpenAI            = "openai"
+	aiProviderGemini            = "gemini"
+	aiProviderVolcengine        = "volcengine"
+	aiProviderOpenAICompatible  = "openai_compatible"
+	defaultOpenAIBaseURL        = "https://api.openai.com/v1"
+	defaultOpenAIModel          = "gpt-5.2"
+	defaultGeminiBaseURL        = "https://generativelanguage.googleapis.com/v1beta"
+	defaultGeminiModel          = "gemini-2.5-flash"
+	defaultVolcengineBaseURL    = "https://ark.cn-beijing.volces.com/api/v3"
+	defaultVolcengineModel      = "doubao-seed-1-6-flash"
+	defaultAIMaxOutputTokens    = 512
+	defaultAITemperature        = 0.2
+	defaultAITestPrompt         = "请仅回复 ok"
+	maxTelegramMessageRunes     = 3500
+	maxAIPromptRunes            = 2000
+	maxHTTPErrorBodyBytes       = 4096
+	aiOfflineRecentSessionLimit = 3
 )
 
 func readResponseBodyLimited(body io.Reader) ([]byte, error) {
@@ -107,8 +108,24 @@ type aiServerSummary struct {
 	ExpireAt          int64                  `json:"expire_at,omitempty"`
 	RenewIntervalSec  int64                  `json:"renew_interval_sec,omitempty"`
 	AlertEnabled      bool                   `json:"alert_enabled"`
+	OfflineSummary    *aiOfflineSummary      `json:"offline_summary,omitempty"`
 	NetworkTests      []aiNetworkTestSummary `json:"network_tests,omitempty"`
 	NetworkTestTrends []aiNetworkTrend       `json:"network_test_trends,omitempty"`
+}
+
+type aiOfflineSummary struct {
+	TotalCount             int                      `json:"total_count"`
+	Last30dCount           int                      `json:"last_30d_count"`
+	LongestDurationSec     float64                  `json:"longest_duration_sec"`
+	AvgDurationSec         float64                  `json:"avg_duration_sec"`
+	LastOfflineRecoveredAt int64                    `json:"last_offline_recovered_at,omitempty"`
+	RecentSessions         []aiOfflineRecentSession `json:"recent_sessions,omitempty"`
+}
+
+type aiOfflineRecentSession struct {
+	StartedAt   int64   `json:"started_at,omitempty"`
+	RecoveredAt int64   `json:"recovered_at,omitempty"`
+	DurationSec float64 `json:"duration_sec"`
 }
 
 type aiNetworkTestSummary struct {
@@ -124,22 +141,22 @@ type aiNetworkTestSummary struct {
 }
 
 type aiNetworkTrend struct {
-	Name           string   `json:"name,omitempty"`
-	Type           string   `json:"type"`
-	Host           string   `json:"host,omitempty"`
-	Port           int      `json:"port,omitempty"`
-	Samples        int      `json:"samples"`
-	WindowStart    int64    `json:"window_start,omitempty"`
-	WindowEnd      int64    `json:"window_end,omitempty"`
-	LatestCheckedAt int64   `json:"latest_checked_at,omitempty"`
+	Name            string   `json:"name,omitempty"`
+	Type            string   `json:"type"`
+	Host            string   `json:"host,omitempty"`
+	Port            int      `json:"port,omitempty"`
+	Samples         int      `json:"samples"`
+	WindowStart     int64    `json:"window_start,omitempty"`
+	WindowEnd       int64    `json:"window_end,omitempty"`
+	LatestCheckedAt int64    `json:"latest_checked_at,omitempty"`
 	LatestLatencyMs *float64 `json:"latest_latency_ms,omitempty"`
-	LatestLoss     *float64 `json:"latest_loss,omitempty"`
-	AvgLatencyMs   *float64 `json:"avg_latency_ms,omitempty"`
-	MaxLatencyMs   *float64 `json:"max_latency_ms,omitempty"`
-	AvgLoss        *float64 `json:"avg_loss,omitempty"`
-	MinIntervalSec int64    `json:"min_interval_sec,omitempty"`
-	AvgIntervalSec float64  `json:"avg_interval_sec,omitempty"`
-	StatusHint     string   `json:"status_hint,omitempty"`
+	LatestLoss      *float64 `json:"latest_loss,omitempty"`
+	AvgLatencyMs    *float64 `json:"avg_latency_ms,omitempty"`
+	MaxLatencyMs    *float64 `json:"max_latency_ms,omitempty"`
+	AvgLoss         *float64 `json:"avg_loss,omitempty"`
+	MinIntervalSec  int64    `json:"min_interval_sec,omitempty"`
+	AvgIntervalSec  float64  `json:"avg_interval_sec,omitempty"`
+	StatusHint      string   `json:"status_hint,omitempty"`
 }
 
 type openAIChatResponse struct {
@@ -727,6 +744,7 @@ func buildAIUserPrompt(store *Store, question string) (string, error) {
 }
 
 func buildAISnapshot(store *Store) aiSnapshot {
+	snapshotTime := time.Now().UTC()
 	nodes := store.Snapshot()
 	history := store.snapshotTestHistory()
 	servers := make([]aiServerSummary, 0, len(nodes))
@@ -739,6 +757,7 @@ func buildAISnapshot(store *Store) aiSnapshot {
 			}
 		}
 		name := resolveNodeDisplayNameForAI(node)
+		offlineSummary := buildAIOfflineSummary(store, stats.NodeID, snapshotTime)
 		hostName := strings.TrimSpace(stats.Hostname)
 		if hostName == "" {
 			hostName = strings.TrimSpace(stats.NodeName)
@@ -789,14 +808,62 @@ func buildAISnapshot(store *Store) aiSnapshot {
 			ExpireAt:          node.ExpireAt,
 			RenewIntervalSec:  node.RenewIntervalSec,
 			AlertEnabled:      node.AlertEnabled,
+			OfflineSummary:    offlineSummary,
 			NetworkTests:      testSummaries,
 			NetworkTestTrends: testTrends,
 		})
 	}
 	return aiSnapshot{
-		GeneratedAt: time.Now().Format("2006-01-02 15:04:05"),
+		GeneratedAt: snapshotTime.Format("2006-01-02 15:04:05"),
 		Servers:     servers,
 	}
+}
+
+func buildAIOfflineSummary(store *Store, nodeID string, now time.Time) *aiOfflineSummary {
+	if store == nil {
+		return nil
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	store.mu.RLock()
+	historyManager := store.historyManager
+	store.mu.RUnlock()
+	if historyManager == nil || historyManager.OfflineStore() == nil {
+		return nil
+	}
+	insights, err := historyManager.OfflineStore().QueryInsights(nodeID, now, aiOfflineRecentSessionLimit)
+	if err != nil {
+		return nil
+	}
+
+	summary := &aiOfflineSummary{
+		TotalCount:         insights.TotalCount,
+		Last30dCount:       insights.Last30dCount,
+		LongestDurationSec: insights.LongestDurationSec,
+		AvgDurationSec:     insights.AvgDurationSec,
+	}
+	if !insights.LastOfflineRecoveredAt.IsZero() {
+		summary.LastOfflineRecoveredAt = insights.LastOfflineRecoveredAt.Unix()
+	}
+	if len(insights.RecentSessions) > 0 {
+		summary.RecentSessions = make([]aiOfflineRecentSession, 0, len(insights.RecentSessions))
+		for _, session := range insights.RecentSessions {
+			summary.RecentSessions = append(summary.RecentSessions, aiOfflineRecentSession{
+				StartedAt:   session.StartedAt.Unix(),
+				RecoveredAt: session.RecoveredAt.Unix(),
+				DurationSec: session.DurationSec,
+			})
+		}
+	}
+	return summary
 }
 
 func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetworkTestSummary, map[string]metrics.NetworkTestResult) {

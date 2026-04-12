@@ -29,6 +29,7 @@ import (
 	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/server/history"
 	"cyber_monitor/internal/updater"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -50,7 +51,12 @@ const (
 	publicVariantConservative = "conservative"
 	publicVariantBalanced     = "balanced"
 	adminSessionCookieName    = "cm_admin_session"
+	publicViewCookieName      = "cm_public_view"
+	publicViewTokenSubject    = "public:view"
+	publicRequestHeader       = "X-CM-Public-Request"
 )
+
+const publicViewTokenTTL = 10 * time.Minute
 
 type sizeLimitedWriter struct {
 	path    string
@@ -199,7 +205,9 @@ type Store struct {
 	lastPersist        time.Time
 	persistInterval    time.Duration
 	alerted            map[string]alertState
+	offlineSessions    map[string]OfflineSessionState
 	testHistory        map[string]map[string]*TestHistoryEntry
+	historyManager     *history.Manager
 	loginAttempts      map[string]*loginAttempt
 	historyDirty       bool
 	historyLastPersist time.Time
@@ -289,8 +297,6 @@ type PublicSettings struct {
 	SiteIcon     string `json:"site_icon,omitempty"`
 	HomeTitle    string `json:"home_title,omitempty"`
 	HomeSubtitle string `json:"home_subtitle,omitempty"`
-	Version      string `json:"version,omitempty"`
-	Commit       string `json:"commit,omitempty"`
 }
 
 type Snapshot struct {
@@ -300,6 +306,14 @@ type Snapshot struct {
 	Groups      []string                                `json:"groups,omitempty"`
 	Settings    PublicSettings                          `json:"settings,omitempty"`
 	TestHistory map[string]map[string]*TestHistoryEntry `json:"test_history,omitempty"`
+}
+
+type PublicNodeHistoryResponse struct {
+	NodeID   string                       `json:"node_id"`
+	RangeKey string                       `json:"range_key"`
+	From     int64                        `json:"from"`
+	To       int64                        `json:"to"`
+	Tests    map[string]*TestHistoryEntry `json:"tests"`
 }
 
 type NodeDelta struct {
@@ -411,6 +425,7 @@ func Run(ctx context.Context, cfg Config) error {
 	settings := defaultSettings
 	profiles := make(map[string]*NodeProfile)
 	nodes := make(map[string]NodeState)
+	offlineSessions := make(map[string]OfflineSessionState)
 	testHistory := historyPayload.Nodes
 	if testHistory == nil {
 		testHistory = make(map[string]map[string]*TestHistoryEntry)
@@ -430,6 +445,9 @@ func Run(ctx context.Context, cfg Config) error {
 		if persisted.Nodes != nil {
 			nodes = persisted.Nodes
 		}
+		if persisted.OfflineSessions != nil {
+			offlineSessions = persisted.OfflineSessions
+		}
 	}
 	ensureServerIDsForProfiles(profiles, nodes)
 	if settings.AuthToken != "" {
@@ -439,12 +457,23 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.AgentToken = settings.AgentToken
 	}
 	if err := savePersistedData(dataPath, PersistedData{
-		Settings: settings,
-		Profiles: profiles,
-		Nodes:    nodes,
+		Settings:        settings,
+		Profiles:        profiles,
+		Nodes:           nodes,
+		OfflineSessions: offlineSessions,
 	}); err != nil {
 		return wrapDataPathError("写入持久化数据失败", dataPath, err)
 	}
+
+	historyManager, err := history.OpenManager(cfg.DataDir)
+	if err != nil {
+		return wrapDataPathError("初始化历史存储失败", history.HistoryRootDir(cfg.DataDir), err)
+	}
+	defer func() {
+		if err := historyManager.Close(); err != nil {
+			log.Printf("关闭历史存储失败: %v", err)
+		}
+	}()
 
 	commit := strings.TrimSpace(cfg.Commit)
 	if commit == "none" {
@@ -468,8 +497,45 @@ func Run(ctx context.Context, cfg Config) error {
 		historyPath:     historyPath,
 		persistInterval: defaultPersistInterval,
 		alerted:         make(map[string]alertState),
+		offlineSessions: offlineSessions,
 		testHistory:     testHistory,
+		historyManager:  historyManager,
 		loginAttempts:   make(map[string]*loginAttempt),
+	}
+	if migration, err := history.MigrateLegacyJSONIfNeeded(historyPath, historyManager.NetworkStore(), time.Now()); err != nil {
+		log.Printf("%v", wrapDataPathError("迁移探测历史失败", historyPath, err))
+	} else if migration.LegacyFound {
+		now := time.Now()
+		historyData, loaded, _, loadErr := loadTestHistoryData(migration.SourcePath)
+		if loadErr != nil {
+			log.Printf("%v", wrapDataPathError("读取 legacy 探测历史失败", migration.SourcePath, loadErr))
+		} else if !loaded {
+			log.Printf("legacy 探测历史源文件在迁移后不可用：%s", migration.SourcePath)
+		} else {
+			store.mu.Lock()
+			if historyData.Nodes == nil {
+				historyData.Nodes = make(map[string]map[string]*TestHistoryEntry)
+			}
+			store.testHistory = historyData.Nodes
+			store.mu.Unlock()
+
+			backupReady := true
+			if migration.SourcePath == historyPath {
+				if err := history.EnsureLegacyMigrationBackup(historyPath); err != nil {
+					backupReady = false
+					log.Printf("%v", wrapDataPathError("备份 legacy 探测历史失败", historyPath, err))
+				}
+			}
+			if backupReady {
+				if err := store.persistHistoryWithError(historyData); err != nil {
+					log.Printf("%v", wrapDataPathError("恢复探测历史热缓存失败", historyPath, err))
+				} else if err := history.MarkLegacyMigrationComplete(historyPath, now); err != nil {
+					log.Printf("%v", wrapDataPathError("写入 legacy 迁移标记失败", migration.MarkerPath, err))
+				} else {
+					log.Printf("已将 legacy 探测历史迁移到 TSDB：%s", migration.SourcePath)
+				}
+			}
+		}
 	}
 	if historyTrimmed {
 		historyData := TestHistoryData{
@@ -583,6 +649,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
 		apiBase, socketURL := buildDefaultPublicConfig(r)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"socket": socketURL,
@@ -591,22 +658,70 @@ func Run(ctx context.Context, cfg Config) error {
 	})
 
 	publicMux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions {
-			w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err := validatePublicViewRequest(cfg.JWTSecret, r); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
 		snapshot := storeSnapshot(store, false)
 		writeJSON(w, http.StatusOK, snapshot)
+	})
+
+	publicMux.HandleFunc("/api/v1/public/nodes/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		if err := validatePublicViewRequest(cfg.JWTSecret, r); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+
+		path := strings.TrimPrefix(r.URL.Path, "/api/v1/public/nodes/")
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) != 2 || parts[1] != "history" {
+			http.NotFound(w, r)
+			return
+		}
+		nodeID, err := url.PathUnescape(parts[0])
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+			return
+		}
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+			return
+		}
+
+		rangeKey, from, to, err := parsePublicHistoryRange(r.URL.Query().Get("range"), time.Now())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if !store.HasNode(nodeID) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+			return
+		}
+
+		tests, err := store.QueryPublicNodeHistory(nodeID, from, to)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query public node history failed"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, PublicNodeHistoryResponse{
+			NodeID:   nodeID,
+			RangeKey: rangeKey,
+			From:     from.Unix(),
+			To:       to.Unix(),
+			Tests:    tests,
+		})
 	})
 
 	adminMux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
@@ -843,7 +958,7 @@ func Run(ctx context.Context, cfg Config) error {
 						return err
 					}
 					targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
-					return dockerUpdater.LaunchSelfContainerUpdate(context.Background(), targetImage)
+					return dockerUpdater.LaunchSelfContainerUpdate(context.Background(), targetImage, "")
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 				defer cancel()
@@ -1098,9 +1213,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 	type wsAuthMode int
 	const (
-		wsAuthOptional wsAuthMode = iota
+		wsAuthPublic wsAuthMode = iota
 		wsAuthRequired
-		wsAuthForbidden
+		wsAuthMixed
 	)
 
 	resolvePublicVariant := func(r *http.Request) string {
@@ -1117,11 +1232,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			explicitToken := extractExplicitToken(r)
+			audience := "public"
 			switch mode {
 			case wsAuthRequired:
-				sessionToken := extractToken(r)
-				if sessionToken == "" {
+				if extractToken(r) == "" {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
@@ -1133,14 +1247,25 @@ func Run(ctx context.Context, cfg Config) error {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
-			case wsAuthForbidden:
-				if explicitToken != "" {
+				audience = "admin"
+			case wsAuthPublic:
+				if err := validatePublicViewTokenFromRequest(cfg.JWTSecret, r); err != nil {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
-			case wsAuthOptional:
-				if explicitToken != "" {
-					if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
+				if !hasExplicitPublicViewToken(r) && !isExplicitSameOrigin(r) {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+			case wsAuthMixed:
+				if validateAdminJWT(store, cfg.JWTSecret, r) == nil {
+					audience = "admin"
+				} else {
+					if err := validatePublicViewTokenFromRequest(cfg.JWTSecret, r); err != nil {
+						writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+						return
+					}
+					if !hasExplicitPublicViewToken(r) && !isExplicitSameOrigin(r) {
 						writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 						return
 					}
@@ -1148,10 +1273,13 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			upgrader := websocket.Upgrader{
 				CheckOrigin: func(request *http.Request) bool {
-					if mode == wsAuthRequired {
+					if audience == "admin" {
 						return isSameOrigin(request)
 					}
-					return true
+					if hasExplicitPublicViewToken(request) {
+						return true
+					}
+					return isExplicitSameOrigin(request)
 				},
 			}
 			conn, err := upgrader.Upgrade(w, r, nil)
@@ -1162,7 +1290,7 @@ func Run(ctx context.Context, cfg Config) error {
 			client := hub.Add(conn, resolvePublicVariant(r))
 
 			// 首次连接立即推送快照
-			snapshot := storeSnapshot(store, true)
+			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
 				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
@@ -1178,17 +1306,17 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	if splitMode {
-		publicMux.HandleFunc("/ws", wsHandler(wsAuthForbidden))
+		publicMux.HandleFunc("/ws", wsHandler(wsAuthPublic))
 		adminMux.HandleFunc("/ws", wsHandler(wsAuthRequired))
 	} else {
-		publicMux.HandleFunc("/ws", wsHandler(wsAuthOptional))
+		publicMux.HandleFunc("/ws", wsHandler(wsAuthMixed))
 	}
 
 	assetsRoot, err := fs.Sub(webRoot, "assets")
 	if err != nil {
 		return err
 	}
-	assetsHandler := http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot)))
+	assetsHandler := withNoStore(http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot))))
 
 	adminAssetsRoot, err := fs.Sub(webRoot, "admin-assets")
 	if err != nil {
@@ -1200,12 +1328,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	adminAssetsFileServer := http.FileServer(http.FS(adminAssetsRoot))
 	adminBundleFileServer := http.FileServer(http.FS(adminBundleRoot))
-	adminAssetsHandler := http.StripPrefix("/admin-assets/", adminAssetsFileServer)
+	adminAssetsHandler := withNoStore(http.StripPrefix("/admin-assets/", adminAssetsFileServer))
+	publicMux.Handle("/assets/", assetsHandler)
 	if splitMode {
 		adminMux.Handle("/assets/", assetsHandler)
 		adminMux.Handle("/admin-assets/", adminAssetsHandler)
 	} else {
-		publicMux.Handle("/assets/", assetsHandler)
 		publicMux.Handle("/admin-assets/", adminAssetsHandler)
 	}
 
@@ -1223,6 +1351,21 @@ func Run(ctx context.Context, cfg Config) error {
 		data, err := webFS.ReadFile(path)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": notFoundMessage})
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}
+
+	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
+		token, exp, err := generatePublicViewToken(cfg.JWTSecret)
+		if err == nil {
+			setPublicViewCookie(w, r, token, exp)
+		}
+		data, err := webFS.ReadFile("web/index.html")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1265,7 +1408,7 @@ func Run(ctx context.Context, cfg Config) error {
 			trimmedRawPath := strings.TrimPrefix(r.URL.RawPath, prefix)
 			next.URL.RawPath = "/" + strings.TrimPrefix(trimmedRawPath, "/")
 		}
-		adminBundleFileServer.ServeHTTP(w, next)
+		withNoStore(adminBundleFileServer).ServeHTTP(w, next)
 	}
 
 	if splitMode {
@@ -1296,7 +1439,13 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			http.NotFound(w, r)
+			switch r.URL.Path {
+			case "/", "/dashboard":
+				writePublicIndexHTML(w, r)
+				return
+			default:
+				http.NotFound(w, r)
+			}
 		})
 	} else {
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1324,14 +1473,7 @@ func Run(ctx context.Context, cfg Config) error {
 				http.NotFound(w, r)
 				return
 			}
-			data, err := webFS.ReadFile("web/index.html")
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
-				return
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
+			writePublicIndexHTML(w, r)
 		})
 	}
 
@@ -1385,6 +1527,7 @@ func Run(ctx context.Context, cfg Config) error {
 						}
 					}
 				}
+				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
 				if len(offlineEvents) > 0 {
 					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
@@ -1512,6 +1655,8 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	var data PersistedData
 	var historyPersist bool
 	var historyData TestHistoryData
+	var recoveryCandidate offlineRecoveryCandidate
+	var hasRecoveryCandidate bool
 	s.mu.Lock()
 
 	now := time.Now()
@@ -1566,6 +1711,16 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	}
 	profile.UpdatedAt = now.Unix()
 
+	if session, ok := s.offlineSessions[stats.NodeID]; ok && session.StartedAt > 0 {
+		recoveryCandidate = offlineRecoveryCandidate{
+			NodeID:      stats.NodeID,
+			StartedAt:   session.StartedAt,
+			RecoveredAt: now.UTC(),
+		}
+		hasRecoveryCandidate = true
+		persist = true
+	}
+
 	if s.updateTestHistoryLocked(stats, now) {
 		s.historyDirty = true
 	}
@@ -1585,8 +1740,16 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	if persist {
 		s.persist(data)
 	}
+	if hasRecoveryCandidate {
+		s.completeOfflineRecovery(recoveryCandidate)
+	}
 	if historyPersist {
 		s.persistHistory(historyData)
+	}
+	if s.historyManager != nil {
+		if err := s.historyManager.AppendNetworkBatch(stats.NodeID, stats.NetworkTests, now); err != nil {
+			log.Printf("写入 network TSDB 失败: %v", err)
+		}
 	}
 }
 
@@ -1838,6 +2001,124 @@ type AlertTargets struct {
 
 type alertState struct {
 	OfflineSince time.Time
+}
+
+type offlineRecoveryCandidate struct {
+	NodeID      string
+	StartedAt   int64
+	RecoveredAt time.Time
+}
+
+func (s *Store) ReconcileOfflineTracker(now time.Time) {
+	var (
+		persistData        PersistedData
+		needsPersist       bool
+		recoveryCandidates []offlineRecoveryCandidate
+	)
+
+	s.mu.Lock()
+	if s.offlineSessions == nil {
+		s.offlineSessions = make(map[string]OfflineSessionState)
+	}
+
+	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
+	if threshold > 0 {
+		for nodeID, node := range s.nodes {
+			offlineFor := now.Sub(node.LastSeen)
+			session, hasSession := s.offlineSessions[nodeID]
+			if offlineFor >= threshold {
+				if !hasSession {
+					s.offlineSessions[nodeID] = OfflineSessionState{StartedAt: node.LastSeen.Unix()}
+					needsPersist = true
+				}
+				continue
+			}
+			if !hasSession {
+				continue
+			}
+			if session.StartedAt <= 0 {
+				delete(s.offlineSessions, nodeID)
+				needsPersist = true
+				continue
+			}
+			recoveredAt := node.LastSeen.UTC()
+			startedAt := time.Unix(session.StartedAt, 0).UTC()
+			if !recoveredAt.After(startedAt) {
+				continue
+			}
+			recoveryCandidates = append(recoveryCandidates, offlineRecoveryCandidate{
+				NodeID:      nodeID,
+				StartedAt:   session.StartedAt,
+				RecoveredAt: recoveredAt,
+			})
+		}
+	}
+
+	for nodeID := range s.offlineSessions {
+		if _, ok := s.nodes[nodeID]; ok {
+			continue
+		}
+		delete(s.offlineSessions, nodeID)
+		needsPersist = true
+	}
+
+	if needsPersist {
+		persistData = s.snapshotPersistedLocked()
+	}
+	s.mu.Unlock()
+
+	if needsPersist {
+		s.persist(persistData)
+	}
+	for _, candidate := range recoveryCandidates {
+		s.completeOfflineRecovery(candidate)
+	}
+}
+
+func (s *Store) completeOfflineRecovery(candidate offlineRecoveryCandidate) {
+	if candidate.StartedAt <= 0 {
+		return
+	}
+	recoveredAt := candidate.RecoveredAt.UTC()
+	startedAt := time.Unix(candidate.StartedAt, 0).UTC()
+	duration := recoveredAt.Sub(startedAt)
+	if duration <= 0 {
+		return
+	}
+
+	manager := s.historyManager
+	if manager == nil {
+		return
+	}
+
+	hasEvent, err := manager.HasOfflineEventForSession(candidate.NodeID, startedAt)
+	if err != nil {
+		log.Printf("检查 offline TSDB 去重失败 node=%s: %v", candidate.NodeID, err)
+		return
+	}
+	if !hasEvent {
+		if err := manager.AppendOfflineEvent(candidate.NodeID, recoveredAt, duration); err != nil {
+			log.Printf("写入 offline TSDB 失败 node=%s: %v", candidate.NodeID, err)
+			return
+		}
+	}
+
+	var (
+		persistData   PersistedData
+		shouldPersist bool
+	)
+	s.mu.Lock()
+	session, ok := s.offlineSessions[candidate.NodeID]
+	if ok && session.StartedAt == candidate.StartedAt {
+		delete(s.offlineSessions, candidate.NodeID)
+		persistData = s.snapshotPersistedLocked()
+		shouldPersist = true
+	}
+	s.mu.Unlock()
+
+	if shouldPersist {
+		s.persist(persistData)
+	}
 }
 
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
@@ -2241,6 +2522,35 @@ func adminDocumentTitle(siteTitle string) string {
 	return normalizeSiteTitle(siteTitle) + " 管理后台"
 }
 
+func parsePublicHistoryRange(raw string, now time.Time) (string, time.Time, time.Time, error) {
+	rangeKey := strings.ToLower(strings.TrimSpace(raw))
+	if rangeKey == "" {
+		rangeKey = "1h"
+	}
+	if rangeKey == "1d" {
+		rangeKey = "24h"
+	}
+
+	to := now.UTC()
+	var duration time.Duration
+	switch rangeKey {
+	case "1h":
+		duration = time.Hour
+	case "24h":
+		duration = 24 * time.Hour
+	case "7d":
+		duration = 7 * 24 * time.Hour
+	case "30d":
+		duration = 30 * 24 * time.Hour
+	case "1y":
+		duration = 366 * 24 * time.Hour
+	default:
+		return "", time.Time{}, time.Time{}, fmt.Errorf("invalid range")
+	}
+
+	return rangeKey, to.Add(-duration), to, nil
+}
+
 func storeSnapshot(s *Store, withHistory bool) Snapshot {
 	nodes := s.Snapshot()
 	snapshot := Snapshot{
@@ -2273,10 +2583,56 @@ func digestPublicSnapshot(snapshot Snapshot) string {
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
+func convertNetworkHistoryToTestHistory(
+	source map[string]*history.NetworkHistoryEntry,
+) map[string]*TestHistoryEntry {
+	result := make(map[string]*TestHistoryEntry, len(source))
+	for key, entry := range source {
+		if entry == nil {
+			continue
+		}
+		result[key] = &TestHistoryEntry{
+			Latency:        slices.Clone(entry.Latency),
+			Loss:           slices.Clone(entry.Loss),
+			Times:          slices.Clone(entry.Times),
+			LastAt:         entry.LastAt,
+			MinIntervalSec: entry.MinIntervalSec,
+			AvgIntervalSec: entry.AvgIntervalSec,
+		}
+	}
+	return result
+}
+
 func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneTestHistory(s.testHistory)
+}
+
+func (s *Store) HasNode(nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, exists := s.nodes[nodeID]
+	return exists
+}
+
+func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[string]*TestHistoryEntry, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return map[string]*TestHistoryEntry{}, nil
+	}
+	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
+		return map[string]*TestHistoryEntry{}, nil
+	}
+	entries, err := s.historyManager.NetworkStore().QueryRange(nodeID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return convertNetworkHistoryToTestHistory(entries), nil
 }
 
 func cloneTestHistory(
@@ -2852,8 +3208,6 @@ func (s *Store) PublicSettings() PublicSettings {
 		SiteIcon:     s.settings.SiteIcon,
 		HomeTitle:    s.settings.HomeTitle,
 		HomeSubtitle: s.settings.HomeSubtitle,
-		Version:      s.buildVersion,
-		Commit:       s.buildCommit,
 	}
 }
 
@@ -2947,6 +3301,26 @@ func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string,
 	http.SetCookie(w, cookie)
 }
 
+func setPublicViewCookie(w http.ResponseWriter, r *http.Request, token string, exp int64) {
+	if w == nil || strings.TrimSpace(token) == "" {
+		return
+	}
+	cookie := &http.Cookie{
+		Name:     publicViewCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	if exp > 0 {
+		cookie.Expires = time.Unix(exp, 0)
+	}
+	if requestIsSecure(r) {
+		cookie.Secure = true
+	}
+	http.SetCookie(w, cookie)
+}
+
 func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request) {
 	if w == nil {
 		return
@@ -2974,6 +3348,24 @@ func requestIsSecure(r *http.Request) bool {
 		return true
 	}
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func isExplicitSameOrigin(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
 }
 
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
@@ -3746,6 +4138,8 @@ func (s *Store) DeleteNode(nodeID string) bool {
 	_, exists := s.nodes[nodeID]
 	delete(s.nodes, nodeID)
 	delete(s.profiles, nodeID)
+	delete(s.alerted, nodeID)
+	delete(s.offlineSessions, nodeID)
 	if s.testHistory != nil {
 		if _, ok := s.testHistory[nodeID]; ok {
 			delete(s.testHistory, nodeID)
@@ -3758,10 +4152,16 @@ func (s *Store) DeleteNode(nodeID string) bool {
 		s.historyDirty = false
 	}
 	data = s.snapshotPersistedLocked()
+	historyManager := s.historyManager
 	s.mu.Unlock()
 	s.persist(data)
 	if historyPersist {
 		s.persistHistory(historyData)
+	}
+	if historyManager != nil {
+		if err := historyManager.DeleteNode(nodeID); err != nil {
+			log.Printf("删除节点 TSDB 历史失败 node=%s: %v", nodeID, err)
+		}
 	}
 	return exists
 }
@@ -3774,6 +4174,8 @@ func (s *Store) ClearNodes() {
 	s.mu.Lock()
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
+	s.alerted = make(map[string]alertState)
+	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.testHistory = make(map[string]map[string]*TestHistoryEntry)
 	s.historyDirty = true
 	if s.shouldPersistHistoryLocked(now) {
@@ -3782,10 +4184,16 @@ func (s *Store) ClearNodes() {
 		s.historyDirty = false
 	}
 	data = s.snapshotPersistedLocked()
+	historyManager := s.historyManager
 	s.mu.Unlock()
 	s.persist(data)
 	if historyPersist {
 		s.persistHistory(historyData)
+	}
+	if historyManager != nil {
+		if err := historyManager.ClearNodes(); err != nil {
+			log.Printf("清空节点 TSDB 历史失败: %v", err)
+		}
 	}
 }
 
@@ -3875,9 +4283,10 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 		nodes[id] = node
 	}
 	return PersistedData{
-		Settings: s.settings,
-		Profiles: profiles,
-		Nodes:    nodes,
+		Settings:        s.settings,
+		Profiles:        profiles,
+		Nodes:           nodes,
+		OfflineSessions: cloneOfflineSessions(s.offlineSessions),
 	}
 }
 
@@ -3905,18 +4314,24 @@ func (s *Store) persist(data PersistedData) {
 }
 
 func (s *Store) persistHistory(data TestHistoryData) {
+	if err := s.persistHistoryWithError(data); err != nil {
+		log.Printf("%v", wrapDataPathError("探测历史持久化失败", s.historyPath, err))
+	}
+}
+
+func (s *Store) persistHistoryWithError(data TestHistoryData) error {
 	if s.historyPath == "" {
-		return
+		return nil
 	}
 	s.historyPersistMu.Lock()
 	defer s.historyPersistMu.Unlock()
 	if err := saveTestHistoryData(s.historyPath, data); err != nil {
-		log.Printf("%v", wrapDataPathError("探测历史持久化失败", s.historyPath, err))
-		return
+		return err
 	}
 	s.mu.Lock()
 	s.historyLastPersist = time.Now()
 	s.mu.Unlock()
+	return nil
 }
 
 func (s *Store) shouldPersistLocked(now time.Time) bool {
@@ -4047,6 +4462,18 @@ func generateToken(secret, subject, tokenSalt string) (string, int64, error) {
 	return str, exp.Unix(), err
 }
 
+func generatePublicViewToken(secret string) (string, int64, error) {
+	exp := time.Now().Add(publicViewTokenTTL)
+	claims := jwt.RegisteredClaims{
+		Subject:   publicViewTokenSubject,
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(exp),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	str, err := token.SignedString([]byte(secret))
+	return str, exp.Unix(), err
+}
+
 func requireJWT(secret string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := validateJWTFromRequest(secret, r); err != nil {
@@ -4067,12 +4494,12 @@ func requireAdminJWT(store *Store, secret string, next http.HandlerFunc) http.Ha
 	}
 }
 
-func validateJWTFromRequest(secret string, r *http.Request) error {
-	token := extractToken(r)
-	if token == "" {
+func validateScopedJWT(secret, token, expectedSubject string) error {
+	if strings.TrimSpace(token) == "" {
 		return errors.New("token required")
 	}
-	parsed, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
+	claims := &jwt.RegisteredClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
@@ -4084,7 +4511,15 @@ func validateJWTFromRequest(secret string, r *http.Request) error {
 	if parsed == nil || !parsed.Valid {
 		return errors.New("token invalid")
 	}
+	if expectedSubject != "" && claims.Subject != expectedSubject {
+		return errors.New("token subject mismatch")
+	}
 	return nil
+}
+
+func validateJWTFromRequest(secret string, r *http.Request) error {
+	token := extractToken(r)
+	return validateScopedJWT(secret, token, "")
 }
 
 func validateAdminJWT(store *Store, secret string, r *http.Request) error {
@@ -4137,6 +4572,60 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
+func extractPublicViewToken(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if cookie, err := r.Cookie(publicViewCookieName); err == nil {
+		return strings.TrimSpace(cookie.Value)
+	}
+	return ""
+}
+
+func hasExplicitPublicViewToken(r *http.Request) bool {
+	return false
+}
+
+func validatePublicViewTokenFromRequest(secret string, r *http.Request) error {
+	return validateScopedJWT(secret, extractPublicViewToken(r), publicViewTokenSubject)
+}
+
+func validatePublicViewRequest(secret string, r *http.Request) error {
+	if err := validatePublicViewTokenFromRequest(secret, r); err != nil {
+		return err
+	}
+	if hasExplicitPublicViewToken(r) {
+		return nil
+	}
+	if !isPublicFetchRequest(r) {
+		return errors.New("public fetch required")
+	}
+	return nil
+}
+
+func isPublicFetchRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get(publicRequestHeader)) == "1" {
+		return true
+	}
+	site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	mode := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")))
+	dest := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")))
+
+	if site != "same-origin" && site != "same-site" {
+		return false
+	}
+	if mode == "" || mode == "navigate" {
+		return false
+	}
+	if dest != "" && dest != "empty" {
+		return false
+	}
+	return true
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	decoder := json.NewDecoder(r.Body)
@@ -4176,11 +4665,34 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func withNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func buildAdminBootPayload(store *Store) (string, error) {
-	payload := struct {
-		Settings PublicSettings `json:"settings"`
+	settings := store.PublicSettings()
+	adminSettings := struct {
+		SiteTitle    string `json:"site_title,omitempty"`
+		SiteIcon     string `json:"site_icon,omitempty"`
+		HomeTitle    string `json:"home_title,omitempty"`
+		HomeSubtitle string `json:"home_subtitle,omitempty"`
+		Version      string `json:"version,omitempty"`
+		Commit       string `json:"commit,omitempty"`
 	}{
-		Settings: store.PublicSettings(),
+		SiteTitle:    settings.SiteTitle,
+		SiteIcon:     settings.SiteIcon,
+		HomeTitle:    settings.HomeTitle,
+		HomeSubtitle: settings.HomeSubtitle,
+		Version:      store.buildVersion,
+		Commit:       store.buildCommit,
+	}
+	payload := struct {
+		Settings interface{} `json:"settings"`
+	}{
+		Settings: adminSettings,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

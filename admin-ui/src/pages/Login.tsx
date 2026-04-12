@@ -238,7 +238,7 @@ export default function Login({
                   <AlertCircle className="h-4 w-4 text-rose-600 dark:text-rose-300" />
                   <AlertTitle className="text-rose-800 dark:text-rose-100">登录失败</AlertTitle>
                   <AlertDescription className="text-rose-700 dark:text-rose-200">
-                    {errorMessage || "用户名或密码错误，请检查后重试。"}
+                    {errorMessage || "账号或密码错误，请检查后重试。"}
                   </AlertDescription>
                 </Alert>
               )}
@@ -274,14 +274,13 @@ export default function Login({
               )}
 
               <div className="space-y-2">
-                <Label htmlFor="username">用户名</Label>
+                <Label htmlFor="username">账号</Label>
                 <div className="relative">
-                  <User className="absolute left-3.5 top-3 h-4 w-4 text-muted-foreground" />
+                  <User className="pointer-events-none absolute left-3.5 top-3 h-4 w-4 text-slate-500 dark:text-slate-300" />
                   <Input
                     id="username"
                     autoComplete="username"
                     name="username"
-                    placeholder="例如：admin…"
                     className={cn(adminInputClass, "pl-10")}
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
@@ -294,7 +293,7 @@ export default function Login({
               <div className="space-y-2">
                 <Label htmlFor="password">密码</Label>
                 <div className="relative">
-                  <Lock className="absolute left-3.5 top-3 h-4 w-4 text-muted-foreground" />
+                  <Lock className="pointer-events-none absolute left-3.5 top-3 h-4 w-4 text-slate-500 dark:text-slate-300" />
                   <Input
                     id="password"
                     type="password"

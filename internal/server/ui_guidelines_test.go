@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -32,6 +33,7 @@ func TestUIHTMLHasThemeColorMeta(t *testing.T) {
 
 	files := []string{
 		"admin-ui/index.html",
+		"internal/server/web/admin.html",
 		"internal/server/web/index.html",
 		"internal/server/web/dashboard.html",
 	}
@@ -41,6 +43,29 @@ func TestUIHTMLHasThemeColorMeta(t *testing.T) {
 		if !strings.Contains(content, `name="theme-color"`) {
 			t.Fatalf("%s missing theme-color meta", relativePath)
 		}
+	}
+}
+
+func TestDefaultIconsStayAlignedAcrossPublicAndAdminEntrypoints(t *testing.T) {
+	t.Parallel()
+
+	publicHTML := readRepoFileForUITest(t, "internal/server/web/index.html")
+	legacyAdminHTML := readRepoFileForUITest(t, "internal/server/web/admin.html")
+	reactAdminHTML := readRepoFileForUITest(t, "admin-ui/index.html")
+
+	iconPattern := regexp.MustCompile(`rel="icon"[^>]*href="([^"]+)"`)
+	publicMatch := iconPattern.FindStringSubmatch(publicHTML)
+	legacyAdminMatch := iconPattern.FindStringSubmatch(legacyAdminHTML)
+	reactAdminMatch := iconPattern.FindStringSubmatch(reactAdminHTML)
+
+	if len(publicMatch) != 2 || len(legacyAdminMatch) != 2 || len(reactAdminMatch) != 2 {
+		t.Fatal("expected public and admin entrypoints to declare favicon href")
+	}
+	if publicMatch[1] != legacyAdminMatch[1] {
+		t.Fatalf("legacy admin icon should match public icon: %q != %q", legacyAdminMatch[1], publicMatch[1])
+	}
+	if publicMatch[1] != reactAdminMatch[1] {
+		t.Fatalf("react admin icon should match public icon: %q != %q", reactAdminMatch[1], publicMatch[1])
 	}
 }
 
@@ -207,9 +232,6 @@ func TestAdminPlaceholderCopyFollowsGuidelines(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string][]string{
-		"admin-ui/src/pages/Login.tsx": {
-			`placeholder="例如：admin…"`,
-		},
 		"admin-ui/src/pages/BasicSettings.tsx": {
 			`placeholder="例如：/cm-admin…"`,
 			`placeholder="例如：https://monitor.example.com…"`,
@@ -244,6 +266,33 @@ func TestAdminPlaceholderCopyFollowsGuidelines(t *testing.T) {
 			if !strings.Contains(content, snippet) {
 				t.Fatalf("%s missing expected placeholder snippet: %s", relativePath, snippet)
 			}
+		}
+	}
+}
+
+func TestAdminLoginUsesAccountCopyAndReadableIcons(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "admin-ui/src/pages/Login.tsx")
+	requiredSnippets := []string{
+		`<Label htmlFor="username">账号</Label>`,
+		`text-slate-500 dark:text-slate-300`,
+		`pointer-events-none absolute left-3.5 top-3 h-4 w-4`,
+	}
+	disallowedSnippets := []string{
+		`<Label htmlFor="username">用户名</Label>`,
+		`placeholder="例如：admin…"`,
+		`text-muted-foreground`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("admin login should include %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("admin login should not include %q", snippet)
 		}
 	}
 }
@@ -474,12 +523,14 @@ func TestPublicMonitorUsesUpdatedRangeLabelsAndDailyInterval(t *testing.T) {
 		`{ key: "24h", label: "1D", seconds: 60 * 60 * 24 },`,
 		`{ key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },`,
 		`{ key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },`,
+		`{ key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 366 },`,
 		`"24h": 30,`,
 	}
 	disallowedSnippets := []string{
 		`{ key: "24h", label: "24H", seconds: 60 * 60 * 24 },`,
 		`{ key: "7d", label: "7D", seconds: 60 * 60 * 24 * 7 },`,
 		`{ key: "30d", label: "30D", seconds: 60 * 60 * 24 * 30 },`,
+		`{ key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 365 },`,
 		`"24h": 60 * 2,`,
 	}
 
@@ -639,20 +690,287 @@ func TestAdminPlaceholderCopyAvoidsInstructionalText(t *testing.T) {
 	}
 }
 
-func TestPublicMonitorPreservesLegacyHistoryCharts(t *testing.T) {
+func TestPublicMonitorLoadsHistoryByNodeRangeFromServer(t *testing.T) {
 	t.Parallel()
 
 	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
 	requiredSnippets := []string{
-		"const historyMap = state.testHistory.get(nodeId) || new Map();",
-		"if (!tests.length && historyMap.size === 0) {",
-		`const activeRange = state.testRange.get(nodeId) || defaultTestRangeForHistory(historyMap);`,
+		`const DEFAULT_TEST_RANGE_KEY = "1h";`,
+		`testHistoryFetched: new Map(),`,
+		`testHistoryInflight: new Map(),`,
+		`async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {`,
+		`return targets.find((item) => item.key === sourceKey) || targets[0] || null;`,
+		`const activeRange = normalizeHistoryRangeKey(`,
+		`state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY`,
+		`void fetchNodeHistory(nodeId, activeRange);`,
+		`const historyMap = getNodeHistoryRange(nodeId, activeRange);`,
+		`cache: "no-store",`,
+		`payload.version !== HISTORY_CACHE_VERSION &&`,
+	}
+	disallowedSnippets := []string{
+		`defaultTestRangeForHistory(historyMap)`,
 		`if (spanSec > 60 * 60 * 24) return "7d";`,
 	}
 
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("public monitor legacy history regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor history fetch regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorHistoryCacheKeysIncludeSourceDimension(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`function historyNodeCacheKey(nodeId, sourceKey) {`,
+		`function historyRequestKey(nodeId, sourceKey, rangeKey) {`,
+		`applyTestHistory(payload.test_history, sourceKey);`,
+		`const sourceKey = resolveNodeSourceKey(nodeId);`,
+		`const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor history cache key regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorLongRangeChartsStayLineBased(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`const mergedTimeline = buildLatencyTimeline(testEntries);`,
+		`const timeSeries = mergedTimeline.times;`,
+		`const timelineSeries = mergedTimeline.series.get(entry.key) || [];`,
+		`const interpolatedLatency = interpolateLatencyGaps(sampled.latency, sampled.times, {`,
+		`function buildLatencyTimeline(testEntries) {`,
+		`function resolveLatencyTimelineToleranceSec(testEntries) {`,
+		`function interpolateLatencyGaps(series, times, options = {}) {`,
+		`function resolveLatencyInterpolationGapSec(times, validIndices, options = {}) {`,
+		`let segment = [];`,
+		`const flushSegment = () => {`,
+		`segments.push(buildSinglePointLatencySegment(`,
+		`return segments.join(" ");`,
+	}
+	disallowedSnippets := []string{
+		`const grid = buildTestGrid(`,
+		`const sampled = resampleHistoryForGrid(entry.history, grid);`,
+		`const pointOverlays = paddedSeries`,
+		`<g class="latency-points">${pointOverlays}</g>`,
+		`class="latency-point"`,
+		`renderPointOverlays(series, stepX, padding, plotHeight, maxValue, color)`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("long-range latency chart regression: missing line-based sparse rendering snippet %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("long-range latency chart regression: found point-marker snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorLatencyHoverSnapsToNearestVisibleSample(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`const hoverIndex = resolveLatencyHoverIndex(meta.paddedSeries, index);`,
+		`const value = series[hoverIndex];`,
+		`const crossX = offsetX + paddingLeft + activeIndex * stepX;`,
+		`function resolveLatencyHoverIndex(seriesList, preferredIndex) {`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency hover regression: missing nearest-sample hover snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorLatencyHoverFallsBackToLatestVisibleSample(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`let activeIndex = hoverIndex;`,
+		`let rows = buildLatencyTooltipRows(meta, labels, activeIndex);`,
+		`activeIndex = resolveLatestLatencySampleIndex(meta.paddedSeries);`,
+		`const time = meta.paddedTimes[activeIndex] || meta.paddedTimes[hoverIndex];`,
+		`function resolveLatestLatencySampleIndex(seriesList) {`,
+		`function buildLatencyTooltipRows(meta, labels, hoverIndex) {`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency hover fallback regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorSmoothingPersistsAcrossSparseBuckets(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`const LATENCY_SMOOTH_ALPHA = 0.2;`,
+		`if (numeric === null) {`,
+		`result.push(null);`,
+		`carry = carry === null ? numeric : carry + normalizedAlpha * (numeric - carry);`,
+	}
+	disallowedSnippets := []string{
+		"result.push(null);\n      carry = null;",
+		`const LATENCY_SMOOTH_ALPHA = 0.35;`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("latency smoothing regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("latency smoothing regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorNetworkCardsStayStaticAcrossRange(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`const snapshot = summarizeTestSnapshot(entry.test, entry.history);`,
+		`cardStats.innerHTML = `,
+		`${snapshot.target}`,
+		`${snapshot.latency}`,
+		`loss.textContent = snapshot.loss;`,
+		`function summarizeTestSnapshot(test, history) {`,
+		`function resolveLatestHistoryValue(series) {`,
+		`function formatTestTarget(test) {`,
+	}
+	disallowedSnippets := []string{
+		`const stats = summarizeLatency(entry.filtered.latency);`,
+		`const lossAvg = summarizeLoss(entry.filtered.loss);`,
+		`loss.textContent = formatLossValue(lossAvg);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("network card stability regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("network card stability regression: found dynamic range snippet %q", snippet)
+		}
+	}
+}
+
+func TestAdminReactThemePaletteStaysAlignedWithPublicMonitor(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "admin-ui/src/index.css")
+	requiredSnippets := []string{
+		`--bg-1: #f4f7fb;`,
+		`--bg-2: #e7eef8;`,
+		`--monitor-accent: #1f5dff;`,
+		`--monitor-accent-2: #30d5c8;`,
+		`--monitor-accent-3: #ff8a3d;`,
+		`--page-bg: radial-gradient(120% 120% at 10% 0%, #ffffff 0%, var(--bg-1) 45%, var(--bg-2) 100%);`,
+		`--page-bg: radial-gradient(120% 120% at 10% 0%, #0b1020 0%, var(--bg-1) 45%, var(--bg-2) 100%);`,
+		`background: var(--page-bg);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("admin theme alignment regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestReactAdminThemeColorMetaMatchesPublicEntrypoint(t *testing.T) {
+	t.Parallel()
+
+	publicHTML := readRepoFileForUITest(t, "internal/server/web/index.html")
+	reactAdminHTML := readRepoFileForUITest(t, "admin-ui/index.html")
+
+	requiredSnippets := []string{
+		`content="#f4f7fb"`,
+		`content="#0b1220"`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(publicHTML, snippet) {
+			t.Fatalf("public entrypoint should include %q", snippet)
+		}
+		if !strings.Contains(reactAdminHTML, snippet) {
+			t.Fatalf("react admin entrypoint should include %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorRangeHistoryUsesAuthoritativeFetchBaseline(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`function isHistoryRangeFetched(`,
+		`replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);`,
+		`const targetRanges = Array.from(ranges.keys()).filter((rangeKey) =>`,
+		`isHistoryRangeFetched(nodeId, rangeKey, sourceKey)`,
+	}
+	disallowedSnippets := []string{
+		`const targetRanges =` + "\n" + `    ranges.size > 0 ? Array.from(ranges.keys()) : [DEFAULT_TEST_RANGE_KEY];`,
+		`ensureHistoryRangeMap(nodeId, normalizedRange, sourceKey);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor authoritative history regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor authoritative history regression: found stale snippet %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorPreservesSelectedRangeAcrossRealtimeUpdates(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`const activeHistoryKeys = new Set();`,
+		`const activeNodeIDs = new Set();`,
+		`activeNodeIDs.add(id);`,
+		`if (!activeNodeIDs.has(id)) {`,
+	}
+	disallowedSnippets := []string{
+		`for (const id of state.testRange.keys()) {` + "\n" + `    if (!active.has(id)) {`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor selected range regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor selected range regression: found stale snippet %q", snippet)
 		}
 	}
 }
