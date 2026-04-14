@@ -254,6 +254,55 @@ func TestOfflineTrackerUpdateSkipsExistingRecoveryForSameSessionAndClearsStaleSe
 	}
 }
 
+func TestStoreUpdatePreservesRawNetworkTotalsWhenAgentCountersDrop(t *testing.T) {
+	t.Parallel()
+
+	store := newOfflineTrackerTestStore(t)
+
+	store.Update(metrics.NodeStats{
+		NodeID:    "node-1",
+		NodeName:  "node-1",
+		Timestamp: 1_960_000_100,
+		Network: metrics.NetworkIO{
+			BytesSent:     100 * 1024 * 1024,
+			BytesRecv:     200 * 1024 * 1024,
+			TxBytesPerSec: 4 * 1024,
+			RxBytesPerSec: 8 * 1024,
+		},
+	})
+
+	store.Update(metrics.NodeStats{
+		NodeID:    "node-1",
+		NodeName:  "node-1",
+		Timestamp: 1_960_000_101,
+		Network: metrics.NetworkIO{
+			BytesSent:     95 * 1024 * 1024,
+			BytesRecv:     190 * 1024 * 1024,
+			TxBytesPerSec: 2 * 1024,
+			RxBytesPerSec: 3 * 1024,
+		},
+	})
+
+	snapshot := store.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("expected one node in snapshot, got %d", len(snapshot))
+	}
+
+	network := snapshot[0].Stats.Network
+	if network.BytesSent != 95*1024*1024 {
+		t.Fatalf("expected latest raw sent bytes to be preserved, got %d", network.BytesSent)
+	}
+	if network.BytesRecv != 190*1024*1024 {
+		t.Fatalf("expected latest raw recv bytes to be preserved, got %d", network.BytesRecv)
+	}
+	if network.TxBytesPerSec != 2*1024 {
+		t.Fatalf("expected latest tx rate to be preserved, got %v", network.TxBytesPerSec)
+	}
+	if network.RxBytesPerSec != 3*1024 {
+		t.Fatalf("expected latest rx rate to be preserved, got %v", network.RxBytesPerSec)
+	}
+}
+
 func TestOfflineTrackerReconcileSkipsDuplicateRecoveryEventAndClearsSession(t *testing.T) {
 	t.Parallel()
 

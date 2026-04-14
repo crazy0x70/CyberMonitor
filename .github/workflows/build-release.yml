@@ -19,6 +19,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCKER_BUILD_SUMMARY: 'false'
 
 concurrency:
   group: "release-${{ github.ref }}"
@@ -299,7 +300,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: admin-ui/package-lock.json
 
@@ -506,13 +507,19 @@ jobs:
           ls -la
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ needs.version.outputs.tag }}
-          body: |
-            Full Changelog: [${{ steps.changelog.outputs.prev_tag }}...${{ needs.version.outputs.tag }}](${{ steps.changelog.outputs.compare_url }})
-          files: |
-            release/*
-          draft: false
-          prerelease: false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          NOTES="Full Changelog: [${{ steps.changelog.outputs.prev_tag }}...${TAG}](${{ steps.changelog.outputs.compare_url }})"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" \
+              --title "$TAG" \
+              --notes "$NOTES"
+          else
+            gh release create "$TAG" release/* \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              --target "${GITHUB_SHA}"
+          fi

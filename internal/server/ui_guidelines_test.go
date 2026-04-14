@@ -337,9 +337,11 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 	content := readRepoFileForUITest(t, ".github/workflows/build-release.yml")
 	requiredSnippets := []string{
 		"FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true",
+		`DOCKER_BUILD_SUMMARY: 'false'`,
 		"uses: actions/checkout@v5",
 		"uses: actions/setup-go@v6",
 		"uses: actions/setup-node@v5",
+		`node-version: '24'`,
 		"uses: actions/download-artifact@v7",
 		"uses: actions/upload-artifact@v6",
 		"uses: docker/setup-qemu-action@v4",
@@ -347,12 +349,15 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: docker/login-action@v4",
 		"uses: docker/build-push-action@v7",
 		`pattern: "!*.dockerbuild"`,
+		"GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+		"gh release create",
 		"needs: [version, build-server, build-agent, build-web, docker-server, docker-agent]",
 	}
 	disallowedSnippets := []string{
 		"uses: actions/checkout@v4",
 		"uses: actions/setup-go@v5",
 		"uses: actions/setup-node@v4",
+		`node-version: '22'`,
 		"uses: actions/download-artifact@v5",
 		"uses: actions/download-artifact@v6",
 		"uses: actions/upload-artifact@v4",
@@ -360,6 +365,7 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 		"uses: docker/setup-buildx-action@v3",
 		"uses: docker/login-action@v3",
 		"uses: docker/build-push-action@v5",
+		"uses: softprops/action-gh-release@v2",
 	}
 
 	for _, snippet := range requiredSnippets {
@@ -660,6 +666,33 @@ func TestPublicMonitorReconnectsRealtimeFeedAggressively(t *testing.T) {
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("public monitor realtime reconnect regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorTrafficTotalsStayMonotonicWithoutMutatingServerCounters(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`publicTrafficCounters: new Map(),`,
+		`function buildTrafficCounterKey(sourceKey, nodeID) {`,
+		`function resolveNodeFreshness(node) {`,
+		`function shouldReplaceNode(existing, candidate) {`,
+		`function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {`,
+		`function prunePublicTrafficCounters(nodes) {`,
+		`const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;`,
+		`if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {`,
+		`if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {`,
+		`if (previous && freshness >= lastFreshness) {`,
+		`const candidate = cloneNodeWithDisplayTraffic(node, sourceKey);`,
+		`prunePublicTrafficCounters(mergedNodes);`,
+		`if (shouldReplaceNode(list[index], nextNode)) {`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor traffic monotonic regression: missing %q", snippet)
 		}
 	}
 }

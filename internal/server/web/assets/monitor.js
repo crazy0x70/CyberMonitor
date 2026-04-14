@@ -72,6 +72,7 @@ const state = {
   historyCacheTimer: null,
   historyCacheLoading: false,
   sourceSnapshots: new Map(),
+  publicTrafficCounters: new Map(),
   renderFrame: 0,
   variant: activeVariant,
   demoEnabled,
@@ -459,6 +460,130 @@ function scheduleReconnect(target) {
   state.reconnectTimers.set(target.key, timer);
 }
 
+function buildTrafficCounterKey(sourceKey, nodeID) {
+  const normalizedNodeID = String(nodeID || "").trim();
+  if (!normalizedNodeID) return "";
+  return `${String(sourceKey || "default")}::${normalizedNodeID}`;
+}
+
+function resolveNodeFreshness(node) {
+  const statsTimestamp = Number(node?.stats?.timestamp || 0);
+  if (Number.isFinite(statsTimestamp) && statsTimestamp > 0) {
+    return statsTimestamp;
+  }
+  const lastSeen = Number(node?.last_seen || 0);
+  return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
+}
+
+function shouldReplaceNode(existing, candidate) {
+  if (!existing) return true;
+  const candidateFreshness = resolveNodeFreshness(candidate);
+  const existingFreshness = resolveNodeFreshness(existing);
+  if (candidateFreshness !== existingFreshness) {
+    return candidateFreshness > existingFreshness;
+  }
+  const candidateLastSeen = Number(candidate?.last_seen || 0);
+  const existingLastSeen = Number(existing?.last_seen || 0);
+  return candidateLastSeen >= existingLastSeen;
+}
+
+function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
+  const candidate = node && typeof node === "object" ? node : {};
+  const nodeID = resolveNodeId(candidate, "").trim();
+  const trafficKey = buildTrafficCounterKey(sourceKey, nodeID);
+  const network = candidate.stats?.network || {};
+  const uptimeSec = Number(candidate.stats?.uptime_sec || 0);
+  const rawSent = Number(network.bytes_sent || 0);
+  const rawRecv = Number(network.bytes_recv || 0);
+  const freshness = resolveNodeFreshness(candidate);
+  const previous = trafficKey ? state.publicTrafficCounters.get(trafficKey) : null;
+
+  let offsetSent = previous?.offsetSent || 0;
+  let offsetRecv = previous?.offsetRecv || 0;
+  const lastRawSent = previous?.lastRawSent ?? rawSent;
+  const lastRawRecv = previous?.lastRawRecv ?? rawRecv;
+  const lastDisplaySent = previous?.lastDisplaySent ?? rawSent;
+  const lastDisplayRecv = previous?.lastDisplayRecv ?? rawRecv;
+  const lastFreshness = previous?.lastFreshness || 0;
+  const lastUptimeSec = previous?.lastUptimeSec || 0;
+
+  if (previous && freshness > 0 && lastFreshness > 0 && freshness < lastFreshness) {
+    return {
+      ...candidate,
+      __sourceKey: sourceKey,
+      stats: {
+        ...(candidate.stats || {}),
+        network: {
+          ...network,
+          bytes_sent: lastDisplaySent,
+          bytes_recv: lastDisplayRecv,
+        },
+      },
+    };
+  }
+
+  if (previous) {
+    const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;
+    if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {
+      offsetSent = lastDisplaySent;
+    }
+    if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {
+      offsetRecv = lastDisplayRecv;
+    }
+  }
+
+  let displaySent = offsetSent + rawSent;
+  let displayRecv = offsetRecv + rawRecv;
+  if (previous && freshness >= lastFreshness) {
+    displaySent = Math.max(lastDisplaySent, displaySent);
+    displayRecv = Math.max(lastDisplayRecv, displayRecv);
+  }
+
+  if (trafficKey) {
+    state.publicTrafficCounters.set(trafficKey, {
+      offsetSent,
+      offsetRecv,
+      lastRawSent: rawSent,
+      lastRawRecv: rawRecv,
+      lastDisplaySent: displaySent,
+      lastDisplayRecv: displayRecv,
+      lastFreshness: freshness,
+      lastUptimeSec: uptimeSec,
+    });
+  }
+
+  return {
+    ...candidate,
+    __sourceKey: sourceKey,
+    stats: {
+      ...(candidate.stats || {}),
+      network: {
+        ...network,
+        bytes_sent: displaySent,
+        bytes_recv: displayRecv,
+      },
+    },
+  };
+}
+
+function prunePublicTrafficCounters(nodes) {
+  const activeKeys = new Set();
+  (nodes || []).forEach((node) => {
+    const trafficKey = buildTrafficCounterKey(
+      node?.__sourceKey || "default",
+      resolveNodeId(node, "").trim()
+    );
+    if (trafficKey) {
+      activeKeys.add(trafficKey);
+    }
+  });
+  Array.from(state.publicTrafficCounters.keys()).forEach((trafficKey) => {
+    if (!activeKeys.has(trafficKey)) {
+      state.publicTrafficCounters.delete(trafficKey);
+    }
+  });
+}
+
 function mergeByNodeID(sourceSnapshots) {
   const merged = new Map();
   sourceSnapshots.forEach(([sourceKey, snapshot]) => {
@@ -466,15 +591,9 @@ function mergeByNodeID(sourceSnapshots) {
     sourceNodes.forEach((node) => {
       const nodeID = resolveNodeId(node, "").trim();
       if (!nodeID) return;
-      const candidate = { ...node, __sourceKey: sourceKey };
+      const candidate = cloneNodeWithDisplayTraffic(node, sourceKey);
       const existing = merged.get(nodeID);
-      if (!existing) {
-        merged.set(nodeID, candidate);
-        return;
-      }
-      const existingLastSeen = existing.last_seen || 0;
-      const currentLastSeen = candidate.last_seen || 0;
-      if (currentLastSeen >= existingLastSeen) {
+      if (shouldReplaceNode(existing, candidate)) {
         merged.set(nodeID, candidate);
       }
     });
@@ -498,6 +617,7 @@ function rebuildMergedSnapshotState() {
   const snapshots = sourceSnapshots.map(([, snapshot]) => snapshot);
   const mergedNodes = mergeByNodeID(sourceSnapshots);
   const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
+  prunePublicTrafficCounters(mergedNodes);
 
   state.lastNodes = mergedNodes;
   state.settingsGroups = mergedGroups;
@@ -588,7 +708,9 @@ function upsertNodeInSnapshot(nodes, nextNode) {
     list.push(nextNode);
     return list;
   }
-  list[index] = nextNode;
+  if (shouldReplaceNode(list[index], nextNode)) {
+    list[index] = nextNode;
+  }
   return list;
 }
 

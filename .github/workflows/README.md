@@ -40,7 +40,7 @@
 
 - 校验 `admin-ui/` 与 `internal/server/web/index.html` 是否存在且已被 Git 跟踪
 - 校验 `go.mod` 与 `Dockerfile` 中声明的 Go 版本完全一致
-- 使用 Node `22`
+- 使用 Node `24`
 - 执行 `npm --prefix admin-ui ci`
 - 执行 `npm --prefix admin-ui run lint`
 - 执行 `npm --prefix admin-ui run build:admin`
@@ -196,7 +196,7 @@
 ## 构建参数
 
 - Go 版本：读取 `go.mod`
-- Node 版本：`22`
+- Node 版本：`24`
 - CGO：禁用
 - 版本注入：
   - `main.Version`
