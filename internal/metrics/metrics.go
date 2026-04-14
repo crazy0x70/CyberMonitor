@@ -292,28 +292,26 @@ func diffUint64(current, prev uint64) uint64 {
 
 func sumNetCounters(stats []gnet.IOCountersStat, filter map[string]struct{}) gnet.IOCountersStat {
 	var total gnet.IOCountersStat
-	var matched bool
 	for _, stat := range stats {
-		if len(filter) > 0 {
-			if _, ok := filter[strings.ToLower(stat.Name)]; !ok {
-				continue
-			}
-			matched = true
-		} else {
-			if isVirtualInterface(stat.Name) {
-				continue
-			}
+		if !shouldCollectInterface(stat.Name, filter) {
+			continue
 		}
 		total.BytesSent += stat.BytesSent
 		total.BytesRecv += stat.BytesRecv
 	}
-	if len(filter) > 0 && !matched {
-		for _, stat := range stats {
-			total.BytesSent += stat.BytesSent
-			total.BytesRecv += stat.BytesRecv
-		}
-	}
 	return total
+}
+
+func shouldCollectInterface(name string, filter map[string]struct{}) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	if len(filter) > 0 {
+		_, ok := filter[normalized]
+		return ok
+	}
+	return !isVirtualInterface(normalized)
 }
 
 func isVirtualInterface(name string) bool {
@@ -340,23 +338,10 @@ func collectNetSpeedMbps(filter map[string]struct{}) float64 {
 	}
 	candidates := make([]string, 0, len(ifaces))
 	for _, iface := range ifaces {
-		name := strings.ToLower(strings.TrimSpace(iface.Name))
-		if name == "" {
-			continue
-		}
-		if len(filter) > 0 {
-			if _, ok := filter[name]; !ok {
-				continue
-			}
-		} else if isVirtualInterface(name) {
+		if !shouldCollectInterface(iface.Name, filter) {
 			continue
 		}
 		candidates = append(candidates, iface.Name)
-	}
-	if len(filter) > 0 && len(candidates) == 0 {
-		for _, iface := range ifaces {
-			candidates = append(candidates, iface.Name)
-		}
 	}
 	maxSpeed := 0.0
 	for _, name := range candidates {

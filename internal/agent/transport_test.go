@@ -23,6 +23,14 @@ type delayedAcceptListener struct {
 	delay time.Duration
 }
 
+func shortGRPCTransportOptions() grpcTransportOptions {
+	options := defaultGRPCTransportOptions()
+	options.dialTimeout = 25 * time.Millisecond
+	options.callTimeout = 25 * time.Millisecond
+	options.readyTimeout = 10 * time.Millisecond
+	return options
+}
+
 func (l delayedAcceptListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
@@ -60,7 +68,7 @@ func TestControlPlaneTransportFallsBackToHTTPConfig(t *testing.T) {
 	}))
 	defer server.Close()
 
-	transport := newControlPlaneTransport(Config{ServerURL: server.URL}, server.Client())
+	transport := newControlPlaneTransportWithOptions(Config{ServerURL: server.URL}, server.Client(), shortGRPCTransportOptions())
 	defer transport.Close()
 
 	resp, err := transport.FetchConfig(context.Background(), "node-1", "node-token")
@@ -273,7 +281,7 @@ func TestControlPlaneTransportFallsBackToHTTPStatsReport(t *testing.T) {
 	}))
 	defer server.Close()
 
-	transport := newControlPlaneTransport(Config{ServerURL: server.URL}, server.Client())
+	transport := newControlPlaneTransportWithOptions(Config{ServerURL: server.URL}, server.Client(), shortGRPCTransportOptions())
 	defer transport.Close()
 
 	err := transport.ReportStats(context.Background(), metrics.NodeStats{
@@ -299,15 +307,6 @@ func TestControlPlaneTransportFallsBackToHTTPStatsReport(t *testing.T) {
 
 func TestControlPlaneTransportKeepsStatsOnHTTPAfterFallback(t *testing.T) {
 	t.Parallel()
-
-	previousDialTimeout := grpcDialTimeout
-	previousCallTimeout := grpcCallTimeout
-	grpcDialTimeout = 80 * time.Millisecond
-	grpcCallTimeout = 80 * time.Millisecond
-	defer func() {
-		grpcDialTimeout = previousDialTimeout
-		grpcCallTimeout = previousCallTimeout
-	}()
 
 	var httpHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -344,6 +343,10 @@ func TestControlPlaneTransportKeepsStatsOnHTTPAfterFallback(t *testing.T) {
 	}()
 	defer close(done)
 
+	options := shortGRPCTransportOptions()
+	options.dialTimeout = 80 * time.Millisecond
+	options.callTimeout = 80 * time.Millisecond
+
 	transport := &controlPlaneTransport{
 		http: &httpControlPlane{
 			client:        server.Client(),
@@ -351,7 +354,9 @@ func TestControlPlaneTransportKeepsStatsOnHTTPAfterFallback(t *testing.T) {
 		},
 		grpc: &grpcControlPlane{
 			target: hangingListener.Addr().String(),
+			opts:   options,
 		},
+		opts: options,
 	}
 	defer transport.Close()
 
@@ -417,7 +422,7 @@ func TestControlPlaneTransportFallsBackToHTTPRegister(t *testing.T) {
 	}))
 	defer server.Close()
 
-	transport := newControlPlaneTransport(Config{ServerURL: server.URL}, server.Client())
+	transport := newControlPlaneTransportWithOptions(Config{ServerURL: server.URL}, server.Client(), shortGRPCTransportOptions())
 	defer transport.Close()
 
 	token, err := transport.RegisterNodeToken(context.Background(), "node-1", "bootstrap-token")
@@ -462,7 +467,7 @@ func TestControlPlaneTransportFallsBackToHTTPReportUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	transport := newControlPlaneTransport(Config{ServerURL: server.URL}, server.Client())
+	transport := newControlPlaneTransportWithOptions(Config{ServerURL: server.URL}, server.Client(), shortGRPCTransportOptions())
 	defer transport.Close()
 
 	if err := transport.ReportUpdate(context.Background(), "node-1", "node-token", "succeeded", "1.1.0", "done"); err != nil {

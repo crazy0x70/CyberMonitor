@@ -32,6 +32,8 @@ type Config struct {
 	NetIfaces     []string
 	DisableUpdate bool
 	TokenFile     string
+
+	transportOptions grpcTransportOptions
 }
 
 func Run(ctx context.Context, cfg Config) error {

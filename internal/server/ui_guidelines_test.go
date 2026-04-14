@@ -682,25 +682,52 @@ func TestPublicMonitorTrafficTotalsStayMonotonicWithoutMutatingServerCounters(t 
 	t.Parallel()
 
 	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
-	requiredSnippets := []string{
-		`publicTrafficCounters: new Map(),`,
-		`function buildTrafficCounterKey(sourceKey, nodeID) {`,
-		`function resolveNodeFreshness(node) {`,
-		`function shouldReplaceNode(existing, candidate) {`,
-		`function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {`,
-		`function prunePublicTrafficCounters(nodes) {`,
-		`const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;`,
-		`if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {`,
-		`if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {`,
-		`if (previous && freshness >= lastFreshness) {`,
-		`const candidate = cloneNodeWithDisplayTraffic(node, sourceKey);`,
-		`prunePublicTrafficCounters(mergedNodes);`,
-		`if (shouldReplaceNode(list[index], nextNode)) {`,
-	}
+		requiredSnippets := []string{
+			`publicTrafficCounters: new Map(),`,
+			`function buildTrafficCounterKey(sourceKey, nodeID) {`,
+			`function resolveNodeFreshness(node) {`,
+			`function shouldReplaceNode(existing, candidate) {`,
+			`function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {`,
+			`function prunePublicTrafficCounters(nodes) {`,
+			`const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;`,
+			`if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {`,
+			`if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {`,
+			`if (previous && freshness >= lastFreshness) {`,
+			`prunePublicTrafficCounters(mergedNodes);`,
+			`if (shouldReplaceNode(list[index], nextNode)) {`,
+		}
 
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
 			t.Fatalf("public monitor traffic monotonic regression: missing %q", snippet)
+		}
+	}
+}
+
+func TestPublicMonitorTrafficDedupesBeforeDisplayCounterAdjustment(t *testing.T) {
+	t.Parallel()
+
+	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	requiredSnippets := []string{
+		`function dedupeNodesByID(nodes) {`,
+		`const sourceNodes = dedupeNodesByID(snapshot?.nodes);`,
+		`state.sourceSnapshots.set(sourceKey, {`,
+		`nodes: dedupeNodesByID(payload.nodes),`,
+		`return Array.from(merged.values()).map((node) =>`,
+		`cloneNodeWithDisplayTraffic(node, node.__sourceKey || "default")`,
+	}
+	disallowedSnippets := []string{
+		`const candidate = cloneNodeWithDisplayTraffic(node, sourceKey);`,
+	}
+
+	for _, snippet := range requiredSnippets {
+		if !strings.Contains(content, snippet) {
+			t.Fatalf("public monitor dedupe regression: missing %q", snippet)
+		}
+	}
+	for _, snippet := range disallowedSnippets {
+		if strings.Contains(content, snippet) {
+			t.Fatalf("public monitor dedupe regression: found stale snippet %q", snippet)
 		}
 	}
 }

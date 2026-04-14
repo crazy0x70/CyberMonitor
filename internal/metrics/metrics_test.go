@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	gnet "github.com/shirou/gopsutil/v3/net"
 )
 
 func TestReadHostVirtualMemory(t *testing.T) {
@@ -104,5 +106,72 @@ func TestReadHostMounts(t *testing.T) {
 	}
 	if got, want := mounts[0].Fstype, "ext4"; got != want {
 		t.Fatalf("fstype = %q, want %q", got, want)
+	}
+}
+
+func TestSumNetCountersSkipsVirtualInterfacesByDefault(t *testing.T) {
+	stats := []gnet.IOCountersStat{
+		{Name: "eth0", BytesSent: 100, BytesRecv: 200},
+		{Name: "docker0", BytesSent: 1_000, BytesRecv: 2_000},
+		{Name: "veth1234", BytesSent: 10_000, BytesRecv: 20_000},
+	}
+
+	total := sumNetCounters(stats, nil)
+
+	if got, want := total.BytesSent, uint64(100); got != want {
+		t.Fatalf("bytes sent = %d, want %d", got, want)
+	}
+	if got, want := total.BytesRecv, uint64(200); got != want {
+		t.Fatalf("bytes recv = %d, want %d", got, want)
+	}
+}
+
+func TestSumNetCountersUsesExplicitFilterOnly(t *testing.T) {
+	stats := []gnet.IOCountersStat{
+		{Name: "eth0", BytesSent: 100, BytesRecv: 200},
+		{Name: "ens18", BytesSent: 300, BytesRecv: 400},
+		{Name: "docker0", BytesSent: 1_000, BytesRecv: 2_000},
+	}
+
+	total := sumNetCounters(stats, map[string]struct{}{"ens18": {}})
+
+	if got, want := total.BytesSent, uint64(300); got != want {
+		t.Fatalf("bytes sent = %d, want %d", got, want)
+	}
+	if got, want := total.BytesRecv, uint64(400); got != want {
+		t.Fatalf("bytes recv = %d, want %d", got, want)
+	}
+}
+
+func TestSumNetCountersDoesNotFallbackToAllInterfacesWhenFilterMisses(t *testing.T) {
+	stats := []gnet.IOCountersStat{
+		{Name: "eth0", BytesSent: 100, BytesRecv: 200},
+		{Name: "docker0", BytesSent: 1_000, BytesRecv: 2_000},
+	}
+
+	total := sumNetCounters(stats, map[string]struct{}{"eno1": {}})
+
+	if got := total.BytesSent; got != 0 {
+		t.Fatalf("bytes sent = %d, want 0 when filter misses", got)
+	}
+	if got := total.BytesRecv; got != 0 {
+		t.Fatalf("bytes recv = %d, want 0 when filter misses", got)
+	}
+}
+
+func TestShouldCollectInterfaceSharesOneSelectionRule(t *testing.T) {
+	filter := map[string]struct{}{"ens18": {}}
+
+	if !shouldCollectInterface("ens18", filter) {
+		t.Fatal("expected explicit interface to be collected")
+	}
+	if shouldCollectInterface("eth0", filter) {
+		t.Fatal("did not expect unmatched explicit interface to be collected")
+	}
+	if shouldCollectInterface("docker0", nil) {
+		t.Fatal("did not expect virtual interface in default mode")
+	}
+	if !shouldCollectInterface("eth0", nil) {
+		t.Fatal("expected physical interface in default mode")
 	}
 }

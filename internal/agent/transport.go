@@ -27,14 +27,47 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-var (
-	grpcFallbackBackoff = 30 * time.Second
-	grpcDialTimeout     = 4 * time.Second
-	grpcCallTimeout     = 5 * time.Second
+const (
+	defaultGRPCFallbackBackoff = 30 * time.Second
+	defaultGRPCDialTimeout     = 4 * time.Second
+	defaultGRPCCallTimeout     = 5 * time.Second
 	// 首次 gRPC 建连在真实 Docker / 跨主机场景下可能需要明显超过 250ms 才能进入 Ready。
 	// 这里保留快速失败，但避免把正常的慢建连过早误判成不可用。
-	grpcReadyTimeout    = 1 * time.Second
+	defaultGRPCReadyTimeout = 1 * time.Second
 )
+
+type grpcTransportOptions struct {
+	fallbackBackoff time.Duration
+	dialTimeout     time.Duration
+	callTimeout     time.Duration
+	readyTimeout    time.Duration
+}
+
+func defaultGRPCTransportOptions() grpcTransportOptions {
+	return grpcTransportOptions{
+		fallbackBackoff: defaultGRPCFallbackBackoff,
+		dialTimeout:     defaultGRPCDialTimeout,
+		callTimeout:     defaultGRPCCallTimeout,
+		readyTimeout:    defaultGRPCReadyTimeout,
+	}
+}
+
+func (o grpcTransportOptions) normalized() grpcTransportOptions {
+	defaults := defaultGRPCTransportOptions()
+	if o.fallbackBackoff <= 0 {
+		o.fallbackBackoff = defaults.fallbackBackoff
+	}
+	if o.dialTimeout <= 0 {
+		o.dialTimeout = defaults.dialTimeout
+	}
+	if o.callTimeout <= 0 {
+		o.callTimeout = defaults.callTimeout
+	}
+	if o.readyTimeout <= 0 {
+		o.readyTimeout = defaults.readyTimeout
+	}
+	return o
+}
 
 type agentControlPlane interface {
 	RegisterNodeToken(context.Context, string, string) (string, error)
@@ -47,6 +80,7 @@ type agentControlPlane interface {
 type controlPlaneTransport struct {
 	http *httpControlPlane
 	grpc *grpcControlPlane
+	opts grpcTransportOptions
 
 	mu               sync.Mutex
 	grpcBackoffUntil time.Time
@@ -64,6 +98,7 @@ type httpControlPlane struct {
 type grpcControlPlane struct {
 	target string
 	secure bool
+	opts   grpcTransportOptions
 
 	mu     sync.Mutex
 	conn   *grpc.ClientConn
@@ -71,7 +106,12 @@ type grpcControlPlane struct {
 }
 
 func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane {
+	return newControlPlaneTransportWithOptions(cfg, client, cfg.transportOptions)
+}
+
+func newControlPlaneTransportWithOptions(cfg Config, client *http.Client, options grpcTransportOptions) agentControlPlane {
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.ServerURL), "/")
+	options = options.normalized()
 	return &controlPlaneTransport{
 		http: &httpControlPlane{
 			client:           client,
@@ -80,11 +120,12 @@ func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane
 			registerEndpoint: baseURL + "/api/v1/agent/register",
 			updateEndpoint:   baseURL + "/api/v1/agent/update/report",
 		},
-		grpc: newGRPCControlPlane(baseURL),
+		grpc: newGRPCControlPlane(baseURL, options),
+		opts: options,
 	}
 }
 
-func newGRPCControlPlane(serverURL string) *grpcControlPlane {
+func newGRPCControlPlane(serverURL string, options grpcTransportOptions) *grpcControlPlane {
 	target, secure, err := parseGRPCTarget(serverURL)
 	if err != nil || target == "" {
 		return nil
@@ -92,6 +133,7 @@ func newGRPCControlPlane(serverURL string) *grpcControlPlane {
 	return &grpcControlPlane{
 		target: target,
 		secure: secure,
+		opts:   options.normalized(),
 	}
 }
 
@@ -214,10 +256,10 @@ func (t *controlPlaneTransport) shouldProbeGRPCForStats() bool {
 
 func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	t.mu.Lock()
-	t.grpcBackoffUntil = time.Now().Add(grpcFallbackBackoff)
+	t.grpcBackoffUntil = time.Now().Add(t.opts.fallbackBackoff)
 	t.lastMode = "http"
 	t.mu.Unlock()
-	log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: %v", grpcFallbackBackoff, err)
+	log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: %v", t.opts.fallbackBackoff, err)
 	if t.grpc != nil {
 		_ = t.grpc.Close()
 	}
@@ -371,7 +413,7 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 	}
 	switch state {
 	case connectivity.Connecting, connectivity.TransientFailure:
-		waitCtx, cancel := context.WithTimeout(ctx, grpcReadyTimeout)
+		waitCtx, cancel := context.WithTimeout(ctx, g.opts.readyTimeout)
 		defer cancel()
 		for state == connectivity.Connecting || state == connectivity.TransientFailure || state == connectivity.Idle {
 			if !conn.WaitForStateChange(waitCtx, state) {
@@ -386,7 +428,7 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 	if state != connectivity.Ready {
 		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport not ready")
 	}
-	callCtx, cancel := context.WithTimeout(ctx, grpcCallTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, g.opts.callTimeout)
 	return client, callCtx, cancel, nil
 }
 
@@ -399,7 +441,7 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 	}
 	g.mu.Unlock()
 
-	dialCtx, cancel := context.WithTimeout(ctx, grpcDialTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
 	defer cancel()
 
 	opts := []grpc.DialOption{
@@ -416,7 +458,7 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 				Jitter:     0.2,
 				MaxDelay:   10 * time.Second,
 			},
-			MinConnectTimeout: grpcDialTimeout,
+			MinConnectTimeout: g.opts.dialTimeout,
 		}),
 	}
 	if g.secure {

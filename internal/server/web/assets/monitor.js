@@ -466,6 +466,40 @@ function buildTrafficCounterKey(sourceKey, nodeID) {
   return `${String(sourceKey || "default")}::${normalizedNodeID}`;
 }
 
+function resolveBackendNodeId(node, fallback) {
+  if (!node) return fallback;
+  if (node.id) return String(node.id);
+  const stats = node.stats || {};
+  if (stats.node_id) return String(stats.node_id);
+  if (stats.node_name) return String(stats.node_name);
+  return fallback;
+}
+
+function resolveDisplayNodeId(node, fallback, sourceKey = node?.__sourceKey || "default") {
+  const nodeID = resolveBackendNodeId(node, "").trim();
+  if (!nodeID) return fallback;
+  return JSON.stringify([normalizeHistorySourceKey(sourceKey), nodeID]);
+}
+
+function parseDisplayNodeId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length !== 2) {
+      return null;
+    }
+    const sourceKey = normalizeHistorySourceKey(parsed[0]);
+    const nodeID = String(parsed[1] || "").trim();
+    if (!nodeID) {
+      return null;
+    }
+    return { sourceKey, nodeID };
+  } catch (error) {
+    return null;
+  }
+}
+
 function resolveNodeFreshness(node) {
   const statsTimestamp = Number(node?.stats?.timestamp || 0);
   if (Number.isFinite(statsTimestamp) && statsTimestamp > 0) {
@@ -489,7 +523,7 @@ function shouldReplaceNode(existing, candidate) {
 
 function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
   const candidate = node && typeof node === "object" ? node : {};
-  const nodeID = resolveNodeId(candidate, "").trim();
+  const nodeID = resolveBackendNodeId(candidate, "").trim();
   const trafficKey = buildTrafficCounterKey(sourceKey, nodeID);
   const network = candidate.stats?.network || {};
   const uptimeSec = Number(candidate.stats?.uptime_sec || 0);
@@ -571,7 +605,7 @@ function prunePublicTrafficCounters(nodes) {
   (nodes || []).forEach((node) => {
     const trafficKey = buildTrafficCounterKey(
       node?.__sourceKey || "default",
-      resolveNodeId(node, "").trim()
+      resolveBackendNodeId(node, "").trim()
     );
     if (trafficKey) {
       activeKeys.add(trafficKey);
@@ -584,21 +618,48 @@ function prunePublicTrafficCounters(nodes) {
   });
 }
 
+function attachSourceKeyToNodes(nodes, sourceKey = "default") {
+  const list = Array.isArray(nodes) ? nodes : [];
+  return list.map((node) => ({
+    ...(node && typeof node === "object" ? node : {}),
+    __sourceKey: sourceKey,
+  }));
+}
+
+function dedupeNodesByID(nodes) {
+  const merged = new Map();
+  const list = Array.isArray(nodes) ? nodes : [];
+  list.forEach((node) => {
+    const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || "default").trim();
+    if (!nodeID) return;
+    const existing = merged.get(nodeID);
+    if (shouldReplaceNode(existing, node)) {
+      merged.set(nodeID, node);
+    }
+  });
+  return Array.from(merged.values());
+}
+
 function mergeByNodeID(sourceSnapshots) {
   const merged = new Map();
   sourceSnapshots.forEach(([sourceKey, snapshot]) => {
-    const sourceNodes = Array.isArray(snapshot?.nodes) ? snapshot.nodes : [];
+    const sourceNodes = dedupeNodesByID(snapshot?.nodes);
     sourceNodes.forEach((node) => {
-      const nodeID = resolveNodeId(node, "").trim();
+      const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || sourceKey).trim();
       if (!nodeID) return;
-      const candidate = cloneNodeWithDisplayTraffic(node, sourceKey);
+      const candidate = {
+        ...node,
+        __sourceKey: sourceKey,
+      };
       const existing = merged.get(nodeID);
       if (shouldReplaceNode(existing, candidate)) {
         merged.set(nodeID, candidate);
       }
     });
   });
-  return Array.from(merged.values());
+  return Array.from(merged.values()).map((node) =>
+    cloneNodeWithDisplayTraffic(node, node.__sourceKey || "default")
+  );
 }
 
 function mergeGroups(groupsBySource) {
@@ -654,7 +715,7 @@ function resolveNodeStatus(node) {
 function syncRealtimeStatus(nodes) {
   const active = new Set();
   (nodes || []).forEach((node) => {
-    const id = resolveNodeId(node, "").trim();
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
     if (!id) return;
     active.add(id);
     state.realtimeStatus.set(id, resolveNodeStatus(node));
@@ -669,7 +730,7 @@ function syncRealtimeStatus(nodes) {
 function refreshRealtimeStatus() {
   let changed = false;
   state.lastNodes.forEach((node) => {
-    const id = resolveNodeId(node, "").trim();
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
     if (!id) return;
     const next = resolveNodeStatus(node);
     if (state.realtimeStatus.get(id) !== next) {
@@ -699,11 +760,13 @@ function updateTransportState(type, generatedAt) {
   live.textContent = `最近 ${label}：${formatTime(state.lastTransportAt)}`;
 }
 
-function upsertNodeInSnapshot(nodes, nextNode) {
+function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
   const list = Array.isArray(nodes) ? nodes.slice() : [];
-  const nodeID = resolveNodeId(nextNode, "").trim();
+  const nodeID = resolveDisplayNodeId(nextNode, "", sourceKey).trim();
   if (!nodeID) return list;
-  const index = list.findIndex((item) => resolveNodeId(item, "").trim() === nodeID);
+  const index = list.findIndex(
+    (item) => resolveDisplayNodeId(item, "", sourceKey).trim() === nodeID
+  );
   if (index === -1) {
     list.push(nextNode);
     return list;
@@ -718,8 +781,15 @@ function handleSnapshot(payload, sourceKey = "default") {
   if (!payload || typeof payload !== "object") {
     return;
   }
+  payload = {
+    ...payload,
+    nodes: attachSourceKeyToNodes(payload.nodes, sourceKey),
+  };
 
-  state.sourceSnapshots.set(sourceKey, payload);
+  state.sourceSnapshots.set(sourceKey, {
+    ...payload,
+    nodes: dedupeNodesByID(payload.nodes),
+  });
   state.snapshotFailures.delete(sourceKey);
   updateTransportState("snapshot", payload.generated_at);
   applyTestHistory(payload.test_history, sourceKey);
@@ -730,6 +800,10 @@ function handleNodeDelta(payload, sourceKey = "default") {
   if (!payload || typeof payload !== "object" || !payload.node) {
     return;
   }
+  const stampedNode = {
+    ...(payload.node && typeof payload.node === "object" ? payload.node : {}),
+    __sourceKey: sourceKey,
+  };
   const previous = state.sourceSnapshots.get(sourceKey) || {
     type: "snapshot",
     nodes: [],
@@ -740,7 +814,7 @@ function handleNodeDelta(payload, sourceKey = "default") {
     ...previous,
     type: "snapshot",
     generated_at: payload.generated_at || Math.floor(Date.now() / 1000),
-    nodes: upsertNodeInSnapshot(previous.nodes, payload.node),
+    nodes: upsertNodeInSnapshot(previous.nodes, stampedNode, sourceKey),
   };
   state.sourceSnapshots.set(sourceKey, next);
   state.snapshotFailures.delete(sourceKey);
@@ -932,12 +1006,20 @@ function historyNodeCacheKey(nodeId, sourceKey) {
   return `${normalizeHistorySourceKey(sourceKey)}::${String(nodeId || "").trim()}`;
 }
 
+function resolveHistoryNodeId(nodeId) {
+  const targetNode = findNodeByDisplayId(nodeId);
+  if (targetNode) {
+    return resolveBackendNodeId(targetNode, "").trim();
+  }
+  return parseDisplayNodeId(nodeId)?.nodeID || String(nodeId || "").trim();
+}
+
 function resolveHistoryNodeCacheKey(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
-  return historyNodeCacheKey(nodeId, sourceKey);
+  return historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey);
 }
 
 function historyRequestKey(nodeId, sourceKey, rangeKey) {
-  return `${historyNodeCacheKey(nodeId, sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
+  return `${historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
 }
 
 function ensureNodeHistoryRangesByKey(cacheKey) {
@@ -1114,10 +1196,10 @@ function cleanupDetachedHistory(nodes) {
   const activeHistoryKeys = new Set();
   const activeNodeIDs = new Set();
   nodes.forEach((node) => {
-    const id = resolveNodeId(node, "");
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default");
     if (id) {
       activeNodeIDs.add(id);
-      activeHistoryKeys.add(historyNodeCacheKey(id, node.__sourceKey || "default"));
+      activeHistoryKeys.add(resolveHistoryNodeCacheKey(id, node.__sourceKey || "default"));
     }
   });
   let changed = false;
@@ -1296,12 +1378,21 @@ function normalizeTestHistorySeries(series, size) {
   return normalized;
 }
 
+function findNodeByDisplayId(nodeId) {
+  const normalized = String(nodeId || "").trim();
+  if (!normalized) {
+    return null;
+  }
+  return state.lastNodes.find(
+    (node) =>
+      resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim() === normalized
+  ) || null;
+}
+
 function resolveNodeSourceKey(nodeId) {
-  const targetNode = state.lastNodes.find(
-    (node) => resolveNodeId(node, "").trim() === nodeId
-  );
+  const targetNode = findNodeByDisplayId(nodeId);
   if (!targetNode) {
-    return "default";
+    return parseDisplayNodeId(nodeId)?.sourceKey || "default";
   }
   return String(targetNode.__sourceKey || "default");
 }
@@ -1318,6 +1409,10 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     return null;
   }
   const sourceKey = resolveNodeSourceKey(nodeId);
+  const rawNodeId = resolveHistoryNodeId(nodeId);
+  if (!rawNodeId) {
+    return null;
+  }
   const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);
   if (state.testHistoryFetched.has(requestKey)) {
     return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
@@ -1334,7 +1429,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
 
   const request = fetch(
     `${apiBase}/api/v1/public/nodes/${encodeURIComponent(
-      nodeId
+      rawNodeId
     )}/history?range=${encodeURIComponent(normalizedRange)}`,
     {
       cache: "no-store",
@@ -1660,7 +1755,11 @@ function updateStats(nodes) {
 function renderFlatList(nodes) {
   const activeIds = new Set();
   nodes.forEach((node, index) => {
-    const id = resolveNodeId(node, `node-flat-${index}`);
+    const id = resolveDisplayNodeId(
+      node,
+      `node-flat-${index}`,
+      node.__sourceKey || "default"
+    );
     activeIds.add(id);
     let card = state.nodes.get(id);
     if (!card) {
@@ -1694,7 +1793,11 @@ function renderTagSections(nodes, group) {
     entry.count.textContent = `(${section.nodes.length})`;
     activeTags.add(section.tag);
     section.nodes.forEach((node, index) => {
-      const id = resolveNodeId(node, `node-${sectionIndex}-${index}`);
+      const id = resolveDisplayNodeId(
+        node,
+        `node-${sectionIndex}-${index}`,
+        node.__sourceKey || "default"
+      );
       activeIds.add(id);
       let card = state.nodes.get(id);
       if (!card) {
@@ -1804,15 +1907,6 @@ function groupNodesByTag(nodes, group) {
       return a.tag.localeCompare(b.tag, "zh-Hans-CN");
     });
   return sorted;
-}
-
-function resolveNodeId(node, fallback) {
-  if (!node) return fallback;
-  if (node.id) return String(node.id);
-  const stats = node.stats || {};
-  if (stats.node_id) return String(stats.node_id);
-  if (stats.node_name) return String(stats.node_name);
-  return fallback;
 }
 
 function createCard() {

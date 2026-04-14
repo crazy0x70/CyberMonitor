@@ -303,6 +303,59 @@ func TestStoreUpdatePreservesRawNetworkTotalsWhenAgentCountersDrop(t *testing.T)
 	}
 }
 
+func TestStoreUpdateIgnoresOlderStatsTimestampButRefreshesHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	store := newOfflineTrackerTestStore(t)
+
+	store.Update(metrics.NodeStats{
+		NodeID:    "node-1",
+		NodeName:  "node-1",
+		Timestamp: 1_960_000_200,
+		Network: metrics.NetworkIO{
+			BytesSent:     200 * 1024 * 1024,
+			BytesRecv:     300 * 1024 * 1024,
+			TxBytesPerSec: 9 * 1024,
+			RxBytesPerSec: 7 * 1024,
+		},
+	})
+
+	store.mu.RLock()
+	firstState := store.nodes["node-1"]
+	store.mu.RUnlock()
+
+	time.Sleep(20 * time.Millisecond)
+
+	store.Update(metrics.NodeStats{
+		NodeID:    "node-1",
+		NodeName:  "node-1",
+		Timestamp: 1_960_000_199,
+		Network: metrics.NetworkIO{
+			BytesSent:     50 * 1024 * 1024,
+			BytesRecv:     60 * 1024 * 1024,
+			TxBytesPerSec: 1 * 1024,
+			RxBytesPerSec: 2 * 1024,
+		},
+	})
+
+	store.mu.RLock()
+	finalState := store.nodes["node-1"]
+	store.mu.RUnlock()
+
+	if finalState.Stats.Timestamp != firstState.Stats.Timestamp {
+		t.Fatalf("expected stale update to keep latest timestamp %d, got %d", firstState.Stats.Timestamp, finalState.Stats.Timestamp)
+	}
+	if finalState.Stats.Network.BytesSent != firstState.Stats.Network.BytesSent {
+		t.Fatalf("expected stale update to keep latest sent bytes %d, got %d", firstState.Stats.Network.BytesSent, finalState.Stats.Network.BytesSent)
+	}
+	if finalState.Stats.Network.BytesRecv != firstState.Stats.Network.BytesRecv {
+		t.Fatalf("expected stale update to keep latest recv bytes %d, got %d", firstState.Stats.Network.BytesRecv, finalState.Stats.Network.BytesRecv)
+	}
+	if !finalState.LastSeen.After(firstState.LastSeen) {
+		t.Fatalf("expected stale update to still refresh heartbeat, before=%s after=%s", firstState.LastSeen, finalState.LastSeen)
+	}
+}
+
 func TestOfflineTrackerReconcileSkipsDuplicateRecoveryEventAndClearsSession(t *testing.T) {
 	t.Parallel()
 

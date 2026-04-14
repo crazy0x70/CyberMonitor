@@ -14,18 +14,6 @@ import (
 )
 
 func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
-	originalDialTimeout := grpcDialTimeout
-	originalCallTimeout := grpcCallTimeout
-	originalReadyTimeout := grpcReadyTimeout
-	grpcDialTimeout = 25 * time.Millisecond
-	grpcCallTimeout = 25 * time.Millisecond
-	grpcReadyTimeout = 10 * time.Millisecond
-	defer func() {
-		grpcDialTimeout = originalDialTimeout
-		grpcCallTimeout = originalCallTimeout
-		grpcReadyTimeout = originalReadyTimeout
-	}()
-
 	tokenFile := filepath.Join(t.TempDir(), "agent-token")
 	mustWriteFile(t, tokenFile, " dedicated-token \n")
 
@@ -68,6 +56,7 @@ func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
 		AgentToken: "bootstrap-token",
 		TokenFile:  tokenFile,
 		HostRoot:   t.TempDir(),
+		transportOptions: shortGRPCTransportOptions(),
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
@@ -78,18 +67,6 @@ func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
 }
 
 func TestBootstrapDedicatedTokenPersistsAcrossRestarts(t *testing.T) {
-	originalDialTimeout := grpcDialTimeout
-	originalCallTimeout := grpcCallTimeout
-	originalReadyTimeout := grpcReadyTimeout
-	grpcDialTimeout = 25 * time.Millisecond
-	grpcCallTimeout = 25 * time.Millisecond
-	grpcReadyTimeout = 10 * time.Millisecond
-	defer func() {
-		grpcDialTimeout = originalDialTimeout
-		grpcCallTimeout = originalCallTimeout
-		grpcReadyTimeout = originalReadyTimeout
-	}()
-
 	tokenFile := filepath.Join(t.TempDir(), "agent-token")
 	cfg := Config{
 		Interval:   time.Hour,
@@ -98,6 +75,7 @@ func TestBootstrapDedicatedTokenPersistsAcrossRestarts(t *testing.T) {
 		AgentToken: "bootstrap-token",
 		TokenFile:  tokenFile,
 		HostRoot:   t.TempDir(),
+		transportOptions: shortGRPCTransportOptions(),
 	}
 
 	var firstRegisterHits atomic.Int32

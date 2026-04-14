@@ -1618,8 +1618,12 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	if firstSeen.IsZero() {
 		firstSeen = now
 	}
+	storedStats := stats
+	if !shouldReplaceNodeStats(prev.Stats, stats) {
+		storedStats = prev.Stats
+	}
 	s.nodes[stats.NodeID] = NodeState{
-		Stats:     stats,
+		Stats:     storedStats,
 		LastSeen:  now,
 		FirstSeen: firstSeen,
 	}
@@ -1633,24 +1637,24 @@ func (s *Store) Update(stats metrics.NodeStats) {
 		persist = true
 	}
 	if profile.Alias == "" {
-		if stats.NodeAlias != "" {
-			profile.Alias = stats.NodeAlias
-		} else if stats.NodeName != "" {
-			profile.Alias = stats.NodeName
-		} else if stats.Hostname != "" {
-			profile.Alias = stats.Hostname
+		if storedStats.NodeAlias != "" {
+			profile.Alias = storedStats.NodeAlias
+		} else if storedStats.NodeName != "" {
+			profile.Alias = storedStats.NodeName
+		} else if storedStats.Hostname != "" {
+			profile.Alias = storedStats.Hostname
 		}
 		if profile.Alias != "" {
 			persist = true
 		}
 	}
-	if stats.NodeGroup != "" {
+	if storedStats.NodeGroup != "" {
 		if profile.Group == "" {
-			profile.Group = stats.NodeGroup
+			profile.Group = storedStats.NodeGroup
 			persist = true
 		}
 		if len(profile.Groups) == 0 {
-			profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(stats.NodeGroup, nil))
+			profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(storedStats.NodeGroup, nil))
 			group, tags := primaryGroupTagsFromSelections(profile.Groups)
 			if group != "" {
 				profile.Group = group
@@ -1694,6 +1698,16 @@ func (s *Store) Update(stats metrics.NodeStats) {
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
 	}
+}
+
+func shouldReplaceNodeStats(current, incoming metrics.NodeStats) bool {
+	if strings.TrimSpace(current.NodeID) == "" {
+		return true
+	}
+	if current.Timestamp <= 0 || incoming.Timestamp <= 0 {
+		return true
+	}
+	return incoming.Timestamp >= current.Timestamp
 }
 
 func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) bool {

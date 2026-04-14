@@ -510,7 +510,7 @@ jobs:
           cp artifacts/web-dist.zip release/ || true
           find release -type f -name "cyber-monitor-*" ! -name "*.exe" -exec chmod +x {} \;
           cd release
-          sha256sum * > checksums.txt
+          sha256sum * > SHA256SUMS
           ls -la
 
       - name: Create release
