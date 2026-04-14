@@ -331,19 +331,22 @@ func TestSidebarNavigationAvoidsHoverTransformFlicker(t *testing.T) {
 	}
 }
 
-func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
+func TestBuildReleaseWorkflowSyncsNodeVersionWithDockerfile(t *testing.T) {
 	t.Parallel()
 
 	content := readRepoFileForUITest(t, ".github/workflows/build-release.yml")
 	requiredSnippets := []string{
 		"FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true",
 		`DOCKER_BUILD_SUMMARY: 'false'`,
-		"uses: actions/checkout@v5",
+		"uses: actions/checkout@v6",
 		"uses: actions/setup-go@v6",
-		"uses: actions/setup-node@v5",
-		`node-version: '24'`,
-		"uses: actions/download-artifact@v7",
-		"uses: actions/upload-artifact@v6",
+		"uses: actions/setup-node@v6",
+		"id: build-inputs",
+		`DOCKER_NODE_VERSION="$(awk '/^FROM --platform=\$BUILDPLATFORM node:/`,
+		`echo "node_version=$DOCKER_NODE_VERSION" >> "$GITHUB_OUTPUT"`,
+		"node-version: ${{ steps.build-inputs.outputs.node_version }}",
+		"uses: actions/download-artifact@v8",
+		"uses: actions/upload-artifact@v7",
 		"uses: docker/setup-qemu-action@v4",
 		"uses: docker/setup-buildx-action@v4",
 		"uses: docker/login-action@v4",
@@ -355,12 +358,17 @@ func TestBuildReleaseWorkflowUsesNode24CompatibleActions(t *testing.T) {
 	}
 	disallowedSnippets := []string{
 		"uses: actions/checkout@v4",
+		"uses: actions/checkout@v5",
 		"uses: actions/setup-go@v5",
+		"uses: actions/setup-node@v5",
 		"uses: actions/setup-node@v4",
+		`node-version: '24'`,
 		`node-version: '22'`,
 		"uses: actions/download-artifact@v5",
 		"uses: actions/download-artifact@v6",
+		"uses: actions/download-artifact@v7",
 		"uses: actions/upload-artifact@v4",
+		"uses: actions/upload-artifact@v6",
 		"uses: docker/setup-qemu-action@v3",
 		"uses: docker/setup-buildx-action@v3",
 		"uses: docker/login-action@v3",

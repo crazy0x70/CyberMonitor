@@ -115,6 +115,76 @@ func TestNetworkStoreDeleteNodeRemovesOnlyMatchingNodeSeries(t *testing.T) {
 	}
 }
 
+func TestNetworkStoreSkipsStaleSamplesWithoutDroppingNewerSamples(t *testing.T) {
+	t.Parallel()
+
+	store := newTestNetworkStore(t)
+	base := time.Unix(1_810_000_000, 0).UTC()
+	initialLatency := 18.6
+	staleLatency := 17.2
+	freshLatency := 25.4
+
+	if err := store.AppendBatch("node-a", []metrics.NetworkTestResult{{
+		Type:       "tcp",
+		Host:       "example.com",
+		Port:       443,
+		Name:       "https",
+		CheckedAt:  base.Unix(),
+		LatencyMs:  &initialLatency,
+		PacketLoss: 0,
+		Status:     "online",
+	}}, base); err != nil {
+		t.Fatalf("append initial sample: %v", err)
+	}
+
+	if err := store.AppendBatch("node-a", []metrics.NetworkTestResult{
+		{
+			Type:       "tcp",
+			Host:       "example.com",
+			Port:       443,
+			Name:       "https",
+			CheckedAt:  base.Add(-time.Minute).Unix(),
+			LatencyMs:  &staleLatency,
+			PacketLoss: 0,
+			Status:     "online",
+		},
+		{
+			Type:       "tcp",
+			Host:       "example.com",
+			Port:       443,
+			Name:       "https",
+			CheckedAt:  base.Add(time.Minute).Unix(),
+			LatencyMs:  &freshLatency,
+			PacketLoss: 0,
+			Status:     "online",
+		},
+	}, base.Add(time.Minute)); err != nil {
+		t.Fatalf("append batch with stale and fresh samples: %v", err)
+	}
+
+	got, err := store.QueryRange("node-a", base.Add(-time.Hour), base.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("query range: %v", err)
+	}
+
+	entry := got["tcp|example.com|443|https"]
+	if entry == nil {
+		t.Fatalf("expected tcp series to exist, got keys=%v", mapKeys(got))
+	}
+	if len(entry.Times) != 2 {
+		t.Fatalf("expected stale sample to be skipped while fresh sample is kept, got %d points", len(entry.Times))
+	}
+	if entry.Times[0] != base.Unix() || entry.Times[1] != base.Add(time.Minute).Unix() {
+		t.Fatalf("unexpected timestamps after stale-sample filtering: %+v", entry.Times)
+	}
+	if entry.Latency[0] == nil || *entry.Latency[0] != initialLatency {
+		t.Fatalf("expected first latency %.1f to be preserved, got %+v", initialLatency, entry.Latency[0])
+	}
+	if entry.Latency[1] == nil || *entry.Latency[1] != freshLatency {
+		t.Fatalf("expected fresh latency %.1f to be appended, got %+v", freshLatency, entry.Latency[1])
+	}
+}
+
 func newTestNetworkStore(t *testing.T) *NetworkStore {
 	t.Helper()
 

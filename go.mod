@@ -1,6 +1,6 @@
 module cyber_monitor
 
-go 1.26.1
+go 1.26.2
 
 require (
 	github.com/docker/docker v28.5.2+incompatible
@@ -8,12 +8,12 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/prometheus/prometheus v0.311.1
+	github.com/prometheus/prometheus v0.311.2
 	github.com/shirou/gopsutil/v3 v3.24.5
-	golang.org/x/crypto v0.49.0
-	golang.org/x/net v0.52.0
-	golang.org/x/sys v0.42.0
-	google.golang.org/grpc v1.79.3
+	golang.org/x/crypto v0.50.0
+	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.43.0
+	google.golang.org/grpc v1.80.0
 )
 
 replace github.com/docker/docker => github.com/moby/moby v28.5.2+incompatible
@@ -100,7 +100,7 @@ require (
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/api v0.272.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260311181403-84a4fc48630c // indirect

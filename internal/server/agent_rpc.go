@@ -74,7 +74,6 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if strings.TrimSpace(remoteAddr) == "" {
 		remoteAddr = "grpc"
 	}
-	reportLogger.Printf("Agent 上报: %s (%s)", payload.NodeID, remoteAddr)
 	return nil
 }
 

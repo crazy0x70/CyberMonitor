@@ -682,16 +682,21 @@ export default function BasicSettings({
                     {systemUpdateInfo?.updating ? "更新中" : "立即更新"}
                   </Button>
                   {systemUpdateInfo?.html_url ? (
-                    <Button asChild type="button" variant="outline" className={cn(adminActionButtonClass, "h-11 px-5")}>
-                      <a
-                        className="inline-flex items-center gap-2"
-                        href={systemUpdateInfo.html_url}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        <ExternalLink className="h-4 w-4 shrink-0" />
-                        查看发布说明
-                      </a>
+                    <Button
+                      variant="outline"
+                      className={cn(adminActionButtonClass, "h-11 px-5")}
+                      nativeButton={false}
+                      render={(
+                        <a
+                          className="inline-flex items-center gap-2"
+                          href={systemUpdateInfo.html_url}
+                          rel="noreferrer"
+                          target="_blank"
+                        />
+                      )}
+                    >
+                      <ExternalLink className="h-4 w-4 shrink-0" />
+                      查看发布说明
                     </Button>
                   ) : null}
                 </div>

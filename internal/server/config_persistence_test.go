@@ -1,9 +1,16 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"cyber_monitor/internal/metrics"
 )
 
 func loadPersistedSettingsForTest(t *testing.T, dataDir string) Settings {
@@ -17,16 +24,6 @@ func loadPersistedSettingsForTest(t *testing.T, dataDir string) Settings {
 		t.Fatal("expected persisted data to exist")
 	}
 	return payload.Settings
-}
-
-func loadPersistedTestHistoryForTest(t *testing.T, dataDir string) TestHistoryData {
-	t.Helper()
-
-	payload, _, _, err := loadTestHistoryData(filepath.Join(dataDir, testHistoryFileName))
-	if err != nil {
-		t.Fatalf("load persisted test history: %v", err)
-	}
-	return payload
 }
 
 func TestMergeSettingsBackfillsMissingValuesWithoutOverwritingExisting(t *testing.T) {
@@ -204,23 +201,40 @@ func TestRunPreservesPersistedSettingsOnRestart(t *testing.T) {
 	}
 }
 
-func TestRunPreservesPersistedTestHistoryOnRestart(t *testing.T) {
+func TestRunMigratesLegacyTestHistoryToTSDBWithoutRecreatingJSON(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
 	cfg := Config{
-		Addr:      reserveTCPAddr(t),
-		DataDir:   dataDir,
-		AdminPath: "/cm-admin",
-		AdminUser: "admin",
-		AdminPass: "admin123",
+		Addr:       reserveTCPAddr(t),
+		DataDir:    dataDir,
+		AdminPath:  "/cm-admin",
+		AdminUser:  "admin",
+		AdminPass:  "admin123",
+		AgentToken: "bootstrap-token",
 	}
 
 	settings := initSettings(cfg)
+	baseNow := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
 	if err := savePersistedData(filepath.Join(dataDir, "state.json"), PersistedData{
 		Settings: settings,
-		Profiles: map[string]*NodeProfile{},
-		Nodes:    map[string]NodeState{},
+		Profiles: map[string]*NodeProfile{
+			"node-a": {},
+		},
+		Nodes: map[string]NodeState{
+			"node-a": {
+				Stats: metrics.NodeStats{
+					NodeID:    "node-a",
+					NodeName:  "node-a",
+					Hostname:  "node-a",
+					OS:        "linux",
+					Arch:      "amd64",
+					Timestamp: baseNow.Unix(),
+				},
+				LastSeen:  baseNow,
+				FirstSeen: baseNow.Add(-time.Hour),
+			},
+		},
 	}); err != nil {
 		t.Fatalf("save persisted data: %v", err)
 	}
@@ -229,50 +243,94 @@ func TestRunPreservesPersistedTestHistoryOnRestart(t *testing.T) {
 	latencyB := 28.8
 	lossA := 0.0
 	lossB := 2.5
+	sampleTimes := []int64{
+		baseNow.Add(-60 * time.Second).Unix(),
+		baseNow.Add(-30 * time.Second).Unix(),
+	}
 	history := TestHistoryData{
 		Version:   testHistoryVersion,
-		UpdatedAt: 1_777_000_123,
+		UpdatedAt: sampleTimes[len(sampleTimes)-1],
 		Nodes: map[string]map[string]*TestHistoryEntry{
 			"node-a": {
 				"icmp|1.1.1.1|0|Cloudflare": {
 					Latency:        []*float64{&latencyA, &latencyB},
 					Loss:           []*float64{&lossA, &lossB},
-					Times:          []int64{1_777_000_000, 1_777_000_030},
-					LastAt:         1_777_000_030,
+					Times:          sampleTimes,
+					LastAt:         sampleTimes[len(sampleTimes)-1],
 					MinIntervalSec: 30,
 					AvgIntervalSec: 30,
 				},
 			},
 		},
 	}
-	if err := saveTestHistoryData(filepath.Join(dataDir, testHistoryFileName), history); err != nil {
+	legacyPath := filepath.Join(dataDir, testHistoryFileName)
+	if err := saveTestHistoryData(legacyPath, history); err != nil {
 		t.Fatalf("save test history: %v", err)
 	}
 
-	startTestServer(t, cfg)
+	baseURL, _ := startTestServer(t, cfg)
 
-	persisted := loadPersistedTestHistoryForTest(t, dataDir)
-	entry := persisted.Nodes["node-a"]["icmp|1.1.1.1|0|Cloudflare"]
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected legacy history file to be removed after TSDB migration, got err=%v", err)
+	}
+	if _, err := os.Stat(legacyPath + ".bak"); err != nil {
+		t.Fatalf("expected migration backup to exist: %v", err)
+	}
+	if _, err := os.Stat(legacyPath + ".migrated"); err != nil {
+		t.Fatalf("expected migration marker to exist: %v", err)
+	}
+
+	client, _ := bootstrapPublicPageClient(t, baseURL)
+	resp := getPublicNodeHistory(t, client, baseURL, "/api/v1/public/nodes/node-a/history?range=24h")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected public history to expose migrated TSDB data, got %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Tests map[string]*TestHistoryEntry `json:"tests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode migrated public history payload: %v", err)
+	}
+	entry := payload.Tests["icmp|1.1.1.1|0|cloudflare"]
 	if entry == nil {
-		t.Fatal("expected persisted test history entry to survive restart")
+		t.Fatal("expected migrated series to exist in TSDB-backed public history")
 	}
-	if len(entry.Times) != 2 || entry.Times[0] != 1_777_000_000 || entry.Times[1] != 1_777_000_030 {
-		t.Fatalf("expected test history timestamps to be preserved, got %+v", entry.Times)
+	if len(entry.Times) != 2 || entry.Times[0] != sampleTimes[0] || entry.Times[1] != sampleTimes[1] {
+		t.Fatalf("expected migrated timestamps to be preserved, got %+v", entry.Times)
 	}
-	if entry.LastAt != 1_777_000_030 {
-		t.Fatalf("expected last_at to be preserved, got %d", entry.LastAt)
-	}
-	if entry.MinIntervalSec != 30 {
-		t.Fatalf("expected min interval to be preserved, got %d", entry.MinIntervalSec)
-	}
-	if entry.AvgIntervalSec != 30 {
-		t.Fatalf("expected average interval to be preserved, got %v", entry.AvgIntervalSec)
+	if entry.LastAt != sampleTimes[len(sampleTimes)-1] {
+		t.Fatalf("expected migrated last_at to be preserved, got %d", entry.LastAt)
 	}
 	if len(entry.Latency) != 2 || entry.Latency[0] == nil || entry.Latency[1] == nil {
-		t.Fatalf("expected latency samples to be preserved, got %+v", entry.Latency)
+		t.Fatalf("expected migrated latency samples to be preserved, got %+v", entry.Latency)
 	}
 	if *entry.Latency[0] != latencyA || *entry.Latency[1] != latencyB {
-		t.Fatalf("expected latency values to be preserved, got %+v", entry.Latency)
+		t.Fatalf("expected migrated latency values to be preserved, got %+v", entry.Latency)
+	}
+}
+
+func TestRunDoesNotCreateTestHistoryJSONOnStatsReport(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	baseURL, _ := startTestServer(t, Config{
+		Addr:       reserveTCPAddr(t),
+		DataDir:    dataDir,
+		AdminPath:  "/cm-admin",
+		AgentToken: "bootstrap-token",
+	})
+
+	baseNow := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+	seedPublicHistory(t, baseURL, "bootstrap-token", "node-live", "1.1.1.1", "live", []int64{
+		baseNow.Unix(),
+		baseNow.Add(30 * time.Second).Unix(),
+	})
+
+	legacyPath := filepath.Join(dataDir, testHistoryFileName)
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected live TSDB writes not to recreate %s, got err=%v", testHistoryFileName, err)
 	}
 }
 

@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Verify Go version sync
         run: |
@@ -83,7 +83,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Download admin assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: admin-web-sync
           path: .
@@ -145,7 +145,7 @@ jobs:
             output: cyber-monitor-server-freebsd-arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -155,7 +155,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Download admin assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: admin-web-sync
           path: .
@@ -180,7 +180,7 @@ jobs:
             ${{ matrix.cmd_path }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
@@ -236,7 +236,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -260,7 +260,7 @@ jobs:
             ${{ matrix.cmd_path }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
@@ -271,14 +271,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Verify build inputs
+        id: build-inputs
         run: |
           GO_VERSION="$(awk '/^go / { print $2; exit }' go.mod)"
           DOCKER_GO_VERSION="$(awk -F= '/^ARG GO_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
+          DOCKER_NODE_VERSION="$(awk '/^FROM --platform=\$BUILDPLATFORM node:/ { line=$0; sub(/^FROM --platform=\$BUILDPLATFORM node:/, "", line); sub(/-.*/, "", line); print line; exit }' Dockerfile)"
           if [ -z "$GO_VERSION" ] || [ -z "$DOCKER_GO_VERSION" ]; then
             echo "Unable to resolve Go version from go.mod or Dockerfile" >&2
+            exit 1
+          fi
+          if [ -z "$DOCKER_NODE_VERSION" ]; then
+            echo "Unable to resolve Node version from Dockerfile" >&2
             exit 1
           fi
           if [ "$GO_VERSION" != "$DOCKER_GO_VERSION" ]; then
@@ -296,11 +302,12 @@ jobs:
             test -e "$path"
             git ls-files --error-unmatch "$path" >/dev/null 2>&1
           done
+          echo "node_version=$DOCKER_NODE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: ${{ steps.build-inputs.outputs.node_version }}
           cache: 'npm'
           cache-dependency-path: admin-ui/package-lock.json
 
@@ -315,7 +322,7 @@ jobs:
           tar -czf admin-web-sync.tar.gz -C internal/server/web admin-app admin-assets
 
       - name: Upload synced admin assets
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: admin-web-sync
           path: admin-web-sync.tar.gz
@@ -326,10 +333,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download admin assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: admin-web-sync
           path: .
@@ -345,14 +352,14 @@ jobs:
           (cd internal/server/web && zip -r ../../../web-dist.zip .)
 
       - name: Upload web archive (tar.gz)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist-tar
           path: web-dist.tar.gz
           retention-days: 30
 
       - name: Upload web archive (zip)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist-zip
           path: web-dist.zip
@@ -370,7 +377,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Verify admin build inputs
         run: |
@@ -429,7 +436,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -469,7 +476,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -489,7 +496,7 @@ jobs:
           echo "compare_url=$URL" >> $GITHUB_OUTPUT
 
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true

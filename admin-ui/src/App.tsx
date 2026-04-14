@@ -1041,16 +1041,18 @@ export default function App() {
 
       <header className="fixed left-0 right-0 top-0 z-50 flex h-16 items-center border-b border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] px-6 backdrop-blur-3xl md:hidden">
         <Sheet open={isMobileMenuOpen} onOpenChange={setIsMobileMenuOpen}>
-          <SheetTrigger asChild>
-            <Button
-              aria-label="打开导航菜单"
-              className={adminSidebarIconButtonClass}
-              size="icon"
-              variant="outline"
-            >
-              <Menu className="h-5 w-5" />
-            </Button>
-          </SheetTrigger>
+          <SheetTrigger
+            render={(
+              <Button
+                aria-label="打开导航菜单"
+                className={adminSidebarIconButtonClass}
+                size="icon"
+                variant="outline"
+              >
+                <Menu className="h-5 w-5" />
+              </Button>
+            )}
+          />
           <SheetContent className="w-[310px] p-0 bg-transparent border-none shadow-none" side="left">
             <NavContent />
           </SheetContent>

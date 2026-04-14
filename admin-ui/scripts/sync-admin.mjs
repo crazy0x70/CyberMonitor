@@ -62,9 +62,13 @@ const entryBundlePath = path.join(adminBundleRoot, entryMatch[1]);
 const entryBundleSource = await readFile(entryBundlePath, "utf8");
 const assetBaseRuntimeExpr =
   `((document.querySelector('meta[name="cm-admin-asset-base"]')?.content)||"${legacyAdminAssetBasePath}")+`;
-const entryBundlePatched = entryBundleSource.replaceAll(
+const entryBundlePatched = [
   `"${legacyAdminAssetBasePath}"+`,
-  assetBaseRuntimeExpr,
+  `'${legacyAdminAssetBasePath}'+`,
+  `\`${legacyAdminAssetBasePath}\`+`,
+].reduce(
+  (source, token) => source.replaceAll(token, assetBaseRuntimeExpr),
+  entryBundleSource,
 );
 
 if (entryBundlePatched === entryBundleSource) {

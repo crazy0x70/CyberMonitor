@@ -779,16 +779,17 @@ export default function ServerManagement({
     if (!item.id) {
       return;
     }
+    const itemID = item.id;
     setForm((current) => {
       if (!current) {
         return current;
       }
       const nextSelections = { ...current.testSelections };
-      if (Object.prototype.hasOwnProperty.call(nextSelections, item.id)) {
-        delete nextSelections[item.id];
+      if (Object.prototype.hasOwnProperty.call(nextSelections, itemID)) {
+        delete nextSelections[itemID];
       } else {
         const isTCP = String(item.type || "icmp").toLowerCase() === "tcp";
-        nextSelections[item.id] = isTCP ? String(defaultInterval(item)) : "0";
+        nextSelections[itemID] = isTCP ? String(defaultInterval(item)) : "0";
       }
       return { ...current, testSelections: nextSelections };
     });
@@ -1382,7 +1383,8 @@ export default function ServerManagement({
                                           disabled={!active || !item.id}
                                           value={intervalValue}
                                           onChange={(event) => {
-                                            if (!item.id) {
+                                            const itemID = item.id;
+                                            if (!itemID) {
                                               return;
                                             }
                                             const value = event.target.value;
@@ -1392,7 +1394,7 @@ export default function ServerManagement({
                                                     ...current,
                                                     testSelections: {
                                                       ...current.testSelections,
-                                                      [item.id]: value,
+                                                      [itemID]: value,
                                                     },
                                                   }
                                                 : current,
@@ -1453,9 +1455,12 @@ export default function ServerManagement({
                             <Label htmlFor="node-renew-plan">自动续费方案</Label>
                             <Select
                               value={form.renewPlan}
-                              onValueChange={(value: RenewPlan) =>
-                                setForm((current) => current && ({ ...current, renewPlan: value }))
-                              }
+                              onValueChange={(value) => {
+                                if (value === null) {
+                                  return;
+                                }
+                                setForm((current) => current && ({ ...current, renewPlan: value as RenewPlan }));
+                              }}
                               disabled={!hasExpireAt}
                             >
                               <SelectTrigger id="node-renew-plan" className={adminSelectTriggerClass}>
@@ -1518,25 +1523,27 @@ export default function ServerManagement({
                       ) : (
                         <div className="grid gap-2">
                           <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                id="node-group-selection-trigger"
-                                type="button"
-                                variant="outline"
-                                className="h-11 w-full justify-between rounded-[1.1rem] border-slate-200 bg-white px-4 text-left text-sm font-medium text-slate-700 shadow-none hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-                              >
-                                <span
-                                  className={`truncate ${
-                                    selectedGroupCount === 0
-                                      ? "text-slate-400 dark:text-slate-500"
-                                      : "text-slate-700 dark:text-slate-200"
-                                  }`}
+                            <DropdownMenuTrigger
+                              render={(
+                                <Button
+                                  id="node-group-selection-trigger"
+                                  type="button"
+                                  variant="outline"
+                                  className="h-11 w-full justify-between rounded-[1.1rem] border-slate-200 bg-white px-4 text-left text-sm font-medium text-slate-700 shadow-none hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
                                 >
-                                  {groupSelectionMenuLabel}
-                                </span>
-                                <ChevronsUpDown className="ml-3 h-4 w-4 shrink-0 text-slate-400" />
-                              </Button>
-                            </DropdownMenuTrigger>
+                                  <span
+                                    className={`truncate ${
+                                      selectedGroupCount === 0
+                                        ? "text-slate-400 dark:text-slate-500"
+                                        : "text-slate-700 dark:text-slate-200"
+                                    }`}
+                                  >
+                                    {groupSelectionMenuLabel}
+                                  </span>
+                                  <ChevronsUpDown className="ml-3 h-4 w-4 shrink-0 text-slate-400" />
+                                </Button>
+                              )}
+                            />
                             <DropdownMenuContent
                               align="start"
                               className="w-[min(26rem,calc(100vw-3rem))] rounded-[1.3rem] border border-slate-200/90 bg-white/98 p-2 shadow-[0_24px_56px_-36px_rgba(15,23,42,0.32)] dark:border-slate-800 dark:bg-slate-950/98"
@@ -1652,21 +1659,23 @@ export default function ServerManagement({
 
               <DialogFooter className={`${adminDialogFooterClass} flex-col-reverse gap-3 sm:flex-row sm:justify-between items-center px-8 py-6`}>
                 <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-                  <AlertDialogTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
-                      disabled={saving || deleting}
-                    >
-                      {deleting ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      ) : (
-                        <Trash2 className="mr-2 h-4 w-4" />
-                      )}
-                      删除节点
-                    </Button>
-                  </AlertDialogTrigger>
+                  <AlertDialogTrigger
+                    render={(
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
+                        disabled={saving || deleting}
+                      >
+                        {deleting ? (
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="mr-2 h-4 w-4" />
+                        )}
+                        删除节点
+                      </Button>
+                    )}
+                  />
                   <AlertDialogContent className={adminDialogContentClass}>
                     <AlertDialogHeader className={adminDialogHeaderClass}>
                       <AlertDialogTitle>

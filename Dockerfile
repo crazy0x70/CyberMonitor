@@ -1,6 +1,6 @@
-ARG GO_IMAGE_VERSION=1.26.1
+ARG GO_IMAGE_VERSION=1.26.2
 
-FROM --platform=$BUILDPLATFORM node:22-alpine AS admin-build
+FROM --platform=$BUILDPLATFORM node:24-alpine AS admin-build
 
 WORKDIR /src
 COPY admin-ui ./admin-ui
@@ -74,7 +74,7 @@ RUN set -eux; \
     -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILD_TIME}" \
     ./cmd/agent
 
-FROM alpine:3.20 AS runtime-base
+FROM alpine:3.23 AS runtime-base
 WORKDIR /app
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN apk add --no-cache su-exec && \

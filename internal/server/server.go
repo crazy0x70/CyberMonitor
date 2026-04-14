@@ -187,25 +187,22 @@ type Config struct {
 }
 
 type Store struct {
-	mu                 sync.RWMutex
-	persistMu          sync.Mutex
-	historyPersistMu   sync.Mutex
-	nodes              map[string]NodeState
-	profiles           map[string]*NodeProfile
-	settings           Settings
-	buildVersion       string
-	buildCommit        string
-	dataPath           string
-	historyPath        string
-	lastPersist        time.Time
-	persistInterval    time.Duration
-	alerted            map[string]alertState
-	offlineSessions    map[string]OfflineSessionState
-	testHistory        map[string]map[string]*TestHistoryEntry
-	historyManager     *history.Manager
-	loginAttempts      map[string]*loginAttempt
-	historyDirty       bool
-	historyLastPersist time.Time
+	mu              sync.RWMutex
+	persistMu       sync.Mutex
+	nodes           map[string]NodeState
+	profiles        map[string]*NodeProfile
+	settings        Settings
+	buildVersion    string
+	buildCommit     string
+	dataPath        string
+	historyPath     string
+	lastPersist     time.Time
+	persistInterval time.Duration
+	alerted         map[string]alertState
+	offlineSessions map[string]OfflineSessionState
+	testHistory     map[string]map[string]*TestHistoryEntry
+	historyManager  *history.Manager
+	loginAttempts   map[string]*loginAttempt
 }
 
 type NodeState struct {
@@ -411,29 +408,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return wrapDataPathError("读取持久化数据失败", dataPath, err)
 	}
 	historyPath := filepath.Join(cfg.DataDir, testHistoryFileName)
-	historyPayload, _, historyNeedsRewrite, historyErr := loadTestHistoryData(historyPath)
-	if historyErr != nil {
-		log.Printf("%v", wrapDataPathError("读取探测历史失败", historyPath, historyErr))
-	}
 	tokenGenerated := !loaded
 	defaultSettings := initSettings(cfg)
 	settings := defaultSettings
 	profiles := make(map[string]*NodeProfile)
 	nodes := make(map[string]NodeState)
 	offlineSessions := make(map[string]OfflineSessionState)
-	testHistory := historyPayload.Nodes
-	if testHistory == nil {
-		testHistory = make(map[string]map[string]*TestHistoryEntry)
-	}
-	historyTrimmed := historyNeedsRewrite
-	nowSec := time.Now().Unix()
-	for _, tests := range testHistory {
-		for _, entry := range tests {
-			if trimHistoryEntry(entry, nowSec) {
-				historyTrimmed = true
-			}
-		}
-	}
+	testHistory := make(map[string]map[string]*TestHistoryEntry)
 	if loaded {
 		settings = mergeSettings(persisted.Settings, defaultSettings)
 		profiles = persisted.Profiles
@@ -522,23 +503,21 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 			}
 			if backupReady {
-				if err := store.persistHistoryWithError(historyData); err != nil {
-					log.Printf("%v", wrapDataPathError("恢复探测历史热缓存失败", historyPath, err))
-				} else if err := history.MarkLegacyMigrationComplete(historyPath, now); err != nil {
-					log.Printf("%v", wrapDataPathError("写入 legacy 迁移标记失败", migration.MarkerPath, err))
-				} else {
-					log.Printf("已将 legacy 探测历史迁移到 TSDB：%s", migration.SourcePath)
+				if migration.SourcePath == historyPath {
+					if err := os.Remove(historyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+						backupReady = false
+						log.Printf("%v", wrapDataPathError("清理 legacy 探测历史失败", historyPath, err))
+					}
+				}
+				if backupReady {
+					if err := history.MarkLegacyMigrationComplete(historyPath, now); err != nil {
+						log.Printf("%v", wrapDataPathError("写入 legacy 迁移标记失败", migration.MarkerPath, err))
+					} else {
+						log.Printf("已将 legacy 探测历史迁移到 TSDB：%s", migration.SourcePath)
+					}
 				}
 			}
 		}
-	}
-	if historyTrimmed {
-		historyData := TestHistoryData{
-			Version:   testHistoryVersion,
-			UpdatedAt: time.Now().Unix(),
-			Nodes:     store.snapshotTestHistory(),
-		}
-		store.persistHistory(historyData)
 	}
 	hub := &Hub{clients: make(map[*websocket.Conn]*hubClient)}
 	agentAPI := newAgentAPI(store, hub, &cfg)
@@ -1504,6 +1483,7 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
+				logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
 				if len(offlineEvents) > 0 {
 					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
 					go sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, offlineEvents)
@@ -1628,8 +1608,6 @@ func generateBootstrapToken() string {
 func (s *Store) Update(stats metrics.NodeStats) {
 	var persist bool
 	var data PersistedData
-	var historyPersist bool
-	var historyData TestHistoryData
 	var recoveryCandidate offlineRecoveryCandidate
 	var hasRecoveryCandidate bool
 	s.mu.Lock()
@@ -1696,16 +1674,9 @@ func (s *Store) Update(stats metrics.NodeStats) {
 		persist = true
 	}
 
-	if s.updateTestHistoryLocked(stats, now) {
-		s.historyDirty = true
-	}
+	s.updateTestHistoryLocked(stats, now)
 	if s.shouldPersistLocked(now) {
 		persist = true
-	}
-	if s.historyDirty && s.shouldPersistHistoryLocked(now) {
-		historyPersist = true
-		historyData = s.snapshotTestHistoryLocked(now)
-		s.historyDirty = false
 	}
 	if persist {
 		data = s.snapshotPersistedLocked()
@@ -1717,9 +1688,6 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	}
 	if hasRecoveryCandidate {
 		s.completeOfflineRecovery(recoveryCandidate)
-	}
-	if historyPersist {
-		s.persistHistory(historyData)
 	}
 	if s.historyManager != nil {
 		if err := s.historyManager.AppendNetworkBatch(stats.NodeID, stats.NetworkTests, now); err != nil {
@@ -2110,7 +2078,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		targets.TelegramToken = ""
 		targets.TelegramUserIDs = nil
 	}
-	if s.settings.AlertOfflineSec <= 0 || (targets.FeishuWebhook == "" && targets.TelegramToken == "") {
+	if s.settings.AlertOfflineSec <= 0 {
 		return AlertTargets{}, nil, nil
 	}
 	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
@@ -2260,6 +2228,35 @@ func buildRecoveryMessage(siteTitle string, events []AlertEvent) string {
 	}
 	lines = append(lines, "", "服务已恢复。")
 	return strings.Join(lines, "\n")
+}
+
+func logReportEvents(siteTitle string, offlineEvents, recoveredEvents []AlertEvent) {
+	title := normalizeSiteTitle(siteTitle)
+	for _, event := range offlineEvents {
+		reportLogger.Printf("[%s] 离线：%s（node=%s，最后=%s，时长=%s）",
+			title,
+			formatAlertValue(event.Display, "未命名节点"),
+			formatAlertValue(event.NodeID, "unknown"),
+			formatReportEventTime(event.LastSeen),
+			formatAlertDuration(event.OfflineSec),
+		)
+	}
+	for _, event := range recoveredEvents {
+		reportLogger.Printf("[%s] 恢复：%s（node=%s，恢复=%s，时长=%s）",
+			title,
+			formatAlertValue(event.Display, "未命名节点"),
+			formatAlertValue(event.NodeID, "unknown"),
+			formatReportEventTime(event.LastSeen),
+			formatAlertDuration(event.OfflineSec),
+		)
+	}
+}
+
+func formatReportEventTime(unixSeconds int64) string {
+	if unixSeconds <= 0 {
+		return "unknown"
+	}
+	return time.Unix(unixSeconds, 0).UTC().Format(time.DateTime)
 }
 
 func formatAlertDuration(seconds int64) string {
@@ -4068,9 +4065,6 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 
 func (s *Store) DeleteNode(nodeID string) bool {
 	var data PersistedData
-	var historyData TestHistoryData
-	var historyPersist bool
-	now := time.Now()
 	s.mu.Lock()
 	_, exists := s.nodes[nodeID]
 	delete(s.nodes, nodeID)
@@ -4078,23 +4072,12 @@ func (s *Store) DeleteNode(nodeID string) bool {
 	delete(s.alerted, nodeID)
 	delete(s.offlineSessions, nodeID)
 	if s.testHistory != nil {
-		if _, ok := s.testHistory[nodeID]; ok {
-			delete(s.testHistory, nodeID)
-			s.historyDirty = true
-		}
-	}
-	if s.historyDirty && s.shouldPersistHistoryLocked(now) {
-		historyPersist = true
-		historyData = s.snapshotTestHistoryLocked(now)
-		s.historyDirty = false
+		delete(s.testHistory, nodeID)
 	}
 	data = s.snapshotPersistedLocked()
 	historyManager := s.historyManager
 	s.mu.Unlock()
 	s.persist(data)
-	if historyPersist {
-		s.persistHistory(historyData)
-	}
 	if historyManager != nil {
 		if err := historyManager.DeleteNode(nodeID); err != nil {
 			log.Printf("删除节点 TSDB 历史失败 node=%s: %v", nodeID, err)
@@ -4105,28 +4088,16 @@ func (s *Store) DeleteNode(nodeID string) bool {
 
 func (s *Store) ClearNodes() {
 	var data PersistedData
-	var historyData TestHistoryData
-	var historyPersist bool
-	now := time.Now()
 	s.mu.Lock()
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
 	s.alerted = make(map[string]alertState)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.testHistory = make(map[string]map[string]*TestHistoryEntry)
-	s.historyDirty = true
-	if s.shouldPersistHistoryLocked(now) {
-		historyPersist = true
-		historyData = s.snapshotTestHistoryLocked(now)
-		s.historyDirty = false
-	}
 	data = s.snapshotPersistedLocked()
 	historyManager := s.historyManager
 	s.mu.Unlock()
 	s.persist(data)
-	if historyPersist {
-		s.persistHistory(historyData)
-	}
 	if historyManager != nil {
 		if err := historyManager.ClearNodes(); err != nil {
 			log.Printf("清空节点 TSDB 历史失败: %v", err)
@@ -4227,14 +4198,6 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 	}
 }
 
-func (s *Store) snapshotTestHistoryLocked(now time.Time) TestHistoryData {
-	return TestHistoryData{
-		Version:   testHistoryVersion,
-		UpdatedAt: now.Unix(),
-		Nodes:     cloneTestHistory(s.testHistory),
-	}
-}
-
 func (s *Store) persist(data PersistedData) {
 	if s.dataPath == "" {
 		return
@@ -4250,27 +4213,6 @@ func (s *Store) persist(data PersistedData) {
 	s.mu.Unlock()
 }
 
-func (s *Store) persistHistory(data TestHistoryData) {
-	if err := s.persistHistoryWithError(data); err != nil {
-		log.Printf("%v", wrapDataPathError("探测历史持久化失败", s.historyPath, err))
-	}
-}
-
-func (s *Store) persistHistoryWithError(data TestHistoryData) error {
-	if s.historyPath == "" {
-		return nil
-	}
-	s.historyPersistMu.Lock()
-	defer s.historyPersistMu.Unlock()
-	if err := saveTestHistoryData(s.historyPath, data); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.historyLastPersist = time.Now()
-	s.mu.Unlock()
-	return nil
-}
-
 func (s *Store) shouldPersistLocked(now time.Time) bool {
 	if s.persistInterval <= 0 {
 		return false
@@ -4279,16 +4221,6 @@ func (s *Store) shouldPersistLocked(now time.Time) bool {
 		return true
 	}
 	return now.Sub(s.lastPersist) >= s.persistInterval
-}
-
-func (s *Store) shouldPersistHistoryLocked(now time.Time) bool {
-	if s.persistInterval <= 0 {
-		return false
-	}
-	if s.historyLastPersist.IsZero() {
-		return true
-	}
-	return now.Sub(s.historyLastPersist) >= s.persistInterval
 }
 
 func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {

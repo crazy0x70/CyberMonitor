@@ -362,6 +362,9 @@ export default function AIProvider({
             <Select
               value={commandProvider}
               onValueChange={(value) => {
+                if (value === null) {
+                  return;
+                }
                 setCommandProvider(value);
                 setIsDirty(true);
               }}
@@ -423,7 +426,7 @@ export default function AIProvider({
           </Button>
         </CardHeader>
         <CardContent className="pt-6 pb-6">
-          <Accordion type="multiple" className="space-y-4">
+          <Accordion multiple className="space-y-4">
             {providers.map((item) => (
               <AccordionItem
                 key={item.id}
