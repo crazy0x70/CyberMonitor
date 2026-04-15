@@ -49,91 +49,10 @@ func Run(ctx context.Context, cfg Config) error {
 	client := &http.Client{Timeout: 6 * time.Second}
 	transport := newControlPlaneTransport(cfg, client)
 	defer transport.Close()
-	collector := metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces)
-
-	runtimeCfg := newRuntimeConfig(cfg)
-	testCache := make(map[string]cachedTest)
-	dockerManagedUpdate := updater.CanDockerManagedUpdate()
-	agentToken := strings.TrimSpace(cfg.AgentToken)
-	if cfg.TokenFile != "" {
-		if persisted, err := loadPersistedAgentToken(cfg.TokenFile); err == nil && persisted != "" {
-			agentToken = persisted
-		} else if err != nil && !os.IsNotExist(err) {
-			log.Printf("读取 Agent 凭据文件失败: %v", err)
-		}
-	}
-
-	if cfg.AgentToken != "" && agentToken == strings.TrimSpace(cfg.AgentToken) {
-		if issuedToken, err := transport.RegisterNodeToken(ctx, cfg.NodeID, cfg.AgentToken); err == nil && issuedToken != "" {
-			agentToken = issuedToken
-			if cfg.TokenFile != "" {
-				if err := persistAgentToken(cfg.TokenFile, issuedToken); err != nil {
-					log.Printf("持久化 Agent 专属凭据失败: %v", err)
-				}
-			}
-		} else if err != nil && !strings.Contains(err.Error(), "register status 401") {
-			log.Printf("节点注册未成功，继续尝试使用当前 Agent Token: %v", err)
-		}
-	}
-
-	fetchConfig := func() {
-		remote, err := transport.FetchConfig(ctx, cfg.NodeID, agentToken)
-		if err != nil {
-			log.Printf("拉取远程配置失败: %v", err)
-			return
-		}
-		if nextToken := strings.TrimSpace(remote.AgentToken); nextToken != "" && nextToken != agentToken {
-			agentToken = nextToken
-			if cfg.TokenFile != "" {
-				if err := persistAgentToken(cfg.TokenFile, nextToken); err != nil {
-					log.Printf("持久化 Agent 专属凭据失败: %v", err)
-				}
-			}
-		}
-		runtimeCfg.Update(remote)
-		runtimeCfgConfig := cfg
-		runtimeCfgConfig.AgentToken = agentToken
-		if err := maybeApplyRemoteUpdate(ctx, transport, runtimeCfgConfig, remote.Update); err != nil {
-			log.Printf("执行远程更新失败: %v", err)
-		}
-	}
-
-	sendOnce := func() {
-		sample, err := collector.Collect()
-		if err != nil {
-			log.Printf("采集失败: %v", err)
-			return
-		}
-		if sample.NodeID == "" {
-			sample.NodeID = sample.Hostname
-		}
-		if sample.NodeName == "" {
-			sample.NodeName = sample.Hostname
-		}
-		if cfg.AgentVersion != "" {
-			sample.AgentVersion = cfg.AgentVersion
-		}
-		sample.DeployMode = string(updater.DetectDeployMode())
-		sample.DockerManagedUpdate = dockerManagedUpdate
-		sample.AgentUpdateDisabled = cfg.DisableUpdate
-		alias, group, tests, interval, _ := runtimeCfg.Snapshot()
-		if alias != "" {
-			sample.NodeAlias = alias
-		}
-		if group != "" {
-			sample.NodeGroup = group
-		}
-		if len(tests) > 0 {
-			sample.NetworkTests = runNetworkTestsWithCache(ctx, tests, interval, testCache)
-		}
-
-		if err := transport.ReportStats(ctx, sample, agentToken); err != nil {
-			log.Printf("上报失败: %v", err)
-		}
-	}
-
-	fetchConfig()
-	sendOnce()
+	runner := newAgentRunner(cfg, transport, metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces))
+	runner.bootstrapToken(ctx)
+	runner.syncRemoteConfig(ctx)
+	runner.collectAndReport(ctx)
 	ticker := time.NewTicker(cfg.Interval)
 	configTicker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -144,9 +63,9 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			sendOnce()
+			runner.collectAndReport(ctx)
 		case <-configTicker.C:
-			fetchConfig()
+			runner.syncRemoteConfig(ctx)
 		}
 	}
 }
@@ -165,10 +84,16 @@ func maybeApplyRemoteUpdate(
 		return nil
 	}
 	currentVersion := strings.TrimSpace(cfg.AgentVersion)
+	if currentVersion == "" {
+		currentVersion = "unknown"
+	}
+	log.Printf("收到远程更新指令: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
 	if currentVersion == targetVersion {
+		log.Printf("跳过远程更新: Agent 已运行目标版本 %s", targetVersion)
 		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
 	}
 	if cfg.DisableUpdate {
+		log.Printf("拒绝远程更新: 当前 Agent 已禁用远程更新，目标版本=%s", targetVersion)
 		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
 	}
 	if updater.CanDockerManagedUpdate() {
@@ -176,6 +101,7 @@ func maybeApplyRemoteUpdate(
 		if err != nil {
 			return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
 		}
+		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
 		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
 			return err
 		}
@@ -190,11 +116,14 @@ func maybeApplyRemoteUpdate(
 		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
 			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
 		}
+		log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
 		return nil
 	}
 	if !updater.CanSelfUpdate() {
+		log.Printf("拒绝远程更新: 当前部署模式不支持 Agent 自更新，目标版本=%s", targetVersion)
 		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
+	log.Printf("开始下载并替换 Agent 二进制: 当前版本=%s，目标版本=%s，下载地址=%s", currentVersion, targetVersion, strings.TrimSpace(update.DownloadURL))
 	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
 	}
@@ -206,6 +135,7 @@ func maybeApplyRemoteUpdate(
 		}
 		return err
 	}
+	log.Printf("Agent 更新包写入完成，准备重启到版本 %s", targetVersion)
 	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}

@@ -48,6 +48,8 @@ const (
 	wsWriteWait               = 10 * time.Second
 	wsPongWait                = 60 * time.Second
 	wsPingPeriod              = (wsPongWait * 9) / 10
+	agentUpdateLeaseUpdating  = 10 * time.Minute
+	agentUpdateLeaseRestart   = 5 * time.Minute
 	publicVariantConservative = "conservative"
 	publicVariantBalanced     = "balanced"
 	adminSessionCookieName    = "cm_admin_session"
@@ -170,7 +172,7 @@ const (
 	defaultPersistInterval = 10 * time.Second
 )
 
-//go:embed web/* web/assets/* web/admin-app/* web/admin-assets/*
+//go:embed web/public/* web/public/assets/* web/dist/admin/* web/dist/admin/assets/*
 var webFS embed.FS
 
 type Config struct {
@@ -232,6 +234,7 @@ type NodeProfile struct {
 	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
 	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
 	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
+	AgentUpdateLeaseUntil    int64                       `json:"agent_update_lease_until,omitempty"`
 	AgentUpdateReportedAt    int64                       `json:"agent_update_reported_at,omitempty"`
 	UpdatedAt                int64                       `json:"updated_at,omitempty"`
 }
@@ -1138,12 +1141,15 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		config, err := agentAPI.config(r.URL.Query().Get("node_id"), r.Header.Get("X-AGENT-TOKEN"))
+		nodeID := r.URL.Query().Get("node_id")
+		token := r.Header.Get("X-AGENT-TOKEN")
+		usingDedicatedToken := store.validateAgentAuthToken(nodeID, token)
+		config, err := agentAPI.config(nodeID, token)
 		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		writeJSON(w, http.StatusOK, httpAgentConfigResponse(config, r.Header.Get(agentrpc.AgentCapabilitiesHeader)))
+		writeJSON(w, http.StatusOK, httpAgentConfigResponse(config, r.Header.Get(agentrpc.AgentCapabilitiesHeader), usingDedicatedToken))
 	})
 
 	publicMux.HandleFunc("/api/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
@@ -1270,29 +1276,20 @@ func Run(ctx context.Context, cfg Config) error {
 		publicMux.HandleFunc("/ws", wsHandler(wsAuthMixed))
 	}
 
-	assetsRoot, err := fs.Sub(webRoot, "assets")
+	assetsRoot, err := fs.Sub(webRoot, "public/assets")
 	if err != nil {
 		return err
 	}
 	assetsHandler := withNoStore(http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot))))
 
-	adminAssetsRoot, err := fs.Sub(webRoot, "admin-assets")
+	adminDistRoot, err := fs.Sub(webRoot, "dist/admin")
 	if err != nil {
 		return err
 	}
-	adminBundleRoot, err := fs.Sub(adminAssetsRoot, "assets")
-	if err != nil {
-		return err
-	}
-	adminAssetsFileServer := http.FileServer(http.FS(adminAssetsRoot))
-	adminBundleFileServer := http.FileServer(http.FS(adminBundleRoot))
-	adminAssetsHandler := withNoStore(http.StripPrefix("/admin-assets/", adminAssetsFileServer))
+	adminDistFileServer := http.FileServer(http.FS(adminDistRoot))
 	publicMux.Handle("/assets/", assetsHandler)
 	if splitMode {
 		adminMux.Handle("/assets/", assetsHandler)
-		adminMux.Handle("/admin-assets/", adminAssetsHandler)
-	} else {
-		publicMux.Handle("/admin-assets/", adminAssetsHandler)
 	}
 
 	if !splitMode {
@@ -1305,19 +1302,8 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	}
 
-	writeEmbeddedHTML := func(w http.ResponseWriter, path string, notFoundMessage string) {
-		data, err := webFS.ReadFile(path)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": notFoundMessage})
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-	}
-
 	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
-		data, err := webFS.ReadFile("web/index.html")
+		data, err := webFS.ReadFile("web/public/index.html")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
 			return
@@ -1327,14 +1313,13 @@ func Run(ctx context.Context, cfg Config) error {
 		_, _ = w.Write(data)
 	}
 
-	writeAdminAppHTML := func(w http.ResponseWriter, adminPath string) {
-		data, err := webFS.ReadFile("web/admin-app/index.html")
+	writeAdminAppHTML := func(w http.ResponseWriter) {
+		data, err := webFS.ReadFile("web/dist/admin/index.html")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
 			return
 		}
-		assetBase := adminPath + "/"
-		html := strings.ReplaceAll(string(data), "__CM_ADMIN_ASSET_BASE_PATH__", assetBase)
+		html := string(data)
 		html = strings.Replace(html, "<title>CyberMonitor 管理后台</title>", "<title>"+adminDocumentTitle(store.SiteTitle())+"</title>", 1)
 		bootPayload, err := buildAdminBootPayload(store)
 		if err == nil {
@@ -1350,7 +1335,7 @@ func Run(ctx context.Context, cfg Config) error {
 		_, _ = w.Write([]byte(html))
 	}
 
-	serveAdminAssetsAt := func(w http.ResponseWriter, r *http.Request, prefix string) {
+	serveAdminDistAt := func(w http.ResponseWriter, r *http.Request, prefix string) {
 		trimmedPath := strings.TrimPrefix(r.URL.Path, prefix)
 		if trimmedPath == r.URL.Path {
 			http.NotFound(w, r)
@@ -1362,34 +1347,36 @@ func Run(ctx context.Context, cfg Config) error {
 			trimmedRawPath := strings.TrimPrefix(r.URL.RawPath, prefix)
 			next.URL.RawPath = "/" + strings.TrimPrefix(trimmedRawPath, "/")
 		}
-		withNoStore(adminBundleFileServer).ServeHTTP(w, next)
+		withNoStore(adminDistFileServer).ServeHTTP(w, next)
+	}
+
+	handleAdminRequest := func(w http.ResponseWriter, r *http.Request) bool {
+		adminPath := store.AdminPath()
+		adminPrefix := adminPath + "/"
+
+		switch r.URL.Path {
+		case adminPath:
+			http.Redirect(w, r, adminPrefix, http.StatusFound)
+			return true
+		case adminPrefix:
+			writeAdminAppHTML(w)
+			return true
+		}
+
+		if strings.HasPrefix(r.URL.Path, adminPrefix) {
+			serveAdminDistAt(w, r, adminPrefix)
+			return true
+		}
+
+		return false
 	}
 
 	if splitMode {
 		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			adminPath := store.AdminPath()
-			if r.URL.Path == adminPath+"/assets" {
-				http.Redirect(w, r, adminPath+"/assets/", http.StatusFound)
+			if handleAdminRequest(w, r) {
 				return
 			}
-			if strings.HasPrefix(r.URL.Path, adminPath+"/assets/") {
-				serveAdminAssetsAt(w, r, adminPath+"/assets/")
-				return
-			}
-			switch r.URL.Path {
-			case adminPath + "/preview", adminPath + "/preview/":
-				http.Redirect(w, r, adminPath, http.StatusFound)
-				return
-			case adminPath + "/legacy":
-				writeEmbeddedHTML(w, "web/admin.html", "admin not found")
-				return
-			case adminPath, adminPath + "/":
-				writeAdminAppHTML(w, adminPath)
-				return
-			default:
-				http.NotFound(w, r)
-				return
-			}
+			http.NotFound(w, r)
 		})
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1403,24 +1390,7 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	} else {
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			adminPath := store.AdminPath()
-			if r.URL.Path == adminPath+"/assets" {
-				http.Redirect(w, r, adminPath+"/assets/", http.StatusFound)
-				return
-			}
-			if strings.HasPrefix(r.URL.Path, adminPath+"/assets/") {
-				serveAdminAssetsAt(w, r, adminPath+"/assets/")
-				return
-			}
-			switch r.URL.Path {
-			case adminPath + "/preview", adminPath + "/preview/":
-				http.Redirect(w, r, adminPath, http.StatusFound)
-				return
-			case adminPath + "/legacy":
-				writeEmbeddedHTML(w, "web/admin.html", "admin not found")
-				return
-			case adminPath, adminPath + "/":
-				writeAdminAppHTML(w, adminPath)
+			if handleAdminRequest(w, r) {
 				return
 			}
 			if r.URL.Path != "/" {
@@ -1605,11 +1575,12 @@ func generateBootstrapToken() string {
 	return signed
 }
 
-func (s *Store) Update(stats metrics.NodeStats) {
+func (s *Store) Update(stats metrics.NodeStats) bool {
 	var persist bool
 	var data PersistedData
 	var recoveryCandidate offlineRecoveryCandidate
 	var hasRecoveryCandidate bool
+	var updateReconciled bool
 	s.mu.Lock()
 
 	now := time.Now()
@@ -1666,6 +1637,10 @@ func (s *Store) Update(stats metrics.NodeStats) {
 	if s.applyAutoRenewLocked(profile, now) {
 		persist = true
 	}
+	if reconcileAgentUpdateWithStatsLocked(profile, storedStats, now) {
+		persist = true
+		updateReconciled = true
+	}
 	profile.UpdatedAt = now.Unix()
 
 	if session, ok := s.offlineSessions[stats.NodeID]; ok && session.StartedAt > 0 {
@@ -1698,6 +1673,7 @@ func (s *Store) Update(stats metrics.NodeStats) {
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
 	}
+	return updateReconciled
 }
 
 func shouldReplaceNodeStats(current, incoming metrics.NodeStats) bool {
@@ -2415,6 +2391,60 @@ func cloneAgentUpdateInstruction(value *AgentUpdateInstruction) *AgentUpdateInst
 	}
 	cloned := *value
 	return &cloned
+}
+
+func isAgentUpdateTerminalState(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "succeeded", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func agentUpdateLeaseForState(state string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "updating":
+		return agentUpdateLeaseUpdating
+	case "restarting":
+		return agentUpdateLeaseRestart
+	default:
+		return 0
+	}
+}
+
+func shouldDispatchAgentUpdate(profile *NodeProfile, now time.Time) bool {
+	if profile == nil || profile.AgentUpdate == nil {
+		return false
+	}
+	if isAgentUpdateTerminalState(profile.AgentUpdateState) {
+		return false
+	}
+	return profile.AgentUpdateLeaseUntil <= now.Unix()
+}
+
+func reconcileAgentUpdateWithStatsLocked(profile *NodeProfile, stats metrics.NodeStats, now time.Time) bool {
+	if profile == nil || profile.AgentUpdate == nil {
+		return false
+	}
+	currentVersion := strings.TrimSpace(stats.AgentVersion)
+	targetVersion := strings.TrimSpace(profile.AgentUpdateTargetVersion)
+	if targetVersion == "" {
+		targetVersion = strings.TrimSpace(profile.AgentUpdate.Version)
+	}
+	if currentVersion == "" || targetVersion == "" {
+		return false
+	}
+	if updater.CompareVersions(currentVersion, targetVersion) != 0 {
+		return false
+	}
+	profile.AgentUpdate = nil
+	profile.AgentUpdateState = "succeeded"
+	profile.AgentUpdateTargetVersion = targetVersion
+	profile.AgentUpdateMessage = "节点已上报目标版本，服务端已自动完成更新任务收口"
+	profile.AgentUpdateLeaseUntil = 0
+	profile.AgentUpdateReportedAt = now.Unix()
+	return true
 }
 
 func resolveAgentUpdateMode(stats metrics.NodeStats) string {
@@ -4137,6 +4167,7 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	profile.AgentUpdateState = "pending"
 	profile.AgentUpdateTargetVersion = instruction.Version
 	profile.AgentUpdateMessage = "已下发更新任务，等待 Agent 执行"
+	profile.AgentUpdateLeaseUntil = 0
 	profile.AgentUpdateReportedAt = instruction.RequestedAt
 	profile.UpdatedAt = instruction.RequestedAt
 	data = s.snapshotPersistedLocked()
@@ -4160,8 +4191,14 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 	}
 	profile.AgentUpdateMessage = strings.TrimSpace(report.Message)
 	profile.AgentUpdateReportedAt = reportedAt
-	if state == "succeeded" || state == "failed" {
+	if lease := agentUpdateLeaseForState(state); lease > 0 {
+		profile.AgentUpdateLeaseUntil = reportedAt + int64(lease/time.Second)
+	} else {
+		profile.AgentUpdateLeaseUntil = 0
+	}
+	if isAgentUpdateTerminalState(state) {
 		profile.AgentUpdate = nil
+		profile.AgentUpdateLeaseUntil = 0
 	}
 	profile.UpdatedAt = reportedAt
 	data = s.snapshotPersistedLocked()
@@ -4188,13 +4225,17 @@ func (s *Store) AgentConfig(nodeID string) AgentConfig {
 	if tests == nil {
 		tests = []metrics.NetworkTestConfig{}
 	}
+	var update *AgentUpdateInstruction
+	if shouldDispatchAgentUpdate(profile, time.Now()) {
+		update = cloneAgentUpdateInstruction(profile.AgentUpdate)
+	}
 	return AgentConfig{
 		Alias:           profile.Alias,
 		Group:           group,
 		AgentToken:      strings.TrimSpace(profile.AgentAuthToken),
 		TestIntervalSec: profile.TestIntervalSec,
 		Tests:           tests,
-		Update:          cloneAgentUpdateInstruction(profile.AgentUpdate),
+		Update:          update,
 	}
 }
 

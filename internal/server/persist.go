@@ -567,7 +567,7 @@ func normalizeAdminPath(path string) (string, error) {
 	if strings.Contains(trimmed, "..") {
 		return "", errors.New("admin path invalid")
 	}
-	for _, prefix := range []string{"/api", "/assets", "/admin-assets", "/ws"} {
+	for _, prefix := range []string{"/api", "/assets", "/ws"} {
 		if strings.HasPrefix(trimmed, prefix) {
 			return "", fmt.Errorf("admin path conflicts with %s", prefix)
 		}

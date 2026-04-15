@@ -73,10 +73,10 @@ func TestLegacyAgentConfigAcceptsBootstrapTokenWithLegacySchema(t *testing.T) {
 		t.Fatalf("expected bootstrap token config success for legacy agent, got %d: %s", bootstrapResp.StatusCode, string(raw))
 	}
 	var legacyPayload struct {
-		Alias           string `json:"alias"`
-		Group           string `json:"group"`
+		Alias           string           `json:"alias"`
+		Group           string           `json:"group"`
 		Tests           []map[string]any `json:"tests"`
-		TestIntervalSec int    `json:"test_interval_sec"`
+		TestIntervalSec int              `json:"test_interval_sec"`
 	}
 	decoder := json.NewDecoder(bootstrapResp.Body)
 	decoder.DisallowUnknownFields()
@@ -192,6 +192,50 @@ func TestIngestRejectsDedicatedNodeMismatch(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected mismatched node token to be rejected, got %d: %s", resp.StatusCode, string(raw))
+	}
+}
+
+func TestDedicatedTokenConfigStillReturnsExtendedSchemaWithoutCapabilitiesHeader(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{
+			AdminUser:  "admin",
+			AdminPass:  "pass",
+			AgentToken: "bootstrap-token",
+		}),
+		profiles: map[string]*NodeProfile{},
+		nodes:    map[string]NodeState{},
+	}
+	dedicatedToken := store.ensureAgentAuthToken("node-123")
+	store.QueueAgentUpdate("node-123", AgentUpdateInstruction{
+		Version:     "1.2.3",
+		DownloadURL: "https://example.com/agent",
+		ChecksumURL: "https://example.com/SHA256SUMS",
+	})
+
+	api := newAgentAPI(store, nil, &Config{AgentToken: "bootstrap-token"})
+	config, apiErr := api.config("node-123", dedicatedToken)
+	if apiErr != nil {
+		t.Fatalf("expected dedicated token config success, got %v", apiErr)
+	}
+
+	payload, err := json.Marshal(httpAgentConfigResponse(config, "", store.validateAgentAuthToken("node-123", dedicatedToken)))
+	if err != nil {
+		t.Fatalf("marshal config payload: %v", err)
+	}
+
+	var extended AgentConfig
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&extended); err != nil {
+		t.Fatalf("expected dedicated token request to keep extended schema, got %v", err)
+	}
+	if extended.AgentToken != dedicatedToken {
+		t.Fatalf("expected dedicated token %q, got %q", dedicatedToken, extended.AgentToken)
+	}
+	if extended.Update == nil || extended.Update.Version != "1.2.3" {
+		t.Fatalf("expected pending update instruction, got %+v", extended.Update)
 	}
 }
 

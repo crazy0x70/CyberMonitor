@@ -13,7 +13,38 @@ import (
 	"time"
 )
 
-var adminAssetPattern = regexp.MustCompile(`/cm-admin/assets/[^"' ]+`)
+var adminAssetPattern = regexp.MustCompile(`(?:\./)?assets/[^"' ]+`)
+
+func resolveAdminAssetPath(t *testing.T, assetRef string) string {
+	t.Helper()
+
+	trimmed := strings.TrimSpace(assetRef)
+	if trimmed == "" {
+		t.Fatal("admin asset path is empty")
+	}
+
+	return "/cm-admin/" + strings.TrimPrefix(trimmed, "./")
+}
+
+func fetchAdminHTML(t *testing.T, baseURL string) string {
+	t.Helper()
+
+	resp, err := http.Get(baseURL + "/cm-admin/")
+	if err != nil {
+		t.Fatalf("get admin route: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read admin body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected admin route 200, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	return string(body)
+}
 
 func reserveTCPAddr(t *testing.T) string {
 	t.Helper()
@@ -85,6 +116,33 @@ func startTestServer(t *testing.T, cfg Config) (string, context.CancelFunc) {
 	return baseURL, cancel
 }
 
+func TestAdminRouteRedirectsToTrailingSlash(t *testing.T) {
+	baseURL, _ := startTestServer(t, Config{
+		Addr:      reserveTCPAddr(t),
+		AdminPath: "/cm-admin",
+	})
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(baseURL + "/cm-admin")
+	if err != nil {
+		t.Fatalf("get admin route: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected admin route 302, got %d: %s", resp.StatusCode, string(body))
+	}
+	if location := resp.Header.Get("Location"); location != "/cm-admin/" {
+		t.Fatalf("expected admin route redirect to /cm-admin/, got %q", location)
+	}
+}
+
 func TestAdminRouteServesReactApp(t *testing.T) {
 	baseURL, _ := startTestServer(t, Config{
 		Addr:      reserveTCPAddr(t),
@@ -92,21 +150,7 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 		Version:   "1.2.3",
 	})
 
-	resp, err := http.Get(baseURL + "/cm-admin")
-	if err != nil {
-		t.Fatalf("get admin route: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read admin body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected admin route 200, got %d: %s", resp.StatusCode, string(body))
-	}
-	bodyText := string(body)
+	bodyText := fetchAdminHTML(t, baseURL)
 	if !strings.Contains(bodyText, "<div id=\"root\"></div>") {
 		t.Fatalf("expected react root mount, got: %s", bodyText)
 	}
@@ -127,8 +171,8 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 	if !strings.Contains(string(bootPayload), "\"version\":\"1.2.3\"") {
 		t.Fatalf("expected boot payload to include deployed version, got: %s", string(bootPayload))
 	}
-	if !strings.Contains(bodyText, "/cm-admin/assets/") {
-		t.Fatalf("expected admin asset base path, got: %s", bodyText)
+	if !strings.Contains(bodyText, "./assets/") {
+		t.Fatalf("expected relative admin asset path, got: %s", bodyText)
 	}
 
 	assetPath := adminAssetPattern.FindString(bodyText)
@@ -136,7 +180,7 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 		t.Fatalf("expected admin html to include a hashed asset path, got: %s", bodyText)
 	}
 
-	assetResp, err := http.Get(baseURL + assetPath)
+	assetResp, err := http.Get(baseURL + resolveAdminAssetPath(t, assetPath))
 	if err != nil {
 		t.Fatalf("get admin asset from html: %v", err)
 	}
@@ -149,64 +193,8 @@ func TestAdminRouteServesReactApp(t *testing.T) {
 	if assetResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected admin html asset 200, got %d: %s", assetResp.StatusCode, string(assetBody))
 	}
-}
-
-func TestAdminPreviewRouteRedirectsToAdmin(t *testing.T) {
-	baseURL, _ := startTestServer(t, Config{
-		Addr:      reserveTCPAddr(t),
-		AdminPath: "/cm-admin",
-	})
-
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Get(baseURL + "/cm-admin/preview")
-	if err != nil {
-		t.Fatalf("get preview route: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusFound {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected preview route 302, got %d: %s", resp.StatusCode, string(body))
-	}
-	if location := resp.Header.Get("Location"); location != "/cm-admin" {
-		t.Fatalf("expected preview route redirect to /cm-admin, got %q", location)
-	}
-}
-
-func TestAdminLegacyRouteServesClassicHTML(t *testing.T) {
-	baseURL, _ := startTestServer(t, Config{
-		Addr:      reserveTCPAddr(t),
-		AdminPath: "/cm-admin",
-	})
-
-	resp, err := http.Get(baseURL + "/cm-admin/legacy")
-	if err != nil {
-		t.Fatalf("get legacy route: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read legacy body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected legacy route 200, got %d: %s", resp.StatusCode, string(body))
-	}
-	bodyText := string(body)
-	if !strings.Contains(bodyText, "CyberMonitor 管理后台") {
-		t.Fatalf("expected classic admin title marker, got: %s", bodyText)
-	}
-	if !strings.Contains(bodyText, "login-panel") {
-		t.Fatalf("expected classic admin login panel marker, got: %s", bodyText)
-	}
-	if !strings.Contains(bodyText, "/assets/styles.css") {
-		t.Fatalf("expected classic admin assets, got: %s", bodyText)
+	if got := assetResp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected admin html asset Cache-Control no-store, got %q", got)
 	}
 }
 
@@ -216,9 +204,15 @@ func TestAdminAssetsRouteServesAdminAssets(t *testing.T) {
 		AdminPath: "/cm-admin",
 	})
 
-	resp, err := http.Get(baseURL + "/cm-admin/assets/admin-marker.txt")
+	bodyText := fetchAdminHTML(t, baseURL)
+	assetPath := adminAssetPattern.FindString(bodyText)
+	if assetPath == "" {
+		t.Fatalf("expected admin html to include a hashed asset path, got: %s", bodyText)
+	}
+
+	resp, err := http.Get(baseURL + resolveAdminAssetPath(t, assetPath))
 	if err != nil {
-		t.Fatalf("get admin asset marker: %v", err)
+		t.Fatalf("get admin asset: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -228,44 +222,15 @@ func TestAdminAssetsRouteServesAdminAssets(t *testing.T) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected admin asset marker 200, got %d: %s", resp.StatusCode, string(body))
+		t.Fatalf("expected admin asset 200, got %d: %s", resp.StatusCode, string(body))
 	}
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("expected admin assets Cache-Control no-store, got %q", got)
 	}
-	if strings.TrimSpace(string(body)) != "CyberMonitor Admin Asset" {
-		t.Fatalf("unexpected admin asset marker body: %q", string(body))
+	if len(body) == 0 {
+		t.Fatal("expected admin asset body to be non-empty")
 	}
 }
-
-func TestLegacyAdminAssetsRouteStillServesAdminAssets(t *testing.T) {
-	baseURL, _ := startTestServer(t, Config{
-		Addr:      reserveTCPAddr(t),
-		AdminPath: "/cm-admin",
-	})
-
-	resp, err := http.Get(baseURL + "/admin-assets/admin-marker.txt")
-	if err != nil {
-		t.Fatalf("get legacy admin asset marker: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read legacy asset body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected legacy admin asset marker 200, got %d: %s", resp.StatusCode, string(body))
-	}
-	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("expected legacy admin assets Cache-Control no-store, got %q", got)
-	}
-	if strings.TrimSpace(string(body)) != "CyberMonitor Admin Asset" {
-		t.Fatalf("unexpected legacy admin asset marker body: %q", string(body))
-	}
-}
-
 
 func TestSplitModePublicAssetsRouteServesPublicAssets(t *testing.T) {
 	publicAddr := reserveTCPAddr(t)

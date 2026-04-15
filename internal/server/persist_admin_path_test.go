@@ -8,9 +8,7 @@ func TestNormalizeAdminPathRejectsReservedPrefixes(t *testing.T) {
 	cases := []string{
 		"/api",
 		"/assets",
-		"/admin-assets",
 		"/ws",
-		"/admin-assets/nested",
 	}
 
 	for _, input := range cases {

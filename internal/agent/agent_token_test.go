@@ -13,6 +13,61 @@ import (
 	"time"
 )
 
+func TestApplyRemoteConfigPersistsIssuedTokenAndUpdatesRuntimeConfig(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "agent-token")
+	runtimeCfg := newRuntimeConfig(Config{
+		NodeAlias:    "origin-alias",
+		NodeGroup:    "origin-group",
+		TestInterval: 5 * time.Second,
+	})
+
+	nextToken, updateCfg, err := applyRemoteConfig(
+		Config{
+			NodeAlias:    "origin-alias",
+			NodeGroup:    "origin-group",
+			AgentToken:   "bootstrap-token",
+			TokenFile:    tokenFile,
+			HostRoot:     t.TempDir(),
+			Interval:     time.Second,
+			TestInterval: 5 * time.Second,
+		},
+		runtimeCfg,
+		"bootstrap-token",
+		RemoteConfig{
+			Alias:           "edge-a",
+			Group:           "group-a",
+			AgentToken:      "issued-token",
+			TestIntervalSec: 12,
+		},
+	)
+	if err != nil {
+		t.Fatalf("applyRemoteConfig() error = %v", err)
+	}
+	if nextToken != "issued-token" {
+		t.Fatalf("nextToken = %q, want %q", nextToken, "issued-token")
+	}
+	if updateCfg.AgentToken != "issued-token" {
+		t.Fatalf("updateCfg.AgentToken = %q, want %q", updateCfg.AgentToken, "issued-token")
+	}
+	if got := strings.TrimSpace(mustReadTrimmedFile(t, tokenFile)); got != "issued-token" {
+		t.Fatalf("persisted token = %q, want %q", got, "issued-token")
+	}
+
+	alias, group, tests, interval, update := runtimeCfg.Snapshot()
+	if alias != "edge-a" || group != "group-a" {
+		t.Fatalf("runtime snapshot alias/group = %q/%q, want edge-a/group-a", alias, group)
+	}
+	if len(tests) != 0 {
+		t.Fatalf("runtime snapshot tests = %+v, want empty", tests)
+	}
+	if interval != 12*time.Second {
+		t.Fatalf("runtime snapshot interval = %v, want %v", interval, 12*time.Second)
+	}
+	if update != nil {
+		t.Fatalf("runtime snapshot update = %+v, want nil", update)
+	}
+}
+
 func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "agent-token")
 	mustWriteFile(t, tokenFile, " dedicated-token \n")
@@ -49,13 +104,13 @@ func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
 	defer server.Close()
 
 	err := Run(ctx, Config{
-		ServerURL:  server.URL,
-		Interval:   time.Hour,
-		NodeID:     "node-1",
-		NodeName:   "node-1",
-		AgentToken: "bootstrap-token",
-		TokenFile:  tokenFile,
-		HostRoot:   t.TempDir(),
+		ServerURL:        server.URL,
+		Interval:         time.Hour,
+		NodeID:           "node-1",
+		NodeName:         "node-1",
+		AgentToken:       "bootstrap-token",
+		TokenFile:        tokenFile,
+		HostRoot:         t.TempDir(),
 		transportOptions: shortGRPCTransportOptions(),
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -69,12 +124,12 @@ func TestPersistedDedicatedTokenPreferredOverBootstrapToken(t *testing.T) {
 func TestBootstrapDedicatedTokenPersistsAcrossRestarts(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "agent-token")
 	cfg := Config{
-		Interval:   time.Hour,
-		NodeID:     "node-1",
-		NodeName:   "node-1",
-		AgentToken: "bootstrap-token",
-		TokenFile:  tokenFile,
-		HostRoot:   t.TempDir(),
+		Interval:         time.Hour,
+		NodeID:           "node-1",
+		NodeName:         "node-1",
+		AgentToken:       "bootstrap-token",
+		TokenFile:        tokenFile,
+		HostRoot:         t.TempDir(),
 		transportOptions: shortGRPCTransportOptions(),
 	}
 

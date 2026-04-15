@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
-    "build:admin": "npm run build && node ./scripts/sync-admin.mjs",
+    "build:admin": "vite build",
     "preview": "vite preview",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf ../dist/admin",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

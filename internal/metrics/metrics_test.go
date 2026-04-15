@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/shirou/gopsutil/v3/disk"
 	gnet "github.com/shirou/gopsutil/v3/net"
 )
 
@@ -173,5 +174,31 @@ func TestShouldCollectInterfaceSharesOneSelectionRule(t *testing.T) {
 	}
 	if !shouldCollectInterface("eth0", nil) {
 		t.Fatal("expected physical interface in default mode")
+	}
+}
+
+func TestShouldSkipPartitionRejectsContainerAndRuntimeMounts(t *testing.T) {
+	t.Parallel()
+
+	cases := []disk.PartitionStat{
+		{Mountpoint: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs", Fstype: "xfs"},
+		{Mountpoint: "/var/lib/kubelet/pods/abc/volumes/kubernetes.io~projected", Fstype: "tmpfs"},
+		{Mountpoint: "/run/user/1000", Fstype: "tmpfs"},
+		{Mountpoint: "/snap/core/123", Fstype: "squashfs"},
+		{Mountpoint: "/var/lib/containers/storage/overlay", Fstype: "overlay"},
+	}
+
+	for _, partition := range cases {
+		if !shouldSkipPartition(partition) {
+			t.Fatalf("expected partition to be skipped: %+v", partition)
+		}
+	}
+}
+
+func TestShouldSkipPartitionKeepsRootOverlayFilesystem(t *testing.T) {
+	t.Parallel()
+
+	if shouldSkipPartition(disk.PartitionStat{Mountpoint: "/", Fstype: "overlay"}) {
+		t.Fatal("did not expect root overlay filesystem to be skipped")
 	}
 }

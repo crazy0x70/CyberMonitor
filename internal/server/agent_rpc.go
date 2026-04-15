@@ -65,10 +65,16 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if !a.store.validateOrProvisionAgentAuthToken(payload.NodeID, token, a.cfg.AgentToken) {
 		return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
 	}
-	a.store.Update(payload)
-	if delta, ok := a.store.PublicNodeDelta(payload.NodeID); ok {
+	updateReconciled := a.store.Update(payload)
+	if delta, ok := a.store.PublicNodeDelta(payload.NodeID); ok && a.hub != nil {
 		if data, err := json.Marshal(delta); err == nil {
 			a.hub.BroadcastVariant(data, publicVariantBalanced)
+		}
+	}
+	if updateReconciled && a.hub != nil {
+		snapshot := storeSnapshot(a.store, false)
+		if data, err := json.Marshal(snapshot); err == nil {
+			a.hub.Broadcast(data)
 		}
 	}
 	if strings.TrimSpace(remoteAddr) == "" {
@@ -108,9 +114,11 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 		return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
 	}
 	a.store.ApplyAgentUpdateReport(nodeID, report)
-	snapshot := storeSnapshot(a.store, false)
-	payload, _ := json.Marshal(snapshot)
-	a.hub.Broadcast(payload)
+	if a.hub != nil {
+		snapshot := storeSnapshot(a.store, false)
+		payload, _ := json.Marshal(snapshot)
+		a.hub.Broadcast(payload)
+	}
 	return nil
 }
 
@@ -213,8 +221,8 @@ func toRPCUpdateInstruction(update *AgentUpdateInstruction) *agentrpc.UpdateInst
 	}
 }
 
-func httpAgentConfigResponse(config AgentConfig, capabilities string) any {
-	if supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityDedicatedToken) || supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityRemoteUpdate) {
+func httpAgentConfigResponse(config AgentConfig, capabilities string, usingDedicatedToken bool) any {
+	if usingDedicatedToken || supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityDedicatedToken) || supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityRemoteUpdate) {
 		return config
 	}
 	return legacyAgentConfigResponse{

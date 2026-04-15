@@ -292,12 +292,11 @@ jobs:
             exit 1
           fi
           for path in \
-            admin-ui/package.json \
-            admin-ui/package-lock.json \
-            admin-ui/src/App.tsx \
-            admin-ui/lib/admin-ui.ts \
-            admin-ui/scripts/sync-admin.mjs \
-            internal/server/web/index.html
+            internal/server/web/admin/package.json \
+            internal/server/web/admin/package-lock.json \
+            internal/server/web/admin/src/App.tsx \
+            internal/server/web/admin/lib/admin-ui.ts \
+            internal/server/web/public/index.html
           do
             test -e "$path"
             git ls-files --error-unmatch "$path" >/dev/null 2>&1
@@ -309,17 +308,17 @@ jobs:
         with:
           node-version: ${{ steps.build-inputs.outputs.node_version }}
           cache: 'npm'
-          cache-dependency-path: admin-ui/package-lock.json
+          cache-dependency-path: internal/server/web/admin/package-lock.json
 
       - name: Build admin assets
         run: |
-          npm --prefix admin-ui ci
-          npm --prefix admin-ui run lint
-          npm --prefix admin-ui run build:admin
+          npm --prefix internal/server/web/admin ci
+          npm --prefix internal/server/web/admin run lint
+          npm --prefix internal/server/web/admin run build:admin
 
       - name: Package synced admin assets
         run: |
-          tar -czf admin-web-sync.tar.gz -C internal/server/web admin-app admin-assets
+          tar -czf admin-web-sync.tar.gz -C internal/server/web dist/admin
 
       - name: Upload synced admin assets
         uses: actions/upload-artifact@v7
@@ -382,12 +381,11 @@ jobs:
       - name: Verify admin build inputs
         run: |
           for path in \
-            admin-ui/package.json \
-            admin-ui/package-lock.json \
-            admin-ui/src/App.tsx \
-            admin-ui/lib/admin-ui.ts \
-            admin-ui/scripts/sync-admin.mjs \
-            internal/server/web/index.html
+            internal/server/web/admin/package.json \
+            internal/server/web/admin/package-lock.json \
+            internal/server/web/admin/src/App.tsx \
+            internal/server/web/admin/lib/admin-ui.ts \
+            internal/server/web/public/index.html
           do
             test -e "$path"
             git ls-files --error-unmatch "$path" >/dev/null 2>&1

@@ -3,18 +3,17 @@ ARG GO_IMAGE_VERSION=1.26.2
 FROM --platform=$BUILDPLATFORM node:24-alpine AS admin-build
 
 WORKDIR /src
-COPY admin-ui ./admin-ui
+COPY internal/server/web/admin ./internal/server/web/admin
 COPY internal/server/web ./internal/server/web
-RUN test -f admin-ui/package.json && \
-    test -f admin-ui/package-lock.json && \
-    test -f admin-ui/src/App.tsx && \
-    test -f admin-ui/lib/admin-ui.ts && \
-    test -f admin-ui/scripts/sync-admin.mjs && \
-    test -f internal/server/web/index.html
+RUN test -f internal/server/web/admin/package.json && \
+    test -f internal/server/web/admin/package-lock.json && \
+    test -f internal/server/web/admin/src/App.tsx && \
+    test -f internal/server/web/admin/lib/admin-ui.ts && \
+    test -f internal/server/web/public/index.html
 RUN --mount=type=cache,target=/root/.npm \
-    npm --prefix admin-ui ci && \
-    npm --prefix admin-ui run lint && \
-    npm --prefix admin-ui run build:admin
+    npm --prefix internal/server/web/admin ci && \
+    npm --prefix internal/server/web/admin run lint && \
+    npm --prefix internal/server/web/admin run build:admin
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
@@ -47,8 +46,7 @@ ARG BUILD_TIME=unknown
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
-COPY --from=admin-build /src/internal/server/web/admin-app ./internal/server/web/admin-app
-COPY --from=admin-build /src/internal/server/web/admin-assets ./internal/server/web/admin-assets
+COPY --from=admin-build /src/internal/server/web/dist/admin ./internal/server/web/dist/admin
 RUN set -eux; \
   export GOOS=${TARGETOS}; \
   export GOARCH=${TARGETARCH}; \

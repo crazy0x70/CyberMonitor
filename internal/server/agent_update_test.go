@@ -3,6 +3,7 @@ package server
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"cyber_monitor/internal/metrics"
 )
@@ -35,6 +36,56 @@ func TestAgentConfigIncludesPendingUpdateInstruction(t *testing.T) {
 	}
 	if cfg.Update.DownloadURL != "https://example.com/agent" {
 		t.Fatalf("unexpected update download url %q", cfg.Update.DownloadURL)
+	}
+}
+
+func TestAgentConfigSuppressesUpdateInstructionDuringActiveLease(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{AdminUser: "admin", AdminPass: "pass"}),
+		profiles: map[string]*NodeProfile{
+			"node-1": {
+				TestIntervalSec: defaultTestIntervalSec,
+				AgentUpdate: &AgentUpdateInstruction{
+					Version:     "1.2.3",
+					DownloadURL: "https://example.com/agent",
+				},
+				AgentUpdateState:      "updating",
+				AgentUpdateLeaseUntil: time.Now().Add(5 * time.Minute).Unix(),
+			},
+		},
+		nodes: map[string]NodeState{},
+	}
+
+	cfg := store.AgentConfig("node-1")
+	if cfg.Update != nil {
+		t.Fatalf("expected active lease to suppress update dispatch, got %+v", cfg.Update)
+	}
+}
+
+func TestAgentConfigRedispatchesUpdateAfterLeaseExpires(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{AdminUser: "admin", AdminPass: "pass"}),
+		profiles: map[string]*NodeProfile{
+			"node-1": {
+				TestIntervalSec: defaultTestIntervalSec,
+				AgentUpdate: &AgentUpdateInstruction{
+					Version:     "1.2.3",
+					DownloadURL: "https://example.com/agent",
+				},
+				AgentUpdateState:      "restarting",
+				AgentUpdateLeaseUntil: time.Now().Add(-time.Minute).Unix(),
+			},
+		},
+		nodes: map[string]NodeState{},
+	}
+
+	cfg := store.AgentConfig("node-1")
+	if cfg.Update == nil {
+		t.Fatal("expected expired lease to allow update redispatch")
 	}
 }
 
@@ -77,6 +128,91 @@ func TestApplyAgentUpdateReportClearsPendingTaskOnSuccess(t *testing.T) {
 	}
 	if profile.AgentUpdateMessage != "updated" {
 		t.Fatalf("expected success message to persist, got %q", profile.AgentUpdateMessage)
+	}
+}
+
+func TestApplyAgentUpdateReportSetsLeaseForActiveStates(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{AdminUser: "admin", AdminPass: "pass"}),
+		profiles: map[string]*NodeProfile{
+			"node-1": {
+				TestIntervalSec: defaultTestIntervalSec,
+				AgentUpdate: &AgentUpdateInstruction{
+					Version:     "1.2.3",
+					DownloadURL: "https://example.com/agent",
+				},
+				AgentUpdateState: "pending",
+			},
+		},
+		nodes: map[string]NodeState{},
+	}
+
+	store.ApplyAgentUpdateReport("node-1", AgentUpdateReport{
+		State:   "updating",
+		Version: "1.2.3",
+		Message: "downloading",
+	})
+
+	profile := store.profiles["node-1"]
+	if profile.AgentUpdate == nil {
+		t.Fatal("expected active update instruction to remain queued during updating state")
+	}
+	if profile.AgentUpdateLeaseUntil <= time.Now().Unix() {
+		t.Fatalf("expected active lease to be extended, got %d", profile.AgentUpdateLeaseUntil)
+	}
+}
+
+func TestStoreUpdateAutoCompletesAgentUpdateWhenTargetVersionReported(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{
+		settings: initSettings(Config{AdminUser: "admin", AdminPass: "pass"}),
+		profiles: map[string]*NodeProfile{
+			"node-1": {
+				TestIntervalSec: defaultTestIntervalSec,
+				AgentUpdate: &AgentUpdateInstruction{
+					Version:     "1.2.3",
+					DownloadURL: "https://example.com/agent",
+				},
+				AgentUpdateState:         "restarting",
+				AgentUpdateTargetVersion: "1.2.3",
+				AgentUpdateLeaseUntil:    time.Now().Add(5 * time.Minute).Unix(),
+			},
+		},
+		nodes:           map[string]NodeState{},
+		alerted:         map[string]alertState{},
+		offlineSessions: map[string]OfflineSessionState{},
+		testHistory:     map[string]map[string]*TestHistoryEntry{},
+		loginAttempts:   map[string]*loginAttempt{},
+	}
+
+	reconciled := store.Update(metrics.NodeStats{
+		NodeID:       "node-1",
+		NodeName:     "node-1",
+		Hostname:     "node-1",
+		OS:           "linux",
+		Arch:         "amd64",
+		AgentVersion: "1.2.3",
+		Timestamp:    time.Now().Unix(),
+	})
+	if !reconciled {
+		t.Fatal("expected matching target version to auto-complete queued update")
+	}
+
+	profile := store.profiles["node-1"]
+	if profile.AgentUpdate != nil {
+		t.Fatalf("expected queued update to be cleared, got %+v", profile.AgentUpdate)
+	}
+	if profile.AgentUpdateState != "succeeded" {
+		t.Fatalf("expected auto-complete state succeeded, got %q", profile.AgentUpdateState)
+	}
+	if profile.AgentUpdateLeaseUntil != 0 {
+		t.Fatalf("expected lease to be cleared, got %d", profile.AgentUpdateLeaseUntil)
+	}
+	if !strings.Contains(profile.AgentUpdateMessage, "自动完成更新任务收口") {
+		t.Fatalf("unexpected auto-complete message: %q", profile.AgentUpdateMessage)
 	}
 }
 

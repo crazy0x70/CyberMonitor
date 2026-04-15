@@ -513,19 +513,59 @@ func shouldSkipPartition(p disk.PartitionStat) bool {
 	if info, err := os.Stat(p.Mountpoint); err == nil && !info.IsDir() {
 		return true
 	}
+	mountpoint := filepath.Clean(strings.TrimSpace(p.Mountpoint))
 	ignorePrefixes := []string{
-		"/proc", "/sys", "/dev", "/run", "/etc",
-		"/var/lib/docker", "/var/lib/containerd", "/var/lib/kubelet",
+		"/proc",
+		"/sys",
+		"/dev",
+		"/run",
+		"/run/user",
+		"/run/credentials",
+		"/var/run",
+		"/etc",
+		"/snap",
+		"/var/snap",
+		"/var/lib/docker",
+		"/var/lib/containerd",
+		"/var/lib/containers",
+		"/var/lib/kubelet",
+		"/var/lib/flatpak",
 	}
 	for _, prefix := range ignorePrefixes {
-		if strings.HasPrefix(p.Mountpoint, prefix) {
+		if mountpoint == prefix || strings.HasPrefix(mountpoint, prefix+"/") {
 			return true
 		}
 	}
 	ignoreFS := map[string]struct{}{
-		"proc": {}, "sysfs": {}, "tmpfs": {}, "devtmpfs": {}, "squashfs": {}, "overlay": {},
-		"cgroup": {}, "cgroup2": {}, "devpts": {}, "mqueue": {}, "debugfs": {}, "tracefs": {},
-		"fusectl": {}, "binfmt_misc": {}, "rpc_pipefs": {}, "nsfs": {},
+		"proc":            {},
+		"sysfs":           {},
+		"tmpfs":           {},
+		"devtmpfs":        {},
+		"squashfs":        {},
+		"overlay":         {},
+		"aufs":            {},
+		"ramfs":           {},
+		"autofs":          {},
+		"securityfs":      {},
+		"pstore":          {},
+		"hugetlbfs":       {},
+		"configfs":        {},
+		"cgroup":          {},
+		"cgroup2":         {},
+		"devpts":          {},
+		"mqueue":          {},
+		"debugfs":         {},
+		"tracefs":         {},
+		"fusectl":         {},
+		"fuse.portal":     {},
+		"fuse.gvfsd-fuse": {},
+		"fuse.lxcfs":      {},
+		"fuse.overlayfs":  {},
+		"binfmt_misc":     {},
+		"rpc_pipefs":      {},
+		"nsfs":            {},
+		"bpf":             {},
+		"lxcfs":           {},
 	}
 	if _, ok := ignoreFS[strings.ToLower(p.Fstype)]; ok && p.Mountpoint != "/" {
 		return true

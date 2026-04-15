@@ -32,10 +32,9 @@ func TestUIHTMLHasThemeColorMeta(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"admin-ui/index.html",
-		"internal/server/web/admin.html",
-		"internal/server/web/index.html",
-		"internal/server/web/dashboard.html",
+		"internal/server/web/admin/index.html",
+		"internal/server/web/public/index.html",
+		"internal/server/web/public/dashboard.html",
 	}
 
 	for _, relativePath := range files {
@@ -49,20 +48,15 @@ func TestUIHTMLHasThemeColorMeta(t *testing.T) {
 func TestDefaultIconsStayAlignedAcrossPublicAndAdminEntrypoints(t *testing.T) {
 	t.Parallel()
 
-	publicHTML := readRepoFileForUITest(t, "internal/server/web/index.html")
-	legacyAdminHTML := readRepoFileForUITest(t, "internal/server/web/admin.html")
-	reactAdminHTML := readRepoFileForUITest(t, "admin-ui/index.html")
+	publicHTML := readRepoFileForUITest(t, "internal/server/web/public/index.html")
+	reactAdminHTML := readRepoFileForUITest(t, "internal/server/web/admin/index.html")
 
 	iconPattern := regexp.MustCompile(`rel="icon"[^>]*href="([^"]+)"`)
 	publicMatch := iconPattern.FindStringSubmatch(publicHTML)
-	legacyAdminMatch := iconPattern.FindStringSubmatch(legacyAdminHTML)
 	reactAdminMatch := iconPattern.FindStringSubmatch(reactAdminHTML)
 
-	if len(publicMatch) != 2 || len(legacyAdminMatch) != 2 || len(reactAdminMatch) != 2 {
+	if len(publicMatch) != 2 || len(reactAdminMatch) != 2 {
 		t.Fatal("expected public and admin entrypoints to declare favicon href")
-	}
-	if publicMatch[1] != legacyAdminMatch[1] {
-		t.Fatalf("legacy admin icon should match public icon: %q != %q", legacyAdminMatch[1], publicMatch[1])
 	}
 	if publicMatch[1] != reactAdminMatch[1] {
 		t.Fatalf("react admin icon should match public icon: %q != %q", reactAdminMatch[1], publicMatch[1])
@@ -73,13 +67,13 @@ func TestAdminPagesUseH1Title(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"admin-ui/src/pages/Dashboard.tsx",
-		"admin-ui/src/pages/ServerManagement.tsx",
-		"admin-ui/src/pages/GroupManagement.tsx",
-		"admin-ui/src/pages/ProbeSettings.tsx",
-		"admin-ui/src/pages/BasicSettings.tsx",
-		"admin-ui/src/pages/NotificationAlert.tsx",
-		"admin-ui/src/pages/AIProvider.tsx",
+		"internal/server/web/admin/src/pages/Dashboard.tsx",
+		"internal/server/web/admin/src/pages/ServerManagement.tsx",
+		"internal/server/web/admin/src/pages/GroupManagement.tsx",
+		"internal/server/web/admin/src/pages/ProbeSettings.tsx",
+		"internal/server/web/admin/src/pages/BasicSettings.tsx",
+		"internal/server/web/admin/src/pages/NotificationAlert.tsx",
+		"internal/server/web/admin/src/pages/AIProvider.tsx",
 	}
 
 	for _, relativePath := range files {
@@ -93,7 +87,7 @@ func TestAdminPagesUseH1Title(t *testing.T) {
 func TestDashboardNavigationUsesAnchors(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/pages/Dashboard.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/Dashboard.tsx")
 	if !strings.Contains(content, "href={dashboardPageHref(item.page)}") {
 		t.Fatal("Dashboard summary navigation should render href links")
 	}
@@ -109,8 +103,8 @@ func TestPublicPagesRenderSemanticH1(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"internal/server/web/index.html",
-		"internal/server/web/dashboard.html",
+		"internal/server/web/public/index.html",
+		"internal/server/web/public/dashboard.html",
 	}
 
 	for _, relativePath := range files {
@@ -125,11 +119,11 @@ func TestAdminSourceAvoidsTransitionAll(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"admin-ui/lib/admin-ui.ts",
-		"admin-ui/components/ui/badge.tsx",
-		"admin-ui/components/ui/tabs.tsx",
-		"admin-ui/components/ui/switch.tsx",
-		"admin-ui/components/ui/accordion.tsx",
+		"internal/server/web/admin/lib/admin-ui.ts",
+		"internal/server/web/admin/components/ui/badge.tsx",
+		"internal/server/web/admin/components/ui/tabs.tsx",
+		"internal/server/web/admin/components/ui/switch.tsx",
+		"internal/server/web/admin/components/ui/accordion.tsx",
 	}
 
 	for _, relativePath := range files {
@@ -143,12 +137,12 @@ func TestAdminSourceAvoidsTransitionAll(t *testing.T) {
 func TestDestructiveFlowsUseManagedConfirmation(t *testing.T) {
 	t.Parallel()
 
-	serverManagement := readRepoFileForUITest(t, "admin-ui/src/pages/ServerManagement.tsx")
+	serverManagement := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/ServerManagement.tsx")
 	if strings.Contains(serverManagement, "window.confirm(") {
 		t.Fatal("ServerManagement still uses window.confirm")
 	}
 
-	probeSettings := readRepoFileForUITest(t, "admin-ui/src/pages/ProbeSettings.tsx")
+	probeSettings := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/ProbeSettings.tsx")
 	if !strings.Contains(probeSettings, "AlertDialog") {
 		t.Fatal("ProbeSettings should use AlertDialog for destructive actions")
 	}
@@ -157,7 +151,7 @@ func TestDestructiveFlowsUseManagedConfirmation(t *testing.T) {
 func TestAdminNavigationUsesAnchors(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/App.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/App.tsx")
 	if !strings.Contains(content, "href={pageHref(item.id)}") {
 		t.Fatal("admin navigation should render href links")
 	}
@@ -166,7 +160,7 @@ func TestAdminNavigationUsesAnchors(t *testing.T) {
 func TestAdminAppWarnsBeforeLeavingDirtyPages(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/App.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/App.tsx")
 	if !strings.Contains(content, "beforeunload") {
 		t.Fatal("App should warn before leaving dirty pages")
 	}
@@ -179,9 +173,9 @@ func TestFormsRenderInlineValidationFeedback(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"admin-ui/src/pages/NotificationAlert.tsx",
-		"admin-ui/src/pages/ProbeSettings.tsx",
-		"admin-ui/src/pages/GroupManagement.tsx",
+		"internal/server/web/admin/src/pages/NotificationAlert.tsx",
+		"internal/server/web/admin/src/pages/ProbeSettings.tsx",
+		"internal/server/web/admin/src/pages/GroupManagement.tsx",
 	}
 
 	for _, relativePath := range files {
@@ -195,7 +189,7 @@ func TestFormsRenderInlineValidationFeedback(t *testing.T) {
 func TestIconButtonsExposeAccessibleLabels(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/pages/ProbeSettings.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/ProbeSettings.tsx")
 	if !strings.Contains(content, "编辑探测节点") {
 		t.Fatal("ProbeSettings edit icon button should expose an aria-label")
 	}
@@ -207,7 +201,7 @@ func TestIconButtonsExposeAccessibleLabels(t *testing.T) {
 func TestLoginTurnstileErrorsAreAnnounced(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/pages/Login.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/Login.tsx")
 	if !strings.Contains(content, `aria-live="polite"`) {
 		t.Fatal("Login should announce turnstile errors with aria-live")
 	}
@@ -216,7 +210,7 @@ func TestLoginTurnstileErrorsAreAnnounced(t *testing.T) {
 func TestServerSearchUsesSearchSemantics(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/pages/ServerManagement.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/ServerManagement.tsx")
 	if !strings.Contains(content, `type="search"`) {
 		t.Fatal("ServerManagement search should use input type search")
 	}
@@ -232,29 +226,29 @@ func TestAdminPlaceholderCopyFollowsGuidelines(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string][]string{
-		"admin-ui/src/pages/BasicSettings.tsx": {
+		"internal/server/web/admin/src/pages/BasicSettings.tsx": {
 			`placeholder="例如：/cm-admin…"`,
 			`placeholder="例如：https://monitor.example.com…"`,
 			`placeholder="例如：cm-agent-token-abc123…"`,
 		},
-		"admin-ui/src/pages/ProbeSettings.tsx": {
+		"internal/server/web/admin/src/pages/ProbeSettings.tsx": {
 			`placeholder="例如：主站 TCP 443…"`,
 			`placeholder="例如：1.1.1.1 / example.com…"`,
 			`placeholder="例如：443…"`,
 			`placeholder={` + "`例如：${DEFAULT_TCP_INTERVAL}…`" + `}`,
 		},
-		"admin-ui/src/pages/GroupManagement.tsx": {
+		"internal/server/web/admin/src/pages/GroupManagement.tsx": {
 			`placeholder="例如：美国、香港、日本…"`,
 			`placeholder="例如：CN2、BGP、GIA…"`,
 		},
-		"admin-ui/src/pages/NotificationAlert.tsx": {
+		"internal/server/web/admin/src/pages/NotificationAlert.tsx": {
 			`placeholder="例如：123456789,987654321…"`,
 		},
-		"admin-ui/src/pages/AIProvider.tsx": {
+		"internal/server/web/admin/src/pages/AIProvider.tsx": {
 			`placeholder="选择命令服务商…"`,
 			`placeholder="例如：请重点关注网络流量、下载量与离线情况…"`,
 		},
-		"admin-ui/src/pages/ServerManagement.tsx": {
+		"internal/server/web/admin/src/pages/ServerManagement.tsx": {
 			`placeholder="例如：搜索节点名、Node ID、主机名、地区…"`,
 			`placeholder="选择续费方案…"`,
 		},
@@ -273,7 +267,7 @@ func TestAdminPlaceholderCopyFollowsGuidelines(t *testing.T) {
 func TestAdminLoginUsesAccountCopyAndReadableIcons(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/pages/Login.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/pages/Login.tsx")
 	requiredSnippets := []string{
 		`<Label htmlFor="username">账号</Label>`,
 		`text-slate-500 dark:text-slate-300`,
@@ -300,7 +294,7 @@ func TestAdminLoginUsesAccountCopyAndReadableIcons(t *testing.T) {
 func TestDashboardActionClassesUseInlineFlexLayout(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/lib/admin-ui.ts")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/lib/admin-ui.ts")
 	requiredSnippets := []string{
 		"adminCompactActionButtonClass =",
 		"inline-flex items-center justify-center gap-1.5 h-9 px-4 text-xs font-bold",
@@ -318,7 +312,7 @@ func TestDashboardActionClassesUseInlineFlexLayout(t *testing.T) {
 func TestSidebarNavigationAvoidsHoverTransformFlicker(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/App.tsx")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/App.tsx")
 	disallowedSnippets := []string{
 		"group-hover:scale-110",
 		"group-hover:-translate-x-1",
@@ -391,7 +385,7 @@ func TestBuildReleaseWorkflowSyncsNodeVersionWithDockerfile(t *testing.T) {
 func TestAdminActionClassesExposeFocusVisibleStates(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/lib/admin-ui.ts")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/lib/admin-ui.ts")
 	requiredSnippets := []string{
 		"focus-visible:border-sky-300",
 		"focus-visible:ring-2",
@@ -410,8 +404,8 @@ func TestAdminActionClassesExposeFocusVisibleStates(t *testing.T) {
 func TestAdminAppUsesSessionProbeForAnonymousRestore(t *testing.T) {
 	t.Parallel()
 
-	appContent := readRepoFileForUITest(t, "admin-ui/src/App.tsx")
-	apiContent := readRepoFileForUITest(t, "admin-ui/lib/admin-api.ts")
+	appContent := readRepoFileForUITest(t, "internal/server/web/admin/src/App.tsx")
+	apiContent := readRepoFileForUITest(t, "internal/server/web/admin/lib/admin-api.ts")
 
 	if !strings.Contains(appContent, "fetchSessionStatus()") {
 		t.Fatal("App should use session probe instead of protected settings request for anonymous restore")
@@ -424,7 +418,7 @@ func TestAdminAppUsesSessionProbeForAnonymousRestore(t *testing.T) {
 func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/styles.css")
 	requiredSnippets := []string{
 		".node-list {\n  display: grid;\n  gap: 16px;",
 		".tag-section {\n  display: grid;\n  gap: 16px;",
@@ -455,7 +449,7 @@ func TestTaggedNodeCardsShareSameSurfaceStyle(t *testing.T) {
 func TestLatencyAxisUsesCompactWholeMillisecondLabels(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	disallowedSnippets := []string{
 		"if (value >= 10) return `${value.toFixed(0)}${unit}`;",
 	}
@@ -480,7 +474,7 @@ func TestLatencyAxisUsesCompactWholeMillisecondLabels(t *testing.T) {
 func TestLatencyHoverAddsLeaveFallbacks(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`container.addEventListener("pointerleave", handleLeave);`,
 		`window.addEventListener("pointermove", handleGlobalPointerMove, true);`,
@@ -498,7 +492,7 @@ func TestLatencyHoverAddsLeaveFallbacks(t *testing.T) {
 func TestPublicMonitorAddsSmoothToggleAndEWMA(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`testSmooth: new Map(),`,
 		`<div class="smooth-control">`,
@@ -532,7 +526,7 @@ func TestPublicMonitorAddsSmoothToggleAndEWMA(t *testing.T) {
 func TestPublicMonitorUsesUpdatedRangeLabelsAndDailyInterval(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`{ key: "24h", label: "1D", seconds: 60 * 60 * 24 },`,
 		`{ key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },`,
@@ -563,7 +557,7 @@ func TestPublicMonitorUsesUpdatedRangeLabelsAndDailyInterval(t *testing.T) {
 func TestPublicMonitorHidesVariantSwitcherBanner(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	disallowedSnippets := []string{
 		`class="demo-variant-banner"`,
 		`>保守版<`,
@@ -581,7 +575,7 @@ func TestPublicMonitorHidesVariantSwitcherBanner(t *testing.T) {
 func TestPublicMonitorLatencyAxisUsesJetBrainsMonoAndGreenToggle(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/styles.css")
 	requiredSnippets := []string{
 		`.latency-chart-svg .latency-axis text {`,
 		`font-family: "Inter", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;`,
@@ -604,7 +598,7 @@ func TestPublicMonitorLatencyAxisUsesJetBrainsMonoAndGreenToggle(t *testing.T) {
 func TestPublicMonitorUsesSystemFirstFontStackAndDarkNetworkCards(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/styles.css")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/styles.css")
 	requiredSnippets := []string{
 		`--font-base: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;`,
 		`.network-card {`,
@@ -621,7 +615,7 @@ func TestPublicMonitorUsesSystemFirstFontStackAndDarkNetworkCards(t *testing.T) 
 func TestExpandedNodeNetworkUsesRealtimeRatesAndPercent(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`<div class="info-row"><span>累计上传</span><strong data-field="detail-upload">--</strong></div>`,
 		`<div class="info-row"><span>累计下载</span><strong data-field="detail-download">--</strong></div>`,
@@ -658,7 +652,7 @@ func TestExpandedNodeNetworkUsesRealtimeRatesAndPercent(t *testing.T) {
 func TestPublicMonitorReconnectsRealtimeFeedAggressively(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`wsReconnectAttempts: new Map(),`,
 		`wsWatchdogs: new Map(),`,
@@ -681,21 +675,21 @@ func TestPublicMonitorReconnectsRealtimeFeedAggressively(t *testing.T) {
 func TestPublicMonitorTrafficTotalsStayMonotonicWithoutMutatingServerCounters(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
-		requiredSnippets := []string{
-			`publicTrafficCounters: new Map(),`,
-			`function buildTrafficCounterKey(sourceKey, nodeID) {`,
-			`function resolveNodeFreshness(node) {`,
-			`function shouldReplaceNode(existing, candidate) {`,
-			`function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {`,
-			`function prunePublicTrafficCounters(nodes) {`,
-			`const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;`,
-			`if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {`,
-			`if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {`,
-			`if (previous && freshness >= lastFreshness) {`,
-			`prunePublicTrafficCounters(mergedNodes);`,
-			`if (shouldReplaceNode(list[index], nextNode)) {`,
-		}
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
+	requiredSnippets := []string{
+		`publicTrafficCounters: new Map(),`,
+		`function buildTrafficCounterKey(sourceKey, nodeID) {`,
+		`function resolveNodeFreshness(node) {`,
+		`function shouldReplaceNode(existing, candidate) {`,
+		`function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {`,
+		`function prunePublicTrafficCounters(nodes) {`,
+		`const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;`,
+		`if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {`,
+		`if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {`,
+		`if (previous && freshness >= lastFreshness) {`,
+		`prunePublicTrafficCounters(mergedNodes);`,
+		`if (shouldReplaceNode(list[index], nextNode)) {`,
+	}
 
 	for _, snippet := range requiredSnippets {
 		if !strings.Contains(content, snippet) {
@@ -707,7 +701,7 @@ func TestPublicMonitorTrafficTotalsStayMonotonicWithoutMutatingServerCounters(t 
 func TestPublicMonitorTrafficDedupesBeforeDisplayCounterAdjustment(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`function dedupeNodesByID(nodes) {`,
 		`const sourceNodes = dedupeNodesByID(snapshot?.nodes);`,
@@ -736,9 +730,9 @@ func TestAdminPlaceholderCopyAvoidsInstructionalText(t *testing.T) {
 	t.Parallel()
 
 	files := []string{
-		"admin-ui/src/pages/BasicSettings.tsx",
-		"admin-ui/src/pages/NotificationAlert.tsx",
-		"admin-ui/src/pages/ProbeSettings.tsx",
+		"internal/server/web/admin/src/pages/BasicSettings.tsx",
+		"internal/server/web/admin/src/pages/NotificationAlert.tsx",
+		"internal/server/web/admin/src/pages/ProbeSettings.tsx",
 	}
 
 	disallowed := []string{
@@ -761,7 +755,7 @@ func TestAdminPlaceholderCopyAvoidsInstructionalText(t *testing.T) {
 func TestPublicMonitorLoadsHistoryByNodeRangeFromServer(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const DEFAULT_TEST_RANGE_KEY = "1h";`,
 		`testHistoryFetched: new Map(),`,
@@ -795,7 +789,7 @@ func TestPublicMonitorLoadsHistoryByNodeRangeFromServer(t *testing.T) {
 func TestPublicMonitorHistoryCacheKeysIncludeSourceDimension(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`function historyNodeCacheKey(nodeId, sourceKey) {`,
 		`function historyRequestKey(nodeId, sourceKey, rangeKey) {`,
@@ -814,7 +808,7 @@ func TestPublicMonitorHistoryCacheKeysIncludeSourceDimension(t *testing.T) {
 func TestPublicMonitorLongRangeChartsStayLineBased(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const mergedTimeline = buildLatencyTimeline(testEntries);`,
 		`const timeSeries = mergedTimeline.times;`,
@@ -853,7 +847,7 @@ func TestPublicMonitorLongRangeChartsStayLineBased(t *testing.T) {
 func TestPublicMonitorLatencyHoverSnapsToNearestVisibleSample(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const hoverIndex = resolveLatencyHoverIndex(meta.paddedSeries, index);`,
 		`const value = series[hoverIndex];`,
@@ -871,7 +865,7 @@ func TestPublicMonitorLatencyHoverSnapsToNearestVisibleSample(t *testing.T) {
 func TestPublicMonitorLatencyHoverFallsBackToLatestVisibleSample(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`let activeIndex = hoverIndex;`,
 		`let rows = buildLatencyTooltipRows(meta, labels, activeIndex);`,
@@ -891,7 +885,7 @@ func TestPublicMonitorLatencyHoverFallsBackToLatestVisibleSample(t *testing.T) {
 func TestPublicMonitorSmoothingPersistsAcrossSparseBuckets(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const LATENCY_SMOOTH_ALPHA = 0.2;`,
 		`if (numeric === null) {`,
@@ -918,7 +912,7 @@ func TestPublicMonitorSmoothingPersistsAcrossSparseBuckets(t *testing.T) {
 func TestPublicMonitorUsesAnonymousPublicBootstrap(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		"fetch(`${base}/api/v1/public/snapshot`, {",
 		"fetch(\n    `${apiBase}/api/v1/public/nodes/${encodeURIComponent(",
@@ -950,7 +944,7 @@ func TestPublicMonitorUsesAnonymousPublicBootstrap(t *testing.T) {
 func TestPublicMonitorNetworkCardsStayStaticAcrossRange(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const snapshot = summarizeTestSnapshot(entry.test, entry.history);`,
 		`cardStats.innerHTML = `,
@@ -982,7 +976,7 @@ func TestPublicMonitorNetworkCardsStayStaticAcrossRange(t *testing.T) {
 func TestAdminReactThemePaletteStaysAlignedWithPublicMonitor(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "admin-ui/src/index.css")
+	content := readRepoFileForUITest(t, "internal/server/web/admin/src/index.css")
 	requiredSnippets := []string{
 		`--bg-1: #f4f7fb;`,
 		`--bg-2: #e7eef8;`,
@@ -1004,8 +998,8 @@ func TestAdminReactThemePaletteStaysAlignedWithPublicMonitor(t *testing.T) {
 func TestReactAdminThemeColorMetaMatchesPublicEntrypoint(t *testing.T) {
 	t.Parallel()
 
-	publicHTML := readRepoFileForUITest(t, "internal/server/web/index.html")
-	reactAdminHTML := readRepoFileForUITest(t, "admin-ui/index.html")
+	publicHTML := readRepoFileForUITest(t, "internal/server/web/public/index.html")
+	reactAdminHTML := readRepoFileForUITest(t, "internal/server/web/admin/index.html")
 
 	requiredSnippets := []string{
 		`content="#f4f7fb"`,
@@ -1025,7 +1019,7 @@ func TestReactAdminThemeColorMetaMatchesPublicEntrypoint(t *testing.T) {
 func TestPublicMonitorRangeHistoryUsesAuthoritativeFetchBaseline(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`function isHistoryRangeFetched(`,
 		`replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);`,
@@ -1052,7 +1046,7 @@ func TestPublicMonitorRangeHistoryUsesAuthoritativeFetchBaseline(t *testing.T) {
 func TestPublicMonitorPreservesSelectedRangeAcrossRealtimeUpdates(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoFileForUITest(t, "internal/server/web/assets/monitor.js")
+	content := readRepoFileForUITest(t, "internal/server/web/public/assets/monitor.js")
 	requiredSnippets := []string{
 		`const activeHistoryKeys = new Set();`,
 		`const activeNodeIDs = new Set();`,
@@ -1103,8 +1097,8 @@ func TestWindowsAgentInstallCommandsAvoidNestedPowerShell(t *testing.T) {
 
 	files := []string{
 		"README.md",
-		"admin-ui/lib/agent-install.ts",
-		"internal/server/web/assets/admin.js",
+		"internal/server/web/admin/lib/agent-install.ts",
+		"internal/server/web/public/assets/admin.js",
 	}
 
 	for _, relativePath := range files {
