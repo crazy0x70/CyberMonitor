@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,6 +131,18 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 }
 
 func (s *NetworkStore) QueryRange(nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
+	return s.queryRange(nodeID, from, to, true)
+}
+
+func (s *NetworkStore) QueryPublicRange(nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
+	return s.queryRange(nodeID, from, to, false)
+}
+
+func (s *NetworkStore) queryRange(
+	nodeID string,
+	from, to time.Time,
+	includeAvailability bool,
+) (map[string]*NetworkHistoryEntry, error) {
 	if s == nil || s.db == nil {
 		return nil, errNilNetworkStore
 	}
@@ -150,11 +163,14 @@ func (s *NetworkStore) QueryRange(nodeID string, from, to time.Time) (map[string
 	defer querier.Close()
 
 	accumulators := make(map[string]*seriesAccumulator)
-	for _, metricName := range []string{
+	metricsToCollect := []string{
 		networkLatencyMetric,
 		networkLossMetric,
-		networkAvailabilityMetric,
-	} {
+	}
+	if includeAvailability {
+		metricsToCollect = append(metricsToCollect, networkAvailabilityMetric)
+	}
+	for _, metricName := range metricsToCollect {
 		if err := collectMetricSeries(context.Background(), querier, nodeID, metricName, mint, maxt, accumulators); err != nil {
 			return nil, err
 		}
@@ -163,9 +179,8 @@ func (s *NetworkStore) QueryRange(nodeID string, from, to time.Time) (map[string
 	result := make(map[string]*NetworkHistoryEntry, len(accumulators))
 	cutoffSeconds := to.UTC().Add(-networkRetentionDays * 24 * time.Hour).Unix()
 	for key, acc := range accumulators {
-		entry := buildHistoryEntry(acc)
+		entry := buildHistoryEntrySince(acc, cutoffSeconds)
 		if entry != nil {
-			trimNetworkHistoryEntryBefore(entry, cutoffSeconds)
 			result[key] = entry
 		}
 	}
@@ -216,29 +231,51 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	return nil
 }
 
-func trimNetworkHistoryEntryBefore(entry *NetworkHistoryEntry, cutoffSeconds int64) {
-	if entry == nil || cutoffSeconds <= 0 || len(entry.Times) == 0 {
-		return
+func buildHistoryEntrySince(acc *seriesAccumulator, cutoffSeconds int64) *NetworkHistoryEntry {
+	if acc == nil {
+		return nil
 	}
-	startIndex := 0
-	for startIndex < len(entry.Times) && entry.Times[startIndex] < cutoffSeconds {
-		startIndex++
+
+	timeSet := make(map[int64]struct{}, len(acc.availability)+len(acc.latency)+len(acc.loss))
+	addVisibleTimestamp := func(ts int64) {
+		if cutoffSeconds > 0 && ts < cutoffSeconds {
+			return
+		}
+		timeSet[ts] = struct{}{}
 	}
-	if startIndex == 0 {
-		return
+	for ts := range acc.availability {
+		addVisibleTimestamp(ts)
 	}
-	entry.Times = append([]int64(nil), entry.Times[startIndex:]...)
-	entry.Latency = append([]*float64(nil), entry.Latency[startIndex:]...)
-	entry.Loss = append([]*float64(nil), entry.Loss[startIndex:]...)
-	entry.Availability = append([]*float64(nil), entry.Availability[startIndex:]...)
-	if len(entry.Times) == 0 {
-		entry.LastAt = 0
-		entry.MinIntervalSec = 0
-		entry.AvgIntervalSec = 0
-		return
+	for ts := range acc.latency {
+		addVisibleTimestamp(ts)
 	}
-	entry.LastAt = entry.Times[len(entry.Times)-1]
-	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(entry.Times)
+	for ts := range acc.loss {
+		addVisibleTimestamp(ts)
+	}
+	if len(timeSet) == 0 {
+		return nil
+	}
+
+	times := make([]int64, 0, len(timeSet))
+	for ts := range timeSet {
+		times = append(times, ts)
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+
+	entry := &NetworkHistoryEntry{
+		Latency:      make([]*float64, 0, len(times)),
+		Loss:         make([]*float64, 0, len(times)),
+		Availability: make([]*float64, 0, len(times)),
+		Times:        times,
+		LastAt:       times[len(times)-1],
+	}
+	for _, ts := range times {
+		entry.Latency = append(entry.Latency, cloneFloatPointer(acc.latency[ts]))
+		entry.Loss = append(entry.Loss, cloneFloatPointer(acc.loss[ts]))
+		entry.Availability = append(entry.Availability, cloneFloatPointer(acc.availability[ts]))
+	}
+	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(times)
+	return entry
 }
 
 func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {

@@ -22,18 +22,10 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
 });
 
 const CONFIG_PATH = "/config.json";
-const VARIANT_CONSERVATIVE = "conservative";
-const VARIANT_BALANCED = "balanced";
 const DEFAULT_GROUP = "全部";
 const DEFAULT_STATUS_FILTER = "all";
 const DEFAULT_TEST_RANGE_KEY = "1h";
 const STATUS_FILTERS = new Set(["all", "online", "offline"]);
-
-const activeVariant =
-  urlParams.get("variant") === VARIANT_CONSERVATIVE
-    ? VARIANT_CONSERVATIVE
-    : VARIANT_BALANCED;
-const demoEnabled = urlParams.get("demo") === "1" || urlParams.has("variant");
 
 const remoteConfig = {
   targets: [],
@@ -64,6 +56,7 @@ const state = {
   testHistory: new Map(),
   testHistoryFetched: new Map(),
   testHistoryInflight: new Map(),
+  testHistoryControllers: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
@@ -74,8 +67,6 @@ const state = {
   sourceSnapshots: new Map(),
   publicTrafficCounters: new Map(),
   renderFrame: 0,
-  variant: activeVariant,
-  demoEnabled,
   lastTransportAt: 0,
   lastTransportType: "snapshot",
   realtimeStatus: new Map(),
@@ -92,13 +83,6 @@ const WS_RECONNECT_BASE_DELAY = 500;
 const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
 const LATENCY_SMOOTH_ALPHA = 0.2;
-
-function buildVariantURL(variant) {
-  const next = new URL(window.location.href);
-  next.searchParams.set("variant", variant);
-  next.searchParams.set("demo", "1");
-  return `${next.pathname}${next.search}${next.hash}`;
-}
 
 function syncViewStateToURL(replace = false) {
   const nextLocation = buildViewURL(state.selectedGroup, state.statusFilter);
@@ -139,24 +123,30 @@ function shouldHandleLocalNavigation(event) {
   );
 }
 
-function appendVariantToSocketURL(value) {
-  const raw = (value || "").trim();
-  if (!raw) return raw;
-  try {
-    const parsed = new URL(raw);
-    parsed.searchParams.set("variant", state.variant);
-    return parsed.toString();
-  } catch (error) {
-    return raw;
-  }
-}
-
 function scheduleRender() {
   if (state.renderFrame) return;
   state.renderFrame = window.requestAnimationFrame(() => {
     state.renderFrame = 0;
     render();
   });
+}
+
+function refreshOpenNodeHistoryViews(nodeId) {
+  const normalized = String(nodeId || "").trim();
+  if (!normalized) {
+    return;
+  }
+  const card = state.nodes.get(normalized);
+  if (
+    !card ||
+    !card.isConnected ||
+    !card.open ||
+    card._nodeId !== normalized ||
+    !card._fields
+  ) {
+    return;
+  }
+  renderNetworkSection(card._fields, card._nodeId);
 }
 
 function resetToAllGroups() {
@@ -201,8 +191,7 @@ function connectWSForTarget(target) {
 
   let ws;
   try {
-    const socketURL = appendVariantToSocketURL(target.socketURL);
-    ws = new WebSocket(socketURL);
+    ws = new WebSocket(target.socketURL);
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
     dropSourceSnapshot(target.key);
@@ -1409,6 +1398,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     return null;
   }
   const sourceKey = resolveNodeSourceKey(nodeId);
+  const cacheKey = resolveHistoryNodeCacheKey(nodeId, sourceKey);
   const rawNodeId = resolveHistoryNodeId(nodeId);
   if (!rawNodeId) {
     return null;
@@ -1427,6 +1417,14 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     return null;
   }
 
+  const controllerEntry = state.testHistoryControllers.get(cacheKey);
+  if (controllerEntry && controllerEntry.requestKey !== requestKey) {
+    controllerEntry.controller.abort();
+    state.testHistoryControllers.delete(cacheKey);
+  }
+  const controller = new AbortController();
+  state.testHistoryControllers.set(cacheKey, { requestKey, controller });
+
   const request = fetch(
     `${apiBase}/api/v1/public/nodes/${encodeURIComponent(
       rawNodeId
@@ -1434,7 +1432,8 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     {
       cache: "no-store",
       headers: buildPublicRequestHeaders(),
-  })
+      signal: controller.signal,
+    })
     .then(async (resp) => {
       if (!resp.ok) {
         throw new Error(`history request failed: ${resp.status}`);
@@ -1456,15 +1455,22 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
         historyRequestKey(nodeId, sourceKey, resolvedRange),
         true
       );
-      scheduleRender();
+      refreshOpenNodeHistoryViews(nodeId);
       return getNodeHistoryRange(nodeId, resolvedRange, sourceKey);
     })
     .catch((error) => {
+      if (error?.name === "AbortError") {
+        return null;
+      }
       console.warn("加载节点历史失败", nodeId, normalizedRange, error);
       return null;
     })
     .finally(() => {
       state.testHistoryInflight.delete(requestKey);
+      const activeController = state.testHistoryControllers.get(cacheKey);
+      if (activeController && activeController.requestKey === requestKey) {
+        state.testHistoryControllers.delete(cacheKey);
+      }
     });
 
   state.testHistoryInflight.set(requestKey, request);
@@ -2149,11 +2155,21 @@ function createCard() {
   };
 
   card._fields = fields;
+  card._detailSignature = "";
   card.addEventListener("toggle", () => {
-    if (!card.open || !card._lastNode || !card._nodeId) {
+    if (!card.open) {
+      card._detailSignature = "";
+      return;
+    }
+    if (!card._lastNode || !card._nodeId) {
+      return;
+    }
+    const detailSignature = buildCardDetailSignature(card._lastNode, card._nodeId);
+    if (card._detailSignature === detailSignature) {
       return;
     }
     renderCardDetails(card, card._lastNode, card._nodeId);
+    card._detailSignature = detailSignature;
   });
   return card;
 }
@@ -2285,8 +2301,10 @@ function updateCard(card, node, nodeId) {
   fields.detailLast.textContent = formatTimeFull(node.last_seen || 0);
   updateTestHistory(nodeId, tests);
 
-  if (card.open) {
+  const detailSignature = buildCardDetailSignature(node, nodeId);
+  if (card.open && card._detailSignature !== detailSignature) {
     renderCardDetails(card, node, nodeId);
+    card._detailSignature = detailSignature;
   }
 }
 
@@ -2333,10 +2351,6 @@ function renderCardDetails(card, node, nodeId) {
 }
 
 function updateNetworkTests(fields, tests, nodeId) {
-  if (tests.length) {
-    updateTestHistory(nodeId, tests);
-  }
-
   if (!tests.length && !hasAnyHistoryForNode(nodeId)) {
     fields.testChart.innerHTML = "";
     fields.testCards.innerHTML = "";
@@ -2361,6 +2375,32 @@ function updateNetworkTests(fields, tests, nodeId) {
   renderNetworkSection(fields, nodeId);
 }
 
+function buildCardDetailSignature(node, nodeId) {
+  const stats = node?.stats || {};
+  const activeRange = normalizeHistoryRangeKey(
+    state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
+  );
+  const historyMap = getNodeHistoryRange(nodeId, activeRange);
+  const renderHistoryMap =
+    historyMap.size > 0 ? historyMap : getFallbackHistoryMap(nodeId, activeRange);
+  let latestHistoryAt = 0;
+  renderHistoryMap.forEach((history) => {
+    const historyLastAt = resolveHistoryLastAt(history);
+    if (historyLastAt > latestHistoryAt) {
+      latestHistoryAt = historyLastAt;
+    }
+  });
+  return [
+    String(nodeId || ""),
+    Number(node?.last_seen || 0),
+    Number(stats?.uptime_sec || 0),
+    Number(stats?.process_count || 0),
+    activeRange,
+    state.testSmooth.get(nodeId) ? "1" : "0",
+    latestHistoryAt,
+  ].join("|");
+}
+
 function renderNetworkSection(fields, nodeId) {
   const activeRange = normalizeHistoryRangeKey(
     state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
@@ -2371,11 +2411,13 @@ function renderNetworkSection(fields, nodeId) {
   void fetchNodeHistory(nodeId, activeRange);
 
   const historyMap = getNodeHistoryRange(nodeId, activeRange);
+  const renderHistoryMap =
+    historyMap.size > 0 ? historyMap : getFallbackHistoryMap(nodeId, activeRange);
   const baseTests = fields._tests || [];
   const tests =
     baseTests.length > 0
       ? baseTests
-      : buildTestsFromHistory(getFallbackHistoryMap(nodeId, activeRange));
+      : buildTestsFromHistory(renderHistoryMap);
   const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
   renderRangeTabs(fields, nodeId, activeRange);
   renderSmoothToggle(fields, nodeId, smoothEnabled);
@@ -2391,7 +2433,8 @@ function renderNetworkSection(fields, nodeId) {
 
   tests.forEach((test, index) => {
     const key = testKey(test);
-    const history = historyMap.get(key) || { latency: [], loss: [], times: [] };
+    const history =
+      renderHistoryMap.get(key) || { latency: [], loss: [], times: [] };
     const color = testColor(key, index);
     const historyLastAt = resolveHistoryLastAt(history);
     if (historyLastAt > latestHistoryAt) {
@@ -2589,45 +2632,75 @@ function buildLatencyTimeline(testEntries) {
     return { times: [], series: new Map() };
   }
   const toleranceSec = resolveLatencyTimelineToleranceSec(testEntries);
-  const anchors = [];
-
-  const findAnchorIndex = (timestamp) => {
-    for (let index = 0; index < anchors.length; index += 1) {
-      if (Math.abs(anchors[index] - timestamp) <= toleranceSec) {
-        return index;
-      }
-    }
-    return -1;
-  };
+  const rawAnchors = [];
 
   testEntries.forEach((entry) => {
     const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
     times.forEach((timestamp) => {
       const numeric = Number(timestamp);
       if (!Number.isFinite(numeric)) return;
-      if (findAnchorIndex(numeric) === -1) {
-        anchors.push(numeric);
-      }
+      rawAnchors.push(numeric);
     });
   });
 
-  anchors.sort((left, right) => left - right);
+  if (!rawAnchors.length) {
+    return { times: [], series: new Map() };
+  }
+
+  rawAnchors.sort((left, right) => left - right);
+  const anchors = [rawAnchors[0]];
+  for (let index = 1; index < rawAnchors.length; index += 1) {
+    if (rawAnchors[index] - anchors[anchors.length - 1] > toleranceSec) {
+      anchors.push(rawAnchors[index]);
+    }
+  }
+
   const series = new Map();
   testEntries.forEach((entry) => {
     const values = Array.from({ length: anchors.length }, () => null);
     const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
     const latency = Array.isArray(entry?.filtered?.latency) ? entry.filtered.latency : [];
+    let anchorIndex = 0;
     for (let index = 0; index < times.length; index += 1) {
       const timestamp = Number(times[index]);
       if (!Number.isFinite(timestamp)) continue;
-      const anchorIndex = findAnchorIndex(timestamp);
-      if (anchorIndex === -1) continue;
-      values[anchorIndex] = normalizeNumber(latency[index]);
+      const resolvedIndex = resolveLatencyAnchorIndex(
+        anchors,
+        anchorIndex,
+        timestamp,
+        toleranceSec
+      );
+      if (resolvedIndex === -1) continue;
+      anchorIndex = resolvedIndex;
+      values[resolvedIndex] = normalizeNumber(latency[index]);
     }
     series.set(entry.key, values);
   });
 
   return { times: anchors, series };
+}
+
+function resolveLatencyAnchorIndex(anchors, startIndex, timestamp, toleranceSec) {
+  if (!Array.isArray(anchors) || anchors.length === 0) {
+    return -1;
+  }
+  let index = Math.max(0, Math.min(startIndex || 0, anchors.length - 1));
+  while (index < anchors.length - 1 && anchors[index] < timestamp - toleranceSec) {
+    index += 1;
+  }
+  if (Math.abs(anchors[index] - timestamp) <= toleranceSec) {
+    return index;
+  }
+  if (index > 0 && Math.abs(anchors[index - 1] - timestamp) <= toleranceSec) {
+    return index - 1;
+  }
+  if (
+    index < anchors.length - 1 &&
+    Math.abs(anchors[index + 1] - timestamp) <= toleranceSec
+  ) {
+    return index + 1;
+  }
+  return -1;
 }
 
 function resolveLatencyTimelineToleranceSec(testEntries) {

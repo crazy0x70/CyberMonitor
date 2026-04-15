@@ -179,26 +179,52 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 		now = now.UTC()
 	}
 
-	allTime, err := s.QuerySummary(nodeID, time.Unix(0, 0).UTC(), now)
+	sessions, err := s.querySessions(nodeID, time.Unix(0, 0).UTC(), now)
 	if err != nil {
 		return OfflineInsights{}, err
 	}
-	last30d, err := s.QuerySummary(nodeID, now.Add(-30*24*time.Hour), now)
-	if err != nil {
-		return OfflineInsights{}, err
+	return buildOfflineInsights(sessions, now, recentLimit), nil
+}
+
+func buildOfflineInsights(sessions []OfflineSession, now time.Time, recentLimit int) OfflineInsights {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
 	}
-	recentSessions, err := s.QueryRecentSessions(nodeID, time.Unix(0, 0).UTC(), now, recentLimit)
-	if err != nil {
-		return OfflineInsights{}, err
+	last30dStart := now.Add(-30 * 24 * time.Hour)
+
+	var (
+		insights  OfflineInsights
+		totalSecs float64
+	)
+	for _, session := range sessions {
+		insights.TotalCount++
+		totalSecs += session.DurationSec
+		if session.DurationSec > insights.LongestDurationSec {
+			insights.LongestDurationSec = session.DurationSec
+		}
+		if insights.LastOfflineRecoveredAt.IsZero() || session.RecoveredAt.After(insights.LastOfflineRecoveredAt) {
+			insights.LastOfflineRecoveredAt = session.RecoveredAt
+		}
+		if !session.RecoveredAt.Before(last30dStart) && !session.RecoveredAt.After(now) {
+			insights.Last30dCount++
+		}
 	}
-	return OfflineInsights{
-		TotalCount:             allTime.TotalCount,
-		Last30dCount:           last30d.TotalCount,
-		LongestDurationSec:     allTime.LongestDurationSec,
-		AvgDurationSec:         allTime.AvgDurationSec,
-		LastOfflineRecoveredAt: allTime.LastOfflineRecoveredAt,
-		RecentSessions:         recentSessions,
-	}, nil
+	if insights.TotalCount > 0 {
+		insights.AvgDurationSec = totalSecs / float64(insights.TotalCount)
+	}
+	if recentLimit <= 0 || len(sessions) == 0 {
+		return insights
+	}
+	if recentLimit > len(sessions) {
+		recentLimit = len(sessions)
+	}
+	insights.RecentSessions = make([]OfflineSession, 0, recentLimit)
+	for i := len(sessions) - 1; i >= 0 && len(insights.RecentSessions) < recentLimit; i-- {
+		insights.RecentSessions = append(insights.RecentSessions, sessions[i])
+	}
+	return insights
 }
 
 func (s *OfflineStore) querySessions(nodeID string, from, to time.Time) ([]OfflineSession, error) {

@@ -31,19 +31,15 @@ func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 		}
 
 		name := ""
-		if strings.Contains(trimmed, "@") {
-			parts := strings.SplitN(trimmed, "@", 2)
-			name = strings.TrimSpace(parts[0])
-			trimmed = strings.TrimSpace(parts[1])
+		if left, right, ok := strings.Cut(trimmed, "@"); ok {
+			name = strings.TrimSpace(left)
+			trimmed = strings.TrimSpace(right)
 		}
 
 		typePrefix := ""
-		if strings.HasPrefix(trimmed, "icmp:") {
-			typePrefix = "icmp"
-			trimmed = strings.TrimPrefix(trimmed, "icmp:")
-		} else if strings.HasPrefix(trimmed, "tcp:") {
-			typePrefix = "tcp"
-			trimmed = strings.TrimPrefix(trimmed, "tcp:")
+		if kind, target, ok := cutNetTestTypePrefix(trimmed); ok {
+			typePrefix = kind
+			trimmed = target
 		}
 
 		host, port := splitHostPort(trimmed)
@@ -76,6 +72,19 @@ func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 		})
 	}
 	return results
+}
+
+func cutNetTestTypePrefix(value string) (kind, target string, ok bool) {
+	prefix, rest, found := strings.Cut(strings.TrimSpace(value), ":")
+	if !found {
+		return "", "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "icmp", "tcp":
+		return strings.ToLower(strings.TrimSpace(prefix)), strings.TrimSpace(rest), true
+	default:
+		return "", "", false
+	}
 }
 
 func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) []metrics.NetworkTestResult {

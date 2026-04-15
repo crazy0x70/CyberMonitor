@@ -70,9 +70,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+type updateReporter func(context.Context, string, string, string) error
+
 func maybeApplyRemoteUpdate(
 	ctx context.Context,
-	transport agentControlPlane,
+	report updateReporter,
 	cfg Config,
 	update *RemoteUpdateInstruction,
 ) error {
@@ -90,30 +92,30 @@ func maybeApplyRemoteUpdate(
 	log.Printf("收到远程更新指令: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
 	if currentVersion == targetVersion {
 		log.Printf("跳过远程更新: Agent 已运行目标版本 %s", targetVersion)
-		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "succeeded", targetVersion, "Agent 已运行目标版本")
+		return report(ctx, "succeeded", targetVersion, "Agent 已运行目标版本")
 	}
 	if cfg.DisableUpdate {
 		log.Printf("拒绝远程更新: 当前 Agent 已禁用远程更新，目标版本=%s", targetVersion)
-		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+		return report(ctx, "failed", targetVersion, "当前 Agent 已禁用远程更新")
 	}
 	if updater.CanDockerManagedUpdate() {
 		dockerUpdater, err := updater.NewDockerManagedUpdater()
 		if err != nil {
-			return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+			return report(ctx, "failed", targetVersion, err.Error())
 		}
 		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
-		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+		if err := report(ctx, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
 			return err
 		}
 		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
 		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage, cfg.NodeID); err != nil {
-			reportErr := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+			reportErr := report(ctx, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 			}
 			return err
 		}
-		if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+		if err := report(ctx, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
 			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
 		}
 		log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
@@ -121,26 +123,30 @@ func maybeApplyRemoteUpdate(
 	}
 	if !updater.CanSelfUpdate() {
 		log.Printf("拒绝远程更新: 当前部署模式不支持 Agent 自更新，目标版本=%s", targetVersion)
-		return transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, resolveUnsupportedUpdateMessage())
+		return report(ctx, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
 	log.Printf("开始下载并替换 Agent 二进制: 当前版本=%s，目标版本=%s，下载地址=%s", currentVersion, targetVersion, strings.TrimSpace(update.DownloadURL))
-	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
+	if err := report(ctx, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
 	}
 	clientUpdater := updater.NewClient(updater.DefaultRepo, updater.KindAgent, currentVersion)
 	if err := clientUpdater.ApplyAsset(ctx, update.DownloadURL, update.ChecksumURL); err != nil {
-		reportErr := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "failed", targetVersion, err.Error())
+		reportErr := report(ctx, "failed", targetVersion, err.Error())
 		if reportErr != nil {
 			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 		}
 		return err
 	}
 	log.Printf("Agent 更新包写入完成，准备重启到版本 %s", targetVersion)
-	if err := transport.ReportUpdate(ctx, cfg.NodeID, cfg.AgentToken, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
+	if err := report(ctx, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
 	return updater.RestartSelf()
+}
+
+func isTerminalUpdateState(state string) bool {
+	return state == "succeeded" || state == "failed"
 }
 
 func resolveUnsupportedUpdateMessage() string {
@@ -223,10 +229,11 @@ func runNetworkTestsWithCache(
 			continue
 		}
 		validKeys[key] = struct{}{}
-		interval := time.Duration(cfg.IntervalSec) * time.Second
-		if strings.ToLower(cfg.Type) == "icmp" {
-			interval = time.Second
-		} else if interval < 0 {
+		interval := defaultInterval
+		if cfg.IntervalSec > 0 {
+			interval = time.Duration(cfg.IntervalSec) * time.Second
+		}
+		if interval <= 0 {
 			interval = defaultInterval
 		}
 		if cached, ok := cache[key]; !ok || now.Sub(cached.lastRun) >= interval {

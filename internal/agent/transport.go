@@ -99,10 +99,12 @@ type grpcControlPlane struct {
 	target string
 	secure bool
 	opts   grpcTransportOptions
+	dialContext func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
 
 	mu     sync.Mutex
 	conn   *grpc.ClientConn
 	client agentrpc.AgentServiceClient
+	dialing chan struct{}
 }
 
 func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane {
@@ -131,9 +133,10 @@ func newGRPCControlPlane(serverURL string, options grpcTransportOptions) *grpcCo
 		return nil
 	}
 	return &grpcControlPlane{
-		target: target,
-		secure: secure,
-		opts:   options.normalized(),
+		target:      target,
+		secure:      secure,
+		opts:        options.normalized(),
+		dialContext: grpc.DialContext,
 	}
 }
 
@@ -248,9 +251,6 @@ func (t *controlPlaneTransport) canUseGRPC() bool {
 func (t *controlPlaneTransport) shouldProbeGRPCForStats() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.lastMode == "http" {
-		return false
-	}
 	return time.Now().After(t.grpcBackoffUntil)
 }
 
@@ -433,57 +433,78 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 }
 
 func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServiceClient, error) {
-	g.mu.Lock()
-	if g.client != nil {
+	for {
+		g.mu.Lock()
+		if g.client != nil {
+			client := g.client
+			g.mu.Unlock()
+			return client, nil
+		}
+		if wait := g.dialing; wait != nil {
+			g.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		wait := make(chan struct{})
+		g.dialing = wait
+		dialContext := g.dialContext
+		g.mu.Unlock()
+
+		dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
+		opts := []grpc.DialOption{
+			grpc.WithDefaultCallOptions(grpc.ForceCodec(agentrpc.GobCodec{})),
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:                20 * time.Second,
+				Timeout:             10 * time.Second,
+				PermitWithoutStream: true,
+			}),
+			grpc.WithConnectParams(grpc.ConnectParams{
+				Backoff: backoff.Config{
+					BaseDelay:  1 * time.Second,
+					Multiplier: 1.6,
+					Jitter:     0.2,
+					MaxDelay:   10 * time.Second,
+				},
+				MinConnectTimeout: g.opts.dialTimeout,
+			}),
+		}
+		if g.secure {
+			opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+				MinVersion: tls.VersionTLS12,
+			})))
+		} else {
+			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		}
+		conn, err := dialContext(dialCtx, g.target, opts...)
+		cancel()
+
+		var closeConn *grpc.ClientConn
+		g.mu.Lock()
+		if err == nil {
+			if g.conn == nil {
+				g.conn = conn
+				g.client = agentrpc.NewAgentServiceClient(conn)
+			} else {
+				closeConn = conn
+			}
+		}
+		g.dialing = nil
+		close(wait)
 		client := g.client
 		g.mu.Unlock()
+
+		if closeConn != nil {
+			_ = closeConn.Close()
+		}
+		if err != nil {
+			return nil, err
+		}
 		return client, nil
 	}
-	g.mu.Unlock()
-
-	dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
-	defer cancel()
-
-	opts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(agentrpc.GobCodec{})),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                20 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: true,
-		}),
-		grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: backoff.Config{
-				BaseDelay:  1 * time.Second,
-				Multiplier: 1.6,
-				Jitter:     0.2,
-				MaxDelay:   10 * time.Second,
-			},
-			MinConnectTimeout: g.opts.dialTimeout,
-		}),
-	}
-	if g.secure {
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			MinVersion: tls.VersionTLS12,
-		})))
-	} else {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
-	conn, err := grpc.DialContext(dialCtx, g.target, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	client := agentrpc.NewAgentServiceClient(conn)
-	g.mu.Lock()
-	if g.conn != nil {
-		g.mu.Unlock()
-		_ = conn.Close()
-		return g.client, nil
-	}
-	g.conn = conn
-	g.client = client
-	g.mu.Unlock()
-	return client, nil
 }
 
 func fromRPCUpdateInstruction(update *agentrpc.UpdateInstruction) *RemoteUpdateInstruction {

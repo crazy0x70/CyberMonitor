@@ -51,7 +51,7 @@ func buildNetworkTestKey(test metrics.NetworkTestResult) string {
 	})
 }
 
-func buildNetworkSeriesKey(identity networkTestIdentity) string {
+func canonicalNetworkSeriesKey(identity networkTestIdentity) (string, bool) {
 	kind := strings.ToLower(strings.TrimSpace(identity.Type))
 	if kind == "" {
 		kind = "icmp"
@@ -59,25 +59,49 @@ func buildNetworkSeriesKey(identity networkTestIdentity) string {
 	host := strings.ToLower(strings.TrimSpace(identity.Host))
 	name := strings.ToLower(strings.TrimSpace(identity.Name))
 	if host == "" && name == "" {
+		return "", false
+	}
+	return fmt.Sprintf("%s|%s|%d|%s", kind, host, identity.Port, name), true
+}
+
+func buildNetworkSeriesKey(identity networkTestIdentity) string {
+	key, ok := canonicalNetworkSeriesKey(identity)
+	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%d|%s", kind, host, identity.Port, name)
+	return key
+}
+
+func splitNetworkSeriesKey(key string) (kind, host, portRaw, name string, ok bool) {
+	kind, rest, found := strings.Cut(key, "|")
+	if !found {
+		return "", "", "", "", false
+	}
+	host, rest, found = strings.Cut(rest, "|")
+	if !found {
+		return "", "", "", "", false
+	}
+	portRaw, name, found = strings.Cut(rest, "|")
+	if !found || strings.Contains(name, "|") {
+		return "", "", "", "", false
+	}
+	return kind, host, portRaw, name, true
 }
 
 func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
-	parts := strings.Split(key, "|")
-	if len(parts) != 4 {
+	kind, host, portRaw, name, ok := splitNetworkSeriesKey(key)
+	if !ok {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
 	}
-	port, err := strconv.Atoi(parts[2])
+	port, err := strconv.Atoi(portRaw)
 	if err != nil {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history port in key %q: %w", key, err)
 	}
 	return networkTestIdentity{
-		Type: strings.TrimSpace(parts[0]),
-		Host: strings.TrimSpace(parts[1]),
+		Type: strings.TrimSpace(kind),
+		Host: strings.TrimSpace(host),
 		Port: port,
-		Name: strings.TrimSpace(parts[3]),
+		Name: strings.TrimSpace(name),
 	}, nil
 }
 

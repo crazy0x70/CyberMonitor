@@ -50,7 +50,6 @@ const (
 	wsPingPeriod              = (wsPongWait * 9) / 10
 	agentUpdateLeaseUpdating  = 10 * time.Minute
 	agentUpdateLeaseRestart   = 5 * time.Minute
-	publicVariantConservative = "conservative"
 	publicVariantBalanced     = "balanced"
 	adminSessionCookieName    = "cm_admin_session"
 )
@@ -1202,18 +1201,6 @@ func Run(ctx context.Context, cfg Config) error {
 		wsAuthMixed
 	)
 
-	resolvePublicVariant := func(r *http.Request) string {
-		if r == nil {
-			return publicVariantBalanced
-		}
-		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("variant"))) {
-		case publicVariantBalanced:
-			return publicVariantBalanced
-		default:
-			return publicVariantBalanced
-		}
-	}
-
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			audience := "public"
@@ -1251,13 +1238,13 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			}
 			configureWSConn(conn)
-			client := hub.Add(conn, resolvePublicVariant(r))
+			client := hub.Add(conn, publicVariantBalanced)
 
 			// 首次连接立即推送快照
 			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
+				if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 					hub.Remove(conn)
 					return
 				}
@@ -1434,22 +1421,16 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			case <-ticker.C:
 				now := time.Now()
-				hasConservative := hub.HasVariant(publicVariantConservative)
-				hasBalanced := hub.HasVariant(publicVariantBalanced)
-				if hasConservative || hasBalanced {
+				if hub.HasVariant(publicVariantBalanced) {
 					snapshot := storeSnapshot(store, false)
-					if payload, err := json.Marshal(snapshot); err == nil {
-						if hasConservative {
-							hub.BroadcastVariant(payload, publicVariantConservative)
-						}
-						if hasBalanced {
-							digest := digestPublicSnapshot(snapshot)
-							if digest != lastBalancedDigest {
-								hub.BroadcastVariant(payload, publicVariantBalanced)
-								lastBalancedDigest = digest
-							}
-						}
-					}
+					lastBalancedDigest = broadcastBalancedPublicSnapshot(
+						hub,
+						snapshot,
+						lastBalancedDigest,
+						func(snapshot Snapshot) ([]byte, error) {
+							return json.Marshal(snapshot)
+						},
+					)
 				}
 				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
@@ -2599,15 +2580,63 @@ func digestPublicSnapshot(snapshot Snapshot) string {
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
+func broadcastBalancedPublicSnapshot(
+	hub *Hub,
+	snapshot Snapshot,
+	lastDigest string,
+	marshalSnapshot func(Snapshot) ([]byte, error),
+) string {
+	if hub == nil || marshalSnapshot == nil || !hub.HasVariant(publicVariantBalanced) {
+		return lastDigest
+	}
+
+	digest := digestPublicSnapshot(snapshot)
+	if digest == lastDigest {
+		return lastDigest
+	}
+
+	payload, err := marshalSnapshot(snapshot)
+	if err != nil {
+		return lastDigest
+	}
+	hub.BroadcastVariant(payload, publicVariantBalanced)
+	return digest
+}
+
 func convertNetworkHistoryToTestHistory(
 	source map[string]*history.NetworkHistoryEntry,
+	maxPoints int,
 ) map[string]*TestHistoryEntry {
 	result := make(map[string]*TestHistoryEntry, len(source))
 	for key, entry := range source {
-		if entry == nil {
-			continue
+		projected := projectNetworkHistoryEntry(entry, maxPoints)
+		if projected != nil {
+			result[key] = projected
 		}
-		result[key] = &TestHistoryEntry{
+	}
+	return result
+}
+
+func projectNetworkHistoryEntry(
+	entry *history.NetworkHistoryEntry,
+	maxPoints int,
+) *TestHistoryEntry {
+	if entry == nil {
+		return nil
+	}
+	total := len(entry.Times)
+	if total == 0 {
+		return &TestHistoryEntry{
+			Latency:        []*float64{},
+			Loss:           []*float64{},
+			Times:          []int64{},
+			LastAt:         entry.LastAt,
+			MinIntervalSec: entry.MinIntervalSec,
+			AvgIntervalSec: entry.AvgIntervalSec,
+		}
+	}
+	if maxPoints <= 0 || total <= maxPoints {
+		return &TestHistoryEntry{
 			Latency:        slices.Clone(entry.Latency),
 			Loss:           slices.Clone(entry.Loss),
 			Times:          slices.Clone(entry.Times),
@@ -2616,7 +2645,101 @@ func convertNetworkHistoryToTestHistory(
 			AvgIntervalSec: entry.AvgIntervalSec,
 		}
 	}
-	return result
+
+	indices := sampleHistoryIndices(total, maxPoints)
+	times := make([]int64, 0, len(indices))
+	latency := make([]*float64, 0, len(indices))
+	loss := make([]*float64, 0, len(indices))
+	for _, index := range indices {
+		times = append(times, entry.Times[index])
+		latency = append(latency, entry.Latency[index])
+		loss = append(loss, entry.Loss[index])
+	}
+	minIntervalSec, avgIntervalSec := testHistoryIntervalStats(times)
+	return &TestHistoryEntry{
+		Latency:        latency,
+		Loss:           loss,
+		Times:          times,
+		LastAt:         times[len(times)-1],
+		MinIntervalSec: minIntervalSec,
+		AvgIntervalSec: avgIntervalSec,
+	}
+}
+
+func sampleHistoryIndices(total, maxPoints int) []int {
+	if total <= 0 {
+		return nil
+	}
+	if maxPoints <= 1 || total <= maxPoints {
+		indices := make([]int, 0, total)
+		for index := 0; index < total; index++ {
+			indices = append(indices, index)
+		}
+		return indices
+	}
+
+	step := float64(total-1) / float64(maxPoints-1)
+	indices := make([]int, 0, maxPoints)
+	lastIndex := -1
+	for point := 0; point < maxPoints; point++ {
+		index := int(math.Round(float64(point) * step))
+		if index <= lastIndex {
+			index = lastIndex + 1
+		}
+		remainingSlots := maxPoints - point - 1
+		maxIndex := total - 1 - remainingSlots
+		if index > maxIndex {
+			index = maxIndex
+		}
+		if index >= total {
+			index = total - 1
+		}
+		indices = append(indices, index)
+		lastIndex = index
+	}
+	return indices
+}
+
+func testHistoryIntervalStats(times []int64) (int64, float64) {
+	if len(times) < 2 {
+		return 0, 0
+	}
+	var (
+		minValue int64
+		total    int64
+		count    int64
+	)
+	for index := 1; index < len(times); index++ {
+		interval := times[index] - times[index-1]
+		if interval <= 0 {
+			continue
+		}
+		if minValue == 0 || interval < minValue {
+			minValue = interval
+		}
+		total += interval
+		count++
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return minValue, float64(total) / float64(count)
+}
+
+func publicHistoryPointBudget(from, to time.Time) int {
+	duration := to.Sub(from)
+	switch {
+	case duration <= time.Hour:
+		return 360
+	case duration <= 24*time.Hour:
+		return 720
+	case duration <= 7*24*time.Hour:
+		return 840
+	case duration <= 30*24*time.Hour:
+		return 960
+	default:
+		return 1440
+	}
 }
 
 func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
@@ -2644,11 +2767,11 @@ func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[s
 	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
 		return map[string]*TestHistoryEntry{}, nil
 	}
-	entries, err := s.historyManager.NetworkStore().QueryRange(nodeID, from, to)
+	entries, err := s.historyManager.NetworkStore().QueryPublicRange(nodeID, from, to)
 	if err != nil {
 		return nil, err
 	}
-	return convertNetworkHistoryToTestHistory(entries), nil
+	return convertNetworkHistoryToTestHistory(entries, publicHistoryPointBudget(from, to)), nil
 }
 
 func cloneTestHistory(
@@ -2858,8 +2981,7 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 func (h *Hub) Broadcast(payload []byte) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
-		copied := bytes.Clone(payload)
-		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -2871,8 +2993,7 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 		if client == nil || client.variant != variant {
 			continue
 		}
-		copied := bytes.Clone(payload)
-		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 			h.removeClient(client)
 		}
 	}

@@ -6,5 +6,8 @@ dist
 admin-ui/node_modules
 admin-ui/dist
 admin-ui/.DS_Store
+internal/server/web/admin/node_modules
+internal/server/web/dist
+internal/server/web/admin/.DS_Store
 **/.DS_Store
 tmp

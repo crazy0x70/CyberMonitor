@@ -740,41 +740,82 @@ func selectionsFromGroupTags(group string, tags []string) []string {
 	return result
 }
 
-func primaryGroupTagsFromSelections(selections []string) (string, []string) {
-	normalized := normalizeGroupSelections(selections)
-	if len(normalized) == 0 {
-		return "", nil
+func primaryGroupTagsFromNormalizedSelections(selections []string) (string, []string, bool) {
+	if len(selections) == 0 {
+		return "", nil, true
 	}
-	seenGroup := make(map[string]struct{})
-	groupOrder := make([]string, 0, len(normalized))
-	tagsByGroup := make(map[string][]string)
+
+	seenEntries := make(map[string]struct{}, len(selections))
+	standaloneGroups := make(map[string]struct{}, len(selections))
 	tagsSeen := make(map[string]map[string]struct{})
-	for _, value := range normalized {
-		group, tag := parseGroupSelection(value)
+	tagsByGroup := make(map[string][]string)
+	primary := ""
+
+	for _, value := range selections {
+		raw := strings.TrimSpace(value)
+		if raw == "" || raw == "全部" {
+			return "", nil, false
+		}
+
+		group, tag := parseGroupSelection(raw)
 		if group == "" {
-			continue
+			return "", nil, false
 		}
-		if _, ok := seenGroup[group]; !ok {
-			seenGroup[group] = struct{}{}
-			groupOrder = append(groupOrder, group)
+
+		canonical := group
+		if tag != "" {
+			canonical = fmt.Sprintf("%s:%s", group, tag)
 		}
+		if raw != canonical {
+			return "", nil, false
+		}
+		if _, ok := seenEntries[canonical]; ok {
+			return "", nil, false
+		}
+		seenEntries[canonical] = struct{}{}
+
+		if primary == "" {
+			primary = group
+		}
+
 		if tag == "" {
+			if _, ok := tagsSeen[group]; ok {
+				return "", nil, false
+			}
+			standaloneGroups[group] = struct{}{}
 			continue
+		}
+		if _, ok := standaloneGroups[group]; ok {
+			return "", nil, false
 		}
 		if tagsSeen[group] == nil {
 			tagsSeen[group] = make(map[string]struct{})
 		}
 		if _, ok := tagsSeen[group][tag]; ok {
-			continue
+			return "", nil, false
 		}
 		tagsSeen[group][tag] = struct{}{}
 		tagsByGroup[group] = append(tagsByGroup[group], tag)
 	}
-	if len(groupOrder) == 0 {
+
+	return primary, tagsByGroup[primary], true
+}
+
+func primaryGroupTagsFromSelections(selections []string) (string, []string) {
+	if len(selections) == 0 {
 		return "", nil
 	}
-	primary := groupOrder[0]
-	return primary, tagsByGroup[primary]
+
+	if group, tags, ok := primaryGroupTagsFromNormalizedSelections(selections); ok {
+		return group, tags
+	}
+
+	normalized := normalizeGroupSelections(selections)
+	if len(normalized) == 0 {
+		return "", nil
+	}
+	group, tags, _ := primaryGroupTagsFromNormalizedSelections(normalized)
+	return group, tags
 }
 
 func normalizeGroupTree(nodes []GroupNode) []GroupNode {

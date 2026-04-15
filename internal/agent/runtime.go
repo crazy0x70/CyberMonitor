@@ -18,6 +18,8 @@ type agentRunner struct {
 	testCache           map[string]cachedTest
 	dockerManagedUpdate bool
 	agentToken          string
+	lastUpdateState     string
+	lastUpdateVersion   string
 }
 
 func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.Collector) *agentRunner {
@@ -67,14 +69,32 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 		return
 	}
 
-	nextToken, updateCfg, persistErr := applyRemoteConfig(r.cfg, r.runtimeCfg, r.agentToken, remote)
+	nextToken, persistErr := applyRemoteConfig(r.cfg, r.runtimeCfg, r.agentToken, remote)
 	r.agentToken = nextToken
 	if persistErr != nil {
 		log.Printf("持久化 Agent 专属凭据失败: %v", persistErr)
 	}
-	if err := maybeApplyRemoteUpdate(ctx, r.transport, updateCfg, remote.Update); err != nil {
+	if remote.Update == nil {
+		r.lastUpdateState = ""
+		r.lastUpdateVersion = ""
+	}
+	if err := maybeApplyRemoteUpdate(ctx, r.reportRemoteUpdate, r.cfg, remote.Update); err != nil {
 		log.Printf("执行远程更新失败: %v", err)
 	}
+}
+
+func (r *agentRunner) reportRemoteUpdate(ctx context.Context, state, version, message string) error {
+	if isTerminalUpdateState(state) && r.lastUpdateState == state && r.lastUpdateVersion == version {
+		return nil
+	}
+	if err := r.transport.ReportUpdate(ctx, r.cfg.NodeID, r.agentToken, state, version, message); err != nil {
+		return err
+	}
+	if isTerminalUpdateState(state) {
+		r.lastUpdateState = state
+		r.lastUpdateVersion = version
+	}
+	return nil
 }
 
 func (r *agentRunner) collectAndReport(ctx context.Context) {
@@ -112,17 +132,15 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 	}
 }
 
-func applyRemoteConfig(cfg Config, runtimeCfg *runtimeConfig, agentToken string, remote RemoteConfig) (string, Config, error) {
+func applyRemoteConfig(cfg Config, runtimeCfg *runtimeConfig, agentToken string, remote RemoteConfig) (string, error) {
 	nextToken := agentToken
 	if issuedToken := strings.TrimSpace(remote.AgentToken); issuedToken != "" && issuedToken != nextToken {
 		nextToken = issuedToken
 	}
 	runtimeCfg.Update(remote)
 
-	updateCfg := cfg
-	updateCfg.AgentToken = nextToken
 	if cfg.TokenFile == "" || nextToken == agentToken {
-		return nextToken, updateCfg, nil
+		return nextToken, nil
 	}
-	return nextToken, updateCfg, persistAgentToken(cfg.TokenFile, nextToken)
+	return nextToken, persistAgentToken(cfg.TokenFile, nextToken)
 }
