@@ -83,15 +83,16 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	return a.store.HasPendingAgentUpdate(payload.NodeID), nil
 }
 
-func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
+func (a *agentAPI) config(nodeID, token string) (AgentConfig, bool, *agentAPIError) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return AgentConfig{}, &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+		return AgentConfig{}, false, &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
 	}
-	if !a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
-		return AgentConfig{}, &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+	usingDedicatedToken, ok := a.store.authorizeOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken)
+	if !ok {
+		return AgentConfig{}, false, &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
 	}
-	return a.store.AgentConfig(nodeID), nil
+	return a.store.AgentConfig(nodeID), usingDedicatedToken, nil
 }
 
 func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIError) {
@@ -170,7 +171,7 @@ func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterReq
 }
 
 func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequest) (*agentrpc.ConfigResponse, error) {
-	config, apiErr := s.api.config(req.NodeID, req.AgentToken)
+	config, _, apiErr := s.api.config(req.NodeID, req.AgentToken)
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}

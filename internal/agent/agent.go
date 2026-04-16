@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,20 @@ import (
 
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/updater"
+)
+
+type dockerManagedUpdater interface {
+	CurrentImage() string
+	LaunchSelfContainerUpdate(context.Context, string, string) error
+}
+
+var (
+	canDockerManagedUpdate  = updater.CanDockerManagedUpdate
+	newDockerManagedUpdater = func(ctx context.Context) (dockerManagedUpdater, error) {
+		return updater.NewDockerManagedUpdaterContext(ctx)
+	}
+	dockerManagedInitTimeout   = 10 * time.Second
+	dockerManagedHelperTimeout = 2 * time.Minute
 )
 
 type Config struct {
@@ -98,9 +113,14 @@ func maybeApplyRemoteUpdate(
 		log.Printf("拒绝远程更新: 当前 Agent 已禁用远程更新，目标版本=%s", targetVersion)
 		return report(ctx, "failed", targetVersion, "当前 Agent 已禁用远程更新")
 	}
-	if updater.CanDockerManagedUpdate() {
-		dockerUpdater, err := updater.NewDockerManagedUpdater()
+	if canDockerManagedUpdate() {
+		log.Printf("检测到 Docker 托管更新能力，正在初始化 Docker updater")
+		dockerInitCtx, cancelDockerInit := context.WithTimeout(ctx, dockerManagedInitTimeout)
+		dockerUpdater, err := newDockerManagedUpdater(dockerInitCtx)
+		cancelDockerInit()
 		if err != nil {
+			err = wrapDockerManagedUpdateError("初始化 Docker updater", err)
+			log.Printf("%v", err)
 			return report(ctx, "failed", targetVersion, err.Error())
 		}
 		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
@@ -108,7 +128,12 @@ func maybeApplyRemoteUpdate(
 			return err
 		}
 		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
-		if err := dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage, cfg.NodeID); err != nil {
+		dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(ctx, dockerManagedHelperTimeout)
+		err = dockerUpdater.LaunchSelfContainerUpdate(dockerLaunchCtx, targetImage, cfg.NodeID)
+		cancelDockerLaunch()
+		if err != nil {
+			err = wrapDockerManagedUpdateError("执行 Docker 更新 helper", err)
+			log.Printf("%v", err)
 			reportErr := report(ctx, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
@@ -142,6 +167,31 @@ func maybeApplyRemoteUpdate(
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
 	return updater.RestartSelf()
+}
+
+func wrapDockerManagedUpdateError(step string, err error) error {
+	step = strings.TrimSpace(step)
+	if err == nil {
+		if step == "" {
+			return fmt.Errorf("Docker 更新失败")
+		}
+		return fmt.Errorf("%s失败", step)
+	}
+	if step == "" {
+		step = "Docker 更新"
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		hint := "请检查容器内访问 docker.sock 与 Docker 守护进程响应"
+		if strings.Contains(step, "helper") {
+			hint = "请检查镜像拉取、helper 日志与 Docker 重建权限"
+		}
+		return fmt.Errorf("%s超时，%s: %w", step, hint, err)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%s被取消: %w", step, err)
+	default:
+		return fmt.Errorf("%s失败: %w", step, err)
+	}
 }
 
 func isTerminalUpdateState(state string) bool {

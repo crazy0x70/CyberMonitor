@@ -6,7 +6,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,16 +30,16 @@ type NetworkStore struct {
 }
 
 type preparedNetworkSample struct {
-	identity       networkTestIdentity
-	seriesKey      string
-	typeLabel      string
-	hostLabel      string
-	portLabel      string
-	nameLabel      string
+	identity        networkTestIdentity
+	seriesKey       string
+	typeLabel       string
+	hostLabel       string
+	portLabel       string
+	nameLabel       string
 	timestampMillis int64
-	latency        *float64
-	loss           *float64
-	availability   float64
+	latency         *float64
+	loss            *float64
+	availability    float64
 }
 
 func OpenNetworkStore(dir string) (*NetworkStore, error) {
@@ -241,50 +240,7 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 }
 
 func buildHistoryEntrySince(acc *seriesAccumulator, cutoffSeconds int64) *NetworkHistoryEntry {
-	if acc == nil {
-		return nil
-	}
-
-	timeSet := make(map[int64]struct{}, len(acc.availability)+len(acc.latency)+len(acc.loss))
-	addVisibleTimestamp := func(ts int64) {
-		if cutoffSeconds > 0 && ts < cutoffSeconds {
-			return
-		}
-		timeSet[ts] = struct{}{}
-	}
-	for ts := range acc.availability {
-		addVisibleTimestamp(ts)
-	}
-	for ts := range acc.latency {
-		addVisibleTimestamp(ts)
-	}
-	for ts := range acc.loss {
-		addVisibleTimestamp(ts)
-	}
-	if len(timeSet) == 0 {
-		return nil
-	}
-
-	times := make([]int64, 0, len(timeSet))
-	for ts := range timeSet {
-		times = append(times, ts)
-	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-
-	entry := &NetworkHistoryEntry{
-		Latency:      make([]*float64, 0, len(times)),
-		Loss:         make([]*float64, 0, len(times)),
-		Availability: make([]*float64, 0, len(times)),
-		Times:        times,
-		LastAt:       times[len(times)-1],
-	}
-	for _, ts := range times {
-		entry.Latency = append(entry.Latency, cloneFloatPointer(acc.latency[ts]))
-		entry.Loss = append(entry.Loss, cloneFloatPointer(acc.loss[ts]))
-		entry.Availability = append(entry.Availability, cloneFloatPointer(acc.availability[ts]))
-	}
-	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(times)
-	return entry
+	return buildNetworkHistoryEntryWithCutoff(acc, cutoffSeconds)
 }
 
 func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {

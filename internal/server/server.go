@@ -1145,8 +1145,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		nodeID := r.URL.Query().Get("node_id")
 		token := r.Header.Get("X-AGENT-TOKEN")
-		usingDedicatedToken := store.validateAgentAuthToken(nodeID, token)
-		config, err := agentAPI.config(nodeID, token)
+		config, usingDedicatedToken, err := agentAPI.config(nodeID, token)
 		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
@@ -3972,6 +3971,17 @@ func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
 }
 
+func (s *Store) authorizeOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) (bool, bool) {
+	if s.validateAgentAuthToken(nodeID, token) {
+		return true, true
+	}
+	if !isBootstrapAgentToken(bootstrapToken, token) {
+		return false, false
+	}
+	s.ensureAgentAuthToken(nodeID)
+	return false, true
+}
+
 func isBootstrapAgentToken(expected, token string) bool {
 	expected = strings.TrimSpace(expected)
 	token = strings.TrimSpace(token)
@@ -3982,14 +3992,8 @@ func isBootstrapAgentToken(expected, token string) bool {
 }
 
 func (s *Store) validateOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) bool {
-	if s.validateAgentAuthToken(nodeID, token) {
-		return true
-	}
-	if !isBootstrapAgentToken(bootstrapToken, token) {
-		return false
-	}
-	s.ensureAgentAuthToken(nodeID)
-	return true
+	_, ok := s.authorizeOrProvisionAgentAuthToken(nodeID, token, bootstrapToken)
+	return ok
 }
 
 func (s *Store) generateAgentAuthTokenLocked() string {

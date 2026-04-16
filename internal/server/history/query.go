@@ -158,18 +158,50 @@ func availabilityForTest(test metrics.NetworkTestResult) float64 {
 }
 
 func buildHistoryEntry(acc *seriesAccumulator) *NetworkHistoryEntry {
+	return buildNetworkHistoryEntryWithCutoff(acc, 0)
+}
+
+func buildNetworkHistoryEntryWithCutoff(acc *seriesAccumulator, cutoffSeconds int64) *NetworkHistoryEntry {
 	if acc == nil {
 		return nil
 	}
+	times := collectNetworkHistoryTimes(acc, cutoffSeconds)
+	if len(times) == 0 {
+		return nil
+	}
+
+	entry := &NetworkHistoryEntry{
+		Latency:      make([]*float64, len(times)),
+		Loss:         make([]*float64, len(times)),
+		Availability: make([]*float64, len(times)),
+		Times:        times,
+		LastAt:       times[len(times)-1],
+	}
+	for index, ts := range times {
+		entry.Latency[index] = cloneFloatPointer(acc.latency[ts])
+		entry.Loss[index] = cloneFloatPointer(acc.loss[ts])
+		entry.Availability[index] = cloneFloatPointer(acc.availability[ts])
+	}
+	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(times)
+	return entry
+}
+
+func collectNetworkHistoryTimes(acc *seriesAccumulator, cutoffSeconds int64) []int64 {
 	timeSet := make(map[int64]struct{}, len(acc.availability)+len(acc.latency)+len(acc.loss))
-	for ts := range acc.availability {
+	addVisibleTimestamp := func(ts int64) {
+		if cutoffSeconds > 0 && ts < cutoffSeconds {
+			return
+		}
 		timeSet[ts] = struct{}{}
+	}
+	for ts := range acc.availability {
+		addVisibleTimestamp(ts)
 	}
 	for ts := range acc.latency {
-		timeSet[ts] = struct{}{}
+		addVisibleTimestamp(ts)
 	}
 	for ts := range acc.loss {
-		timeSet[ts] = struct{}{}
+		addVisibleTimestamp(ts)
 	}
 	if len(timeSet) == 0 {
 		return nil
@@ -180,21 +212,7 @@ func buildHistoryEntry(acc *seriesAccumulator) *NetworkHistoryEntry {
 		times = append(times, ts)
 	}
 	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
-
-	entry := &NetworkHistoryEntry{
-		Latency:      make([]*float64, 0, len(times)),
-		Loss:         make([]*float64, 0, len(times)),
-		Availability: make([]*float64, 0, len(times)),
-		Times:        times,
-		LastAt:       times[len(times)-1],
-	}
-	for _, ts := range times {
-		entry.Latency = append(entry.Latency, cloneFloatPointer(acc.latency[ts]))
-		entry.Loss = append(entry.Loss, cloneFloatPointer(acc.loss[ts]))
-		entry.Availability = append(entry.Availability, cloneFloatPointer(acc.availability[ts]))
-	}
-	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(times)
-	return entry
+	return times
 }
 
 func intervalStats(times []int64) (int64, float64) {

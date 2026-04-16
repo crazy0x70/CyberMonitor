@@ -147,17 +147,18 @@ func (s *OfflineStore) QueryRecentSessions(nodeID string, from, to time.Time, li
 		return nil, nil
 	}
 
-	recent := make([]OfflineSession, 0, limit)
+	recent := newRecentOfflineSessions(limit)
 	if err := s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
-		recent = appendRecentSession(recent, session, limit)
+		recent.Append(session)
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	if len(recent) == 0 {
+	result := recent.NewestFirst()
+	if len(result) == 0 {
 		return nil, nil
 	}
-	return reverseOfflineSessions(recent), nil
+	return result, nil
 }
 
 func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit int) (OfflineInsights, error) {
@@ -178,8 +179,11 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 	var (
 		insights  OfflineInsights
 		totalSecs float64
-		recent    []OfflineSession
+		recent    *recentOfflineSessions
 	)
+	if recentLimit > 0 {
+		recent = newRecentOfflineSessions(recentLimit)
+	}
 	err := s.scanSessions(nodeID, time.Unix(0, 0).UTC(), now, func(session OfflineSession) bool {
 		insights.TotalCount++
 		totalSecs += session.DurationSec
@@ -192,8 +196,8 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 		if !session.RecoveredAt.Before(last30dStart) && !session.RecoveredAt.After(now) {
 			insights.Last30dCount++
 		}
-		if recentLimit > 0 {
-			recent = appendRecentSession(recent, session, recentLimit)
+		if recent != nil {
+			recent.Append(session)
 		}
 		return true
 	})
@@ -203,21 +207,10 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 	if insights.TotalCount > 0 {
 		insights.AvgDurationSec = totalSecs / float64(insights.TotalCount)
 	}
-	if len(recent) > 0 {
-		insights.RecentSessions = reverseOfflineSessions(recent)
+	if recentSessions := recent.NewestFirst(); len(recentSessions) > 0 {
+		insights.RecentSessions = recentSessions
 	}
 	return insights, nil
-}
-
-func (s *OfflineStore) querySessions(nodeID string, from, to time.Time) ([]OfflineSession, error) {
-	sessions := make([]OfflineSession, 0)
-	if err := s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
-		sessions = append(sessions, session)
-		return true
-	}); err != nil {
-		return nil, err
-	}
-	return sessions, nil
 }
 
 func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit func(OfflineSession) bool) error {
@@ -247,7 +240,7 @@ func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit fun
 	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
 		Start: from.UnixMilli(),
 		End:   to.UnixMilli(),
-		}, nameMatcher, nodeMatcher)
+	}, nameMatcher, nodeMatcher)
 
 	for seriesSet.Next() {
 		iterator := seriesSet.At().Iterator(nil)
@@ -279,24 +272,45 @@ func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit fun
 	return nil
 }
 
-func appendRecentSession(recent []OfflineSession, session OfflineSession, limit int) []OfflineSession {
-	if limit <= 0 {
-		return recent
-	}
-	if len(recent) < limit {
-		return append(recent, session)
-	}
-	copy(recent, recent[1:])
-	recent[len(recent)-1] = session
-	return recent
+type recentOfflineSessions struct {
+	items []OfflineSession
+	start int
+	size  int
 }
 
-func reverseOfflineSessions(sessions []OfflineSession) []OfflineSession {
-	reversed := make([]OfflineSession, 0, len(sessions))
-	for i := len(sessions) - 1; i >= 0; i-- {
-		reversed = append(reversed, sessions[i])
+func newRecentOfflineSessions(limit int) *recentOfflineSessions {
+	if limit <= 0 {
+		return &recentOfflineSessions{}
 	}
-	return reversed
+	return &recentOfflineSessions{
+		items: make([]OfflineSession, limit),
+	}
+}
+
+func (buffer *recentOfflineSessions) Append(session OfflineSession) {
+	if buffer == nil || len(buffer.items) == 0 {
+		return
+	}
+	index := (buffer.start + buffer.size) % len(buffer.items)
+	if buffer.size < len(buffer.items) {
+		buffer.items[index] = session
+		buffer.size++
+		return
+	}
+	buffer.items[buffer.start] = session
+	buffer.start = (buffer.start + 1) % len(buffer.items)
+}
+
+func (buffer *recentOfflineSessions) NewestFirst() []OfflineSession {
+	if buffer == nil || buffer.size == 0 {
+		return nil
+	}
+	result := make([]OfflineSession, buffer.size)
+	for index := 0; index < buffer.size; index++ {
+		sourceIndex := (buffer.start + buffer.size - 1 - index + len(buffer.items)) % len(buffer.items)
+		result[index] = buffer.items[sourceIndex]
+	}
+	return result
 }
 
 func (s *OfflineStore) HasEventForSession(nodeID string, startedAt time.Time) (bool, error) {

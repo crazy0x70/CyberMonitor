@@ -145,13 +145,6 @@ install_agent() {
 
   local service="cyber-monitor-agent"
   local service_file="/etc/systemd/system/${service}.service"
-  local extra_args=""
-  if [[ -n "${net_iface}" ]]; then
-    extra_args="-net-iface ${net_iface}"
-  fi
-  if [[ "${disable_update}" == "1" ]]; then
-    extra_args="${extra_args} -disable-update"
-  fi
 
   cat > "${service_file}" <<EOF
 [Unit]
@@ -161,7 +154,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=${CONF_DIR}/agent.conf
-ExecStart=${bin} -server-url \${CM_SERVER_URL} -node-id \${CM_NODE_ID} -agent-token \${CM_AGENT_TOKEN} ${extra_args}
+ExecStart=${bin}
 Restart=on-failure
 LimitNOFILE=1048576
 

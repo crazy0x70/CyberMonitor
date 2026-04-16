@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/server/history"
 )
 
 const (
@@ -747,6 +748,7 @@ func buildAISnapshot(store *Store) aiSnapshot {
 	snapshotTime := time.Now().UTC()
 	nodes := store.Snapshot()
 	history := store.snapshotTestHistory()
+	offlineStore := resolveAIOfflineStore(store)
 	servers := make([]aiServerSummary, 0, len(nodes))
 	for _, node := range nodes {
 		stats := node.Stats
@@ -757,7 +759,7 @@ func buildAISnapshot(store *Store) aiSnapshot {
 			}
 		}
 		name := resolveNodeDisplayNameForAI(node)
-		offlineSummary := buildAIOfflineSummary(store, stats.NodeID, snapshotTime)
+		offlineSummary := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
 		hostName := strings.TrimSpace(stats.Hostname)
 		if hostName == "" {
 			hostName = strings.TrimSpace(stats.NodeName)
@@ -819,8 +821,21 @@ func buildAISnapshot(store *Store) aiSnapshot {
 	}
 }
 
-func buildAIOfflineSummary(store *Store, nodeID string, now time.Time) *aiOfflineSummary {
+func resolveAIOfflineStore(store *Store) *history.OfflineStore {
 	if store == nil {
+		return nil
+	}
+	store.mu.RLock()
+	historyManager := store.historyManager
+	store.mu.RUnlock()
+	if historyManager == nil {
+		return nil
+	}
+	return historyManager.OfflineStore()
+}
+
+func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, now time.Time) *aiOfflineSummary {
+	if offlineStore == nil {
 		return nil
 	}
 	nodeID = strings.TrimSpace(nodeID)
@@ -832,14 +847,7 @@ func buildAIOfflineSummary(store *Store, nodeID string, now time.Time) *aiOfflin
 	} else {
 		now = now.UTC()
 	}
-
-	store.mu.RLock()
-	historyManager := store.historyManager
-	store.mu.RUnlock()
-	if historyManager == nil || historyManager.OfflineStore() == nil {
-		return nil
-	}
-	insights, err := historyManager.OfflineStore().QueryInsights(nodeID, now, aiOfflineRecentSessionLimit)
+	insights, err := offlineStore.QueryInsights(nodeID, now, aiOfflineRecentSessionLimit)
 	if err != nil {
 		return nil
 	}
@@ -854,13 +862,13 @@ func buildAIOfflineSummary(store *Store, nodeID string, now time.Time) *aiOfflin
 		summary.LastOfflineRecoveredAt = insights.LastOfflineRecoveredAt.Unix()
 	}
 	if len(insights.RecentSessions) > 0 {
-		summary.RecentSessions = make([]aiOfflineRecentSession, 0, len(insights.RecentSessions))
-		for _, session := range insights.RecentSessions {
-			summary.RecentSessions = append(summary.RecentSessions, aiOfflineRecentSession{
+		summary.RecentSessions = make([]aiOfflineRecentSession, len(insights.RecentSessions))
+		for i, session := range insights.RecentSessions {
+			summary.RecentSessions[i] = aiOfflineRecentSession{
 				StartedAt:   session.StartedAt.Unix(),
 				RecoveredAt: session.RecoveredAt.Unix(),
 				DurationSec: session.DurationSec,
-			})
+			}
 		}
 	}
 	return summary

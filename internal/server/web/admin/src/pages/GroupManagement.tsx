@@ -152,11 +152,11 @@ function toEditableTree(tree: GroupNode[]): EditableGroupNode[] {
 function normalizeGroupTree(tree: EditableGroupNode[]): GroupNode[] {
   const seenGroups = new Set<string>();
 
-  return toEditableTree(tree)
+  return tree
     .map((group) => ({
-      name: group.name.trim(),
+      name: String(group.name || "").trim(),
       children: (group.children || []).map((tag) => ({
-        name: String(tag?.name ?? "").trim(),
+        name: String(tag.name || "").trim(),
       })),
     }))
     .filter((group) => {

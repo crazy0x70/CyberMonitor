@@ -156,8 +156,10 @@ type GroupCatalogItem = {
 
 type NodeListEntry = {
   node: NodeView;
+  nodeGroups: string[];
   nodeId: string;
   nodeName: string;
+  statusRank: number;
   searchText: string;
 };
 
@@ -572,16 +574,19 @@ export default function ServerManagement({
       nodes.map((node) => {
         const nodeId = resolveNodeId(node);
         const nodeName = resolveNodeName(node);
+        const nodeGroups = resolveNodeGroups(node);
         return {
           node,
+          nodeGroups,
           nodeId,
           nodeName,
+          statusRank: node.status === "online" ? 0 : 1,
           searchText: [
             nodeName,
             nodeId,
             node.stats.hostname,
             node.region,
-            ...(node.groups || []),
+            ...nodeGroups,
           ]
             .filter(Boolean)
             .join(" ")
@@ -589,6 +594,17 @@ export default function ServerManagement({
         };
       }),
     [nodes],
+  );
+
+  const sortedNodeListEntries = useMemo(
+    () =>
+      [...nodeListEntries].sort((a, b) => {
+        if (a.statusRank !== b.statusRank) {
+          return a.statusRank - b.statusRank;
+        }
+        return a.nodeName.localeCompare(b.nodeName, "zh-CN");
+      }),
+    [nodeListEntries],
   );
 
   const metricCards = [
@@ -614,17 +630,11 @@ export default function ServerManagement({
 
   const filteredNodes = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    const list = [...nodeListEntries].sort((a, b) => {
-      if (a.node.status !== b.node.status) {
-        return a.node.status === "online" ? -1 : 1;
-      }
-      return a.nodeName.localeCompare(b.nodeName, "zh-CN");
-    });
     if (!keyword) {
-      return list.map((entry) => entry.node);
+      return sortedNodeListEntries;
     }
-    return list.filter((entry) => entry.searchText.includes(keyword)).map((entry) => entry.node);
-  }, [nodeListEntries, search]);
+    return sortedNodeListEntries.filter((entry) => entry.searchText.includes(keyword));
+  }, [search, sortedNodeListEntries]);
 
   const agentEndpoint = settings?.agent_endpoint?.trim() || "";
   const agentToken = settings?.agent_token?.trim() || "";
@@ -674,6 +684,34 @@ export default function ServerManagement({
     [form?.groups],
   );
   const selectedGroupSet = useMemo(() => new Set(form?.groups || []), [form?.groups]);
+  const selectedGroupStats = useMemo(() => {
+    const stats = new Map<
+      string,
+      {
+        groupSelected: boolean;
+        selectedTags: Set<string>;
+      }
+    >();
+    selectedGroupSet.forEach((value) => {
+      const parsed = parseSelectionValue(value);
+      const group = String(parsed?.group || "").trim();
+      const tag = String(parsed?.tag || "").trim();
+      if (!group) {
+        return;
+      }
+      const current = stats.get(group) || {
+        groupSelected: false,
+        selectedTags: new Set<string>(),
+      };
+      if (tag) {
+        current.selectedTags.add(tag);
+      } else {
+        current.groupSelected = true;
+      }
+      stats.set(group, current);
+    });
+    return stats;
+  }, [selectedGroupSet]);
   const groupSelectionMenuLabel = useMemo(() => {
     if (selectedGroupItems.length === 0) {
       return "请选择分组与标签";
@@ -1053,8 +1091,8 @@ export default function ServerManagement({
                 {nodes.length === 0 ? "当前还没有节点接入。" : "没有匹配的节点，请调整搜索条件。"}
               </div>
             ) : (
-              filteredNodes.map((node) => {
-                const nodeGroups = resolveNodeGroups(node);
+              filteredNodes.map((entry) => {
+                const { node, nodeGroups, nodeId, nodeName } = entry;
                 const renewSummary =
                   node.auto_renew && node.renew_interval_sec
                     ? ` ／ ${renewPlanLabel(resolveRenewPlan(node.auto_renew, node.renew_interval_sec))}`
@@ -1062,8 +1100,8 @@ export default function ServerManagement({
 
                 return (
                   <button
-                    key={resolveNodeId(node)}
-                    data-node-card-id={resolveNodeId(node)}
+                    key={nodeId}
+                    data-node-card-id={nodeId}
                     type="button"
                     onClick={() => handleOpen(node)}
                     className={adminWorkspaceItemClass}
@@ -1072,7 +1110,7 @@ export default function ServerManagement({
                     <div className={adminWorkspaceHeaderClass}>
                       <div className="space-y-2">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-base font-semibold text-slate-900 dark:text-slate-50">{resolveNodeName(node)}</span>
+                          <span className="text-base font-semibold text-slate-900 dark:text-slate-50">{nodeName}</span>
                           {renderStatusBadge(node.status)}
                           {node.alert_enabled === false ? (
                             <Badge variant="outline" className={adminWarningBadgeClass}>
@@ -1081,7 +1119,7 @@ export default function ServerManagement({
                           ) : null}
                         </div>
                         <div className="text-xs text-slate-500 dark:text-slate-400">
-                          Node ID：{resolveNodeId(node)} ／ 主机名：{node.stats.hostname || "--"} ／ Agent：{node.stats.agent_version || "--"}
+                          Node ID：{nodeId} ／ 主机名：{node.stats.hostname || "--"} ／ Agent：{node.stats.agent_version || "--"}
                         </div>
                       </div>
                       <div className={adminWorkspaceActionChipClass}>
@@ -1576,11 +1614,10 @@ export default function ServerManagement({
                               </div>
                               <div className="mt-2 max-h-[22rem] space-y-2 overflow-y-auto pr-1">
                                 {groupCatalog.map((item) => {
-                                  const tagValues = item.tags.map((tag) => `${item.group}:${tag}`);
-                                  const groupSelected = selectedGroupSet.has(item.group);
-                                  const tagSelectedCount = tagValues.filter((value) =>
-                                    selectedGroupSet.has(value),
-                                  ).length;
+                                  const currentSelection = selectedGroupStats.get(item.group);
+                                  const groupSelected = currentSelection?.groupSelected || false;
+                                  const tagSelectedCount =
+                                    currentSelection?.selectedTags.size || 0;
                                   return (
                                     <div
                                       key={item.group}
@@ -1619,7 +1656,8 @@ export default function ServerManagement({
                                         <div className="ml-5 mt-2 space-y-1 border-l border-slate-200 pl-3 dark:border-slate-800">
                                           {item.tags.map((tag) => {
                                             const value = `${item.group}:${tag}`;
-                                            const tagSelected = selectedGroupSet.has(value);
+                                            const tagSelected =
+                                              currentSelection?.selectedTags.has(tag) || false;
                                             return (
                                               <button
                                                 key={value}
