@@ -184,7 +184,7 @@ func (s *NetworkStore) queryRange(
 	result := make(map[string]*NetworkHistoryEntry, len(accumulators))
 	cutoffSeconds := to.UTC().Add(-networkRetentionDays * 24 * time.Hour).Unix()
 	for key, acc := range accumulators {
-		entry := buildHistoryEntrySince(acc, cutoffSeconds)
+		entry := buildNetworkHistoryEntryWithCutoff(acc, cutoffSeconds)
 		if entry != nil {
 			result[key] = entry
 		}
@@ -231,16 +231,12 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	}
 	if s.latestLoaded {
 		for key := range s.latestSeriesTime {
-			if strings.Contains(key, "|"+nodeID+"|") {
+			if networkSeriesTimestampNodeID(key) == nodeID {
 				delete(s.latestSeriesTime, key)
 			}
 		}
 	}
 	return nil
-}
-
-func buildHistoryEntrySince(acc *seriesAccumulator, cutoffSeconds int64) *NetworkHistoryEntry {
-	return buildNetworkHistoryEntryWithCutoff(acc, cutoffSeconds)
 }
 
 func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {
@@ -338,19 +334,14 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 	latestSeriesTime := make(map[string]int64)
 	for seriesSet.Next() {
 		series := seriesSet.At()
-		metricName := strings.TrimSpace(series.Labels().Get(labels.MetricName))
-		identity := networkTestIdentity{
-			Type: normalizeIdentityValue(series.Labels().Get("type"), "icmp"),
-			Host: strings.TrimSpace(series.Labels().Get("host")),
-			Port: parsePortLabel(series.Labels().Get("port")),
-			Name: strings.TrimSpace(series.Labels().Get("name")),
-		}
-		key := networkSeriesTimestampKey(metricName, series.Labels().Get("node_id"), buildNetworkSeriesKey(identity))
+		seriesLabels := series.Labels()
+		metricName := strings.TrimSpace(seriesLabels.Get(labels.MetricName))
+		key := networkSeriesTimestampKey(metricName, seriesLabels.Get("node_id"), buildNetworkSeriesKey(networkIdentityFromLabels(seriesLabels)))
 		if key == "" {
 			continue
 		}
 
-		iterator := seriesSet.At().Iterator(nil)
+		iterator := series.Iterator(nil)
 		var (
 			latestMillis int64
 			found        bool
@@ -384,6 +375,18 @@ func networkSeriesTimestampKey(metricName, nodeID, seriesKey string) string {
 		return ""
 	}
 	return metricName + "|" + strings.TrimSpace(nodeID) + "|" + seriesKey
+}
+
+func networkSeriesTimestampNodeID(key string) string {
+	_, remainder, found := strings.Cut(strings.TrimSpace(key), "|")
+	if !found {
+		return ""
+	}
+	nodeID, _, found := strings.Cut(remainder, "|")
+	if !found {
+		return ""
+	}
+	return strings.TrimSpace(nodeID)
 }
 
 func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (preparedNetworkSample, bool) {
@@ -442,13 +445,9 @@ func collectMetricSeriesBatch(
 	}, nameMatcher, nodeMatcher)
 	for seriesSet.Next() {
 		series := seriesSet.At()
-		metricName := strings.TrimSpace(series.Labels().Get(labels.MetricName))
-		identity := networkTestIdentity{
-			Type: normalizeIdentityValue(series.Labels().Get("type"), "icmp"),
-			Host: strings.TrimSpace(series.Labels().Get("host")),
-			Port: parsePortLabel(series.Labels().Get("port")),
-			Name: strings.TrimSpace(series.Labels().Get("name")),
-		}
+		seriesLabels := series.Labels()
+		metricName := strings.TrimSpace(seriesLabels.Get(labels.MetricName))
+		identity := networkIdentityFromLabels(seriesLabels)
 		acc := ensureSeriesAccumulator(accumulators, identity)
 		if acc == nil {
 			continue
@@ -475,6 +474,15 @@ func collectMetricSeriesBatch(
 		}
 	}
 	return seriesSet.Err()
+}
+
+func networkIdentityFromLabels(seriesLabels labels.Labels) networkTestIdentity {
+	return networkTestIdentity{
+		Type: normalizeIdentityValue(seriesLabels.Get("type"), "icmp"),
+		Host: strings.TrimSpace(seriesLabels.Get("host")),
+		Port: parsePortLabel(seriesLabels.Get("port")),
+		Name: strings.TrimSpace(seriesLabels.Get("name")),
+	}
 }
 
 func parsePortLabel(raw string) int {

@@ -21,6 +21,16 @@ const (
 	pingSampleCount = 3
 )
 
+var (
+	pingLossRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)%\s*(?:packet\s+)?loss`)
+	pingTxRxRegex           = regexp.MustCompile(`(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received`)
+	pingWindowsCountRegex   = regexp.MustCompile(`(?is)sent\s*=\s*(\d+).*received\s*=\s*(\d+)`)
+	pingChineseCountRegex   = regexp.MustCompile(`(?is)已发送\s*=\s*(\d+).*已接收\s*=\s*(\d+)`)
+	pingWindowsAverageRegex = regexp.MustCompile(`Average\s*=\s*(\d+(?:\.\d+)?)\s*ms`)
+	pingUnixAverageRegex    = regexp.MustCompile(`=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)`)
+	pingGenericMSRegex      = regexp.MustCompile(`(\d+(?:\.\d+)?)\s*ms`)
+)
+
 func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 	items := strings.Split(raw, ",")
 	results := make([]metrics.NetworkTestConfig, 0, len(items))
@@ -198,66 +208,48 @@ func parsePingOutput(output string) (*float64, float64, string, string) {
 	status := "ok"
 	packetLoss := 0.0
 	var latency *float64
+	lowerOutput := strings.ToLower(output)
 
-	lossRegex := regexp.MustCompile(`(\d+(?:\.\d+)?)%\s*(?:packet\s+)?loss`)
-	if matches := lossRegex.FindStringSubmatch(output); len(matches) > 1 {
+	if matches := pingLossRegex.FindStringSubmatch(output); len(matches) > 1 {
 		if loss, err := strconv.ParseFloat(matches[1], 64); err == nil {
 			packetLoss = loss
 		}
 	}
 	if packetLoss == 0 {
-		txrxRegex := regexp.MustCompile(`(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received`)
-		if matches := txrxRegex.FindStringSubmatch(output); len(matches) > 2 {
-			if sent, err := strconv.Atoi(matches[1]); err == nil && sent > 0 {
-				if received, err := strconv.Atoi(matches[2]); err == nil {
-					packetLoss = float64(sent-received) / float64(sent) * 100
-				}
-			}
+		if matches := pingTxRxRegex.FindStringSubmatch(output); len(matches) > 2 {
+			packetLoss = packetLossFromCounts(matches[1], matches[2])
 		}
 	}
 	if packetLoss == 0 {
-		winRegex := regexp.MustCompile(`(?is)sent\s*=\s*(\d+).*received\s*=\s*(\d+)`)
-		if matches := winRegex.FindStringSubmatch(output); len(matches) > 2 {
-			if sent, err := strconv.Atoi(matches[1]); err == nil && sent > 0 {
-				if received, err := strconv.Atoi(matches[2]); err == nil {
-					packetLoss = float64(sent-received) / float64(sent) * 100
-				}
-			}
+		if matches := pingWindowsCountRegex.FindStringSubmatch(output); len(matches) > 2 {
+			packetLoss = packetLossFromCounts(matches[1], matches[2])
 		}
 	}
 	if packetLoss == 0 {
-		cnRegex := regexp.MustCompile(`已发送\s*=\s*(\d+).*已接收\s*=\s*(\d+)`)
-		if matches := cnRegex.FindStringSubmatch(output); len(matches) > 2 {
-			if sent, err := strconv.Atoi(matches[1]); err == nil && sent > 0 {
-				if received, err := strconv.Atoi(matches[2]); err == nil {
-					packetLoss = float64(sent-received) / float64(sent) * 100
-				}
-			}
+		if matches := pingChineseCountRegex.FindStringSubmatch(output); len(matches) > 2 {
+			packetLoss = packetLossFromCounts(matches[1], matches[2])
 		}
 	}
 
-	if strings.Contains(output, "100%") || strings.Contains(strings.ToLower(output), "timeout") {
+	if strings.Contains(output, "100%") || strings.Contains(lowerOutput, "timeout") {
 		status = "timeout"
 		packetLoss = 100
 	}
 
 	if runtime.GOOS == "windows" {
-		avgRegex := regexp.MustCompile(`Average\s*=\s*(\d+(?:\.\d+)?)\s*ms`)
-		if matches := avgRegex.FindStringSubmatch(output); len(matches) > 1 {
+		if matches := pingWindowsAverageRegex.FindStringSubmatch(output); len(matches) > 1 {
 			if lat, err := strconv.ParseFloat(matches[1], 64); err == nil {
 				latency = &lat
 			}
 		}
 	} else {
-		avgRegex := regexp.MustCompile(`=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)`)
-		if matches := avgRegex.FindStringSubmatch(output); len(matches) > 2 {
+		if matches := pingUnixAverageRegex.FindStringSubmatch(output); len(matches) > 2 {
 			if lat, err := strconv.ParseFloat(matches[2], 64); err == nil {
 				latency = &lat
 			}
 		}
 		if latency == nil {
-			msRegex := regexp.MustCompile(`(\d+(?:\.\d+)?)\s*ms`)
-			matches := msRegex.FindAllStringSubmatch(output, -1)
+			matches := pingGenericMSRegex.FindAllStringSubmatch(output, -1)
 			if len(matches) > 0 {
 				if lat, err := strconv.ParseFloat(matches[len(matches)-1][1], 64); err == nil {
 					latency = &lat
@@ -275,6 +267,18 @@ func parsePingOutput(output string) (*float64, float64, string, string) {
 	}
 
 	return latency, packetLoss, status, ""
+}
+
+func packetLossFromCounts(sentText, receivedText string) float64 {
+	sent, err := strconv.Atoi(sentText)
+	if err != nil || sent <= 0 {
+		return 0
+	}
+	received, err := strconv.Atoi(receivedText)
+	if err != nil {
+		return 0
+	}
+	return float64(sent-received) / float64(sent) * 100
 }
 
 func splitHostPort(value string) (string, int) {

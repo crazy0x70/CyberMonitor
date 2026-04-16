@@ -174,10 +174,10 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		filter[name] = struct{}{}
 	}
 	return &Collector{
-		nodeID:    nodeID,
-		nodeName:  nodeName,
-		hostRoot:  hostRoot,
-		netIfaces: filter,
+		nodeID:                  nodeID,
+		nodeName:                nodeName,
+		hostRoot:                hostRoot,
+		netIfaces:               filter,
 		publicIPRefreshInterval: defaultPublicIPRefreshInterval,
 		publicIPLookup:          newPublicIPLookup(defaultPublicIPLookupTimeout),
 	}
@@ -253,6 +253,8 @@ func (c *Collector) Collect() (NodeStats, error) {
 
 	netSpeedMbps := collectNetSpeedMbps(netFilter)
 	publicIPs := c.collectPublicIPsAt(now)
+	loadStat := valueOrZero(loadAvg)
+	memoryStat := valueOrZeroMem(memStat)
 	stats := NodeStats{
 		NodeID:       c.nodeID,
 		NodeName:     c.nodeName,
@@ -266,17 +268,17 @@ func (c *Collector) Collect() (NodeStats, error) {
 		NetSpeedMbps: netSpeedMbps,
 		CPU: CPUInfo{
 			UsagePercent: usage,
-			Load1:        valueOrZero(loadAvg).Load1,
-			Load5:        valueOrZero(loadAvg).Load5,
-			Load15:       valueOrZero(loadAvg).Load15,
+			Load1:        loadStat.Load1,
+			Load5:        loadStat.Load5,
+			Load15:       loadStat.Load15,
 			Model:        cpuModel,
 			Cores:        coreCount,
 		},
 		Memory: MemInfo{
-			Total:       valueOrZeroMem(memStat).Total,
-			Used:        valueOrZeroMem(memStat).Used,
-			Free:        valueOrZeroMem(memStat).Free,
-			UsedPercent: valueOrZeroMem(memStat).UsedPercent,
+			Total:       memoryStat.Total,
+			Used:        memoryStat.Used,
+			Free:        memoryStat.Free,
+			UsedPercent: memoryStat.UsedPercent,
 		},
 		Disk:     diskUsage,
 		DiskType: diskType,

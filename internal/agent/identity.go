@@ -2,10 +2,8 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,7 +21,6 @@ const (
 type NodeIDOptions struct {
 	Explicit     string
 	ExplicitFile string
-	LegacyPath   string
 	IsDocker     bool
 	HostRoot     string
 }
@@ -102,19 +99,8 @@ func migrateLegacyStateFile(targetPath, fileName string) error {
 	}
 }
 
-func ResolveNodeID(opts NodeIDOptions) (string, error) {
-	return resolveNodeIDWithFallbacks(opts)
-}
-
-func ResolveOrCreateNodeID(explicit, filePath string) (string, error) {
-	return ResolveOrCreateNodeIDWithOptions(NodeIDOptions{
-		Explicit:     explicit,
-		ExplicitFile: filePath,
-	})
-}
-
 func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
-	nodeID, err := ResolveNodeID(opts)
+	nodeID, err := resolveNodeIDWithFallbacks(opts)
 	if err == nil {
 		return nodeID, nil
 	}
@@ -141,39 +127,13 @@ func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
 	return nodeID, nil
 }
 
-func LoadPersistedAgentToken(filePath string) (string, error) {
-	return loadPersistedAgentToken(filePath)
-}
-
-func PersistAgentToken(filePath, token string) error {
-	return persistAgentToken(filePath, token)
-}
-
-func RegisterNodeToken(ctx context.Context, client *http.Client, endpoint, nodeID, bootstrapToken string) (string, error) {
-	return registerNodeToken(ctx, client, endpoint, nodeID, bootstrapToken)
-}
-
-func DefaultNodeIDFileName() string {
-	return defaultNodeIDFileName
-}
-
-func DefaultAgentTokenFileName() string {
-	return defaultAgentTokenFileName
-}
-
 func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
 	if explicit := strings.TrimSpace(opts.Explicit); explicit != "" {
 		return explicit, nil
 	}
 
 	if explicitFile := strings.TrimSpace(opts.ExplicitFile); explicitFile != "" {
-		value, err := readTrimmedFile(explicitFile)
-		switch {
-		case err == nil:
-			return value, nil
-		case !errors.Is(err, os.ErrNotExist):
-			return "", err
-		}
+		return readTrimmedFile(explicitFile)
 	}
 
 	homePath, homeErr := defaultNodeIDHomePath()
@@ -181,23 +141,6 @@ func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
 		value, err := readTrimmedFile(homePath)
 		switch {
 		case err == nil:
-			return value, nil
-		case !errors.Is(err, os.ErrNotExist):
-			return "", err
-		}
-	}
-
-	legacyPath := strings.TrimSpace(opts.LegacyPath)
-	if legacyPath != "" {
-		value, err := readTrimmedFile(legacyPath)
-		switch {
-		case err == nil:
-			if homeErr != nil {
-				return "", homeErr
-			}
-			if err := writeTrimmedFile(homePath, value); err != nil {
-				return "", err
-			}
 			return value, nil
 		case !errors.Is(err, os.ErrNotExist):
 			return "", err
@@ -324,23 +267,10 @@ func registerNodeToken(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		message := strings.TrimSpace(string(body))
-		if message == "" {
-			return "", fmt.Errorf("register status %d", resp.StatusCode)
-		}
-		return "", fmt.Errorf("register status %d: %s", resp.StatusCode, message)
+		return "", readAgentAPIStatusError(resp, "register")
 	}
 	var payload nodeRegisterResponse
-	decoder := json.NewDecoder(resp.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return "", err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return "", fmt.Errorf("register response has trailing data")
-		}
+	if err := decodeStrictAgentJSON(resp.Body, &payload, "register response has trailing data"); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(payload.AgentToken) == "" {

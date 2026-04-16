@@ -67,16 +67,18 @@ import type {
   TestSelection,
 } from "@/lib/admin-types";
 import {
-  buildSelectionValues,
   flattenGroupTree,
   formatDateTime,
   formatMbps,
   formatRelativeTime,
+  normalizeSelectionValues,
+  resolveNodeSelectionValues,
   resolveNodeIdentitySummary,
   parseSelectionValue,
   resolveNodeId,
   resolveNodeName,
   resolveProbeLabel,
+  upsertSelectionValue,
 } from "@/lib/admin-format";
 import {
   buildAgentInstallCommand,
@@ -154,6 +156,23 @@ type GroupCatalogItem = {
   tags: string[];
 };
 
+type SelectedGroupState = {
+  count: number;
+  items: Array<{
+    value: string;
+    label: string;
+    level: string;
+  }>;
+  label: string;
+  stats: Map<
+    string,
+    {
+      groupSelected: boolean;
+      selectedTags: Set<string>;
+    }
+  >;
+};
+
 type NodeListEntry = {
   node: NodeView;
   nodeGroups: string[];
@@ -217,16 +236,6 @@ function formatVersionLabel(value?: string) {
   return normalized.startsWith("v") ? normalized : `v${normalized}`;
 }
 
-function normalizeList(values: string[]) {
-  return Array.from(
-    new Set(
-      values
-        .map((item) => item.trim())
-        .filter(Boolean),
-    ),
-  ).sort((a, b) => a.localeCompare(b, "zh-CN"));
-}
-
 function planToSeconds(plan: RenewPlan) {
   switch (plan) {
     case "month":
@@ -274,13 +283,6 @@ function resolveRenewPlan(autoRenew?: boolean, renewIntervalSec?: number): Renew
         : best,
     targets[0],
   ).key;
-}
-
-function resolveNodeGroups(node: NodeView) {
-  if (Array.isArray(node.groups) && node.groups.length > 0) {
-    return normalizeList(node.groups);
-  }
-  return normalizeList(buildSelectionValues(node.group || node.stats.node_group || "", node.tags || []));
 }
 
 function testKey(test?: Partial<NetworkTestConfig | TestCatalogItem>) {
@@ -359,7 +361,7 @@ function buildFormState(node: NodeView, catalog: TestCatalogItem[]): FormState {
     alertEnabled: node.alert_enabled !== false,
     expireAt: toDateTimeLocalValue(node.expire_at),
     renewPlan: resolveRenewPlan(node.auto_renew, node.renew_interval_sec),
-    groups: resolveNodeGroups(node),
+    groups: resolveNodeSelectionValues(node),
     testSelections: buildInitialSelections(node, catalog),
   };
 }
@@ -400,7 +402,7 @@ function buildPayload(
     alert_enabled: form.alertEnabled,
     auto_renew: autoRenew,
     disk_type: form.diskType.trim(),
-    groups: normalizeList(form.groups),
+    groups: normalizeSelectionValues(form.groups),
     net_speed_mbps:
       Number.isFinite(normalizedSpeed) && normalizedSpeed >= 0 ? normalizedSpeed : 0,
     region: form.region.trim().toUpperCase(),
@@ -462,7 +464,7 @@ function escapeSelectorValue(value: string) {
 
 function buildGroupCatalog(
   tree: SettingsView["group_tree"] | undefined,
-  nodes: NodeView[],
+  nodeListEntries: NodeListEntry[],
 ): GroupCatalogItem[] {
   const values = new Map<string, Set<string>>();
 
@@ -482,8 +484,8 @@ function buildGroupCatalog(
     });
   });
 
-  nodes.forEach((node) => {
-    resolveNodeGroups(node).forEach((value) => {
+  nodeListEntries.forEach((entry) => {
+    entry.nodeGroups.forEach((value) => {
       const parsed = parseSelectionValue(value);
       const group = String(parsed.group || "").trim();
       const tag = String(parsed.tag || "").trim();
@@ -507,15 +509,54 @@ function buildGroupCatalog(
     .sort((a, b) => a.group.localeCompare(b.group, "zh-CN"));
 }
 
-function upsertGroupSelection(currentValues: string[], nextValue: string) {
-  const parsed = parseSelectionValue(nextValue);
-  const group = String(parsed.group || "").trim();
-  const tag = String(parsed.tag || "").trim();
-  if (!group) {
-    return normalizeList(currentValues);
+function buildSelectedGroupState(values: string[] | undefined): SelectedGroupState {
+  const items: SelectedGroupState["items"] = [];
+  const stats = new Map<
+    string,
+    {
+      groupSelected: boolean;
+      selectedTags: Set<string>;
+    }
+  >();
+  normalizeSelectionValues(values || []).forEach((normalized) => {
+    const parsed = parseSelectionValue(normalized);
+    const group = String(parsed.group || "").trim();
+    const tag = String(parsed.tag || "").trim();
+    if (!group) {
+      return;
+    }
+
+    items.push({
+      value: normalized,
+      label: tag ? `${group} / ${tag}` : group,
+      level: tag ? "二级标签" : "一级分组",
+    });
+
+    const current = stats.get(group) || {
+      groupSelected: false,
+      selectedTags: new Set<string>(),
+    };
+    if (tag) {
+      current.selectedTags.add(tag);
+    } else {
+      current.groupSelected = true;
+    }
+    stats.set(group, current);
+  });
+
+  let label = "请选择分组与标签";
+  if (items.length === 1) {
+    label = items[0].label;
+  } else if (items.length > 1) {
+    label = `${items[0].label} 等 ${items.length} 项`;
   }
-  const filtered = currentValues.filter((value) => parseSelectionValue(value).group !== group);
-  return normalizeList([...filtered, tag ? `${group}:${tag}` : group]);
+
+  return {
+    count: items.length,
+    items,
+    label,
+    stats,
+  };
 }
 
 export default function ServerManagement({
@@ -557,43 +598,51 @@ export default function ServerManagement({
       ),
     [testCatalog],
   );
-  const groupCatalog = useMemo(
-    () => buildGroupCatalog(settings?.group_tree, nodes),
-    [nodes, settings?.group_tree],
-  );
+  const { metrics, nodeListEntries, nodeLookup } = useMemo(() => {
+    const entries: NodeListEntry[] = [];
+    const lookup = new Map<string, NodeView>();
+    let online = 0;
+    let alertDisabled = 0;
 
-  const metrics = useMemo(() => {
-    const total = nodes.length;
-    const online = nodes.filter((node) => node.status === "online").length;
-    const alertDisabled = nodes.filter((node) => node.alert_enabled === false).length;
-    return { total, online, alertDisabled };
+    nodes.forEach((node) => {
+      if (node.status === "online") {
+        online += 1;
+      }
+      if (node.alert_enabled === false) {
+        alertDisabled += 1;
+      }
+
+      const nodeId = resolveNodeId(node);
+      const nodeName = resolveNodeName(node);
+      const nodeGroups = resolveNodeSelectionValues(node);
+      entries.push({
+        node,
+        nodeGroups,
+        nodeId,
+        nodeName,
+        statusRank: node.status === "online" ? 0 : 1,
+        searchText: [nodeName, nodeId, node.stats.hostname, node.region, ...nodeGroups]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase(),
+      });
+      lookup.set(nodeId, node);
+    });
+
+    return {
+      metrics: {
+        total: nodes.length,
+        online,
+        alertDisabled,
+      },
+      nodeListEntries: entries,
+      nodeLookup: lookup,
+    };
   }, [nodes]);
 
-  const nodeListEntries = useMemo<NodeListEntry[]>(
-    () =>
-      nodes.map((node) => {
-        const nodeId = resolveNodeId(node);
-        const nodeName = resolveNodeName(node);
-        const nodeGroups = resolveNodeGroups(node);
-        return {
-          node,
-          nodeGroups,
-          nodeId,
-          nodeName,
-          statusRank: node.status === "online" ? 0 : 1,
-          searchText: [
-            nodeName,
-            nodeId,
-            node.stats.hostname,
-            node.region,
-            ...nodeGroups,
-          ]
-            .filter(Boolean)
-            .join(" ")
-            .toLowerCase(),
-        };
-      }),
-    [nodes],
+  const groupCatalog = useMemo(
+    () => buildGroupCatalog(settings?.group_tree, nodeListEntries),
+    [nodeListEntries, settings?.group_tree],
   );
 
   const sortedNodeListEntries = useMemo(
@@ -650,8 +699,8 @@ export default function ServerManagement({
   const activeInstallCommand = installPlatform === "windows" ? windowsInstallCommand : linuxInstallCommand;
 
   const editingNode = useMemo(
-    () => nodes.find((node) => resolveNodeId(node) === editingNodeId) || null,
-    [editingNodeId, nodes],
+    () => nodeLookup.get(editingNodeId) || null,
+    [editingNodeId, nodeLookup],
   );
 
   useEffect(() => {
@@ -670,57 +719,11 @@ export default function ServerManagement({
   }, [editingNode, editingNodeId, testCatalog, testCatalogSignature]);
 
   const selectedTestIds = form ? new Set(Object.keys(form.testSelections)) : new Set<string>();
-  const selectedGroupCount = form?.groups.length || 0;
-  const selectedGroupItems = useMemo(
-    () =>
-      (form?.groups || []).map((value) => {
-        const parsed = parseSelectionValue(value);
-        return {
-          value,
-          label: parsed.tag ? `${parsed.group} / ${parsed.tag}` : parsed.group,
-          level: parsed.tag ? "二级标签" : "一级分组",
-        };
-      }),
+  const selectedGroupState = useMemo(
+    () => buildSelectedGroupState(form?.groups),
     [form?.groups],
   );
-  const selectedGroupSet = useMemo(() => new Set(form?.groups || []), [form?.groups]);
-  const selectedGroupStats = useMemo(() => {
-    const stats = new Map<
-      string,
-      {
-        groupSelected: boolean;
-        selectedTags: Set<string>;
-      }
-    >();
-    selectedGroupSet.forEach((value) => {
-      const parsed = parseSelectionValue(value);
-      const group = String(parsed?.group || "").trim();
-      const tag = String(parsed?.tag || "").trim();
-      if (!group) {
-        return;
-      }
-      const current = stats.get(group) || {
-        groupSelected: false,
-        selectedTags: new Set<string>(),
-      };
-      if (tag) {
-        current.selectedTags.add(tag);
-      } else {
-        current.groupSelected = true;
-      }
-      stats.set(group, current);
-    });
-    return stats;
-  }, [selectedGroupSet]);
-  const groupSelectionMenuLabel = useMemo(() => {
-    if (selectedGroupItems.length === 0) {
-      return "请选择分组与标签";
-    }
-    if (selectedGroupItems.length === 1) {
-      return selectedGroupItems[0].label;
-    }
-    return `${selectedGroupItems[0].label} 等 ${selectedGroupItems.length} 项`;
-  }, [selectedGroupItems]);
+  const selectedGroupCount = selectedGroupState.count;
   const testSelectionSummary = useMemo(() => {
     if (!form) {
       return { selected: 0, tcpCustom: 0 };
@@ -813,14 +816,14 @@ export default function ServerManagement({
       if (!current) {
         return current;
       }
-      const normalized = normalizeList(current.groups);
+      const normalized = normalizeSelectionValues(current.groups);
       if (normalized.includes(value)) {
         return {
           ...current,
-          groups: normalizeList(normalized.filter((item) => item !== value)),
+          groups: normalizeSelectionValues(normalized.filter((item) => item !== value)),
         };
       }
-      return { ...current, groups: upsertGroupSelection(normalized, value) };
+      return { ...current, groups: upsertSelectionValue(normalized, value) };
     });
   };
 
@@ -829,7 +832,10 @@ export default function ServerManagement({
       if (!current) {
         return current;
       }
-      return { ...current, groups: normalizeList(current.groups.filter((item) => item !== value)) };
+      return {
+        ...current,
+        groups: normalizeSelectionValues(current.groups.filter((item) => item !== value)),
+      };
     });
   };
 
@@ -1598,7 +1604,7 @@ export default function ServerManagement({
                                         : "text-slate-700 dark:text-slate-200"
                                     }`}
                                   >
-                                    {groupSelectionMenuLabel}
+                                    {selectedGroupState.label}
                                   </span>
                                   <ChevronsUpDown className="ml-3 h-4 w-4 shrink-0 text-slate-400" />
                                 </Button>
@@ -1614,7 +1620,7 @@ export default function ServerManagement({
                               </div>
                               <div className="mt-2 max-h-[22rem] space-y-2 overflow-y-auto pr-1">
                                 {groupCatalog.map((item) => {
-                                  const currentSelection = selectedGroupStats.get(item.group);
+                                  const currentSelection = selectedGroupState.stats.get(item.group);
                                   const groupSelected = currentSelection?.groupSelected || false;
                                   const tagSelectedCount =
                                     currentSelection?.selectedTags.size || 0;
@@ -1690,9 +1696,9 @@ export default function ServerManagement({
                         </div>
                       )}
 
-                      {selectedGroupItems.length > 0 ? (
+                      {selectedGroupState.items.length > 0 ? (
                         <div className="flex flex-wrap gap-2">
-                          {selectedGroupItems.map((item) => (
+                          {selectedGroupState.items.map((item) => (
                             <button
                               key={item.value}
                               type="button"

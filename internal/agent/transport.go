@@ -96,14 +96,14 @@ type httpControlPlane struct {
 }
 
 type grpcControlPlane struct {
-	target string
-	secure bool
-	opts   grpcTransportOptions
+	target      string
+	secure      bool
+	opts        grpcTransportOptions
 	dialContext func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
 
-	mu     sync.Mutex
-	conn   *grpc.ClientConn
-	client agentrpc.AgentServiceClient
+	mu      sync.Mutex
+	conn    *grpc.ClientConn
+	client  agentrpc.AgentServiceClient
 	dialing chan struct{}
 }
 
@@ -135,7 +135,7 @@ func newGRPCControlPlane(serverURL string, options grpcTransportOptions) *grpcCo
 	return &grpcControlPlane{
 		target:      target,
 		secure:      secure,
-		opts:        options.normalized(),
+		opts:        options,
 		dialContext: grpc.DialContext,
 	}
 }
@@ -160,80 +160,56 @@ func parseGRPCTarget(serverURL string) (string, bool, error) {
 }
 
 func (t *controlPlaneTransport) RegisterNodeToken(ctx context.Context, nodeID, bootstrapToken string) (string, error) {
-	if t.grpc != nil && t.canUseGRPC() {
-		token, err := t.grpc.RegisterNodeToken(ctx, nodeID, bootstrapToken)
-		if err == nil {
-			t.noteMode("grpc")
-			return token, nil
-		}
-		if !shouldFallbackToHTTP(err) {
-			return "", err
-		}
-		t.disableGRPCTemporarily(err)
-	}
-	token, err := t.http.RegisterNodeToken(ctx, nodeID, bootstrapToken)
-	if err == nil {
-		t.noteMode("http")
-	}
-	return token, err
+	return callWithFallback(
+		t,
+		ctx,
+		func(callCtx context.Context, grpcPlane *grpcControlPlane) (string, error) {
+			return grpcPlane.RegisterNodeToken(callCtx, nodeID, bootstrapToken)
+		},
+		func(callCtx context.Context, httpPlane *httpControlPlane) (string, error) {
+			return httpPlane.RegisterNodeToken(callCtx, nodeID, bootstrapToken)
+		},
+	)
 }
 
 func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token string) (RemoteConfig, error) {
-	if t.grpc != nil && t.canUseGRPC() {
-		config, err := t.grpc.FetchConfig(ctx, nodeID, token)
-		if err == nil {
-			t.noteMode("grpc")
-			return config, nil
-		}
-		if !shouldFallbackToHTTP(err) {
-			return RemoteConfig{}, err
-		}
-		t.disableGRPCTemporarily(err)
-	}
-	config, err := t.http.FetchConfig(ctx, nodeID, token)
-	if err == nil {
-		t.noteMode("http")
-	}
-	return config, err
+	return callWithFallback(
+		t,
+		ctx,
+		func(callCtx context.Context, grpcPlane *grpcControlPlane) (RemoteConfig, error) {
+			return grpcPlane.FetchConfig(callCtx, nodeID, token)
+		},
+		func(callCtx context.Context, httpPlane *httpControlPlane) (RemoteConfig, error) {
+			return httpPlane.FetchConfig(callCtx, nodeID, token)
+		},
+	)
 }
 
 func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
-	if t.grpc != nil && t.canUseGRPC() {
-		refreshConfig, err := t.grpc.ReportStats(ctx, stats, token)
-		if err == nil {
-			t.noteMode("grpc")
-			return refreshConfig, nil
-		}
-		if !shouldFallbackToHTTP(err) {
-			return false, err
-		}
-		t.disableGRPCTemporarily(err)
-	}
-	refreshConfig, err := t.http.ReportStats(ctx, stats, token)
-	if err != nil {
-		return false, err
-	}
-	t.noteMode("http")
-	return refreshConfig, nil
+	return callWithFallback(
+		t,
+		ctx,
+		func(callCtx context.Context, grpcPlane *grpcControlPlane) (bool, error) {
+			return grpcPlane.ReportStats(callCtx, stats, token)
+		},
+		func(callCtx context.Context, httpPlane *httpControlPlane) (bool, error) {
+			return httpPlane.ReportStats(callCtx, stats, token)
+		},
+	)
 }
 
 func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
-	if t.grpc != nil && t.canUseGRPC() {
-		err := t.grpc.ReportUpdate(ctx, nodeID, token, state, version, message)
-		if err == nil {
-			t.noteMode("grpc")
-			return nil
-		}
-		if !shouldFallbackToHTTP(err) {
-			return err
-		}
-		t.disableGRPCTemporarily(err)
-	}
-	if err := t.http.ReportUpdate(ctx, nodeID, token, state, version, message); err != nil {
-		return err
-	}
-	t.noteMode("http")
-	return nil
+	_, err := callWithFallback(
+		t,
+		ctx,
+		func(callCtx context.Context, grpcPlane *grpcControlPlane) (struct{}, error) {
+			return struct{}{}, grpcPlane.ReportUpdate(callCtx, nodeID, token, state, version, message)
+		},
+		func(callCtx context.Context, httpPlane *httpControlPlane) (struct{}, error) {
+			return struct{}{}, httpPlane.ReportUpdate(callCtx, nodeID, token, state, version, message)
+		},
+	)
+	return err
 }
 
 func (t *controlPlaneTransport) Close() error {
@@ -258,6 +234,32 @@ func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	if t.grpc != nil {
 		_ = t.grpc.Close()
 	}
+}
+
+func callWithFallback[T any](
+	t *controlPlaneTransport,
+	ctx context.Context,
+	grpcCall func(context.Context, *grpcControlPlane) (T, error),
+	httpCall func(context.Context, *httpControlPlane) (T, error),
+) (T, error) {
+	var zero T
+	if t.grpc != nil && t.canUseGRPC() {
+		result, err := grpcCall(ctx, t.grpc)
+		if err == nil {
+			t.noteMode("grpc")
+			return result, nil
+		}
+		if !shouldFallbackToHTTP(err) {
+			return zero, err
+		}
+		t.disableGRPCTemporarily(err)
+	}
+
+	result, err := httpCall(ctx, t.http)
+	if err == nil {
+		t.noteMode("http")
+	}
+	return result, err
 }
 
 func (t *controlPlaneTransport) noteMode(mode string) {
@@ -304,8 +306,7 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 		return false, fmt.Errorf("ingest failed: %s", text)
 	}
 	var result struct {
-		Status        string `json:"status"`
-		RefreshConfig bool   `json:"refresh_config"`
+		RefreshConfig bool `json:"refresh_config"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return false, err

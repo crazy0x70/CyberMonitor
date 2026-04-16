@@ -1,4 +1,9 @@
-import type { GroupNode, NodeView, TestCatalogItem } from "@/lib/admin-types";
+import type {
+  GroupNode,
+  GroupSelection,
+  NodeView,
+  TestCatalogItem,
+} from "@/lib/admin-types";
 
 export function formatDateTime(value?: number) {
   if (!value) return "--";
@@ -104,7 +109,67 @@ export function parseSelectionValue(value: string) {
     const [group, ...rest] = raw.split(":");
     return { group: group.trim(), tag: rest.join(":").trim() };
   }
+  if (raw.includes("/")) {
+    const [group, ...rest] = raw.split("/");
+    return { group: group.trim(), tag: rest.join("/").trim() };
+  }
   return { group: raw, tag: "" };
+}
+
+export function normalizeSelectionValues(values: string[]) {
+  return Array.from(
+    new Set(
+      (values || [])
+        .map((item) => String(item || "").trim())
+        .filter(Boolean),
+    ),
+  ).sort((a, b) => a.localeCompare(b, "zh-CN"));
+}
+
+export function resolveNodeSelectionValues(
+  node: Pick<NodeView, "group" | "groups" | "tags" | "stats">,
+) {
+  if (Array.isArray(node.groups) && node.groups.length > 0) {
+    return normalizeSelectionValues(node.groups);
+  }
+  return normalizeSelectionValues(
+    buildSelectionValues(node.group || node.stats.node_group || "", node.tags || []),
+  );
+}
+
+export function resolveSelectionValues(values: string[]) {
+  const seenSelections = new Set<string>();
+
+  return normalizeSelectionValues(values)
+    .map(parseSelectionValue)
+    .filter((item): item is GroupSelection => Boolean(item.group))
+    .filter((item) => {
+      const key = `${item.group}::${item.tag}`;
+      if (seenSelections.has(key)) {
+        return false;
+      }
+      seenSelections.add(key);
+      return true;
+    });
+}
+
+export function resolveNodeSelections(
+  node: Pick<NodeView, "group" | "groups" | "tags" | "stats">,
+) {
+  return resolveSelectionValues(resolveNodeSelectionValues(node));
+}
+
+export function upsertSelectionValue(currentValues: string[], nextValue: string) {
+  const parsed = parseSelectionValue(nextValue);
+  const group = String(parsed.group || "").trim();
+  const tag = String(parsed.tag || "").trim();
+  if (!group) {
+    return normalizeSelectionValues(currentValues);
+  }
+  const filtered = currentValues.filter(
+    (value) => parseSelectionValue(value).group !== group,
+  );
+  return normalizeSelectionValues([...filtered, tag ? `${group}:${tag}` : group]);
 }
 
 export function resolveProbeLabel(item: TestCatalogItem) {

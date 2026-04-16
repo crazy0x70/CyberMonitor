@@ -108,10 +108,38 @@ write_agent_conf() {
   cat > "${CONF_DIR}/agent.conf" <<EOF
 CM_SERVER_URL=${1}
 CM_NODE_ID=${2}
-CM_AGENT_TOKEN=${3}
-CM_NET_IFACE=${4}
-CM_DISABLE_UPDATE=${5}
+CM_AGENT_TOKEN_FILE=${INSTALL_DIR}/.cybermonitor-agent-token
+CM_NET_IFACE=${3}
+CM_DISABLE_UPDATE=${4}
 EOF
+}
+
+write_service_file() {
+  local service_file="$1"
+  local description="$2"
+  local env_file="$3"
+  local bin="$4"
+  cat > "${service_file}" <<EOF
+[Unit]
+Description=${description}
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=${env_file}
+ExecStart=${bin}
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+enable_service() {
+  local service="$1"
+  systemctl daemon-reload
+  systemctl enable --now "${service}"
 }
 
 generate_node_id() {
@@ -240,24 +268,8 @@ install_server() {
 
   local service="cyber-monitor-server"
   local service_file="/etc/systemd/system/${service}.service"
-  cat > "${service_file}" <<EOF
-[Unit]
-Description=CyberMonitor Server
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=${CONF_DIR}/server.conf
-ExecStart=${bin} -listen \${CM_LISTEN} -data-dir \${CM_DATA_DIR}
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
+  write_service_file "${service_file}" "CyberMonitor Server" "${CONF_DIR}/server.conf" "${bin}"
+  enable_service "${service}"
   echo "已安装并启动 ${service}"
   print_admin_info "${listen}" "${data_dir}"
 }
@@ -282,29 +294,12 @@ install_agent() {
   local bin
   bin="$(download_binary "agent" "${version}" "${arch}")"
   write_agent_token_file "${node_token}"
-  write_agent_conf "${server_url}" "${node_id}" "${node_token}" "${net_iface}" "${disable_update}"
+  write_agent_conf "${server_url}" "${node_id}" "${net_iface}" "${disable_update}"
 
   local service="cyber-monitor-agent"
   local service_file="/etc/systemd/system/${service}.service"
-
-  cat > "${service_file}" <<EOF
-[Unit]
-Description=CyberMonitor Agent
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=${CONF_DIR}/agent.conf
-ExecStart=${bin}
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
+  write_service_file "${service_file}" "CyberMonitor Agent" "${CONF_DIR}/agent.conf" "${bin}"
+  enable_service "${service}"
   echo "已安装并启动 ${service}"
   echo "Node ID: ${node_id}"
 }
@@ -345,7 +340,9 @@ cleanup_server_config() {
 
 cleanup_agent_config() {
   rm -f "${CONF_DIR}/agent.conf"
+  rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
   rmdir "${CONF_DIR}" 2>/dev/null || true
+  rmdir "${INSTALL_DIR}" 2>/dev/null || true
 }
 
 uninstall_server() {

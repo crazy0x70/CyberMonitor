@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,8 @@ type RemoteUpdateInstruction struct {
 	ChecksumURL string `json:"checksum_url,omitempty"`
 	RequestedAt int64  `json:"requested_at,omitempty"`
 }
+
+const maxAgentAPIErrorBodyBytes = 4096
 
 type runtimeConfig struct {
 	mu       sync.RWMutex
@@ -112,25 +115,39 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		message := strings.TrimSpace(string(body))
-		if message == "" {
-			return RemoteConfig{}, fmt.Errorf("config status %d", resp.StatusCode)
-		}
-		return RemoteConfig{}, fmt.Errorf("config status %d: %s", resp.StatusCode, message)
+		return RemoteConfig{}, readAgentAPIStatusError(resp, "config")
 	}
 
 	var payload RemoteConfig
-	decoder := json.NewDecoder(resp.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return RemoteConfig{}, err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return RemoteConfig{}, fmt.Errorf("config response has trailing data")
-		}
+	if err := decodeStrictAgentJSON(resp.Body, &payload, "config response has trailing data"); err != nil {
 		return RemoteConfig{}, err
 	}
 	return payload, nil
+}
+
+func readAgentAPIStatusError(resp *http.Response, label string) error {
+	if resp == nil {
+		return fmt.Errorf("%s request failed", strings.TrimSpace(label))
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxAgentAPIErrorBodyBytes))
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		return fmt.Errorf("%s status %d", strings.TrimSpace(label), resp.StatusCode)
+	}
+	return fmt.Errorf("%s status %d: %s", strings.TrimSpace(label), resp.StatusCode, message)
+}
+
+func decodeStrictAgentJSON(body io.Reader, target any, trailingMessage string) error {
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New(strings.TrimSpace(trailingMessage))
+		}
+		return err
+	}
+	return nil
 }

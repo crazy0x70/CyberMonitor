@@ -77,6 +77,7 @@ import {
   adminWideInputClass,
   adminWorkspaceHeaderClass,
 } from "@/lib/admin-ui";
+import { resolveNodeSelections } from "@/lib/admin-format";
 import type { GroupNode, NodeView } from "@/lib/admin-types";
 
 export interface GroupManagementProps {
@@ -87,17 +88,25 @@ export interface GroupManagementProps {
   onSave: (groupTree: GroupNode[]) => Promise<void>;
 }
 
-type GroupSelection = {
-  group: string;
-  tag: string;
-};
-
 type ValidationIssue = {
   key: string;
   message: string;
   target?: {
     groupIndex: number;
     tagIndex?: number;
+  };
+};
+
+type DraftTreeAnalysis = {
+  validationIssues: ValidationIssue[];
+  validationLookup: {
+    groupErrors: Record<string, string>;
+    tagErrors: Record<string, string>;
+  };
+  generalValidationMessage: string;
+  summary: {
+    totalGroups: number;
+    totalTags: number;
   };
 };
 
@@ -192,63 +201,16 @@ function serializeEditableTree(tree: EditableGroupNode[]) {
   );
 }
 
-function parseSelectionValue(value: string) {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-
-  if (raw.includes(":")) {
-    const [group, ...rest] = raw.split(":");
-    return {
-      group: group.trim(),
-      tag: rest.join(":").trim(),
-    };
-  }
-
-  if (raw.includes("/")) {
-    const [group, ...rest] = raw.split("/");
-    return {
-      group: group.trim(),
-      tag: rest.join("/").trim(),
-    };
-  }
-
-  return {
-    group: raw,
-    tag: "",
-  };
-}
-
-function resolveNodeSelections(node: NodeView): GroupSelection[] {
-  const rawValues =
-    Array.isArray(node.groups) && node.groups.length > 0
-      ? node.groups
-      : node.group
-        ? Array.isArray(node.tags) && node.tags.length > 0
-          ? node.tags.map((tag) => `${node.group}:${tag}`)
-          : [node.group]
-        : [];
-
-  const seenSelections = new Set<string>();
-
-  return rawValues
-    .map(parseSelectionValue)
-    .filter((item): item is GroupSelection => Boolean(item?.group))
-    .filter((item) => {
-      const key = `${item.group}::${item.tag}`;
-      if (seenSelections.has(key)) {
-        return false;
-      }
-      seenSelections.add(key);
-      return true;
-    });
-}
-
-function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
+function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
+  const validationIssues: ValidationIssue[] = [];
+  const groupErrors: Record<string, string> = {};
+  const tagErrors: Record<string, string> = {};
   const seenGroups = new Set<string>();
+  let totalGroups = 0;
+  let totalTags = 0;
 
   if (tree.length === 0) {
-    issues.push({
+    validationIssues.push({
       key: "group-empty",
       message: "至少需要保留一个一级分组。",
     });
@@ -258,24 +220,34 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
     const groupName = String(group.name || "").trim();
     const groupLabel = groupName || `第 ${groupIndex + 1} 个一级分组`;
 
+    if (groupName) {
+      totalGroups += 1;
+    }
+
     if (!groupName) {
-      issues.push({
+      const message = `${groupLabel} 名称不能为空。`;
+      validationIssues.push({
         key: `group-name-${groupIndex}`,
-        message: `${groupLabel} 名称不能为空。`,
+        message,
         target: { groupIndex },
       });
+      groupErrors[String(groupIndex)] = message;
     } else if (groupName === "全部") {
-      issues.push({
+      const message = "一级分组名称不能使用“全部”。";
+      validationIssues.push({
         key: `group-all-${groupIndex}`,
-        message: "一级分组名称不能使用“全部”。",
+        message,
         target: { groupIndex },
       });
+      groupErrors[String(groupIndex)] = message;
     } else if (seenGroups.has(groupName)) {
-      issues.push({
+      const message = `一级分组“${groupName}”重复，请保留唯一名称。`;
+      validationIssues.push({
         key: `group-duplicate-${groupIndex}`,
-        message: `一级分组“${groupName}”重复，请保留唯一名称。`,
+        message,
         target: { groupIndex },
       });
+      groupErrors[String(groupIndex)] = message;
     } else {
       seenGroups.add(groupName);
     }
@@ -283,31 +255,40 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
     const seenTags = new Set<string>();
     (group.children || []).forEach((tag, tagIndex) => {
       const tagName = String(tag.name || "").trim();
+      if (tagName) {
+        totalTags += 1;
+      }
 
       if (!tagName) {
-        issues.push({
+        const message = `${groupLabel} 下第 ${tagIndex + 1} 个标签名称不能为空。`;
+        validationIssues.push({
           key: `tag-name-${groupIndex}-${tagIndex}`,
-          message: `${groupLabel} 下第 ${tagIndex + 1} 个标签名称不能为空。`,
+          message,
           target: { groupIndex, tagIndex },
         });
+        tagErrors[`${groupIndex}-${tagIndex}`] = message;
         return;
       }
 
       if (tagName === "全部") {
-        issues.push({
+        const message = `${groupLabel} 下的标签不能使用“全部”。`;
+        validationIssues.push({
           key: `tag-all-${groupIndex}-${tagIndex}`,
-          message: `${groupLabel} 下的标签不能使用“全部”。`,
+          message,
           target: { groupIndex, tagIndex },
         });
+        tagErrors[`${groupIndex}-${tagIndex}`] = message;
         return;
       }
 
       if (seenTags.has(tagName)) {
-        issues.push({
+        const message = `${groupLabel} 下标签“${tagName}”重复，请保留唯一名称。`;
+        validationIssues.push({
           key: `tag-duplicate-${groupIndex}-${tagIndex}`,
-          message: `${groupLabel} 下标签“${tagName}”重复，请保留唯一名称。`,
+          message,
           target: { groupIndex, tagIndex },
         });
+        tagErrors[`${groupIndex}-${tagIndex}`] = message;
         return;
       }
 
@@ -315,7 +296,16 @@ function buildValidationIssues(tree: EditableGroupNode[]): ValidationIssue[] {
     });
   });
 
-  return issues;
+  return {
+    validationIssues,
+    validationLookup: { groupErrors, tagErrors },
+    generalValidationMessage:
+      validationIssues.find((issue) => !issue.target)?.message || "",
+    summary: {
+      totalGroups,
+      totalTags,
+    },
+  };
 }
 
 export default function GroupManagement({
@@ -354,26 +344,13 @@ export default function GroupManagement({
     };
   }, [onDirtyChange]);
 
-  const validationIssues = useMemo(() => buildValidationIssues(draftTree), [draftTree]);
-  const validationLookup = useMemo(() => {
-    const groupErrors: Record<string, string> = {};
-    const tagErrors: Record<string, string> = {};
-    validationIssues.forEach((issue) => {
-      if (!issue.target) {
-        return;
-      }
-      if (typeof issue.target.tagIndex === "number") {
-        tagErrors[`${issue.target.groupIndex}-${issue.target.tagIndex}`] = issue.message;
-        return;
-      }
-      groupErrors[String(issue.target.groupIndex)] = issue.message;
-    });
-    return { groupErrors, tagErrors };
-  }, [validationIssues]);
-  const generalValidationMessage = useMemo(
-    () => validationIssues.find((issue) => !issue.target)?.message || "",
-    [validationIssues],
-  );
+  const draftTreeAnalysis = useMemo(() => analyzeDraftTree(draftTree), [draftTree]);
+  const {
+    validationIssues,
+    validationLookup,
+    generalValidationMessage,
+    summary,
+  } = draftTreeAnalysis;
 
   const usageStats = useMemo(() => {
     const groupCount = new Map<string, number>();
@@ -412,21 +389,6 @@ export default function GroupManagement({
       ungroupedNodes: Math.max(0, nodes.length - assignedNodes),
     };
   }, [nodes]);
-
-  const summary = useMemo(() => {
-    const nonEmptyGroups = draftTree.filter((group) => String(group.name || "").trim()).length;
-    const nonEmptyTags = draftTree.reduce((count, group) => {
-      return (
-        count +
-        (group.children || []).filter((tag) => String(tag.name || "").trim()).length
-      );
-    }, 0);
-
-    return {
-      totalGroups: nonEmptyGroups,
-      totalTags: nonEmptyTags,
-    };
-  }, [draftTree]);
 
   const statCards = [
     {

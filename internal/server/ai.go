@@ -239,7 +239,6 @@ func mergeAISettings(existing, fallback AISettings) AISettings {
 	existing.OpenAI = mergeAIProviderConfig(existing.OpenAI, fallback.OpenAI)
 	existing.Gemini = mergeAIProviderConfig(existing.Gemini, fallback.Gemini)
 	existing.Volcengine = mergeAIProviderConfig(existing.Volcengine, fallback.Volcengine)
-	existing.OpenAICompatible = mergeAIProviderConfig(existing.OpenAICompatible, fallback.OpenAICompatible)
 	if len(existing.OpenAICompatibles) == 0 {
 		existing.OpenAICompatibles = fallback.OpenAICompatibles
 	}
@@ -270,17 +269,11 @@ func normalizeAISettings(settings AISettings) AISettings {
 	settings.OpenAI = normalizeAIProviderConfig(settings.OpenAI)
 	settings.Gemini = normalizeAIProviderConfig(settings.Gemini)
 	settings.Volcengine = normalizeAIProviderConfig(settings.Volcengine)
-	settings.OpenAICompatible = normalizeAIProviderConfig(settings.OpenAICompatible)
-	settings.OpenAICompatibles = normalizeAICompatibles(settings.OpenAICompatibles)
-	if len(settings.OpenAICompatibles) == 0 && hasLegacyCompat(settings.OpenAICompatible) {
-		settings.OpenAICompatibles = normalizeAICompatibles([]AIProviderProfile{
-			{
-				ID:               "compat-legacy",
-				Name:             "OpenAI 兼容",
-				AIProviderConfig: settings.OpenAICompatible,
-			},
-		})
-	}
+	settings.OpenAICompatibles = normalizedAICompatibles(
+		settings.OpenAICompatibles,
+		settings.OpenAICompatible,
+	)
+	settings.OpenAICompatible = AIProviderConfig{}
 	return settings
 }
 
@@ -312,6 +305,23 @@ func normalizeAIProviderSelector(value string) string {
 		return fmt.Sprintf("%s:%s", aiProviderOpenAICompatible, id)
 	}
 	return normalizeAIProviderName(trimmed)
+}
+
+func normalizedAICompatibles(items []AIProviderProfile, legacy AIProviderConfig) []AIProviderProfile {
+	normalized := normalizeAICompatibles(items)
+	if len(normalized) > 0 {
+		return normalized
+	}
+	if !hasLegacyCompat(legacy) {
+		return normalized
+	}
+	return normalizeAICompatibles([]AIProviderProfile{
+		{
+			ID:               "compat-legacy",
+			Name:             "OpenAI 兼容",
+			AIProviderConfig: normalizeAIProviderConfig(legacy),
+		},
+	})
 }
 
 func normalizeAICompatibles(items []AIProviderProfile) []AIProviderProfile {
@@ -366,7 +376,6 @@ func validateAISettings(settings AISettings) error {
 		settings.OpenAI,
 		settings.Gemini,
 		settings.Volcengine,
-		settings.OpenAICompatible,
 	}
 	for _, cfg := range configs {
 		if err := validateAIBaseURL(cfg.BaseURL); err != nil {
@@ -471,13 +480,6 @@ func resolveAIProviderConfigBySelector(settings AISettings, selector string) (ai
 		if len(settings.OpenAICompatibles) > 0 {
 			return resolveAICompatibleSelection(settings.OpenAICompatibles[0])
 		}
-		if hasLegacyCompat(settings.OpenAICompatible) {
-			return resolveAICompatibleSelection(AIProviderProfile{
-				ID:               "compat-legacy",
-				Name:             "OpenAI 兼容",
-				AIProviderConfig: settings.OpenAICompatible,
-			})
-		}
 		return aiProviderSelection{}, errors.New("未配置 OpenAI 兼容服务商")
 	}
 	return resolveAIProviderConfig(settings, provider)
@@ -510,17 +512,8 @@ func resolveAICompatibleSelection(provider AIProviderProfile) (aiProviderSelecti
 		Config:   provider.AIProviderConfig,
 	}
 	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
-	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
+	if err := validateResolvedAISelection(selection); err != nil {
 		return aiProviderSelection{}, err
-	}
-	if selection.Config.APIKey == "" {
-		return aiProviderSelection{}, fmt.Errorf("%s API Key 未配置", selection.Label)
-	}
-	if selection.Config.BaseURL == "" {
-		return aiProviderSelection{}, errors.New("OpenAI 兼容服务商需填写 Base URL")
-	}
-	if selection.Config.Model == "" {
-		return aiProviderSelection{}, errors.New("OpenAI 兼容服务商需填写模型")
 	}
 	return selection, nil
 }
@@ -531,19 +524,8 @@ func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSe
 		return aiProviderSelection{}, err
 	}
 	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
-	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
+	if err := validateResolvedAISelection(selection); err != nil {
 		return aiProviderSelection{}, err
-	}
-	if selection.Config.APIKey == "" {
-		return aiProviderSelection{}, fmt.Errorf("%s API Key 未配置", selection.Label)
-	}
-	if selection.Provider == aiProviderOpenAICompatible {
-		if selection.Config.BaseURL == "" {
-			return aiProviderSelection{}, errors.New("OpenAI 兼容提供商需填写 Base URL")
-		}
-		if selection.Config.Model == "" {
-			return aiProviderSelection{}, errors.New("OpenAI 兼容提供商需填写模型")
-		}
 	}
 	return selection, nil
 }
@@ -565,21 +547,29 @@ func resolveAIProviderConfigWithOverride(settings AISettings, provider string, o
 		base.Model = override.Model
 	}
 	selection.Config = applyAIProviderDefaults(selection.Provider, base)
-	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
+	if err := validateResolvedAISelection(selection); err != nil {
 		return aiProviderSelection{}, err
 	}
-	if selection.Config.APIKey == "" {
-		return aiProviderSelection{}, fmt.Errorf("%s API Key 未配置", selection.Label)
-	}
-	if selection.Provider == aiProviderOpenAICompatible {
-		if selection.Config.BaseURL == "" {
-			return aiProviderSelection{}, errors.New("OpenAI 兼容提供商需填写 Base URL")
-		}
-		if selection.Config.Model == "" {
-			return aiProviderSelection{}, errors.New("OpenAI 兼容提供商需填写模型")
-		}
-	}
 	return selection, nil
+}
+
+func validateResolvedAISelection(selection aiProviderSelection) error {
+	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
+		return err
+	}
+	if selection.Config.APIKey == "" {
+		return fmt.Errorf("%s API Key 未配置", selection.Label)
+	}
+	if selection.Provider != aiProviderOpenAICompatible {
+		return nil
+	}
+	if selection.Config.BaseURL == "" {
+		return errors.New("OpenAI 兼容服务商需填写 Base URL")
+	}
+	if selection.Config.Model == "" {
+		return errors.New("OpenAI 兼容服务商需填写模型")
+	}
+	return nil
 }
 
 func (s *Store) AISettings() AISettings {
@@ -883,7 +873,7 @@ func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetwork
 	for _, test := range tests {
 		key := buildTestHistoryKey(test)
 		if key == "" {
-			key = fmt.Sprintf("%s|%s|%d|%s", strings.ToLower(strings.TrimSpace(test.Type)), strings.ToLower(strings.TrimSpace(test.Host)), test.Port, strings.ToLower(strings.TrimSpace(test.Name)))
+			continue
 		}
 		existing, ok := testsByKey[key]
 		if !ok || test.CheckedAt >= existing.CheckedAt {

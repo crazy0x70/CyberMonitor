@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
@@ -36,6 +37,7 @@ const (
 	dockerManagedMode              = "docker-managed"
 	dockerSelfMountInfoPath        = "/proc/self/mountinfo"
 	dockerSelfCgroupPath           = "/proc/self/cgroup"
+	dockerManagedProbeCacheTTL     = 2 * time.Second
 )
 
 var (
@@ -48,6 +50,12 @@ var (
 		regexp.MustCompile(`(?:^|[/:_-])containerd[-/]([a-f0-9]{64})(?:\.scope)?(?:$|[/:_.-])`),
 		regexp.MustCompile(`(?:^|[/:_-])containerd[-/]([a-f0-9]{12})(?:\.scope)?(?:$|[/:_.-])`),
 	}
+	dockerManagedProbeCache = struct {
+		mu    sync.Mutex
+		until time.Time
+		probe dockerManagedProbe
+		err   error
+	}{}
 )
 
 type DockerManagedUpdater struct {
@@ -128,6 +136,20 @@ func resolveCurrentContainerID() (string, error) {
 }
 
 func probeDockerManagedUpdate() (dockerManagedProbe, error) {
+	dockerManagedProbeCache.mu.Lock()
+	defer dockerManagedProbeCache.mu.Unlock()
+	now := time.Now()
+	if now.Before(dockerManagedProbeCache.until) {
+		return dockerManagedProbeCache.probe, dockerManagedProbeCache.err
+	}
+	probe, err := probeDockerManagedUpdateUncached()
+	dockerManagedProbeCache.probe = probe
+	dockerManagedProbeCache.err = err
+	dockerManagedProbeCache.until = now.Add(dockerManagedProbeCacheTTL)
+	return probe, err
+}
+
+func probeDockerManagedUpdateUncached() (dockerManagedProbe, error) {
 	if DetectDeployMode() != DeployModeDocker {
 		return dockerManagedProbe{}, fmt.Errorf("当前部署模式不是 Docker")
 	}
@@ -320,6 +342,9 @@ func waitForDockerHelperExit(
 			if !ok {
 				statusCh = nil
 				continue
+			}
+			if resp.StatusCode == 0 && resp.Error == nil {
+				return nil
 			}
 			return fmt.Errorf("Docker 更新 helper 提前退出%s", formatDockerHelperExitDetail(resp, helperID, logsFn))
 		case err, ok := <-errCh:

@@ -207,8 +207,10 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 	if insights.TotalCount > 0 {
 		insights.AvgDurationSec = totalSecs / float64(insights.TotalCount)
 	}
-	if recentSessions := recent.NewestFirst(); len(recentSessions) > 0 {
-		insights.RecentSessions = recentSessions
+	if recent != nil {
+		if recentSessions := recent.NewestFirst(); len(recentSessions) > 0 {
+			insights.RecentSessions = recentSessions
+		}
 	}
 	return insights, nil
 }
@@ -221,8 +223,11 @@ func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit fun
 	if nodeID == "" || to.Before(from) {
 		return nil
 	}
+	return s.scanSessionsMillis(nodeID, from.UnixMilli(), to.UnixMilli(), visit)
+}
 
-	querier, err := s.db.Querier(from.UnixMilli(), to.UnixMilli())
+func (s *OfflineStore) scanSessionsMillis(nodeID string, mint, maxt int64, visit func(OfflineSession) bool) error {
+	querier, err := s.db.Querier(mint, maxt)
 	if err != nil {
 		return err
 	}
@@ -238,8 +243,8 @@ func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit fun
 	}
 
 	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
-		Start: from.UnixMilli(),
-		End:   to.UnixMilli(),
+		Start: mint,
+		End:   maxt,
 	}, nameMatcher, nodeMatcher)
 
 	for seriesSet.Next() {
@@ -324,53 +329,20 @@ func (s *OfflineStore) HasEventForSession(nodeID string, startedAt time.Time) (b
 
 	targetStartedAt := normalizeOfflineSessionStartedAt(startedAt)
 	mint := targetStartedAt.UnixMilli()
-	querier, err := s.db.Querier(mint, math.MaxInt64)
-	if err != nil {
-		return false, err
-	}
-	defer querier.Close()
-
-	nameMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, offlineDurationMetric)
-	if err != nil {
-		return false, err
-	}
-	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
-	if err != nil {
-		return false, err
-	}
-
-	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
-		Start: mint,
-		End:   math.MaxInt64,
-	}, nameMatcher, nodeMatcher)
-	for seriesSet.Next() {
-		iterator := seriesSet.At().Iterator(nil)
-		for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
-			if valueType != chunkenc.ValFloat {
-				continue
-			}
-			tsMillis, value := iterator.At()
-			if math.IsNaN(value) || math.IsInf(value, 0) {
-				continue
-			}
-			duration := time.Duration(math.Round(value * float64(time.Second)))
-			if duration <= 0 {
-				continue
-			}
-			recoveredAt := time.UnixMilli(tsMillis).UTC()
-			derivedStartedAt := normalizeOfflineSessionStartedAt(recoveredAt.Add(-duration))
-			if derivedStartedAt.Equal(targetStartedAt) {
-				return true, nil
-			}
+	found := false
+	if err := s.scanSessionsMillis(nodeID, mint, math.MaxInt64, func(session OfflineSession) bool {
+		if session.DurationSec <= 0 {
+			return true
 		}
-		if err := iterator.Err(); err != nil {
-			return false, err
+		if normalizeOfflineSessionStartedAt(session.StartedAt).Equal(targetStartedAt) {
+			found = true
+			return false
 		}
-	}
-	if err := seriesSet.Err(); err != nil {
+		return true
+	}); err != nil {
 		return false, err
 	}
-	return false, nil
+	return found, nil
 }
 
 func normalizeOfflineSessionStartedAt(startedAt time.Time) time.Time {

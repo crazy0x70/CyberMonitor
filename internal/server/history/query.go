@@ -42,7 +42,7 @@ type seriesAccumulator struct {
 	availability map[int64]*float64
 }
 
-func buildNetworkTestKey(test metrics.NetworkTestResult) string {
+func BuildNetworkTestKey(test metrics.NetworkTestResult) string {
 	return buildNetworkSeriesKey(networkTestIdentity{
 		Type: strings.TrimSpace(test.Type),
 		Host: strings.TrimSpace(test.Host),
@@ -51,7 +51,7 @@ func buildNetworkTestKey(test metrics.NetworkTestResult) string {
 	})
 }
 
-func canonicalNetworkSeriesKey(identity networkTestIdentity) (string, bool) {
+func buildNetworkSeriesKey(identity networkTestIdentity) string {
 	kind := strings.ToLower(strings.TrimSpace(identity.Type))
 	if kind == "" {
 		kind = "icmp"
@@ -59,38 +59,22 @@ func canonicalNetworkSeriesKey(identity networkTestIdentity) (string, bool) {
 	host := strings.ToLower(strings.TrimSpace(identity.Host))
 	name := strings.ToLower(strings.TrimSpace(identity.Name))
 	if host == "" && name == "" {
-		return "", false
-	}
-	return fmt.Sprintf("%s|%s|%d|%s", kind, host, identity.Port, name), true
-}
-
-func buildNetworkSeriesKey(identity networkTestIdentity) string {
-	key, ok := canonicalNetworkSeriesKey(identity)
-	if !ok {
 		return ""
 	}
-	return key
-}
-
-func splitNetworkSeriesKey(key string) (kind, host, portRaw, name string, ok bool) {
-	kind, rest, found := strings.Cut(key, "|")
-	if !found {
-		return "", "", "", "", false
-	}
-	host, rest, found = strings.Cut(rest, "|")
-	if !found {
-		return "", "", "", "", false
-	}
-	portRaw, name, found = strings.Cut(rest, "|")
-	if !found || strings.Contains(name, "|") {
-		return "", "", "", "", false
-	}
-	return kind, host, portRaw, name, true
+	return fmt.Sprintf("%s|%s|%d|%s", kind, host, identity.Port, name)
 }
 
 func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
-	kind, host, portRaw, name, ok := splitNetworkSeriesKey(key)
-	if !ok {
+	kind, rest, found := strings.Cut(key, "|")
+	if !found {
+		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
+	}
+	host, rest, found := strings.Cut(rest, "|")
+	if !found {
+		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
+	}
+	portRaw, name, found := strings.Cut(rest, "|")
+	if !found || strings.Contains(name, "|") {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
 	}
 	port, err := strconv.Atoi(portRaw)
@@ -157,10 +141,6 @@ func availabilityForTest(test metrics.NetworkTestResult) float64 {
 	return 0
 }
 
-func buildHistoryEntry(acc *seriesAccumulator) *NetworkHistoryEntry {
-	return buildNetworkHistoryEntryWithCutoff(acc, 0)
-}
-
 func buildNetworkHistoryEntryWithCutoff(acc *seriesAccumulator, cutoffSeconds int64) *NetworkHistoryEntry {
 	if acc == nil {
 		return nil
@@ -182,7 +162,7 @@ func buildNetworkHistoryEntryWithCutoff(acc *seriesAccumulator, cutoffSeconds in
 		entry.Loss[index] = cloneFloatPointer(acc.loss[ts])
 		entry.Availability[index] = cloneFloatPointer(acc.availability[ts])
 	}
-	entry.MinIntervalSec, entry.AvgIntervalSec = intervalStats(times)
+	entry.MinIntervalSec, entry.AvgIntervalSec = HistoryIntervalStats(times)
 	return entry
 }
 
@@ -215,7 +195,7 @@ func collectNetworkHistoryTimes(acc *seriesAccumulator, cutoffSeconds int64) []i
 	return times
 }
 
-func intervalStats(times []int64) (int64, float64) {
+func HistoryIntervalStats(times []int64) (int64, float64) {
 	if len(times) < 2 {
 		return 0, 0
 	}

@@ -73,16 +73,17 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 	}
 
 	for nodeID, tests := range payload.Nodes {
+		existingTimesBySeries, err := loadExistingNodeHistoryTimestamps(store, nodeID, tests)
+		if err != nil {
+			return result, err
+		}
 		for key, entry := range tests {
 			identity, err := parseNetworkSeriesKey(key)
 			if err != nil {
 				return result, err
 			}
 			normalizeLegacyHistoryEntry(entry)
-			existingTimes, err := loadExistingHistoryTimestamps(store, nodeID, key, entry.Times)
-			if err != nil {
-				return result, err
-			}
+			existingTimes := existingTimesBySeries[key]
 
 			batch := make([]metrics.NetworkTestResult, 0, len(entry.Times))
 			for idx, checkedAt := range entry.Times {
@@ -110,9 +111,8 @@ func buildLegacyNetworkTestResult(
 	index int,
 	checkedAt int64,
 ) metrics.NetworkTestResult {
-	loss := legacyLossValue(entry, index)
-	latency := legacyLatencyValue(entry, index)
-	available := deriveLegacyAvailability(latency, loss)
+	latency, loss := legacyEntryValues(entry, index)
+	available := deriveLegacyAvailability(latency)
 	status := "offline"
 	if available {
 		status = "online"
@@ -129,35 +129,19 @@ func buildLegacyNetworkTestResult(
 	}
 }
 
-func deriveLegacyAvailability(latency *float64, loss float64) bool {
-	if latency != nil {
-		return true
-	}
-	if loss >= 100 {
-		return false
-	}
-	return false
+func deriveLegacyAvailability(latency *float64) bool {
+	return latency != nil
 }
 
-func loadExistingHistoryTimestamps(
+func loadExistingNodeHistoryTimestamps(
 	store networkHistoryStore,
 	nodeID string,
-	seriesKey string,
-	timestamps []int64,
-) (map[int64]struct{}, error) {
-	result := make(map[int64]struct{})
-	if len(timestamps) == 0 {
+	tests map[string]*legacyHistoryEntry,
+) (map[string]map[int64]struct{}, error) {
+	result := make(map[string]map[int64]struct{}, len(tests))
+	minTime, maxTime, ok := legacyNodeTimeBounds(tests)
+	if !ok {
 		return result, nil
-	}
-	minTime := timestamps[0]
-	maxTime := timestamps[0]
-	for _, ts := range timestamps[1:] {
-		if ts < minTime {
-			minTime = ts
-		}
-		if ts > maxTime {
-			maxTime = ts
-		}
 	}
 
 	seriesMap, err := store.QueryRange(
@@ -168,14 +152,40 @@ func loadExistingHistoryTimestamps(
 	if err != nil {
 		return nil, err
 	}
-	entry := seriesMap[seriesKey]
-	if entry == nil {
-		return result, nil
-	}
-	for _, ts := range entry.Times {
-		result[ts] = struct{}{}
+	for seriesKey, entry := range seriesMap {
+		if entry == nil || len(entry.Times) == 0 {
+			continue
+		}
+		timestamps := make(map[int64]struct{}, len(entry.Times))
+		for _, ts := range entry.Times {
+			timestamps[ts] = struct{}{}
+		}
+		result[seriesKey] = timestamps
 	}
 	return result, nil
+}
+
+func legacyNodeTimeBounds(tests map[string]*legacyHistoryEntry) (int64, int64, bool) {
+	var (
+		minTime int64
+		maxTime int64
+		found   bool
+	)
+	for _, entry := range tests {
+		if entry == nil || len(entry.Times) == 0 {
+			continue
+		}
+		for _, ts := range entry.Times {
+			if !found || ts < minTime {
+				minTime = ts
+			}
+			if !found || ts > maxTime {
+				maxTime = ts
+			}
+			found = true
+		}
+	}
+	return minTime, maxTime, found
 }
 
 func resolveLegacySourcePath(path string) (string, bool, error) {
@@ -262,13 +272,6 @@ func legacyMarkerPath(path string) string {
 	return path + ".migrated"
 }
 
-func legacyLatencyValue(entry *legacyHistoryEntry, idx int) *float64 {
-	if entry == nil || idx < 0 || idx >= len(entry.Latency) {
-		return nil
-	}
-	return cloneFloatPointer(entry.Latency[idx])
-}
-
 func normalizeLegacyHistoryEntry(entry *legacyHistoryEntry) {
 	if entry == nil {
 		return
@@ -277,34 +280,36 @@ func normalizeLegacyHistoryEntry(entry *legacyHistoryEntry) {
 		entry.Times = []int64{}
 	}
 	count := len(entry.Times)
-	if entry.Latency == nil {
-		entry.Latency = make([]*float64, 0, count)
-	}
-	if entry.Loss == nil {
-		entry.Loss = make([]*float64, 0, count)
-	}
-	if len(entry.Latency) > count {
-		entry.Latency = entry.Latency[len(entry.Latency)-count:]
-	}
-	if len(entry.Loss) > count {
-		entry.Loss = entry.Loss[len(entry.Loss)-count:]
-	}
-	for len(entry.Latency) < count {
-		entry.Latency = append(entry.Latency, nil)
-	}
-	for len(entry.Loss) < count {
-		entry.Loss = append(entry.Loss, nil)
-	}
+	entry.Latency = normalizeLegacySeriesValues(entry.Latency, count)
+	entry.Loss = normalizeLegacySeriesValues(entry.Loss, count)
 }
 
-func legacyLossValue(entry *legacyHistoryEntry, idx int) float64 {
-	if entry == nil || idx < 0 || idx >= len(entry.Loss) {
-		return 0
+func normalizeLegacySeriesValues(values []*float64, count int) []*float64 {
+	if values == nil {
+		values = make([]*float64, 0, count)
 	}
-	if entry.Loss[idx] == nil {
-		return 0
+	if len(values) > count {
+		values = values[len(values)-count:]
 	}
-	return *entry.Loss[idx]
+	for len(values) < count {
+		values = append(values, nil)
+	}
+	return values
+}
+
+func legacyEntryValues(entry *legacyHistoryEntry, idx int) (*float64, float64) {
+	if entry == nil || idx < 0 {
+		return nil, 0
+	}
+
+	var latency *float64
+	if idx < len(entry.Latency) {
+		latency = cloneFloatPointer(entry.Latency[idx])
+	}
+	if idx >= len(entry.Loss) || entry.Loss[idx] == nil {
+		return latency, 0
+	}
+	return latency, *entry.Loss[idx]
 }
 
 func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload, bool, error) {

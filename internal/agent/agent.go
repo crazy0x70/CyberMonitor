@@ -293,6 +293,7 @@ func runNetworkTestsWithCacheAt(
 	dueConfigs := make([]metrics.NetworkTestConfig, 0, len(configs))
 	dueKeys := make([]string, 0, len(configs))
 	validKeys := make(map[string]struct{}, len(configs))
+	queuedKeys := make(map[string]struct{}, len(configs))
 
 	for _, cfg := range configs {
 		key := testKey(cfg)
@@ -304,12 +305,13 @@ func runNetworkTestsWithCacheAt(
 		if cfg.IntervalSec > 0 {
 			interval = time.Duration(cfg.IntervalSec) * time.Second
 		}
-		if interval <= 0 {
-			interval = defaultInterval
+		if _, duplicated := queuedKeys[key]; duplicated {
+			continue
 		}
 		if cached, ok := cache[key]; !ok || currentTime.Sub(cached.lastRun) >= interval {
 			dueConfigs = append(dueConfigs, cfg)
 			dueKeys = append(dueKeys, key)
+			queuedKeys[key] = struct{}{}
 		}
 	}
 

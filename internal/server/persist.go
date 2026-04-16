@@ -530,12 +530,10 @@ func mergeSettings(existing, fallback Settings) Settings {
 	if existing.Groups == nil {
 		existing.Groups = fallback.Groups
 	}
-	if existing.GroupTree == nil || len(existing.GroupTree) == 0 {
+	if len(existing.GroupTree) == 0 {
 		existing.GroupTree = buildGroupTree(existing.Groups)
 	}
-	if existing.Groups == nil || len(existing.Groups) == 0 || len(existing.GroupTree) > 0 {
-		existing.Groups = flattenGroupTree(existing.GroupTree)
-	}
+	existing.Groups = flattenGroupTree(existing.GroupTree)
 	if existing.TestCatalog == nil {
 		existing.TestCatalog = fallback.TestCatalog
 	}
@@ -586,12 +584,12 @@ func randomToken(length int) string {
 	return string(bytes)
 }
 
-func normalizeGroups(groups []string) []string {
+func normalizeUniqueStrings(values []string, skip func(string) bool) []string {
 	seen := make(map[string]struct{})
-	normalized := make([]string, 0, len(groups))
-	for _, group := range groups {
-		value := strings.TrimSpace(group)
-		if value == "" || value == "全部" {
+	normalized := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" || (skip != nil && skip(value)) {
 			continue
 		}
 		if _, ok := seen[value]; ok {
@@ -601,40 +599,20 @@ func normalizeGroups(groups []string) []string {
 		normalized = append(normalized, value)
 	}
 	return normalized
+}
+
+func normalizeGroups(groups []string) []string {
+	return normalizeUniqueStrings(groups, func(value string) bool {
+		return value == "全部"
+	})
 }
 
 func normalizeAlertNodes(nodes []string) []string {
-	seen := make(map[string]struct{})
-	normalized := make([]string, 0, len(nodes))
-	for _, node := range nodes {
-		value := strings.TrimSpace(node)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		normalized = append(normalized, value)
-	}
-	return normalized
+	return normalizeUniqueStrings(nodes, nil)
 }
 
 func normalizeTagValues(tags []string) []string {
-	seen := make(map[string]struct{})
-	normalized := make([]string, 0, len(tags))
-	for _, tag := range tags {
-		value := strings.TrimSpace(tag)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		normalized = append(normalized, value)
-	}
-	return normalized
+	return normalizeUniqueStrings(tags, nil)
 }
 
 func parseGroupSelection(value string) (string, string) {

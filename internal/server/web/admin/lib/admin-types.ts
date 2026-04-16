@@ -16,6 +16,11 @@ export interface GroupNode {
   children?: GroupNode[];
 }
 
+export interface GroupSelection {
+  group: string;
+  tag: string;
+}
+
 export interface TestCatalogItem {
   id?: string;
   name: string;

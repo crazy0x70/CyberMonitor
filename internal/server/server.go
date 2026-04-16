@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1738,25 +1737,7 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 }
 
 func buildTestHistoryKey(test metrics.NetworkTestResult) string {
-	kind := strings.ToLower(strings.TrimSpace(test.Type))
-	if kind == "" {
-		kind = "icmp"
-	}
-	host := strings.ToLower(strings.TrimSpace(test.Host))
-	name := strings.ToLower(strings.TrimSpace(test.Name))
-	if host == "" && name == "" {
-		return ""
-	}
-	var builder strings.Builder
-	builder.Grow(len(kind) + len(host) + len(name) + 16)
-	builder.WriteString(kind)
-	builder.WriteByte('|')
-	builder.WriteString(host)
-	builder.WriteByte('|')
-	builder.WriteString(strconv.Itoa(test.Port))
-	builder.WriteByte('|')
-	builder.WriteString(name)
-	return builder.String()
+	return history.BuildNetworkTestKey(test)
 }
 
 func normalizeHistoryEntry(entry *TestHistoryEntry) {
@@ -2663,7 +2644,7 @@ func projectNetworkHistoryEntry(
 		latency = append(latency, entry.Latency[index])
 		loss = append(loss, entry.Loss[index])
 	}
-	minIntervalSec, avgIntervalSec := testHistoryIntervalStats(times)
+	minIntervalSec, avgIntervalSec := history.HistoryIntervalStats(times)
 	return &TestHistoryEntry{
 		Latency:        latency,
 		Loss:           loss,
@@ -2706,32 +2687,6 @@ func sampleHistoryIndices(total, maxPoints int) []int {
 		lastIndex = index
 	}
 	return indices
-}
-
-func testHistoryIntervalStats(times []int64) (int64, float64) {
-	if len(times) < 2 {
-		return 0, 0
-	}
-	var (
-		minValue int64
-		total    int64
-		count    int64
-	)
-	for index := 1; index < len(times); index++ {
-		interval := times[index] - times[index-1]
-		if interval <= 0 {
-			continue
-		}
-		if minValue == 0 || interval < minValue {
-			minValue = interval
-		}
-		total += interval
-		count++
-	}
-	if count == 0 {
-		return 0, 0
-	}
-	return minValue, float64(total) / float64(count)
 }
 
 func publicHistoryPointBudget(from, to time.Time) int {
@@ -2826,39 +2781,7 @@ func (s *Store) Snapshot() []NodeView {
 		if s.applyAutoRenewLocked(profile, now) {
 			persist = true
 		}
-		status := "online"
-		if now.Sub(node.LastSeen) > 5*time.Second {
-			status = "offline"
-		}
-		group, tags := resolveProfileGroupTags(profile, node.Stats)
-		groups := normalizeGroupSelections(profile.Groups)
-		updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
-		views = append(views, NodeView{
-			Stats:                    node.Stats,
-			LastSeen:                 node.LastSeen.Unix(),
-			FirstSeen:                node.FirstSeen.Unix(),
-			Status:                   status,
-			ServerID:                 profile.ServerID,
-			AlertEnabled:             isAlertEnabled(profile),
-			Alias:                    profile.Alias,
-			Group:                    group,
-			Tags:                     tags,
-			Groups:                   groups,
-			Region:                   profile.Region,
-			DiskType:                 profile.DiskType,
-			NetSpeedMbps:             profile.NetSpeedMbps,
-			ExpireAt:                 profile.ExpireAt,
-			AutoRenew:                profile.AutoRenew,
-			RenewIntervalSec:         profile.RenewIntervalSec,
-			TestIntervalSec:          profile.TestIntervalSec,
-			Tests:                    profile.Tests,
-			TestSelections:           profile.TestSelections,
-			AgentUpdateSupported:     updateSupported,
-			AgentUpdateMode:          updateMode,
-			AgentUpdateState:         updateState,
-			AgentUpdateTargetVersion: updateTargetVersion,
-			AgentUpdateMessage:       updateMessage,
-		})
+		views = append(views, buildNodeView(node, profile, now))
 	}
 	sort.Slice(views, func(i, j int) bool {
 		leftGroup := views[i].Group
@@ -2893,48 +2816,57 @@ func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 	}
 
 	profile := s.profiles[nodeID]
-	if profile == nil {
-		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
-	}
-
-	status := "online"
-	if time.Since(node.LastSeen) > 5*time.Second {
-		status = "offline"
-	}
-	group, tags := resolveProfileGroupTags(profile, node.Stats)
-	groups := normalizeGroupSelections(profile.Groups)
-	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
 	return NodeDelta{
 		Type:        "node_delta",
 		GeneratedAt: time.Now().Unix(),
-		Node: NodeView{
-			Stats:                    node.Stats,
-			LastSeen:                 node.LastSeen.Unix(),
-			FirstSeen:                node.FirstSeen.Unix(),
-			Status:                   status,
-			ServerID:                 profile.ServerID,
-			AlertEnabled:             isAlertEnabled(profile),
-			Alias:                    profile.Alias,
-			Group:                    group,
-			Tags:                     tags,
-			Groups:                   groups,
-			Region:                   profile.Region,
-			DiskType:                 profile.DiskType,
-			NetSpeedMbps:             profile.NetSpeedMbps,
-			ExpireAt:                 profile.ExpireAt,
-			AutoRenew:                profile.AutoRenew,
-			RenewIntervalSec:         profile.RenewIntervalSec,
-			TestIntervalSec:          profile.TestIntervalSec,
-			Tests:                    profile.Tests,
-			TestSelections:           profile.TestSelections,
-			AgentUpdateSupported:     updateSupported,
-			AgentUpdateMode:          updateMode,
-			AgentUpdateState:         updateState,
-			AgentUpdateTargetVersion: updateTargetVersion,
-			AgentUpdateMessage:       updateMessage,
-		},
+		Node:        buildNodeView(node, profile, time.Now()),
 	}, true
+}
+
+func buildNodeView(node NodeState, profile *NodeProfile, now time.Time) NodeView {
+	resolved := NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+	if profile != nil {
+		resolved = *profile
+		if resolved.TestIntervalSec <= 0 {
+			resolved.TestIntervalSec = defaultTestIntervalSec
+		}
+	}
+	group, tags := resolveProfileGroupTags(&resolved, node.Stats)
+	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(&resolved, node.Stats)
+	return NodeView{
+		Stats:                    node.Stats,
+		LastSeen:                 node.LastSeen.Unix(),
+		FirstSeen:                node.FirstSeen.Unix(),
+		Status:                   resolveNodeStatus(node.LastSeen, now),
+		ServerID:                 resolved.ServerID,
+		AlertEnabled:             isAlertEnabled(&resolved),
+		Alias:                    resolved.Alias,
+		Group:                    group,
+		Tags:                     tags,
+		Groups:                   normalizeGroupSelections(resolved.Groups),
+		Region:                   resolved.Region,
+		DiskType:                 resolved.DiskType,
+		NetSpeedMbps:             resolved.NetSpeedMbps,
+		ExpireAt:                 resolved.ExpireAt,
+		AutoRenew:                resolved.AutoRenew,
+		RenewIntervalSec:         resolved.RenewIntervalSec,
+		TestIntervalSec:          resolved.TestIntervalSec,
+		Tests:                    resolved.Tests,
+		TestSelections:           resolved.TestSelections,
+		AgentUpdateSupported:     updateSupported,
+		AgentUpdateMode:          updateMode,
+		AgentUpdateState:         updateState,
+		AgentUpdateTargetVersion: updateTargetVersion,
+		AgentUpdateMessage:       updateMessage,
+	}
+}
+
+func resolveNodeStatus(lastSeen time.Time, now time.Time) string {
+	if now.Sub(lastSeen) > 5*time.Second {
+		return "offline"
+	}
+	return "online"
 }
 
 func resolveProfileGroupTags(profile *NodeProfile, stats metrics.NodeStats) (string, []string) {
@@ -4099,20 +4031,27 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 			profile.AlertEnabled = boolPointer(true)
 		}
 		id := strings.TrimSpace(profile.ServerID)
-		if id == "" || containsKey(used, id) {
+		if id == "" {
 			id = randomToken(10)
-			for containsKey(used, id) {
+			for {
+				if _, exists := used[id]; !exists {
+					break
+				}
+				id = randomToken(10)
+			}
+			profile.ServerID = id
+		} else if _, exists := used[id]; exists {
+			id = randomToken(10)
+			for {
+				if _, duplicate := used[id]; !duplicate {
+					break
+				}
 				id = randomToken(10)
 			}
 			profile.ServerID = id
 		}
 		used[id] = struct{}{}
 	}
-}
-
-func containsKey(seen map[string]struct{}, key string) bool {
-	_, ok := seen[key]
-	return ok
 }
 
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfile {
@@ -4432,14 +4371,49 @@ func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {
 	return true
 }
 
+func testCatalogByID(items []TestCatalogItem) map[string]TestCatalogItem {
+	catalog := make(map[string]TestCatalogItem, len(items))
+	for _, item := range items {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		catalog[id] = item
+	}
+	return catalog
+}
+
+func normalizeSelectionInterval(item TestCatalogItem, interval int) int {
+	if interval < 0 {
+		interval = 0
+	}
+	if strings.EqualFold(item.Type, "icmp") {
+		return 0
+	}
+	return interval
+}
+
+func resolveSelectionInterval(item TestCatalogItem, requested, fallback int) int {
+	if strings.EqualFold(item.Type, "icmp") {
+		return 0
+	}
+	if requested > 0 {
+		return requested
+	}
+	if item.IntervalSec > 0 {
+		return item.IntervalSec
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return defaultTestIntervalSec
+}
+
 func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
 	if len(profile.TestSelections) == 0 {
 		return profile.Tests
 	}
-	catalog := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
-	for _, item := range s.settings.TestCatalog {
-		catalog[item.ID] = item
-	}
+	catalog := testCatalogByID(s.settings.TestCatalog)
 	results := make([]metrics.NetworkTestConfig, 0, len(profile.TestSelections))
 	for _, sel := range profile.TestSelections {
 		if sel.TestID == "" {
@@ -4449,24 +4423,12 @@ func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestCo
 		if !ok {
 			continue
 		}
-		interval := 0
-		if strings.ToLower(item.Type) == "tcp" {
-			if sel.IntervalSec > 0 {
-				interval = sel.IntervalSec
-			} else if item.IntervalSec > 0 {
-				interval = item.IntervalSec
-			} else if profile.TestIntervalSec > 0 {
-				interval = profile.TestIntervalSec
-			} else {
-				interval = defaultTestIntervalSec
-			}
-		}
 		results = append(results, metrics.NetworkTestConfig{
 			Name:        item.Name,
 			Type:        item.Type,
 			Host:        item.Host,
 			Port:        item.Port,
-			IntervalSec: interval,
+			IntervalSec: resolveSelectionInterval(item, sel.IntervalSec, profile.TestIntervalSec),
 		})
 	}
 	return results
@@ -4476,13 +4438,7 @@ func (s *Store) normalizeSelectionsLocked(selections []TestSelection) []TestSele
 	if len(selections) == 0 {
 		return nil
 	}
-	valid := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
-	for _, item := range s.settings.TestCatalog {
-		if item.ID == "" {
-			continue
-		}
-		valid[item.ID] = item
-	}
+	valid := testCatalogByID(s.settings.TestCatalog)
 	seen := make(map[string]struct{})
 	result := make([]TestSelection, 0, len(selections))
 	for _, sel := range selections {
@@ -4498,16 +4454,9 @@ func (s *Store) normalizeSelectionsLocked(selections []TestSelection) []TestSele
 			continue
 		}
 		seen[id] = struct{}{}
-		interval := sel.IntervalSec
-		if interval < 0 {
-			interval = 0
-		}
-		if strings.ToLower(item.Type) == "icmp" {
-			interval = 0
-		}
 		result = append(result, TestSelection{
 			TestID:      id,
-			IntervalSec: interval,
+			IntervalSec: normalizeSelectionInterval(item, sel.IntervalSec),
 		})
 	}
 	return result

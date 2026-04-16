@@ -115,10 +115,36 @@ write_conf() {
   cat > "${CONF_DIR}/agent.conf" <<EOF
 CM_SERVER_URL=${1}
 CM_NODE_ID=${2}
-CM_AGENT_TOKEN=${3}
-CM_NET_IFACE=${4}
-CM_DISABLE_UPDATE=${5}
+CM_AGENT_TOKEN_FILE=${INSTALL_DIR}/.cybermonitor-agent-token
+CM_NET_IFACE=${3}
+CM_DISABLE_UPDATE=${4}
 EOF
+}
+
+write_service_file() {
+  local service_file="$1"
+  local bin="$2"
+  cat > "${service_file}" <<EOF
+[Unit]
+Description=CyberMonitor Agent
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=${CONF_DIR}/agent.conf
+ExecStart=${bin}
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+enable_service() {
+  local service="$1"
+  systemctl daemon-reload
+  systemctl enable --now "${service}"
 }
 
 install_agent() {
@@ -141,29 +167,12 @@ install_agent() {
   local bin
   bin="$(download_binary "${version}" "${arch}")"
   write_agent_token_file "${node_token}"
-  write_conf "${server_url}" "${node_id}" "${node_token}" "${net_iface}" "${disable_update}"
+  write_conf "${server_url}" "${node_id}" "${net_iface}" "${disable_update}"
 
   local service="cyber-monitor-agent"
   local service_file="/etc/systemd/system/${service}.service"
-
-  cat > "${service_file}" <<EOF
-[Unit]
-Description=CyberMonitor Agent
-After=network.target
-
-[Service]
-Type=simple
-EnvironmentFile=${CONF_DIR}/agent.conf
-ExecStart=${bin}
-Restart=on-failure
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
+  write_service_file "${service_file}" "${bin}"
+  enable_service "${service}"
   echo "已安装并启动 ${service}"
   echo "Node ID: ${node_id}"
 }

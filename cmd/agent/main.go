@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -55,8 +56,10 @@ func main() {
 	hostRoot := flag.String("host-root", cmdutil.EnvOrDefault("CM_HOST_ROOT", "/host"), "宿主机挂载根目录")
 	flag.Parse()
 
+	agentVersion := resolvedVersion()
+	agentCommit := resolvedCommit()
 	if *showVersion {
-		printVersion()
+		printVersion(agentVersion, agentCommit)
 		return
 	}
 
@@ -73,11 +76,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化节点 ID 失败: %v", err)
 	}
-	*nodeID = resolvedNodeID
-
-	hostname := cmdutil.DefaultHostname()
-	if *nodeName == "" {
-		*nodeName = hostname
+	resolvedNodeName := strings.TrimSpace(*nodeName)
+	if resolvedNodeName == "" {
+		resolvedNodeName = cmdutil.DefaultHostname()
 	}
 	resolvedTokenFile, err := agent.ResolveAgentTokenFilePath(*agentTokenFile)
 	if err != nil {
@@ -90,12 +91,12 @@ func main() {
 	cfg := agent.Config{
 		ServerURL:     *serverURL,
 		Interval:      *interval,
-		NodeID:        *nodeID,
-		NodeName:      *nodeName,
+		NodeID:        resolvedNodeID,
+		NodeName:      resolvedNodeName,
 		NodeAlias:     *nodeAlias,
 		NodeGroup:     *nodeGroup,
 		AgentToken:    *agentToken,
-		AgentVersion:  resolvedVersion(),
+		AgentVersion:  agentVersion,
 		HostRoot:      *hostRoot,
 		NetTests:      agent.ParseNetTests(*netTestsRaw),
 		TestInterval:  *testInterval,
@@ -114,6 +115,6 @@ func main() {
 	}
 }
 
-func printVersion() {
-	fmt.Printf("CyberMonitor Agent %s (commit %s, build %s)\n", resolvedVersion(), resolvedCommit(), BuildTime)
+func printVersion(version, commit string) {
+	fmt.Printf("CyberMonitor Agent %s (commit %s, build %s)\n", version, commit, BuildTime)
 }
