@@ -169,12 +169,7 @@ func ResetAdminPassword(dataDir string) (ResetResult, error) {
 	}
 	if !loaded {
 		payload.Settings = initSettings(Config{JWTSecret: ""})
-		if payload.Profiles == nil {
-			payload.Profiles = make(map[string]*NodeProfile)
-		}
-		if payload.Nodes == nil {
-			payload.Nodes = make(map[string]NodeState)
-		}
+		payload = applyPersistedDataDefaults(payload)
 	}
 	newPass := randomToken(adminTokenLength)
 	newHash, err := hashPassword(newPass)
@@ -255,31 +250,11 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if err := strictUnmarshalJSON(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	if payload.Profiles == nil {
-		payload.Profiles = make(map[string]*NodeProfile)
-	}
-	if payload.Nodes == nil {
-		payload.Nodes = make(map[string]NodeState)
-	}
-	if payload.OfflineSessions == nil {
-		payload.OfflineSessions = make(map[string]OfflineSessionState)
-	}
-	return payload, true, nil
+	return applyPersistedDataDefaults(payload), true, nil
 }
 
 func savePersistedData(path string, payload PersistedData) error {
-	if err := ensureDataDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeJSONFileAtomic(path, payload)
 }
 
 func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
@@ -345,6 +320,23 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 }
 
 func saveTestHistoryData(path string, payload TestHistoryData) error {
+	return writeJSONFileAtomic(path, payload)
+}
+
+func applyPersistedDataDefaults(payload PersistedData) PersistedData {
+	if payload.Profiles == nil {
+		payload.Profiles = make(map[string]*NodeProfile)
+	}
+	if payload.Nodes == nil {
+		payload.Nodes = make(map[string]NodeState)
+	}
+	if payload.OfflineSessions == nil {
+		payload.OfflineSessions = make(map[string]OfflineSessionState)
+	}
+	return payload
+}
+
+func writeJSONFileAtomic(path string, payload any) error {
 	if err := ensureDataDir(filepath.Dir(path)); err != nil {
 		return err
 	}

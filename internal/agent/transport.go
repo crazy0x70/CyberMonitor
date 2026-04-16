@@ -198,7 +198,7 @@ func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token s
 }
 
 func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
-	if t.grpc != nil && t.shouldProbeGRPCForStats() {
+	if t.grpc != nil && t.canUseGRPC() {
 		refreshConfig, err := t.grpc.ReportStats(ctx, stats, token)
 		if err == nil {
 			t.noteMode("grpc")
@@ -244,12 +244,6 @@ func (t *controlPlaneTransport) Close() error {
 }
 
 func (t *controlPlaneTransport) canUseGRPC() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return time.Now().After(t.grpcBackoffUntil)
-}
-
-func (t *controlPlaneTransport) shouldProbeGRPCForStats() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return time.Now().After(t.grpcBackoffUntil)

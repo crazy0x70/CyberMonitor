@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -31,6 +32,20 @@ const (
 	dockerDefaultSocketPath        = "/var/run/docker.sock"
 	dockerHelperMountTarget        = "/var/run/docker.sock"
 	dockerManagedMode              = "docker-managed"
+	dockerSelfMountInfoPath        = "/proc/self/mountinfo"
+	dockerSelfCgroupPath           = "/proc/self/cgroup"
+)
+
+var (
+	mountInfoContainerIDPattern = regexp.MustCompile(`/containers/([a-f0-9]{64})/(?:hostname|hosts|resolv\.conf)\b`)
+	cgroupContainerIDPatterns   = []*regexp.Regexp{
+		regexp.MustCompile(`(?:^|[/:_-])docker[-/]([a-f0-9]{64})(?:\.scope)?(?:$|[/:_.-])`),
+		regexp.MustCompile(`(?:^|[/:_-])docker[-/]([a-f0-9]{12})(?:\.scope)?(?:$|[/:_.-])`),
+		regexp.MustCompile(`(?:^|[/:_-])cri-containerd[-/]([a-f0-9]{64})(?:\.scope)?(?:$|[/:_.-])`),
+		regexp.MustCompile(`(?:^|[/:_-])cri-containerd[-/]([a-f0-9]{12})(?:\.scope)?(?:$|[/:_.-])`),
+		regexp.MustCompile(`(?:^|[/:_-])containerd[-/]([a-f0-9]{64})(?:\.scope)?(?:$|[/:_.-])`),
+		regexp.MustCompile(`(?:^|[/:_-])containerd[-/]([a-f0-9]{12})(?:\.scope)?(?:$|[/:_.-])`),
+	}
 )
 
 type DockerManagedUpdater struct {
@@ -42,6 +57,11 @@ type DockerManagedUpdater struct {
 	helperImage      string
 	helperEntrypoint []string
 	cli              *client.Client
+}
+
+type dockerManagedProbe struct {
+	socketPath  string
+	containerID string
 }
 
 func (u *DockerManagedUpdater) CurrentImage() string {
@@ -65,25 +85,8 @@ func DetectUpdateMode() string {
 }
 
 func CanDockerManagedUpdate() bool {
-	if DetectDeployMode() != DeployModeDocker {
-		return false
-	}
-	socketPath := resolveDockerSocketPath()
-	if socketPath == "" {
-		return false
-	}
-	if _, err := os.Stat(socketPath); err != nil {
-		return false
-	}
-	if _, err := resolveCurrentContainerID(); err != nil {
-		return false
-	}
-	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	_, err := probeDockerManagedUpdate()
+	return err == nil
 }
 
 func CanCurrentDeployUpdate() bool {
@@ -119,32 +122,98 @@ func resolveDockerSocketPath() string {
 }
 
 func resolveCurrentContainerID() (string, error) {
-	if value := strings.TrimSpace(os.Getenv(containerIDEnvKey)); value != "" {
+	return resolveCurrentContainerIDWithSources(os.Getenv, os.ReadFile)
+}
+
+func probeDockerManagedUpdate() (dockerManagedProbe, error) {
+	if DetectDeployMode() != DeployModeDocker {
+		return dockerManagedProbe{}, fmt.Errorf("当前部署模式不是 Docker")
+	}
+	socketPath := resolveDockerSocketPath()
+	if socketPath == "" {
+		return dockerManagedProbe{}, fmt.Errorf("未配置 docker socket")
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		return dockerManagedProbe{}, err
+	}
+	containerID, err := resolveCurrentContainerID()
+	if err != nil {
+		return dockerManagedProbe{}, err
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	if err != nil {
+		return dockerManagedProbe{}, err
+	}
+	_ = conn.Close()
+	return dockerManagedProbe{
+		socketPath:  socketPath,
+		containerID: containerID,
+	}, nil
+}
+
+func resolveCurrentContainerIDWithSources(
+	getenv func(string) string,
+	readFile func(string) ([]byte, error),
+) (string, error) {
+	if getenv == nil {
+		getenv = func(string) string { return "" }
+	}
+	if value := strings.TrimSpace(getenv(containerIDEnvKey)); value != "" {
 		return value, nil
 	}
-	if value := strings.TrimSpace(os.Getenv("HOSTNAME")); value != "" {
-		return value, nil
+	if readFile != nil {
+		if raw, err := readFile(dockerSelfMountInfoPath); err == nil {
+			if value := parseContainerIDFromMountInfo(raw); value != "" {
+				return value, nil
+			}
+		}
+		if raw, err := readFile(dockerSelfCgroupPath); err == nil {
+			if value := parseContainerIDFromCgroup(raw); value != "" {
+				return value, nil
+			}
+		}
 	}
 	return "", fmt.Errorf("无法解析当前容器 ID")
 }
 
-func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
-	if DetectDeployMode() != DeployModeDocker {
-		return nil, fmt.Errorf("当前部署模式不是 Docker")
+func parseContainerIDFromMountInfo(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
 	}
-	if !CanDockerManagedUpdate() {
+	matches := mountInfoContainerIDPattern.FindSubmatch(raw)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(string(matches[1]))
+}
+
+func parseContainerIDFromCgroup(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return ""
+	}
+	for _, pattern := range cgroupContainerIDPatterns {
+		matches := pattern.FindStringSubmatch(text)
+		if len(matches) >= 2 {
+			return strings.TrimSpace(matches[1])
+		}
+	}
+	return ""
+}
+
+func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
+	probe, err := probeDockerManagedUpdate()
+	if err != nil {
 		return nil, fmt.Errorf("Docker 一键更新需要挂载可访问的 docker.sock")
 	}
-	containerID, err := resolveCurrentContainerID()
+	cli, err := newDockerClient(probe.socketPath)
 	if err != nil {
 		return nil, err
 	}
-	socketPath := resolveDockerSocketPath()
-	cli, err := newDockerClient(socketPath)
-	if err != nil {
-		return nil, err
-	}
-	inspect, err := cli.ContainerInspect(context.Background(), containerID)
+	inspect, err := cli.ContainerInspect(context.Background(), probe.containerID)
 	if err != nil {
 		return nil, fmt.Errorf("读取当前容器信息失败: %w", err)
 	}
@@ -154,16 +223,16 @@ func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
 	if inspect.HostConfig == nil {
 		return nil, fmt.Errorf("当前容器缺少 HostConfig 信息")
 	}
-	socketSource := resolveDockerSocketSource(inspect.Mounts, dockerHelperMountTarget)
+	socketSource := resolveDockerSocketSource(inspect.Mounts, probe.socketPath)
 	if socketSource == "" {
-		return nil, fmt.Errorf("当前容器未挂载 docker.sock")
+		return nil, fmt.Errorf("当前容器未挂载 docker socket: %s", probe.socketPath)
 	}
 	helperEntrypoint := append([]string{}, inspect.Config.Entrypoint...)
 	if len(helperEntrypoint) == 0 {
 		helperEntrypoint = []string{"/app/cyber-monitor"}
 	}
 	return &DockerManagedUpdater{
-		socketPath:       socketPath,
+		socketPath:       probe.socketPath,
 		socketSource:     socketSource,
 		containerID:      inspect.ID,
 		containerName:    strings.TrimPrefix(inspect.Name, "/"),
@@ -380,9 +449,6 @@ func resolveDockerSocketSource(mounts []container.MountPoint, target string) str
 		if strings.TrimSpace(item.Destination) == target {
 			return strings.TrimSpace(item.Source)
 		}
-	}
-	if target == dockerHelperMountTarget {
-		return dockerDefaultSocketPath
 	}
 	return ""
 }

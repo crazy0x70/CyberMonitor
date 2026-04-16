@@ -20,6 +20,23 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
   minute: "2-digit",
   second: "2-digit",
 });
+const regionDisplayNames =
+  typeof Intl !== "undefined" && Intl.DisplayNames
+    ? new Intl.DisplayNames(["en"], { type: "region" })
+    : null;
+const fallbackRegionNames = {
+  CA: "Canada",
+  CN: "China",
+  DE: "Germany",
+  FR: "France",
+  HK: "Hong Kong",
+  JP: "Japan",
+  NL: "Netherlands",
+  SG: "Singapore",
+  TW: "Taiwan",
+  UK: "United Kingdom",
+  US: "United States",
+};
 
 const CONFIG_PATH = "/config.json";
 const DEFAULT_GROUP = "全部";
@@ -3150,6 +3167,8 @@ function setupLatencyHover(fields, meta, labels) {
   const hide = () => {
     tooltip.classList.remove("visible");
     crosshair.classList.remove("visible");
+    tooltip.__latencyTooltipSignature = "";
+    tooltip.__latencyTooltipSize = null;
   };
 
   const handleLeave = () => hide();
@@ -3221,21 +3240,33 @@ function setupLatencyHover(fields, meta, labels) {
       return;
     }
 
-    tooltip.innerHTML = `
-      <div class="latency-tooltip-time">${formatTimeFull(time)}</div>
-      ${rows}
-    `;
+    const tooltipSignature = `${activeIndex}|${time}|${rows}`;
+    let tooltipSize = tooltip.__latencyTooltipSize;
+    if (tooltip.__latencyTooltipSignature !== tooltipSignature) {
+      tooltip.innerHTML = `
+        <div class="latency-tooltip-time">${formatTimeFull(time)}</div>
+        ${rows}
+      `;
+      tooltip.__latencyTooltipSignature = tooltipSignature;
+      const tooltipRect = tooltip.getBoundingClientRect();
+      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
+      tooltip.__latencyTooltipSize = tooltipSize;
+    }
     tooltip.classList.add("visible");
+    if (!tooltipSize) {
+      const tooltipRect = tooltip.getBoundingClientRect();
+      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
+      tooltip.__latencyTooltipSize = tooltipSize;
+    }
 
     const containerRect = hostRect;
-    const tooltipRect = tooltip.getBoundingClientRect();
     let left = event.clientX - containerRect.left + 12;
     let top = event.clientY - containerRect.top + 12;
-    if (left + tooltipRect.width > containerRect.width) {
-      left = containerRect.width - tooltipRect.width - 12;
+    if (left + tooltipSize.width > containerRect.width) {
+      left = containerRect.width - tooltipSize.width - 12;
     }
-    if (top + tooltipRect.height > containerRect.height) {
-      top = containerRect.height - tooltipRect.height - 12;
+    if (top + tooltipSize.height > containerRect.height) {
+      top = containerRect.height - tooltipSize.height - 12;
     }
     tooltip.style.left = `${Math.max(left, 8)}px`;
     tooltip.style.top = `${Math.max(top, 8)}px`;
@@ -3638,25 +3669,9 @@ function flagEmoji(code) {
 function formatRegion(code) {
   const normalized = (code || "").trim().toUpperCase();
   if (!normalized) return "--";
-  const regionNames = typeof Intl !== "undefined" && Intl.DisplayNames
-    ? new Intl.DisplayNames(["en"], { type: "region" })
-    : null;
-  const fallbackRegionNames = {
-    CA: "Canada",
-    CN: "China",
-    DE: "Germany",
-    FR: "France",
-    HK: "Hong Kong",
-    JP: "Japan",
-    NL: "Netherlands",
-    SG: "Singapore",
-    TW: "Taiwan",
-    UK: "United Kingdom",
-    US: "United States",
-  };
   const resolved =
-    (regionNames && typeof regionNames.of === "function"
-      ? regionNames.of(normalized)
+    (regionDisplayNames && typeof regionDisplayNames.of === "function"
+      ? regionDisplayNames.of(normalized)
       : "") ||
     fallbackRegionNames[normalized] ||
     normalized;

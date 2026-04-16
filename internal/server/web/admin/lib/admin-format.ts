@@ -73,6 +73,15 @@ export function resolveNodeName(node: NodeView) {
   return node.alias || node.stats.node_alias || node.stats.node_name || node.stats.node_id;
 }
 
+export function resolveNodeIdentitySummary(node: NodeView) {
+  const parts = [
+    resolveNodeId(node),
+    String(node.stats.public_ipv4 || "").trim(),
+    String(node.stats.public_ipv6 || "").trim(),
+  ].filter(Boolean);
+  return parts.join(" / ");
+}
+
 export function flattenGroupTree(tree: GroupNode[]) {
   return (tree || [])
     .map((group) => ({

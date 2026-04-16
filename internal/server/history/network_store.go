@@ -30,6 +30,19 @@ type NetworkStore struct {
 	latestLoaded     bool
 }
 
+type preparedNetworkSample struct {
+	identity       networkTestIdentity
+	seriesKey      string
+	typeLabel      string
+	hostLabel      string
+	portLabel      string
+	nameLabel      string
+	timestampMillis int64
+	latency        *float64
+	loss           *float64
+	availability   float64
+}
+
 func OpenNetworkStore(dir string) (*NetworkStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, errors.New("network history dir required")
@@ -82,41 +95,35 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	}()
 
 	for _, test := range tests {
-		identity := networkTestIdentity{
-			Type: strings.TrimSpace(test.Type),
-			Host: strings.TrimSpace(test.Host),
-			Port: test.Port,
-			Name: strings.TrimSpace(test.Name),
-		}
-		if buildNetworkSeriesKey(identity) == "" {
+		sample, ok := prepareNetworkSample(test, now)
+		if !ok {
 			continue
 		}
 
-		tsMillis := resolveTimestampMillis(test.CheckedAt, now)
-		if latency := cloneFloatPointer(test.LatencyMs); latency != nil {
-			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, identity, networkLatencyMetric, tsMillis, *latency)
+		if sample.latency != nil {
+			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkLatencyMetric, *sample.latency)
 			if err != nil {
 				return err
 			}
 			if appended {
-				appendedSeries[networkSeriesTimestampKey(networkLatencyMetric, nodeID, identity)] = tsMillis
+				appendedSeries[networkSeriesTimestampKey(networkLatencyMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
 			}
 		}
-		if loss := normalizeFloatValue(test.PacketLoss); loss != nil {
-			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, identity, networkLossMetric, tsMillis, *loss)
+		if sample.loss != nil {
+			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkLossMetric, *sample.loss)
 			if err != nil {
 				return err
 			}
 			if appended {
-				appendedSeries[networkSeriesTimestampKey(networkLossMetric, nodeID, identity)] = tsMillis
+				appendedSeries[networkSeriesTimestampKey(networkLossMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
 			}
 		}
-		appended, err := s.appendMetricSampleIfFresh(appender, nodeID, identity, networkAvailabilityMetric, tsMillis, availabilityForTest(test))
+		appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkAvailabilityMetric, sample.availability)
 		if err != nil {
 			return err
 		}
 		if appended {
-			appendedSeries[networkSeriesTimestampKey(networkAvailabilityMetric, nodeID, identity)] = tsMillis
+			appendedSeries[networkSeriesTimestampKey(networkAvailabilityMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
 		}
 	}
 
@@ -171,10 +178,8 @@ func (s *NetworkStore) queryRange(
 	if includeAvailability {
 		metricsToCollect = append(metricsToCollect, networkAvailabilityMetric)
 	}
-	for _, metricName := range metricsToCollect {
-		if err := collectMetricSeries(context.Background(), querier, nodeID, metricName, mint, maxt, accumulators); err != nil {
-			return nil, err
-		}
+	if err := collectMetricSeriesBatch(context.Background(), querier, nodeID, metricsToCollect, mint, maxt, accumulators); err != nil {
+		return nil, err
 	}
 
 	result := make(map[string]*NetworkHistoryEntry, len(accumulators))
@@ -292,49 +297,47 @@ func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {
 func appendMetricSample(
 	appender storage.Appender,
 	nodeID string,
-	identity networkTestIdentity,
+	sample preparedNetworkSample,
 	metricName string,
-	timestampMillis int64,
 	value float64,
 ) error {
 	_, err := appender.Append(0, labels.FromStrings(
 		labels.MetricName, metricName,
 		"node_id", nodeID,
-		"type", normalizeIdentityValue(identity.Type, "icmp"),
-		"host", strings.ToLower(strings.TrimSpace(identity.Host)),
-		"port", strconv.Itoa(identity.Port),
-		"name", strings.ToLower(strings.TrimSpace(identity.Name)),
-	), timestampMillis, value)
+		"type", sample.typeLabel,
+		"host", sample.hostLabel,
+		"port", sample.portLabel,
+		"name", sample.nameLabel,
+	), sample.timestampMillis, value)
 	return err
 }
 
 func (s *NetworkStore) appendMetricSampleIfFresh(
 	appender storage.Appender,
 	nodeID string,
-	identity networkTestIdentity,
+	sample preparedNetworkSample,
 	metricName string,
-	timestampMillis int64,
 	value float64,
 ) (bool, error) {
-	latestMillis, known, err := s.latestTimestampMillis(metricName, nodeID, identity)
+	latestMillis, known, err := s.latestTimestampMillis(metricName, nodeID, sample.seriesKey)
 	if err != nil {
 		return false, err
 	}
-	if known && timestampMillis <= latestMillis {
+	if known && sample.timestampMillis <= latestMillis {
 		return false, nil
 	}
-	if err := appendMetricSample(appender, nodeID, identity, metricName, timestampMillis, value); err != nil {
+	if err := appendMetricSample(appender, nodeID, sample, metricName, value); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *NetworkStore) latestTimestampMillis(metricName, nodeID string, identity networkTestIdentity) (int64, bool, error) {
+func (s *NetworkStore) latestTimestampMillis(metricName, nodeID, seriesKey string) (int64, bool, error) {
 	if err := s.ensureLatestSeriesTimeLoaded(); err != nil {
 		return 0, false, err
 	}
 
-	key := networkSeriesTimestampKey(metricName, nodeID, identity)
+	key := networkSeriesTimestampKey(metricName, nodeID, seriesKey)
 	if latestMillis, ok := s.latestSeriesTime[key]; ok {
 		return latestMillis, true, nil
 	}
@@ -386,7 +389,7 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 			Port: parsePortLabel(series.Labels().Get("port")),
 			Name: strings.TrimSpace(series.Labels().Get("name")),
 		}
-		key := networkSeriesTimestampKey(metricName, series.Labels().Get("node_id"), identity)
+		key := networkSeriesTimestampKey(metricName, series.Labels().Get("node_id"), buildNetworkSeriesKey(identity))
 		if key == "" {
 			continue
 		}
@@ -419,20 +422,56 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 	return latestSeriesTime, nil
 }
 
-func networkSeriesTimestampKey(metricName, nodeID string, identity networkTestIdentity) string {
-	return metricName + "|" + strings.TrimSpace(nodeID) + "|" + buildNetworkSeriesKey(identity)
+func networkSeriesTimestampKey(metricName, nodeID, seriesKey string) string {
+	seriesKey = strings.TrimSpace(seriesKey)
+	if seriesKey == "" {
+		return ""
+	}
+	return metricName + "|" + strings.TrimSpace(nodeID) + "|" + seriesKey
 }
 
-func collectMetricSeries(
+func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (preparedNetworkSample, bool) {
+	sample := preparedNetworkSample{
+		identity: networkTestIdentity{
+			Type: strings.TrimSpace(test.Type),
+			Host: strings.TrimSpace(test.Host),
+			Port: test.Port,
+			Name: strings.TrimSpace(test.Name),
+		},
+		timestampMillis: resolveTimestampMillis(test.CheckedAt, now),
+		latency:         cloneFloatPointer(test.LatencyMs),
+		loss:            normalizeFloatValue(test.PacketLoss),
+		availability:    availabilityForTest(test),
+	}
+	sample.seriesKey = buildNetworkSeriesKey(sample.identity)
+	if sample.seriesKey == "" {
+		return preparedNetworkSample{}, false
+	}
+	sample.typeLabel = normalizeIdentityValue(sample.identity.Type, "icmp")
+	sample.hostLabel = strings.ToLower(strings.TrimSpace(sample.identity.Host))
+	sample.portLabel = strconv.Itoa(sample.identity.Port)
+	sample.nameLabel = strings.ToLower(strings.TrimSpace(sample.identity.Name))
+	return sample, true
+}
+
+func collectMetricSeriesBatch(
 	ctx context.Context,
 	querier storage.Querier,
 	nodeID string,
-	metricName string,
+	metricNames []string,
 	mint int64,
 	maxt int64,
 	accumulators map[string]*seriesAccumulator,
 ) error {
-	nameMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metricName)
+	if len(metricNames) == 0 {
+		return nil
+	}
+
+	nameMatcher, err := labels.NewMatcher(
+		labels.MatchRegexp,
+		labels.MetricName,
+		"^(?:"+strings.Join(metricNames, "|")+")$",
+	)
 	if err != nil {
 		return err
 	}
@@ -447,6 +486,7 @@ func collectMetricSeries(
 	}, nameMatcher, nodeMatcher)
 	for seriesSet.Next() {
 		series := seriesSet.At()
+		metricName := strings.TrimSpace(series.Labels().Get(labels.MetricName))
 		identity := networkTestIdentity{
 			Type: normalizeIdentityValue(series.Labels().Get("type"), "icmp"),
 			Host: strings.TrimSpace(series.Labels().Get("host")),

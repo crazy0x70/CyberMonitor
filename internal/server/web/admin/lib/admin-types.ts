@@ -149,6 +149,8 @@ export interface NodeStats {
   node_alias?: string;
   node_group?: string;
   hostname: string;
+  public_ipv4?: string;
+  public_ipv6?: string;
   os: string;
   arch: string;
   agent_version?: string;

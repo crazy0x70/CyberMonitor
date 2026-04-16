@@ -2,6 +2,12 @@ package metrics
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,6 +89,8 @@ type NodeStats struct {
 	NodeAlias           string              `json:"node_alias,omitempty"`
 	NodeGroup           string              `json:"node_group,omitempty"`
 	Hostname            string              `json:"hostname"`
+	PublicIPv4          string              `json:"public_ipv4,omitempty"`
+	PublicIPv6          string              `json:"public_ipv6,omitempty"`
 	OS                  string              `json:"os"`
 	Arch                string              `json:"arch"`
 	DeployMode          string              `json:"deploy_mode,omitempty"`
@@ -105,6 +113,40 @@ type NodeStats struct {
 	NetworkTests        []NetworkTestResult `json:"network_tests,omitempty"`
 }
 
+type publicIPFamily string
+
+const (
+	defaultPublicIPRefreshInterval = 10 * time.Minute
+	defaultPublicIPRetryInterval   = time.Minute
+	defaultPublicIPLookupTimeout   = 2 * time.Second
+
+	publicIPv4Family publicIPFamily = "ipv4"
+	publicIPv6Family publicIPFamily = "ipv6"
+)
+
+var defaultPublicIPv4Endpoints = []string{
+	"https://api-ipv4.ip.sb/ip",
+	"https://api64.ipify.org",
+	"https://api.ipify.org",
+	"https://icanhazip.com",
+	"https://ipinfo.io",
+}
+
+var defaultPublicIPv6Endpoints = []string{
+	"https://api-ipv6.ip.sb/ip",
+	"https://api64.ipify.org",
+	"https://icanhazip.com",
+	"https://6.ipinfo.io",
+}
+
+type publicIPLookupFunc func(context.Context, publicIPFamily) (string, error)
+
+type publicIPInfo struct {
+	IPv4      string
+	IPv6      string
+	checkedAt time.Time
+}
+
 type Collector struct {
 	nodeID     string
 	nodeName   string
@@ -116,6 +158,10 @@ type Collector struct {
 	prevTCP    int
 	prevUDP    int
 	prevConnAt time.Time
+
+	publicIPs               publicIPInfo
+	publicIPRefreshInterval time.Duration
+	publicIPLookup          publicIPLookupFunc
 }
 
 func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collector {
@@ -132,6 +178,8 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		nodeName:  nodeName,
 		hostRoot:  hostRoot,
 		netIfaces: filter,
+		publicIPRefreshInterval: defaultPublicIPRefreshInterval,
+		publicIPLookup:          newPublicIPLookup(defaultPublicIPLookupTimeout),
 	}
 }
 
@@ -204,10 +252,13 @@ func (c *Collector) Collect() (NodeStats, error) {
 	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
 
 	netSpeedMbps := collectNetSpeedMbps(netFilter)
+	publicIPs := c.collectPublicIPsAt(now)
 	stats := NodeStats{
 		NodeID:       c.nodeID,
 		NodeName:     c.nodeName,
 		Hostname:     hostname,
+		PublicIPv4:   publicIPs.IPv4,
+		PublicIPv6:   publicIPs.IPv6,
 		OS:           osLabel,
 		Arch:         arch,
 		UptimeSec:    uptime,
@@ -282,6 +333,39 @@ func (c *Collector) sampleConnectionCountsAt(
 	return c.prevTCP, c.prevUDP
 }
 
+func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
+	refreshInterval := c.publicIPRefreshInterval
+	if refreshInterval <= 0 {
+		refreshInterval = defaultPublicIPRefreshInterval
+	}
+	retryInterval := refreshInterval
+	if c.publicIPs.IPv4 == "" && c.publicIPs.IPv6 == "" && retryInterval > defaultPublicIPRetryInterval {
+		retryInterval = defaultPublicIPRetryInterval
+	}
+	if !c.publicIPs.checkedAt.IsZero() && now.Sub(c.publicIPs.checkedAt) < retryInterval {
+		return c.publicIPs
+	}
+	if c.publicIPLookup == nil {
+		c.publicIPs.checkedAt = now
+		return c.publicIPs
+	}
+
+	next := c.publicIPs
+	next.checkedAt = now
+	if value, err := c.publicIPLookup(context.Background(), publicIPv4Family); err == nil {
+		if normalized := normalizePublicIPAddress(publicIPv4Family, value); normalized != "" {
+			next.IPv4 = normalized
+		}
+	}
+	if value, err := c.publicIPLookup(context.Background(), publicIPv6Family); err == nil {
+		if normalized := normalizePublicIPAddress(publicIPv6Family, value); normalized != "" {
+			next.IPv6 = normalized
+		}
+	}
+	c.publicIPs = next
+	return c.publicIPs
+}
+
 func readConnectionCounts() (int, int) {
 	tcpConns := 0
 	udpConns := 0
@@ -292,6 +376,127 @@ func readConnectionCounts() (int, int) {
 		udpConns = len(conns)
 	}
 	return tcpConns, udpConns
+}
+
+func newPublicIPLookup(timeout time.Duration) publicIPLookupFunc {
+	if timeout <= 0 {
+		timeout = defaultPublicIPLookupTimeout
+	}
+	return func(ctx context.Context, family publicIPFamily) (string, error) {
+		return lookupPublicIPAddress(ctx, family, timeout, defaultPublicIPEndpointsForFamily(family))
+	}
+}
+
+func defaultPublicIPEndpointsForFamily(family publicIPFamily) []string {
+	switch family {
+	case publicIPv6Family:
+		return append([]string(nil), defaultPublicIPv6Endpoints...)
+	default:
+		return append([]string(nil), defaultPublicIPv4Endpoints...)
+	}
+}
+
+func lookupPublicIPAddress(
+	ctx context.Context,
+	family publicIPFamily,
+	timeout time.Duration,
+	endpoints []string,
+) (string, error) {
+	if len(endpoints) == 0 {
+		return "", nil
+	}
+	if timeout <= 0 {
+		timeout = defaultPublicIPLookupTimeout
+	}
+	network := "tcp4"
+	if family == publicIPv6Family {
+		network = "tcp6"
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(callCtx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(callCtx, network, addr)
+		},
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		DisableKeepAlives:     true,
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+
+	for _, endpoint := range endpoints {
+		reqCtx, cancel := context.WithTimeout(baseCtx, timeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			cancel()
+			continue
+		}
+		req.Header.Set("User-Agent", "CyberMonitor-Agent")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+		resp.Body.Close()
+		cancel()
+		if err != nil || resp.StatusCode >= http.StatusMultipleChoices {
+			continue
+		}
+		if normalized := extractPublicIPAddress(family, string(body)); normalized != "" {
+			return normalized, nil
+		}
+	}
+	return "", nil
+}
+
+func extractPublicIPAddress(family publicIPFamily, raw string) string {
+	if normalized := normalizePublicIPAddress(family, raw); normalized != "" {
+		return normalized
+	}
+
+	var payload struct {
+		IP string `json:"ip"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	return normalizePublicIPAddress(family, payload.IP)
+}
+
+func normalizePublicIPAddress(family publicIPFamily, raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return ""
+	}
+	switch family {
+	case publicIPv4Family:
+		if !addr.Is4() {
+			return ""
+		}
+	case publicIPv6Family:
+		if !addr.Is6() || addr.Is4In6() {
+			return ""
+		}
+	default:
+		return ""
+	}
+	return addr.String()
 }
 
 func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {

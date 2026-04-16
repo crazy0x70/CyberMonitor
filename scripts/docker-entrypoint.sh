@@ -27,11 +27,7 @@ prepare_data_dir() {
   fi
 
   mkdir -p "${DATA_DIR}"
-  if ! chmod u+rwx "${DATA_DIR}"; then
-    echo "Failed to make data directory writable: ${DATA_DIR}" >&2
-    exit 1
-  fi
-  if ! chown -R "${RUNTIME_USER}:${RUNTIME_USER}" "${DATA_DIR}"; then
+  if ! chown "${RUNTIME_USER}:${RUNTIME_USER}" "${DATA_DIR}"; then
     echo "Failed to prepare data directory permissions for ${DATA_DIR}" >&2
     exit 1
   fi

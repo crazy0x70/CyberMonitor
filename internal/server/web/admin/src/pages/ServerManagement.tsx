@@ -72,6 +72,7 @@ import {
   formatDateTime,
   formatMbps,
   formatRelativeTime,
+  resolveNodeIdentitySummary,
   parseSelectionValue,
   resolveNodeId,
   resolveNodeName,
@@ -151,6 +152,13 @@ type SelectionDraft = Record<string, string>;
 type GroupCatalogItem = {
   group: string;
   tags: string[];
+};
+
+type NodeListEntry = {
+  node: NodeView;
+  nodeId: string;
+  nodeName: string;
+  searchText: string;
 };
 
 type FormState = {
@@ -559,6 +567,30 @@ export default function ServerManagement({
     return { total, online, alertDisabled };
   }, [nodes]);
 
+  const nodeListEntries = useMemo<NodeListEntry[]>(
+    () =>
+      nodes.map((node) => {
+        const nodeId = resolveNodeId(node);
+        const nodeName = resolveNodeName(node);
+        return {
+          node,
+          nodeId,
+          nodeName,
+          searchText: [
+            nodeName,
+            nodeId,
+            node.stats.hostname,
+            node.region,
+            ...(node.groups || []),
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase(),
+        };
+      }),
+    [nodes],
+  );
+
   const metricCards = [
     {
       label: "节点总数",
@@ -582,29 +614,17 @@ export default function ServerManagement({
 
   const filteredNodes = useMemo(() => {
     const keyword = search.trim().toLowerCase();
-    const list = [...nodes].sort((a, b) => {
-      if (a.status !== b.status) {
-        return a.status === "online" ? -1 : 1;
+    const list = [...nodeListEntries].sort((a, b) => {
+      if (a.node.status !== b.node.status) {
+        return a.node.status === "online" ? -1 : 1;
       }
-      return resolveNodeName(a).localeCompare(resolveNodeName(b), "zh-CN");
+      return a.nodeName.localeCompare(b.nodeName, "zh-CN");
     });
     if (!keyword) {
-      return list;
+      return list.map((entry) => entry.node);
     }
-    return list.filter((node) => {
-      const haystack = [
-        resolveNodeName(node),
-        resolveNodeId(node),
-        node.stats.hostname,
-        node.region,
-        ...(node.groups || []),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(keyword);
-    });
-  }, [nodes, search]);
+    return list.filter((entry) => entry.searchText.includes(keyword)).map((entry) => entry.node);
+  }, [nodeListEntries, search]);
 
   const agentEndpoint = settings?.agent_endpoint?.trim() || "";
   const agentToken = settings?.agent_token?.trim() || "";
@@ -1126,7 +1146,9 @@ export default function ServerManagement({
                 节点配置编辑
               </DialogTitle>
               <DialogDescription className="text-sm text-slate-500 dark:text-slate-400">
-                {editingNode ? `${resolveNodeName(editingNode)} ／ ${resolveNodeId(editingNode)}` : "选择节点后编辑"}
+                {editingNode
+                  ? `${resolveNodeName(editingNode)} ／ ${resolveNodeIdentitySummary(editingNode)}`
+                  : "选择节点后编辑"}
               </DialogDescription>
             </div>
           </DialogHeader>

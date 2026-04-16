@@ -36,6 +36,8 @@ func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.
 }
 
 func (r *agentRunner) bootstrapToken(ctx context.Context) {
+	bootstrapToken := strings.TrimSpace(r.cfg.AgentToken)
+
 	if r.cfg.TokenFile != "" {
 		if persisted, err := loadPersistedAgentToken(r.cfg.TokenFile); err == nil && persisted != "" {
 			r.agentToken = persisted
@@ -44,11 +46,11 @@ func (r *agentRunner) bootstrapToken(ctx context.Context) {
 		}
 	}
 
-	if r.cfg.AgentToken == "" || r.agentToken != strings.TrimSpace(r.cfg.AgentToken) {
+	if bootstrapToken == "" || r.agentToken != bootstrapToken {
 		return
 	}
 
-	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, r.cfg.AgentToken)
+	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, bootstrapToken)
 	if err == nil && issuedToken != "" {
 		r.agentToken = issuedToken
 		if r.cfg.TokenFile != "" {
