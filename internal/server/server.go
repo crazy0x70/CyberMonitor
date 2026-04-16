@@ -38,20 +38,20 @@ import (
 )
 
 const (
-	maxLogSize                = 10 * 1024 * 1024
-	maxLogBackupCount         = 3
-	maxTestHistoryPoints      = 5000
-	testHistoryHotSeconds     = 60 * 60
-	testHistoryMaxAgeSeconds  = 60 * 60 * 24 * 365
-	maxJSONBodySize           = 4 * 1024 * 1024
-	wsSendQueueSize           = 8
-	wsWriteWait               = 10 * time.Second
-	wsPongWait                = 60 * time.Second
-	wsPingPeriod              = (wsPongWait * 9) / 10
-	agentUpdateLeaseUpdating  = 10 * time.Minute
-	agentUpdateLeaseRestart   = 5 * time.Minute
-	publicVariantBalanced     = "balanced"
-	adminSessionCookieName    = "cm_admin_session"
+	maxLogSize               = 10 * 1024 * 1024
+	maxLogBackupCount        = 3
+	maxTestHistoryPoints     = 5000
+	testHistoryHotSeconds    = 60 * 60
+	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
+	maxJSONBodySize          = 4 * 1024 * 1024
+	wsSendQueueSize          = 8
+	wsWriteWait              = 10 * time.Second
+	wsPongWait               = 60 * time.Second
+	wsPingPeriod             = (wsPongWait * 9) / 10
+	agentUpdateLeaseUpdating = 10 * time.Minute
+	agentUpdateLeaseRestart  = 5 * time.Minute
+	publicVariantBalanced    = "balanced"
+	adminSessionCookieName   = "cm_admin_session"
 )
 
 type sizeLimitedWriter struct {
@@ -720,11 +720,15 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		if err := agentAPI.ingest(r.RemoteAddr, payload, r.Header.Get("X-AGENT-TOKEN")); err != nil {
+		refreshConfig, err := agentAPI.ingest(r.RemoteAddr, payload, r.Header.Get("X-AGENT-TOKEN"))
+		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":         "ok",
+			"refresh_config": refreshConfig,
+		})
 	})
 
 	adminMux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
@@ -945,7 +949,6 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := systemUpdater.client.ApplyAsset(ctx, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
 					return err
 				}
-				time.Sleep(700 * time.Millisecond)
 				return updater.RestartSelf()
 			})
 			if err != nil {
@@ -1562,6 +1565,7 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 	var recoveryCandidate offlineRecoveryCandidate
 	var hasRecoveryCandidate bool
 	var updateReconciled bool
+	networkTestsChanged := stats.NetworkTestsChanged
 	s.mu.Lock()
 
 	now := time.Now()
@@ -1573,7 +1577,10 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 	storedStats := stats
 	if !shouldReplaceNodeStats(prev.Stats, stats) {
 		storedStats = prev.Stats
+	} else if !networkTestsChanged {
+		storedStats.NetworkTests = prev.Stats.NetworkTests
 	}
+	storedStats.NetworkTestsChanged = false
 	s.nodes[stats.NodeID] = NodeState{
 		Stats:     storedStats,
 		LastSeen:  now,
@@ -1634,7 +1641,9 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 		persist = true
 	}
 
-	s.updateTestHistoryLocked(stats, now)
+	if networkTestsChanged {
+		s.updateTestHistoryLocked(stats, now)
+	}
 	if s.shouldPersistLocked(now) {
 		persist = true
 	}
@@ -1649,7 +1658,7 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 	if hasRecoveryCandidate {
 		s.completeOfflineRecovery(recoveryCandidate)
 	}
-	if s.historyManager != nil {
+	if s.historyManager != nil && networkTestsChanged && len(stats.NetworkTests) > 0 {
 		if err := s.historyManager.AppendNetworkBatch(stats.NodeID, stats.NetworkTests, now); err != nil {
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
@@ -4295,6 +4304,12 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	s.mu.Unlock()
 	s.persist(data)
 	return *profile
+}
+
+func (s *Store) HasPendingAgentUpdate(nodeID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return shouldDispatchAgentUpdate(s.profiles[strings.TrimSpace(nodeID)], time.Now())
 }
 
 func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) NodeProfile {

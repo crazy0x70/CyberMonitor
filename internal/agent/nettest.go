@@ -98,40 +98,50 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 		wg.Add(1)
 		go func(index int, config metrics.NetworkTestConfig) {
 			defer wg.Done()
-			result := metrics.NetworkTestResult{
-				Name:      config.Name,
-				Type:      config.Type,
-				Host:      config.Host,
-				Port:      config.Port,
-				Status:    "error",
-				CheckedAt: time.Now().Unix(),
-			}
-
-			switch config.Type {
-			case "tcp":
-				latency, status, errText := testTCP(config.Host, config.Port)
-				result.LatencyMs = latency
-				result.Status = status
-				if status == "ok" {
-					result.PacketLoss = 0
-				} else {
-					result.PacketLoss = 100
-				}
-				result.Error = errText
-			default:
-				latency, loss, status, errText := pingHost(ctx, config.Host)
-				result.LatencyMs = latency
-				result.PacketLoss = loss
-				result.Status = status
-				result.Error = errText
-			}
-
-			results[index] = result
+			results[index] = runSingleNetworkTest(ctx, config, time.Now, testTCP, pingHost)
 		}(i, cfg)
 	}
 
 	wg.Wait()
 	return results
+}
+
+func runSingleNetworkTest(
+	ctx context.Context,
+	config metrics.NetworkTestConfig,
+	now func() time.Time,
+	tcpProbe func(string, int) (*float64, string, string),
+	icmpProbe func(context.Context, string) (*float64, float64, string, string),
+) metrics.NetworkTestResult {
+	result := metrics.NetworkTestResult{
+		Name:   config.Name,
+		Type:   config.Type,
+		Host:   config.Host,
+		Port:   config.Port,
+		Status: "error",
+	}
+
+	switch config.Type {
+	case "tcp":
+		latency, status, errText := tcpProbe(config.Host, config.Port)
+		result.LatencyMs = latency
+		result.Status = status
+		if status == "ok" {
+			result.PacketLoss = 0
+		} else {
+			result.PacketLoss = 100
+		}
+		result.Error = errText
+	default:
+		latency, loss, status, errText := icmpProbe(ctx, config.Host)
+		result.LatencyMs = latency
+		result.PacketLoss = loss
+		result.Status = status
+		result.Error = errText
+	}
+
+	result.CheckedAt = now().Unix()
+	return result
 }
 
 func testTCP(host string, port int) (*float64, string, string) {

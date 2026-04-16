@@ -6,6 +6,21 @@ RUNTIME_USER="${CM_RUNTIME_USER:-cm}"
 DOCKER_SOCKET_PATH="${CM_DOCKER_SOCKET:-/var/run/docker.sock}"
 DATA_DIR="${CM_DATA_DIR:-}"
 
+apply_timezone() {
+  if [ -z "${TZ:-}" ]; then
+    return
+  fi
+
+  zoneinfo="/usr/share/zoneinfo/${TZ}"
+  if [ ! -f "${zoneinfo}" ]; then
+    echo "Invalid TZ value: ${TZ}" >&2
+    return
+  fi
+
+  ln -snf "${zoneinfo}" /etc/localtime
+  printf '%s\n' "${TZ}" > /etc/timezone
+}
+
 prepare_data_dir() {
   if [ -z "${DATA_DIR}" ]; then
     return
@@ -27,6 +42,7 @@ if [ "${1:-}" = "docker-recreate-helper" ]; then
 fi
 
 if [ "$(id -u)" -eq 0 ]; then
+  apply_timezone
   prepare_data_dir
 
   if [ -S "${DOCKER_SOCKET_PATH}" ]; then

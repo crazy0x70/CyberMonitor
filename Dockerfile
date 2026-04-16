@@ -75,7 +75,7 @@ RUN set -eux; \
 FROM alpine:3.23 AS runtime-base
 WORKDIR /app
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN apk add --no-cache su-exec && \
+RUN apk add --no-cache su-exec tzdata && \
     addgroup -S cm && \
     adduser -S -G cm cm && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \

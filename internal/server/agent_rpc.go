@@ -48,7 +48,7 @@ func newAgentAPI(store *Store, hub *Hub, cfg *Config) *agentAPI {
 	return &agentAPI{store: store, hub: hub, cfg: cfg}
 }
 
-func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) *agentAPIError {
+func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) (bool, *agentAPIError) {
 	if payload.NodeID == "" {
 		if payload.NodeName != "" {
 			payload.NodeID = payload.NodeName
@@ -57,13 +57,13 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 		}
 	}
 	if payload.NodeID == "" {
-		return &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+		return false, &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
 	}
 	if payload.NodeName == "" {
 		payload.NodeName = payload.NodeID
 	}
 	if !a.store.validateOrProvisionAgentAuthToken(payload.NodeID, token, a.cfg.AgentToken) {
-		return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+		return false, &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
 	}
 	updateReconciled := a.store.Update(payload)
 	if delta, ok := a.store.PublicNodeDelta(payload.NodeID); ok && a.hub != nil {
@@ -80,7 +80,7 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if strings.TrimSpace(remoteAddr) == "" {
 		remoteAddr = "grpc"
 	}
-	return nil
+	return a.store.HasPendingAgentUpdate(payload.NodeID), nil
 }
 
 func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
@@ -188,10 +188,11 @@ func (s *agentRPCServer) ReportStats(ctx context.Context, req *agentrpc.ReportSt
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request required")
 	}
-	if apiErr := s.api.ingest(remoteAddrFromContext(ctx), req.Stats, req.AgentToken); apiErr != nil {
+	refreshConfig, apiErr := s.api.ingest(remoteAddrFromContext(ctx), req.Stats, req.AgentToken)
+	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
-	return &agentrpc.ReportStatsResponse{Status: "ok"}, nil
+	return &agentrpc.ReportStatsResponse{Status: "ok", RefreshConfig: refreshConfig}, nil
 }
 
 func (s *agentRPCServer) ReportUpdate(ctx context.Context, req *agentrpc.ReportUpdateRequest) (*agentrpc.ReportUpdateResponse, error) {

@@ -35,10 +35,33 @@ type nodeRegisterResponse struct {
 
 var newRandomNodeUUID = uuid.NewRandom
 
-func ResolveStateFilePath(explicit, fallbackName string) (string, error) {
+func ResolveAgentTokenFilePath(explicit string) (string, error) {
 	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
 		return trimmed, nil
 	}
+	homePath, err := defaultAgentTokenHomePath()
+	if err != nil {
+		return "", err
+	}
+	if err := migrateLegacyStateFile(homePath, defaultAgentTokenFileName); err != nil {
+		return "", err
+	}
+	return homePath, nil
+}
+
+func defaultStateHomePath(fileName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", fmt.Errorf("resolve home dir: empty home dir")
+	}
+	return filepath.Join(home, fileName), nil
+}
+
+func defaultLegacyStateFilePath(fileName string) (string, error) {
 	exePath, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -47,7 +70,36 @@ func ResolveStateFilePath(explicit, fallbackName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(resolved), fallbackName), nil
+	return filepath.Join(filepath.Dir(resolved), fileName), nil
+}
+
+func migrateLegacyStateFile(targetPath, fileName string) error {
+	if strings.TrimSpace(targetPath) == "" {
+		return fmt.Errorf("target path required")
+	}
+	if _, err := os.Stat(targetPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	legacyPath, err := defaultLegacyStateFilePath(fileName)
+	if err != nil {
+		return nil
+	}
+	if legacyPath == targetPath {
+		return nil
+	}
+
+	value, err := readTrimmedFile(legacyPath)
+	switch {
+	case err == nil:
+		return writeTrimmedFile(targetPath, value)
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	default:
+		return err
+	}
 }
 
 func ResolveNodeID(opts NodeIDOptions) (string, error) {
@@ -135,7 +187,7 @@ func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
 		}
 	}
 
-	legacyPath := resolveLegacyNodeIDPath(opts.LegacyPath)
+	legacyPath := strings.TrimSpace(opts.LegacyPath)
 	if legacyPath != "" {
 		value, err := readTrimmedFile(legacyPath)
 		switch {
@@ -173,27 +225,11 @@ func resolveNodeIDCreatePath(opts NodeIDOptions) (string, error) {
 }
 
 func defaultNodeIDHomePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	home = strings.TrimSpace(home)
-	if home == "" {
-		return "", fmt.Errorf("resolve home dir: empty home dir")
-	}
-	return filepath.Join(home, defaultNodeIDFileName), nil
+	return defaultStateHomePath(defaultNodeIDFileName)
 }
 
-func resolveLegacyNodeIDPath(legacyPath string) string {
-	legacyPath = strings.TrimSpace(legacyPath)
-	if legacyPath != "" {
-		return legacyPath
-	}
-	defaultPath, err := ResolveStateFilePath("", defaultNodeIDFileName)
-	if err != nil {
-		return ""
-	}
-	return defaultPath
+func defaultAgentTokenHomePath() (string, error) {
+	return defaultStateHomePath(defaultAgentTokenFileName)
 }
 
 func resolveStableDockerNodeID(hostRoot string) (string, error) {
@@ -210,21 +246,38 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 		return "", os.ErrNotExist
 	}
 
-	candidates := []string{
-		filepath.Join(root, "etc", "machine-id"),
-		filepath.Join(root, "var", "lib", "dbus", "machine-id"),
-		filepath.Join(root, "etc", "hostname"),
+	type fingerprintSource struct {
+		label string
+		path  string
 	}
-	for _, candidate := range candidates {
-		value, err := readTrimmedFile(candidate)
-		switch {
-		case err == nil:
-			return value, nil
-		default:
+
+	sources := []fingerprintSource{
+		{label: "machine-id", path: filepath.Join(root, "etc", "machine-id")},
+		{label: "dbus-machine-id", path: filepath.Join(root, "var", "lib", "dbus", "machine-id")},
+		{label: "product-uuid", path: filepath.Join(root, "sys", "class", "dmi", "id", "product_uuid")},
+		{label: "product-serial", path: filepath.Join(root, "sys", "class", "dmi", "id", "product_serial")},
+		{label: "board-serial", path: filepath.Join(root, "sys", "class", "dmi", "id", "board_serial")},
+		{label: "hostname", path: filepath.Join(root, "etc", "hostname")},
+	}
+
+	parts := make([]string, 0, len(sources))
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		value, err := readTrimmedFile(source.path)
+		if err != nil {
 			continue
 		}
+		part := source.label + "=" + value
+		if _, exists := seen[part]; exists {
+			continue
+		}
+		seen[part] = struct{}{}
+		parts = append(parts, part)
 	}
-	return "", os.ErrNotExist
+	if len(parts) == 0 {
+		return "", os.ErrNotExist
+	}
+	return strings.Join(parts, "\n"), nil
 }
 
 func deriveStableNodeIDFromFingerprint(fingerprint string) string {

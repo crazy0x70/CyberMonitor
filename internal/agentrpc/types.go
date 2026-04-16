@@ -39,7 +39,8 @@ type ReportStatsRequest struct {
 }
 
 type ReportStatsResponse struct {
-	Status string
+	Status        string
+	RefreshConfig bool
 }
 
 type ReportUpdateRequest struct {

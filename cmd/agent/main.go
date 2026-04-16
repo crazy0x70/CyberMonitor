@@ -79,7 +79,7 @@ func main() {
 	if *nodeName == "" {
 		*nodeName = hostname
 	}
-	resolvedTokenFile, err := agent.ResolveStateFilePath(*agentTokenFile, agent.DefaultAgentTokenFileName())
+	resolvedTokenFile, err := agent.ResolveAgentTokenFilePath(*agentTokenFile)
 	if err != nil {
 		log.Fatalf("解析 Agent 凭据文件失败: %v", err)
 	}

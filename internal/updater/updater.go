@@ -24,6 +24,7 @@ const (
 	defaultUserAgent = "CyberMonitor-Updater"
 	maxDownloadBytes = 512 * 1024 * 1024
 	deployModeEnvKey = "CM_DEPLOY_MODE"
+	checksumAssetName = "SHA256SUMS"
 )
 
 type Kind string
@@ -219,7 +220,7 @@ func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
 		switch asset.Name {
 		case assetName:
 			info.DownloadURL = asset.DownloadURL
-		case "checksums.txt":
+		case checksumAssetName:
 			info.ChecksumURL = asset.DownloadURL
 		}
 	}
@@ -363,7 +364,7 @@ func lookupChecksum(contents, filename string) (string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("读取 checksums.txt 失败: %w", err)
+		return "", fmt.Errorf("读取校验文件失败: %w", err)
 	}
 	return "", fmt.Errorf("未找到 %s 的校验和", filename)
 }

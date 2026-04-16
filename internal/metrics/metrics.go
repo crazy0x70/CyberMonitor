@@ -101,23 +101,27 @@ type NodeStats struct {
 	ProcessCount        int                 `json:"process_count,omitempty"`
 	TCPConns            int                 `json:"tcp_conns,omitempty"`
 	UDPConns            int                 `json:"udp_conns,omitempty"`
+	NetworkTestsChanged bool                `json:"network_tests_changed,omitempty"`
 	NetworkTests        []NetworkTestResult `json:"network_tests,omitempty"`
 }
 
 type Collector struct {
-	nodeID    string
-	nodeName  string
-	hostRoot  string
-	netIfaces map[string]struct{}
-	prevNet   *gnet.IOCountersStat
-	prevDisk  *disk.IOCountersStat
-	prevTime  time.Time
+	nodeID     string
+	nodeName   string
+	hostRoot   string
+	netIfaces  map[string]struct{}
+	prevNet    *gnet.IOCountersStat
+	prevDisk   *disk.IOCountersStat
+	prevTime   time.Time
+	prevTCP    int
+	prevUDP    int
+	prevConnAt time.Time
 }
 
 func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collector {
 	filter := make(map[string]struct{})
 	for _, iface := range netIfaces {
-		name := strings.ToLower(strings.TrimSpace(iface))
+		name := normalizeInterfaceName(iface)
 		if name == "" {
 			continue
 		}
@@ -163,8 +167,14 @@ func (c *Collector) Collect() (NodeStats, error) {
 		diskWrite += stat.WriteBytes
 	}
 
+	netFilter := c.netIfaces
+	if len(netFilter) == 0 {
+		if ifaces, err := gnet.Interfaces(); err == nil {
+			netFilter = resolveInterfaceFilter(nil, ifaces)
+		}
+	}
 	netCounters, _ := gnet.IOCounters(true)
-	netStat := sumNetCounters(netCounters, c.netIfaces)
+	netStat := sumNetCounters(netCounters, netFilter)
 
 	hostInfo, _ := host.Info()
 	osLabel := normalizeOSLabel(runtime.GOOS, "")
@@ -191,16 +201,9 @@ func (c *Collector) Collect() (NodeStats, error) {
 		hostname = hostName
 	}
 
-	tcpConns := 0
-	udpConns := 0
-	if conns, err := gnet.Connections("tcp"); err == nil {
-		tcpConns = len(conns)
-	}
-	if conns, err := gnet.Connections("udp"); err == nil {
-		udpConns = len(conns)
-	}
+	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
 
-	netSpeedMbps := collectNetSpeedMbps(c.netIfaces)
+	netSpeedMbps := collectNetSpeedMbps(netFilter)
 	stats := NodeStats{
 		NodeID:       c.nodeID,
 		NodeName:     c.nodeName,
@@ -261,6 +264,36 @@ func (c *Collector) Collect() (NodeStats, error) {
 	return stats, nil
 }
 
+func (c *Collector) sampleConnectionCountsAt(
+	now time.Time,
+	interval time.Duration,
+	sampler func() (int, int),
+) (int, int) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if sampler == nil {
+		sampler = readConnectionCounts
+	}
+	if c.prevConnAt.IsZero() || now.Sub(c.prevConnAt) >= interval {
+		c.prevTCP, c.prevUDP = sampler()
+		c.prevConnAt = now
+	}
+	return c.prevTCP, c.prevUDP
+}
+
+func readConnectionCounts() (int, int) {
+	tcpConns := 0
+	udpConns := 0
+	if conns, err := gnet.Connections("tcp"); err == nil {
+		tcpConns = len(conns)
+	}
+	if conns, err := gnet.Connections("udp"); err == nil {
+		udpConns = len(conns)
+	}
+	return tcpConns, udpConns
+}
+
 func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {
 	if hostStat, ok := readHostVirtualMemory(c.hostRoot); ok {
 		return hostStat
@@ -303,7 +336,7 @@ func sumNetCounters(stats []gnet.IOCountersStat, filter map[string]struct{}) gne
 }
 
 func shouldCollectInterface(name string, filter map[string]struct{}) bool {
-	normalized := strings.ToLower(strings.TrimSpace(name))
+	normalized := normalizeInterfaceName(name)
 	if normalized == "" {
 		return false
 	}
@@ -314,8 +347,58 @@ func shouldCollectInterface(name string, filter map[string]struct{}) bool {
 	return !isVirtualInterface(normalized)
 }
 
+func resolveInterfaceFilter(filter map[string]struct{}, ifaces []gnet.InterfaceStat) map[string]struct{} {
+	if len(filter) > 0 {
+		return filter
+	}
+	return buildDefaultInterfaceFilter(ifaces, readInterfaceMasterName)
+}
+
+func buildDefaultInterfaceFilter(
+	ifaces []gnet.InterfaceStat,
+	readMaster func(string) string,
+) map[string]struct{} {
+	if len(ifaces) == 0 {
+		return nil
+	}
+	resolved := make(map[string]struct{}, len(ifaces))
+	for _, iface := range ifaces {
+		if shouldIgnoreDefaultInterface(iface, readMaster) {
+			continue
+		}
+		name := normalizeInterfaceName(iface.Name)
+		if name == "" {
+			continue
+		}
+		resolved[name] = struct{}{}
+	}
+	if len(resolved) == 0 {
+		return nil
+	}
+	return resolved
+}
+
+func shouldIgnoreDefaultInterface(
+	iface gnet.InterfaceStat,
+	readMaster func(string) string,
+) bool {
+	name := normalizeInterfaceName(iface.Name)
+	if name == "" {
+		return true
+	}
+	if isVirtualInterface(name) {
+		return true
+	}
+	if readMaster != nil {
+		if master := normalizeInterfaceName(readMaster(iface.Name)); isDockerBridgeMaster(master) {
+			return true
+		}
+	}
+	return false
+}
+
 func isVirtualInterface(name string) bool {
-	lower := strings.ToLower(name)
+	lower := normalizeInterfaceName(name)
 	virtualPrefixes := []string{
 		"lo", "loopback", "docker", "veth", "br-", "virbr", "vmnet", "utun",
 		"tun", "tap", "wg", "tailscale", "zt", "vboxnet", "ham", "bridge",
@@ -326,6 +409,38 @@ func isVirtualInterface(name string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeInterfaceName(name string) string {
+	return strings.ToLower(canonicalInterfaceName(name))
+}
+
+func canonicalInterfaceName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if idx := strings.Index(trimmed, "@"); idx > 0 {
+		return trimmed[:idx]
+	}
+	return trimmed
+}
+
+func isDockerBridgeMaster(name string) bool {
+	lower := normalizeInterfaceName(name)
+	return lower == "docker0" || strings.HasPrefix(lower, "br-")
+}
+
+func readInterfaceMasterName(name string) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	ifaceName := canonicalInterfaceName(name)
+	if ifaceName == "" {
+		return ""
+	}
+	target, err := os.Readlink(filepath.Join("/sys/class/net", ifaceName, "master"))
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(target)
 }
 
 func collectNetSpeedMbps(filter map[string]struct{}) float64 {
@@ -356,7 +471,7 @@ func readInterfaceSpeedMbps(name string) float64 {
 	if name == "" {
 		return 0
 	}
-	path := filepath.Join("/sys/class/net", name, "speed")
+	path := filepath.Join("/sys/class/net", canonicalInterfaceName(name), "speed")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0

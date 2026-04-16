@@ -16,6 +16,7 @@ type agentRunner struct {
 	collector           *metrics.Collector
 	runtimeCfg          *runtimeConfig
 	testCache           map[string]cachedTest
+	lastTestConfigSig   string
 	dockerManagedUpdate bool
 	agentToken          string
 	lastUpdateState     string
@@ -123,13 +124,30 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 	if group != "" {
 		sample.NodeGroup = group
 	}
-	if len(tests) > 0 {
-		sample.NetworkTests = runNetworkTestsWithCache(ctx, tests, interval, r.testCache)
+	configChanged := false
+	if configSig := networkTestConfigSignature(tests); configSig != r.lastTestConfigSig {
+		r.lastTestConfigSig = configSig
+		configChanged = true
+	}
+	if testsSnapshot, resultsChanged := runNetworkTestsWithCache(ctx, tests, interval, r.testCache); configChanged || resultsChanged {
+		sample.NetworkTestsChanged = true
+		sample.NetworkTests = testsSnapshot
 	}
 
-	if err := r.transport.ReportStats(ctx, sample, r.agentToken); err != nil {
+	if err := r.reportStats(ctx, sample); err != nil {
 		log.Printf("上报失败: %v", err)
 	}
+}
+
+func (r *agentRunner) reportStats(ctx context.Context, sample metrics.NodeStats) error {
+	refreshConfig, err := r.transport.ReportStats(ctx, sample, r.agentToken)
+	if err != nil {
+		return err
+	}
+	if refreshConfig {
+		r.syncRemoteConfig(ctx)
+	}
+	return nil
 }
 
 func applyRemoteConfig(cfg Config, runtimeCfg *runtimeConfig, agentToken string, remote RemoteConfig) (string, error) {

@@ -72,7 +72,7 @@ func (o grpcTransportOptions) normalized() grpcTransportOptions {
 type agentControlPlane interface {
 	RegisterNodeToken(context.Context, string, string) (string, error)
 	FetchConfig(context.Context, string, string) (RemoteConfig, error)
-	ReportStats(context.Context, metrics.NodeStats, string) error
+	ReportStats(context.Context, metrics.NodeStats, string) (bool, error)
 	ReportUpdate(context.Context, string, string, string, string, string) error
 	Close() error
 }
@@ -197,23 +197,24 @@ func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token s
 	return config, err
 }
 
-func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) error {
+func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
 	if t.grpc != nil && t.shouldProbeGRPCForStats() {
-		err := t.grpc.ReportStats(ctx, stats, token)
+		refreshConfig, err := t.grpc.ReportStats(ctx, stats, token)
 		if err == nil {
 			t.noteMode("grpc")
-			return nil
+			return refreshConfig, nil
 		}
 		if !shouldFallbackToHTTP(err) {
-			return err
+			return false, err
 		}
 		t.disableGRPCTemporarily(err)
 	}
-	if err := t.http.ReportStats(ctx, stats, token); err != nil {
-		return err
+	refreshConfig, err := t.http.ReportStats(ctx, stats, token)
+	if err != nil {
+		return false, err
 	}
 	t.noteMode("http")
-	return nil
+	return refreshConfig, nil
 }
 
 func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
@@ -282,14 +283,14 @@ func (h *httpControlPlane) FetchConfig(ctx context.Context, nodeID, token string
 	return fetchRemoteConfig(ctx, h.client, h.configEndpoint, nodeID, token)
 }
 
-func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) error {
+func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
 	payload, err := json.Marshal(stats)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.statsEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
@@ -297,7 +298,7 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -306,9 +307,16 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 		if text == "" {
 			text = fmt.Sprintf("status %d", resp.StatusCode)
 		}
-		return fmt.Errorf("ingest failed: %s", text)
+		return false, fmt.Errorf("ingest failed: %s", text)
 	}
-	return nil
+	var result struct {
+		Status        string `json:"status"`
+		RefreshConfig bool   `json:"refresh_config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	return result.RefreshConfig, nil
 }
 
 func (h *httpControlPlane) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
@@ -354,17 +362,20 @@ func (g *grpcControlPlane) FetchConfig(ctx context.Context, nodeID, token string
 	}, nil
 }
 
-func (g *grpcControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) error {
+func (g *grpcControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
 	client, callCtx, cancel, err := g.prepareCall(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer cancel()
-	_, err = client.ReportStats(callCtx, &agentrpc.ReportStatsRequest{
+	resp, err := client.ReportStats(callCtx, &agentrpc.ReportStatsRequest{
 		AgentToken: token,
 		Stats:      stats,
 	})
-	return err
+	if err != nil {
+		return false, err
+	}
+	return resp.RefreshConfig, nil
 }
 
 func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {

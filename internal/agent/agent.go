@@ -141,7 +141,6 @@ func maybeApplyRemoteUpdate(
 	if err := report(ctx, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
 	return updater.RestartSelf()
 }
 
@@ -210,15 +209,37 @@ func runNetworkTestsWithCache(
 	configs []metrics.NetworkTestConfig,
 	defaultInterval time.Duration,
 	cache map[string]cachedTest,
-) []metrics.NetworkTestResult {
+) ([]metrics.NetworkTestResult, bool) {
+	return runNetworkTestsWithCacheAt(ctx, configs, defaultInterval, cache, time.Now, RunNetworkTests)
+}
+
+func runNetworkTestsWithCacheAt(
+	ctx context.Context,
+	configs []metrics.NetworkTestConfig,
+	defaultInterval time.Duration,
+	cache map[string]cachedTest,
+	now func() time.Time,
+	runner func(context.Context, []metrics.NetworkTestConfig) []metrics.NetworkTestResult,
+) ([]metrics.NetworkTestResult, bool) {
 	if len(configs) == 0 {
-		return nil
+		if len(cache) == 0 {
+			return nil, false
+		}
+		clear(cache)
+		return []metrics.NetworkTestResult{}, true
 	}
 	if defaultInterval <= 0 {
 		defaultInterval = 5 * time.Second
 	}
+	if now == nil {
+		now = time.Now
+	}
+	if runner == nil {
+		runner = RunNetworkTests
+	}
 
-	now := time.Now()
+	changed := false
+	currentTime := now()
 	dueConfigs := make([]metrics.NetworkTestConfig, 0, len(configs))
 	dueKeys := make([]string, 0, len(configs))
 	validKeys := make(map[string]struct{}, len(configs))
@@ -236,14 +257,14 @@ func runNetworkTestsWithCache(
 		if interval <= 0 {
 			interval = defaultInterval
 		}
-		if cached, ok := cache[key]; !ok || now.Sub(cached.lastRun) >= interval {
+		if cached, ok := cache[key]; !ok || currentTime.Sub(cached.lastRun) >= interval {
 			dueConfigs = append(dueConfigs, cfg)
 			dueKeys = append(dueKeys, key)
 		}
 	}
 
 	if len(dueConfigs) > 0 {
-		results := RunNetworkTests(ctx, dueConfigs)
+		results := runner(ctx, dueConfigs)
 		for i, result := range results {
 			if i >= len(dueKeys) {
 				break
@@ -253,11 +274,13 @@ func runNetworkTestsWithCache(
 				result:  result,
 			}
 		}
+		changed = true
 	}
 
 	for key := range cache {
 		if _, ok := validKeys[key]; !ok {
 			delete(cache, key)
+			changed = true
 		}
 	}
 
@@ -271,7 +294,7 @@ func runNetworkTestsWithCache(
 			ordered = append(ordered, cached.result)
 		}
 	}
-	return ordered
+	return ordered, changed
 }
 
 func testKey(cfg metrics.NetworkTestConfig) string {
@@ -280,6 +303,17 @@ func testKey(cfg metrics.NetworkTestConfig) string {
 		return ""
 	}
 	return strings.ToLower(fmt.Sprintf("%s|%s|%d|%s", cfg.Type, host, cfg.Port, cfg.Name))
+}
+
+func networkTestConfigSignature(configs []metrics.NetworkTestConfig) string {
+	if len(configs) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		keys = append(keys, testKey(cfg))
+	}
+	return strings.Join(keys, ",")
 }
 
 func configureHostEnv(hostRoot string) {

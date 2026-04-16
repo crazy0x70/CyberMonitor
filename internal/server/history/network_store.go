@@ -27,6 +27,7 @@ type NetworkStore struct {
 	dir              string
 	appendMu         sync.Mutex
 	latestSeriesTime map[string]int64
+	latestLoaded     bool
 }
 
 func OpenNetworkStore(dir string) (*NetworkStore, error) {
@@ -203,6 +204,7 @@ func (s *NetworkStore) Clear() error {
 		}
 	}
 	clear(s.latestSeriesTime)
+	s.latestLoaded = true
 	return nil
 }
 
@@ -223,9 +225,11 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	if err := s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher); err != nil {
 		return err
 	}
-	for key := range s.latestSeriesTime {
-		if strings.Contains(key, "|"+nodeID+"|") {
-			delete(s.latestSeriesTime, key)
+	if s.latestLoaded {
+		for key := range s.latestSeriesTime {
+			if strings.Contains(key, "|"+nodeID+"|") {
+				delete(s.latestSeriesTime, key)
+			}
 		}
 	}
 	return nil
@@ -326,64 +330,72 @@ func (s *NetworkStore) appendMetricSampleIfFresh(
 }
 
 func (s *NetworkStore) latestTimestampMillis(metricName, nodeID string, identity networkTestIdentity) (int64, bool, error) {
+	if err := s.ensureLatestSeriesTimeLoaded(); err != nil {
+		return 0, false, err
+	}
+
 	key := networkSeriesTimestampKey(metricName, nodeID, identity)
 	if latestMillis, ok := s.latestSeriesTime[key]; ok {
 		return latestMillis, true, nil
 	}
-
-	latestMillis, found, err := s.queryLatestTimestampMillis(metricName, nodeID, identity)
-	if err != nil {
-		return 0, false, err
-	}
-	if found {
-		s.latestSeriesTime[key] = latestMillis
-	}
-	return latestMillis, found, nil
+	return 0, false, nil
 }
 
-func (s *NetworkStore) queryLatestTimestampMillis(metricName, nodeID string, identity networkTestIdentity) (int64, bool, error) {
+func (s *NetworkStore) ensureLatestSeriesTimeLoaded() error {
+	if s.latestLoaded {
+		return nil
+	}
+
+	latestSeriesTime, err := s.queryAllLatestTimestampMillis()
+	if err != nil {
+		return err
+	}
+	s.latestSeriesTime = latestSeriesTime
+	s.latestLoaded = true
+	return nil
+}
+
+func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error) {
 	querier, err := s.db.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
-		return 0, false, err
+		return nil, err
 	}
 	defer querier.Close()
 
-	nameMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metricName)
+	nameMatcher, err := labels.NewMatcher(
+		labels.MatchRegexp,
+		labels.MetricName,
+		"^(?:"+networkLatencyMetric+"|"+networkLossMetric+"|"+networkAvailabilityMetric+")$",
+	)
 	if err != nil {
-		return 0, false, err
-	}
-	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
-	if err != nil {
-		return 0, false, err
-	}
-	typeMatcher, err := labels.NewMatcher(labels.MatchEqual, "type", normalizeIdentityValue(identity.Type, "icmp"))
-	if err != nil {
-		return 0, false, err
-	}
-	hostMatcher, err := labels.NewMatcher(labels.MatchEqual, "host", strings.ToLower(strings.TrimSpace(identity.Host)))
-	if err != nil {
-		return 0, false, err
-	}
-	portMatcher, err := labels.NewMatcher(labels.MatchEqual, "port", strconv.Itoa(identity.Port))
-	if err != nil {
-		return 0, false, err
-	}
-	nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, "name", strings.ToLower(strings.TrimSpace(identity.Name)))
-	if err != nil {
-		return 0, false, err
+		return nil, err
 	}
 
 	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
 		Start: math.MinInt64,
 		End:   math.MaxInt64,
-	}, nameMatcher, nodeMatcher, typeMatcher, hostMatcher, portMatcher, nameLabelMatcher)
+	}, nameMatcher)
 
-	var (
-		latestMillis int64
-		found        bool
-	)
+	latestSeriesTime := make(map[string]int64)
 	for seriesSet.Next() {
+		series := seriesSet.At()
+		metricName := strings.TrimSpace(series.Labels().Get(labels.MetricName))
+		identity := networkTestIdentity{
+			Type: normalizeIdentityValue(series.Labels().Get("type"), "icmp"),
+			Host: strings.TrimSpace(series.Labels().Get("host")),
+			Port: parsePortLabel(series.Labels().Get("port")),
+			Name: strings.TrimSpace(series.Labels().Get("name")),
+		}
+		key := networkSeriesTimestampKey(metricName, series.Labels().Get("node_id"), identity)
+		if key == "" {
+			continue
+		}
+
 		iterator := seriesSet.At().Iterator(nil)
+		var (
+			latestMillis int64
+			found        bool
+		)
 		for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
 			if valueType != chunkenc.ValFloat {
 				continue
@@ -395,13 +407,16 @@ func (s *NetworkStore) queryLatestTimestampMillis(metricName, nodeID string, ide
 			}
 		}
 		if err := iterator.Err(); err != nil {
-			return 0, false, err
+			return nil, err
+		}
+		if found {
+			latestSeriesTime[key] = latestMillis
 		}
 	}
 	if err := seriesSet.Err(); err != nil {
-		return 0, false, err
+		return nil, err
 	}
-	return latestMillis, found, nil
+	return latestSeriesTime, nil
 }
 
 func networkSeriesTimestampKey(metricName, nodeID string, identity networkTestIdentity) string {
