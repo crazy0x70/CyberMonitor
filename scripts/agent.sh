@@ -4,13 +4,6 @@ set -euo pipefail
 REPO="crazy0x70/CyberMonitor"
 INSTALL_DIR="/opt/CyberMonitor"
 CONF_DIR="/etc/cybermonitor"
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-cleanup() {
-  if [[ -f "${SCRIPT_PATH}" ]]; then
-    rm -f "${SCRIPT_PATH}"
-  fi
-}
-trap cleanup EXIT
 
 usage() {
   cat <<'EOF'

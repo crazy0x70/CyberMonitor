@@ -83,7 +83,7 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 				return result, err
 			}
 			normalizeLegacyHistoryEntry(entry)
-			existingTimes := existingTimesBySeries[key]
+			existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
 
 			batch := make([]metrics.NetworkTestResult, 0, len(entry.Times))
 			for idx, checkedAt := range entry.Times {
@@ -226,14 +226,7 @@ func EnsureLegacyMigrationBackup(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(backupPath), 0o755); err != nil {
-		return err
-	}
-	tmpPath := backupPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, backupPath)
+	return writeLegacyFileAtomic(backupPath, data)
 }
 
 func MarkLegacyMigrationComplete(path string, now time.Time) error {
@@ -242,15 +235,19 @@ func MarkLegacyMigrationComplete(path string, now time.Time) error {
 		return errors.New("legacy history path required")
 	}
 	markerPath := legacyMarkerPath(path)
-	if err := os.MkdirAll(filepath.Dir(markerPath), 0o755); err != nil {
+	payload := []byte(strconv.FormatInt(now.Unix(), 10))
+	return writeLegacyFileAtomic(markerPath, payload)
+}
+
+func writeLegacyFileAtomic(path string, payload []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	payload := []byte(strconv.FormatInt(now.Unix(), 10))
-	tmpPath := markerPath + ".tmp"
+	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, markerPath)
+	return os.Rename(tmpPath, path)
 }
 
 func legacyMigrationMarked(path string) (bool, error) {

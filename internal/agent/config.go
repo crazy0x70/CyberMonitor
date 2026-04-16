@@ -125,16 +125,53 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	return payload, nil
 }
 
-func readAgentAPIStatusError(resp *http.Response, label string) error {
+func readAgentAPIErrorMessage(resp *http.Response, fallback string) string {
+	message := strings.TrimSpace(fallback)
 	if resp == nil {
-		return fmt.Errorf("%s request failed", strings.TrimSpace(label))
+		if message != "" {
+			return message
+		}
+		return "request failed"
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxAgentAPIErrorBodyBytes))
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		return fmt.Errorf("%s status %d", strings.TrimSpace(label), resp.StatusCode)
+	if text := strings.TrimSpace(string(body)); text != "" {
+		return text
 	}
-	return fmt.Errorf("%s status %d: %s", strings.TrimSpace(label), resp.StatusCode, message)
+	if message != "" {
+		return message
+	}
+	return fmt.Sprintf("status %d", resp.StatusCode)
+}
+
+func readAgentAPIStatusError(resp *http.Response, label string) error {
+	trimmedLabel := strings.TrimSpace(label)
+	if resp == nil {
+		if trimmedLabel == "" {
+			return fmt.Errorf("request failed")
+		}
+		return fmt.Errorf("%s request failed", trimmedLabel)
+	}
+	statusText := fmt.Sprintf("status %d", resp.StatusCode)
+	message := readAgentAPIErrorMessage(resp, statusText)
+	if message == statusText {
+		if trimmedLabel == "" {
+			return fmt.Errorf("%s", statusText)
+		}
+		return fmt.Errorf("%s %s", trimmedLabel, statusText)
+	}
+	if trimmedLabel == "" {
+		return fmt.Errorf("%s", message)
+	}
+	return fmt.Errorf("%s %s: %s", trimmedLabel, statusText, message)
+}
+
+func readAgentAPIActionError(resp *http.Response, action string) error {
+	trimmedAction := strings.TrimSpace(action)
+	message := readAgentAPIErrorMessage(resp, "")
+	if trimmedAction == "" {
+		return fmt.Errorf("%s", message)
+	}
+	return fmt.Errorf("%s: %s", trimmedAction, message)
 }
 
 func decodeStrictAgentJSON(body io.Reader, target any, trailingMessage string) error {

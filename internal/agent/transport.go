@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -298,12 +297,7 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		text := strings.TrimSpace(string(body))
-		if text == "" {
-			text = fmt.Sprintf("status %d", resp.StatusCode)
-		}
-		return false, fmt.Errorf("ingest failed: %s", text)
+		return false, readAgentAPIActionError(resp, "ingest failed")
 	}
 	var result struct {
 		RefreshConfig bool `json:"refresh_config"`

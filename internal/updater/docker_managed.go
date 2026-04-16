@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -19,7 +18,6 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -311,122 +309,7 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 	if err := u.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("启动 Docker 更新 helper 失败: %w", err)
 	}
-	return waitForDockerHelperExit(
-		ctx,
-		resp.ID,
-		func(waitCtx context.Context, helperID string) (<-chan container.WaitResponse, <-chan error) {
-			return u.cli.ContainerWait(waitCtx, helperID, container.WaitConditionNotRunning)
-		},
-		func(logCtx context.Context, helperID string) (io.ReadCloser, error) {
-			return u.cli.ContainerLogs(logCtx, helperID, container.LogsOptions{
-				ShowStdout: true,
-				ShowStderr: true,
-			})
-		},
-	)
-}
-
-func waitForDockerHelperExit(
-	ctx context.Context,
-	helperID string,
-	waitFn func(context.Context, string) (<-chan container.WaitResponse, <-chan error),
-	logsFn func(context.Context, string) (io.ReadCloser, error),
-) error {
-	if waitFn == nil {
-		return fmt.Errorf("等待 Docker 更新 helper 退出失败: 缺少等待函数")
-	}
-	statusCh, errCh := waitFn(ctx, strings.TrimSpace(helperID))
-	for statusCh != nil || errCh != nil {
-		select {
-		case resp, ok := <-statusCh:
-			if !ok {
-				statusCh = nil
-				continue
-			}
-			if resp.StatusCode == 0 && resp.Error == nil {
-				return nil
-			}
-			return fmt.Errorf("Docker 更新 helper 提前退出%s", formatDockerHelperExitDetail(resp, helperID, logsFn))
-		case err, ok := <-errCh:
-			if !ok {
-				errCh = nil
-				continue
-			}
-			if err == nil {
-				errCh = nil
-				continue
-			}
-			return fmt.Errorf("等待 Docker 更新 helper 退出失败: %w", err)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return fmt.Errorf("Docker 更新 helper 提前结束，但未返回退出状态")
-}
-
-func formatDockerHelperExitDetail(
-	resp container.WaitResponse,
-	helperID string,
-	logsFn func(context.Context, string) (io.ReadCloser, error),
-) string {
-	parts := make([]string, 0, 3)
-	parts = append(parts, fmt.Sprintf("，退出码=%d", resp.StatusCode))
-	if resp.Error != nil {
-		if message := strings.TrimSpace(resp.Error.Message); message != "" {
-			parts = append(parts, fmt.Sprintf("，错误=%s", message))
-		}
-	}
-	if logs := readDockerHelperLogs(helperID, logsFn); logs != "" {
-		parts = append(parts, fmt.Sprintf("，日志=%s", logs))
-	}
-	return strings.Join(parts, "")
-}
-
-func readDockerHelperLogs(helperID string, logsFn func(context.Context, string) (io.ReadCloser, error)) string {
-	if logsFn == nil {
-		return ""
-	}
-	logCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	reader, err := logsFn(logCtx, strings.TrimSpace(helperID))
-	if err != nil {
-		return ""
-	}
-	defer reader.Close()
-	raw, err := io.ReadAll(io.LimitReader(reader, 8192))
-	if err != nil || len(raw) == 0 {
-		return ""
-	}
-	text := decodeDockerLogBytes(raw)
-	if text == "" {
-		return ""
-	}
-	const maxLogLen = 512
-	if len(text) > maxLogLen {
-		text = text[:maxLogLen]
-	}
-	return strings.TrimSpace(text)
-}
-
-func decodeDockerLogBytes(raw []byte) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	if _, err := stdcopy.StdCopy(&stdout, &stderr, bytes.NewReader(raw)); err == nil {
-		text := strings.TrimSpace(stdout.String())
-		if errText := strings.TrimSpace(stderr.String()); errText != "" {
-			if text != "" {
-				text += "\n"
-			}
-			text += errText
-		}
-		if text != "" {
-			return text
-		}
-	}
-	return strings.TrimSpace(string(raw))
+	return nil
 }
 
 func RunDockerRecreateHelper(ctx context.Context) error {

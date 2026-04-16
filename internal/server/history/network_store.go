@@ -391,12 +391,12 @@ func networkSeriesTimestampNodeID(key string) string {
 
 func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (preparedNetworkSample, bool) {
 	sample := preparedNetworkSample{
-		identity: networkTestIdentity{
-			Type: strings.TrimSpace(test.Type),
-			Host: strings.TrimSpace(test.Host),
+		identity: normalizeNetworkIdentity(networkTestIdentity{
+			Type: test.Type,
+			Host: test.Host,
 			Port: test.Port,
-			Name: strings.TrimSpace(test.Name),
-		},
+			Name: test.Name,
+		}),
 		timestampMillis: resolveTimestampMillis(test.CheckedAt, now),
 		latency:         cloneFloatPointer(test.LatencyMs),
 		loss:            normalizeFloatValue(test.PacketLoss),
@@ -406,10 +406,10 @@ func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (prepar
 	if sample.seriesKey == "" {
 		return preparedNetworkSample{}, false
 	}
-	sample.typeLabel = normalizeIdentityValue(sample.identity.Type, "icmp")
-	sample.hostLabel = strings.ToLower(strings.TrimSpace(sample.identity.Host))
+	sample.typeLabel = sample.identity.Type
+	sample.hostLabel = sample.identity.Host
 	sample.portLabel = strconv.Itoa(sample.identity.Port)
-	sample.nameLabel = strings.ToLower(strings.TrimSpace(sample.identity.Name))
+	sample.nameLabel = sample.identity.Name
 	return sample, true
 }
 
@@ -477,12 +477,12 @@ func collectMetricSeriesBatch(
 }
 
 func networkIdentityFromLabels(seriesLabels labels.Labels) networkTestIdentity {
-	return networkTestIdentity{
+	return normalizeNetworkIdentity(networkTestIdentity{
 		Type: normalizeIdentityValue(seriesLabels.Get("type"), "icmp"),
 		Host: strings.TrimSpace(seriesLabels.Get("host")),
 		Port: parsePortLabel(seriesLabels.Get("port")),
 		Name: strings.TrimSpace(seriesLabels.Get("name")),
-	}
+	})
 }
 
 func parsePortLabel(raw string) int {

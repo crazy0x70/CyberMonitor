@@ -3,7 +3,6 @@ ARG GO_IMAGE_VERSION=1.26.2
 FROM --platform=$BUILDPLATFORM node:24-alpine AS admin-build
 
 WORKDIR /src
-COPY internal/server/web/admin ./internal/server/web/admin
 COPY internal/server/web ./internal/server/web
 RUN test -f internal/server/web/admin/package.json && \
     test -f internal/server/web/admin/package-lock.json && \

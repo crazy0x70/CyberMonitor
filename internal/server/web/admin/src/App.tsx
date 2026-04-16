@@ -67,6 +67,7 @@ import type {
   SettingsView,
   SystemUpdateInfo,
 } from "@/lib/admin-types";
+import { formatVersionLabel, getErrorMessage } from "@/lib/admin-format";
 import {
   adminDialogCancelClass,
   adminDialogContentClass,
@@ -208,14 +209,6 @@ function resolveBrandTitle(settings: SettingsView | null, publicSettings: Public
   ).trim();
 }
 
-function versionLabel(value?: string | null) {
-  const normalized = String(value || "").trim();
-  if (!normalized) {
-    return "--";
-  }
-  return normalized.startsWith("v") ? normalized : `v${normalized}`;
-}
-
 function adminBrowserTitle(settings: SettingsView | null, publicSettings: PublicSettings | null) {
   const siteTitle = (settings?.site_title || publicSettings?.site_title || "CyberMonitor").trim() || "CyberMonitor";
   return `${siteTitle} 管理后台`;
@@ -294,7 +287,7 @@ export default function App() {
   const siteIcon = (settings?.site_icon || publicSettings?.site_icon || "").trim();
   const siteTitle = resolveBrandTitle(settings, publicSettings);
   const deployedVersion = (settings?.version || publicSettings?.version || "").trim();
-  const deployedVersionLabel = versionLabel(deployedVersion);
+  const deployedVersionLabel = formatVersionLabel(deployedVersion);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -440,7 +433,7 @@ export default function App() {
           });
           return;
         }
-        toast.error(error instanceof Error ? error.message : "初始化节点数据失败");
+        toast.error(getErrorMessage(error, "初始化节点数据失败"));
         return;
       }
       setNodes(nodesResult.data.nodes || []);
@@ -487,7 +480,7 @@ export default function App() {
       }
 
       setLoginState(
-        createLoginState("invalid", error instanceof Error ? error.message : "登录失败，请稍后重试。"),
+        createLoginState("invalid", getErrorMessage(error, "登录失败，请稍后重试。")),
       );
     }
   }
@@ -496,7 +489,7 @@ export default function App() {
     try {
       await logoutAdmin();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "退出登录失败");
+      toast.error(getErrorMessage(error, "退出登录失败"));
       return;
     }
     handleLogout();
@@ -507,7 +500,7 @@ export default function App() {
       return;
     }
     loadAll(token).catch((error) => {
-      toast.error(error instanceof Error ? error.message : "初始化后台数据失败");
+      toast.error(getErrorMessage(error, "初始化后台数据失败"));
     });
   }, [token]);
 
@@ -516,7 +509,7 @@ export default function App() {
       return;
     }
     refreshSystemUpdate().catch((error) => {
-      toast.error(error instanceof Error ? error.message : "加载服务端更新状态失败");
+      toast.error(getErrorMessage(error, "加载服务端更新状态失败"));
     });
   }, [currentPage, token]);
 
@@ -530,7 +523,7 @@ export default function App() {
     }
     systemUpdatePollRef.current = window.setInterval(() => {
       refreshSystemUpdate().catch((error) => {
-        toast.error(error instanceof Error ? error.message : "刷新服务端更新状态失败");
+        toast.error(getErrorMessage(error, "刷新服务端更新状态失败"));
       });
     }, 1500);
     return () => {
@@ -555,7 +548,7 @@ export default function App() {
       })
       .catch((error) => {
         if (!cancelled) {
-          toast.error(error instanceof Error ? error.message : "恢复登录会话失败");
+          toast.error(getErrorMessage(error, "恢复登录会话失败"));
         }
       });
     fetchLoginConfig()
@@ -567,7 +560,7 @@ export default function App() {
       .catch((error) => {
         if (!cancelled) {
           setLoginConfig(null);
-          toast.error(error instanceof Error ? error.message : "加载登录配置失败");
+          toast.error(getErrorMessage(error, "加载登录配置失败"));
         }
       });
     fetchPublicSnapshot()

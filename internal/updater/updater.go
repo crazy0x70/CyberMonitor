@@ -20,11 +20,13 @@ import (
 )
 
 const (
-	DefaultRepo      = "crazy0x70/CyberMonitor"
-	defaultUserAgent = "CyberMonitor-Updater"
-	maxDownloadBytes = 512 * 1024 * 1024
-	deployModeEnvKey = "CM_DEPLOY_MODE"
-	checksumAssetName = "SHA256SUMS"
+	DefaultRepo              = "crazy0x70/CyberMonitor"
+	defaultUserAgent         = "CyberMonitor-Updater"
+	maxDownloadBytes         = 512 * 1024 * 1024
+	deployModeEnvKey         = "CM_DEPLOY_MODE"
+	checksumAssetName        = "SHA256SUMS"
+	maxUpdaterErrorBodyBytes = 4096
+	maxChecksumFileBytes     = 1024 * 1024
 )
 
 type Kind string
@@ -241,12 +243,7 @@ func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		message := strings.TrimSpace(string(body))
-		if message == "" {
-			message = fmt.Sprintf("GitHub API 返回状态码 %d", resp.StatusCode)
-		}
-		return githubRelease{}, fmt.Errorf("%s", message)
+		return githubRelease{}, fmt.Errorf("%s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("GitHub API 返回状态码 %d", resp.StatusCode)))
 	}
 
 	var release githubRelease
@@ -269,12 +266,7 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		message := strings.TrimSpace(string(body))
-		if message == "" {
-			message = fmt.Sprintf("下载返回状态码 %d", resp.StatusCode)
-		}
-		return fmt.Errorf("%s", message)
+		return fmt.Errorf("%s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("下载返回状态码 %d", resp.StatusCode)))
 	}
 	if resp.ContentLength > maxDownloadBytes {
 		return fmt.Errorf("更新文件过大: %d bytes", resp.ContentLength)
@@ -312,9 +304,9 @@ func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, down
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载校验文件失败: 状态码 %d", resp.StatusCode)
+		return fmt.Errorf("下载校验文件失败: %s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("状态码 %d", resp.StatusCode)))
 	}
-	checksumBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	checksumBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumFileBytes))
 	if err != nil {
 		return fmt.Errorf("读取校验文件失败: %w", err)
 	}
@@ -338,6 +330,18 @@ func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, down
 		return fmt.Errorf("校验和不匹配")
 	}
 	return nil
+}
+
+func readUpdaterHTTPErrorMessage(resp *http.Response, fallback string) string {
+	message := strings.TrimSpace(fallback)
+	if resp == nil {
+		return message
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpdaterErrorBodyBytes))
+	if text := strings.TrimSpace(string(body)); text != "" {
+		return text
+	}
+	return message
 }
 
 func resolveChecksumLookupName(downloadURL, filePath string) string {

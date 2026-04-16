@@ -44,24 +44,19 @@ type seriesAccumulator struct {
 
 func BuildNetworkTestKey(test metrics.NetworkTestResult) string {
 	return buildNetworkSeriesKey(networkTestIdentity{
-		Type: strings.TrimSpace(test.Type),
-		Host: strings.TrimSpace(test.Host),
+		Type: test.Type,
+		Host: test.Host,
 		Port: test.Port,
-		Name: strings.TrimSpace(test.Name),
+		Name: test.Name,
 	})
 }
 
 func buildNetworkSeriesKey(identity networkTestIdentity) string {
-	kind := strings.ToLower(strings.TrimSpace(identity.Type))
-	if kind == "" {
-		kind = "icmp"
-	}
-	host := strings.ToLower(strings.TrimSpace(identity.Host))
-	name := strings.ToLower(strings.TrimSpace(identity.Name))
-	if host == "" && name == "" {
+	identity = normalizeNetworkIdentity(identity)
+	if identity.Host == "" && identity.Name == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%d|%s", kind, host, identity.Port, name)
+	return fmt.Sprintf("%s|%s|%d|%s", identity.Type, identity.Host, identity.Port, identity.Name)
 }
 
 func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
@@ -89,10 +84,18 @@ func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
 	}, nil
 }
 
+func normalizeNetworkIdentity(identity networkTestIdentity) networkTestIdentity {
+	identity.Type = normalizeIdentityValue(identity.Type, "icmp")
+	identity.Host = strings.ToLower(strings.TrimSpace(identity.Host))
+	identity.Name = strings.ToLower(strings.TrimSpace(identity.Name))
+	return identity
+}
+
 func ensureSeriesAccumulator(
 	result map[string]*seriesAccumulator,
 	identity networkTestIdentity,
 ) *seriesAccumulator {
+	identity = normalizeNetworkIdentity(identity)
 	key := buildNetworkSeriesKey(identity)
 	if key == "" {
 		return nil

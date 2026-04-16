@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { AlertTriangle, Bell, Clock3, Send, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { getErrorMessage, parseTelegramUserIds } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
   adminDetailGroupClass,
@@ -59,17 +60,6 @@ export interface NotificationAlertProps {
   saving?: boolean;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
   onTest: (payload: AlertTestPayload) => Promise<void>;
-}
-
-function parseTelegramIds(raw: string) {
-  return Array.from(
-    new Set(
-      raw
-        .split(/[,，\s]+/)
-        .map((item) => Number.parseInt(item.trim(), 10))
-        .filter((value) => Number.isFinite(value) && value > 0),
-    ),
-  );
 }
 
 function isValidHTTPURL(value: string) {
@@ -152,7 +142,7 @@ export default function NotificationAlert({
     const normalizedWebhook = webhook.trim();
     const normalizedToken = telegramToken.trim();
     const normalizedUserIds = telegramUserIds.trim();
-    const ids = parseTelegramIds(telegramUserIds);
+    const ids = parseTelegramUserIds(telegramUserIds);
     const minutes = Number.parseInt(offlineMinutes, 10);
 
     if (!Number.isFinite(minutes) || minutes < 1) {
@@ -207,7 +197,7 @@ export default function NotificationAlert({
       setIsDirty(false);
       setFieldErrors({});
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存告警配置失败");
+      toast.error(getErrorMessage(error, "保存告警配置失败"));
     } finally {
       setIsSaving(false);
     }
@@ -237,7 +227,7 @@ export default function NotificationAlert({
       await onTest(payload);
       toast.success("测试消息已发送");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试发送失败");
+      toast.error(getErrorMessage(error, "测试发送失败"));
     } finally {
       setTestingChannel(null);
     }

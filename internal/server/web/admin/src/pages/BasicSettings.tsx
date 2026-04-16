@@ -63,6 +63,7 @@ import {
   buildAgentInstallCommand,
   buildAgentWindowsInstallCommand,
 } from "@/lib/agent-install";
+import { formatVersionLabel, getErrorMessage } from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
 
 export interface BasicSettingsProps {
@@ -93,14 +94,6 @@ const compactConfirmContentClass = cn(adminDialogContentClass, "gap-0");
 const compactConfirmHeaderClass = cn(adminDialogHeaderClass, "border-b-0 pb-3");
 
 const compactConfirmFooterClass = cn(adminDialogFooterClass, "border-t-0 bg-transparent pt-0");
-
-function formatVersionText(value?: string) {
-  const normalized = String(value || "").trim();
-  if (!normalized) {
-    return "--";
-  }
-  return normalized.startsWith("v") ? normalized : `v${normalized}`;
-}
 
 export default function BasicSettings({
   settings,
@@ -216,7 +209,7 @@ export default function BasicSettings({
       toast.success(messages.join("；"));
       setIsDirty(false);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存基础设置失败");
+      toast.error(getErrorMessage(error, "保存基础设置失败"));
     } finally {
       setIsSaving(false);
     }
@@ -237,7 +230,7 @@ export default function BasicSettings({
       toast.success(messages.join("；"));
       setIsDirty(false);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "导入配置失败");
+      toast.error(getErrorMessage(error, "导入配置失败"));
     } finally {
       setIsImporting(false);
       if (fileInputRef.current) {
@@ -627,7 +620,7 @@ export default function BasicSettings({
                   <div className={adminPreviewPanelClass}>
                     <p className={overviewLabelClass}>当前版本</p>
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
-                      {formatVersionText(systemUpdateInfo?.current_version || settings?.version)}
+                      {formatVersionLabel(systemUpdateInfo?.current_version || settings?.version)}
                     </p>
                   </div>
                   <div className={adminPreviewPanelClass}>
@@ -636,7 +629,7 @@ export default function BasicSettings({
                       {refreshingSystemUpdate && !systemUpdateInfo
                         ? "检查中…"
                         : systemUpdateInfo?.latest_version
-                          ? formatVersionText(systemUpdateInfo.latest_version)
+                          ? formatVersionLabel(systemUpdateInfo.latest_version)
                           : "未检查"}
                     </p>
                   </div>
@@ -650,7 +643,7 @@ export default function BasicSettings({
                     disabled={refreshingSystemUpdate || startingSystemUpdate}
                     onClick={() => {
                       onRefreshSystemUpdate().catch((error) => {
-                        toast.error(error instanceof Error ? error.message : "刷新服务端更新状态失败");
+                        toast.error(getErrorMessage(error, "刷新服务端更新状态失败"));
                       });
                     }}
                   >
@@ -672,7 +665,7 @@ export default function BasicSettings({
                     }
                     onClick={() => {
                       onTriggerSystemUpdate().catch((error) => {
-                        toast.error(error instanceof Error ? error.message : "服务端更新操作失败");
+                        toast.error(getErrorMessage(error, "服务端更新操作失败"));
                       });
                     }}
                   >

@@ -77,7 +77,7 @@ import {
   adminWideInputClass,
   adminWorkspaceHeaderClass,
 } from "@/lib/admin-ui";
-import { resolveNodeSelections } from "@/lib/admin-format";
+import { getErrorMessage, resolveNodeSelections } from "@/lib/admin-format";
 import type { GroupNode, NodeView } from "@/lib/admin-types";
 
 export interface GroupManagementProps {
@@ -522,7 +522,7 @@ export default function GroupManagement({
       setDraftTree(toEditableTree(nextTree));
       toast.success("分组配置已保存。");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存分组失败。");
+      toast.error(getErrorMessage(error, "保存分组失败。"));
     } finally {
       setIsSaving(false);
     }

@@ -22,6 +22,7 @@ import { Label } from "@/components/ui/label";
 import { Edit2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import type { TestCatalogItem } from "@/lib/admin-types";
+import { getErrorMessage } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
   adminAccentBadgeClass,
@@ -351,7 +352,7 @@ export default function ProbeSettings({
       setIsDirty(false);
       toast.success("探测节点配置已保存");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存探测节点配置失败");
+      toast.error(getErrorMessage(error, "保存探测节点配置失败"));
     } finally {
       setIsSaving(false);
     }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,7 +28,8 @@ var (
 		return updater.NewDockerManagedUpdaterContext(ctx)
 	}
 	dockerManagedInitTimeout   = 10 * time.Second
-	dockerManagedHelperTimeout = 2 * time.Minute
+	dockerManagedLaunchTimeout = 15 * time.Second
+	updateReportTimeout        = 8 * time.Second
 )
 
 type Config struct {
@@ -107,11 +107,11 @@ func maybeApplyRemoteUpdate(
 	log.Printf("收到远程更新指令: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
 	if currentVersion == targetVersion {
 		log.Printf("跳过远程更新: Agent 已运行目标版本 %s", targetVersion)
-		return report(ctx, "succeeded", targetVersion, "Agent 已运行目标版本")
+		return reportUpdateState(report, "succeeded", targetVersion, "Agent 已运行目标版本")
 	}
 	if cfg.DisableUpdate {
 		log.Printf("拒绝远程更新: 当前 Agent 已禁用远程更新，目标版本=%s", targetVersion)
-		return report(ctx, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+		return reportUpdateState(report, "failed", targetVersion, "当前 Agent 已禁用远程更新")
 	}
 	if canDockerManagedUpdate() {
 		log.Printf("检测到 Docker 托管更新能力，正在初始化 Docker updater")
@@ -121,26 +121,26 @@ func maybeApplyRemoteUpdate(
 		if err != nil {
 			err = wrapDockerManagedUpdateError("初始化 Docker updater", err)
 			log.Printf("%v", err)
-			return report(ctx, "failed", targetVersion, err.Error())
+			return reportUpdateState(report, "failed", targetVersion, err.Error())
 		}
 		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
-		if err := report(ctx, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+		if err := reportUpdateState(report, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
 			return err
 		}
 		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
-		dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(ctx, dockerManagedHelperTimeout)
+		dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(context.Background(), dockerManagedLaunchTimeout)
 		err = dockerUpdater.LaunchSelfContainerUpdate(dockerLaunchCtx, targetImage, cfg.NodeID)
 		cancelDockerLaunch()
 		if err != nil {
 			err = wrapDockerManagedUpdateError("执行 Docker 更新 helper", err)
 			log.Printf("%v", err)
-			reportErr := report(ctx, "failed", targetVersion, err.Error())
+			reportErr := reportUpdateState(report, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 			}
 			return err
 		}
-		if err := report(ctx, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+		if err := reportUpdateState(report, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
 			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
 		}
 		log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
@@ -148,25 +148,34 @@ func maybeApplyRemoteUpdate(
 	}
 	if !updater.CanSelfUpdate() {
 		log.Printf("拒绝远程更新: 当前部署模式不支持 Agent 自更新，目标版本=%s", targetVersion)
-		return report(ctx, "failed", targetVersion, resolveUnsupportedUpdateMessage())
+		return reportUpdateState(report, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
 	log.Printf("开始下载并替换 Agent 二进制: 当前版本=%s，目标版本=%s，下载地址=%s", currentVersion, targetVersion, strings.TrimSpace(update.DownloadURL))
-	if err := report(ctx, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
+	if err := reportUpdateState(report, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
 	}
 	clientUpdater := updater.NewClient(updater.DefaultRepo, updater.KindAgent, currentVersion)
 	if err := clientUpdater.ApplyAsset(ctx, update.DownloadURL, update.ChecksumURL); err != nil {
-		reportErr := report(ctx, "failed", targetVersion, err.Error())
+		reportErr := reportUpdateState(report, "failed", targetVersion, err.Error())
 		if reportErr != nil {
 			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 		}
 		return err
 	}
 	log.Printf("Agent 更新包写入完成，准备重启到版本 %s", targetVersion)
-	if err := report(ctx, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
+	if err := reportUpdateState(report, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
 	return updater.RestartSelf()
+}
+
+func reportUpdateState(report updateReporter, state, version, message string) error {
+	if report == nil {
+		return nil
+	}
+	reportCtx, cancel := context.WithTimeout(context.Background(), updateReportTimeout)
+	defer cancel()
+	return report(reportCtx, state, version, message)
 }
 
 func wrapDockerManagedUpdateError(step string, err error) error {
@@ -239,12 +248,7 @@ func postAgentUpdateReport(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		text := strings.TrimSpace(string(body))
-		if text == "" {
-			text = fmt.Sprintf("status %d", resp.StatusCode)
-		}
-		return fmt.Errorf("update report failed: %s", text)
+		return readAgentAPIActionError(resp, "update report failed")
 	}
 	return nil
 }

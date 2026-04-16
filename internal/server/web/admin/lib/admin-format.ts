@@ -46,6 +46,12 @@ export function formatMbps(value?: number) {
   return `${num} Mbps`;
 }
 
+export function formatVersionLabel(value?: string | null) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "--";
+  return normalized.startsWith("v") ? normalized : `v${normalized}`;
+}
+
 export function toDateInputValue(value?: number) {
   if (!value) return "";
   return new Date(value * 1000).toISOString().slice(0, 10);
@@ -68,6 +74,16 @@ export function parseTelegramUserIds(raw: string) {
         .filter((item) => Number.isFinite(item) && item > 0),
     ),
   );
+}
+
+export function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error) {
+    const message = error.message.trim();
+    if (message) {
+      return message;
+    }
+  }
+  return fallback;
 }
 
 export function resolveNodeId(node: NodeView) {

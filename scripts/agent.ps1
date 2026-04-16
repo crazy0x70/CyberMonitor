@@ -29,14 +29,21 @@ function Ensure-Tls12 {
   }
 }
 
-function Invoke-WebRequestCompat {
+function New-WebRequestParams {
   param(
     [string]$Uri,
+    [string]$Method = "Get",
+    [hashtable]$Headers = @{},
     [string]$OutFile = ""
   )
+  $requestHeaders = @{ "User-Agent" = "CyberMonitor" }
+  foreach ($name in $Headers.Keys) {
+    $requestHeaders[$name] = $Headers[$name]
+  }
   $params = @{
     Uri     = $Uri
-    Headers = @{ "User-Agent" = "CyberMonitor" }
+    Method  = $Method
+    Headers = $requestHeaders
   }
   if ($OutFile) {
     $params.OutFile = $OutFile
@@ -44,21 +51,54 @@ function Invoke-WebRequestCompat {
   if ($PSVersionTable.PSVersion.Major -lt 6) {
     $params.UseBasicParsing = $true
   }
+  return $params
+}
+
+function Invoke-WebRequestCompat {
+  param(
+    [string]$Uri,
+    [string]$Method = "Get",
+    [hashtable]$Headers = @{},
+    [string]$OutFile = ""
+  )
+  $params = New-WebRequestParams -Uri $Uri -Method $Method -Headers $Headers -OutFile $OutFile
   return Invoke-WebRequest @params
 }
 
 function Invoke-RestMethodCompat {
   param(
-    [string]$Uri
+    [string]$Uri,
+    [string]$Method = "Get",
+    [hashtable]$Headers = @{}
   )
-  $params = @{
-    Uri     = $Uri
-    Headers = @{ "User-Agent" = "CyberMonitor" }
-  }
-  if ($PSVersionTable.PSVersion.Major -lt 6) {
-    $params.UseBasicParsing = $true
-  }
+  $params = New-WebRequestParams -Uri $Uri -Method $Method -Headers $Headers
   return Invoke-RestMethod @params
+}
+
+function Invoke-Sc {
+  param(
+    [string[]]$Arguments
+  )
+  & sc.exe @Arguments | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw ('sc.exe failed: {0}' -f ($Arguments -join ' '))
+  }
+}
+
+function Wait-ServiceRunning {
+  param(
+    [string]$Name,
+    [int]$TimeoutSeconds = 15
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    $service = Get-Service -Name $Name -ErrorAction Stop
+    if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running) {
+      return
+    }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+  throw ('Service failed to reach Running state: {0}' -f $service.Status)
 }
 
 function Get-InstallDir {
@@ -117,8 +157,66 @@ function Get-LatestVersion {
   exit 1
 }
 
+function Read-TrimmedFile {
+  param(
+    [string]$Path
+  )
+  if (-not $Path) {
+    return ""
+  }
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return ""
+  }
+  try {
+    return ([System.IO.File]::ReadAllText($Path)).Trim()
+  } catch {
+    return ""
+  }
+}
+
+function Write-TrimmedFile {
+  param(
+    [string]$Path,
+    [string]$Value
+  )
+  $trimmedPath = ""
+  if ($Path) {
+    $trimmedPath = $Path.Trim()
+  }
+  $trimmedValue = ""
+  if ($Value) {
+    $trimmedValue = $Value.Trim()
+  }
+  if (-not $trimmedPath) {
+    throw "file path required"
+  }
+  if (-not $trimmedValue) {
+    throw "file value required"
+  }
+  $parent = Split-Path -Parent $trimmedPath
+  if ($parent) {
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+  }
+  [System.IO.File]::WriteAllText($trimmedPath, $trimmedValue + [Environment]::NewLine)
+}
+
 function New-NodeId {
-  return "node-" + ([guid]::NewGuid().ToString("N").Substring(0, 16))
+  return ([guid]::NewGuid().ToString()).ToLowerInvariant()
+}
+
+function Resolve-NodeId {
+  param(
+    [string]$ExplicitNodeId,
+    [string]$NodeIdFile
+  )
+  if ($ExplicitNodeId -and $ExplicitNodeId.Trim()) {
+    return $ExplicitNodeId.Trim()
+  }
+  $persisted = Read-TrimmedFile -Path $NodeIdFile
+  if ($persisted) {
+    return $persisted
+  }
+  return New-NodeId
 }
 
 function Register-Agent {
@@ -129,7 +227,7 @@ function Register-Agent {
   )
   $registerNodeId = [Uri]::EscapeDataString($CurrentNodeId)
   $uri = "{0}/api/v1/agent/register?node_id={1}" -f $RegisterServerUrl.TrimEnd('/'), $registerNodeId
-  $response = Invoke-RestMethod -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
+  $response = Invoke-RestMethodCompat -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
   if (-not $response -or -not $response.agent_token) {
     Write-Host "Agent registration succeeded but the server did not return a dedicated token."
     exit 1
@@ -143,26 +241,27 @@ Ensure-Tls12
 $repo = "crazy0x70/CyberMonitor"
 $installDir = Get-InstallDir
 $binary = Join-Path $installDir "cyber-monitor-agent.exe"
+$nodeIDFile = Join-Path $installDir ".cybermonitor-node-id"
+$tokenFile = Join-Path $installDir ".cybermonitor-agent-token"
 $arch = Get-Arch
 $resolvedVersion = Get-LatestVersion -Repo $repo -FallbackVersion $Version
-if (-not $NodeId) {
-  $NodeId = New-NodeId
-}
+New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+$NodeId = Resolve-NodeId -ExplicitNodeId $NodeId -NodeIdFile $nodeIDFile
 $nodeToken = Register-Agent -RegisterServerUrl $ServerUrl -BootstrapToken $AgentToken -CurrentNodeId $NodeId
 
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 $url = "https://github.com/$repo/releases/download/$resolvedVersion/cyber-monitor-agent-windows-$arch.exe"
 Invoke-WebRequestCompat -Uri $url -OutFile $binary
-[System.IO.File]::WriteAllText((Join-Path $installDir ".cybermonitor-agent-token"), $nodeToken + [Environment]::NewLine)
+Write-TrimmedFile -Path $nodeIDFile -Value $NodeId
+Write-TrimmedFile -Path $tokenFile -Value $nodeToken
 
 $serviceName = "CyberMonitorAgent"
 $serviceArgs = @(
   "--server-url"
   ('"{0}"' -f $ServerUrl)
-  "--node-id"
-  ('"{0}"' -f $NodeId)
-  "--agent-token"
-  ('"{0}"' -f $nodeToken)
+  "--node-id-file"
+  ('"{0}"' -f $nodeIDFile)
+  "--agent-token-file"
+  ('"{0}"' -f $tokenFile)
 )
 if ($DisableUpdate) {
   $serviceArgs += "--disable-update"
@@ -171,13 +270,14 @@ $serviceBinPath = ('"{0}" {1}' -f $binary, ($serviceArgs -join ' '))
 
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
   Stop-Service -Name $serviceName -Force
-  sc.exe delete $serviceName | Out-Null
+  Invoke-Sc -Arguments @("delete", $serviceName)
 }
 
-sc.exe create $serviceName binPath= $serviceBinPath start= auto | Out-Null
-sc.exe failure $serviceName reset= 0 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-sc.exe failureflag $serviceName 1 | Out-Null
-sc.exe start $serviceName | Out-Null
+Invoke-Sc -Arguments @("create", $serviceName, "binPath=", $serviceBinPath, "start=", "auto")
+Invoke-Sc -Arguments @("failure", $serviceName, "reset=", "0", "actions=", "restart/5000/restart/5000/restart/5000")
+Invoke-Sc -Arguments @("failureflag", $serviceName, "1")
+Invoke-Sc -Arguments @("start", $serviceName)
+Wait-ServiceRunning -Name $serviceName
 
 Write-Host "Service installed: $serviceName"
 Write-Host "Node ID: $NodeId"

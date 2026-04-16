@@ -26,6 +26,7 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Bot, CheckCircle2, FileText, HelpCircle, Layers3, Loader2, Plus, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
+import { getErrorMessage } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
   adminDangerOutlineButtonClass,
@@ -271,7 +272,7 @@ export default function AIProvider({
       );
       toast.success(`${item.name} 验证成功`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "验证失败");
+      toast.error(getErrorMessage(error, "验证失败"));
     } finally {
       setTestingId(null);
     }
@@ -289,7 +290,7 @@ export default function AIProvider({
       }
       toast.success(`${item.name} 模型列表已刷新`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "获取模型列表失败");
+      toast.error(getErrorMessage(error, "获取模型列表失败"));
     } finally {
       setFetchingModelsId(null);
     }
@@ -321,7 +322,7 @@ export default function AIProvider({
       toast.success("AI 服务商配置已保存");
       setIsDirty(false);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存 AI 配置失败");
+      toast.error(getErrorMessage(error, "保存 AI 配置失败"));
     } finally {
       setSaving(false);
     }

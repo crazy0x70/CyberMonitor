@@ -18,6 +18,7 @@ import {
   adminSurfaceCardClass,
   adminThemeToggleButtonClass,
 } from "@/lib/admin-ui";
+import { getErrorMessage } from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
 
 declare global {
@@ -162,7 +163,7 @@ export default function Login({
       } catch (error) {
         if (!cancelled) {
           setTurnstileToken("");
-          setTurnstileError(error instanceof Error ? error.message : "Turnstile 加载失败");
+          setTurnstileError(getErrorMessage(error, "Turnstile 加载失败"));
         }
       }
     };

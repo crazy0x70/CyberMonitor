@@ -34,18 +34,34 @@ func OpenManager(dataDir string) (*Manager, error) {
 }
 
 func (m *Manager) Close() error {
+	return m.joinStoreOps((*NetworkStore).Close, (*OfflineStore).Close)
+}
+
+func (m *Manager) joinStoreOps(
+	runNetwork func(*NetworkStore) error,
+	runOffline func(*OfflineStore) error,
+) error {
 	if m == nil {
 		return nil
 	}
-	var networkErr error
-	if m.network != nil {
-		networkErr = m.network.Close()
+	return errors.Join(
+		runNetworkStoreOp(m.network, runNetwork),
+		runOfflineStoreOp(m.offline, runOffline),
+	)
+}
+
+func runNetworkStoreOp(store *NetworkStore, run func(*NetworkStore) error) error {
+	if store == nil || run == nil {
+		return nil
 	}
-	var offlineErr error
-	if m.offline != nil {
-		offlineErr = m.offline.Close()
+	return run(store)
+}
+
+func runOfflineStoreOp(store *OfflineStore, run func(*OfflineStore) error) error {
+	if store == nil || run == nil {
+		return nil
 	}
-	return errors.Join(networkErr, offlineErr)
+	return run(store)
 }
 
 func (m *Manager) AppendNetworkBatch(nodeID string, tests []metrics.NetworkTestResult, now time.Time) error {
@@ -56,33 +72,14 @@ func (m *Manager) AppendNetworkBatch(nodeID string, tests []metrics.NetworkTestR
 }
 
 func (m *Manager) DeleteNode(nodeID string) error {
-	if m == nil {
-		return nil
-	}
-	var networkErr error
-	if m.network != nil {
-		networkErr = m.network.DeleteNode(nodeID)
-	}
-	var offlineErr error
-	if m.offline != nil {
-		offlineErr = m.offline.DeleteNode(nodeID)
-	}
-	return errors.Join(networkErr, offlineErr)
+	return m.joinStoreOps(
+		func(store *NetworkStore) error { return store.DeleteNode(nodeID) },
+		func(store *OfflineStore) error { return store.DeleteNode(nodeID) },
+	)
 }
 
 func (m *Manager) ClearNodes() error {
-	if m == nil {
-		return nil
-	}
-	var networkErr error
-	if m.network != nil {
-		networkErr = m.network.Clear()
-	}
-	var offlineErr error
-	if m.offline != nil {
-		offlineErr = m.offline.Clear()
-	}
-	return errors.Join(networkErr, offlineErr)
+	return m.joinStoreOps((*NetworkStore).Clear, (*OfflineStore).Clear)
 }
 
 func (m *Manager) NetworkStore() *NetworkStore {

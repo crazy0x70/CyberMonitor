@@ -71,6 +71,8 @@ import {
   formatDateTime,
   formatMbps,
   formatRelativeTime,
+  formatVersionLabel,
+  getErrorMessage,
   normalizeSelectionValues,
   resolveNodeSelectionValues,
   resolveNodeIdentitySummary,
@@ -226,14 +228,6 @@ function parseDateTimeLocalValue(value: string) {
     return 0;
   }
   return Math.floor(timestamp / 1000);
-}
-
-function formatVersionLabel(value?: string) {
-  const normalized = String(value || "").trim();
-  if (!normalized) {
-    return "--";
-  }
-  return normalized.startsWith("v") ? normalized : `v${normalized}`;
 }
 
 function planToSeconds(plan: RenewPlan) {
@@ -805,7 +799,7 @@ export default function ServerManagement({
       await onRefresh();
       toast.success("节点列表已刷新");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "刷新节点列表失败");
+      toast.error(getErrorMessage(error, "刷新节点列表失败"));
     } finally {
       setRefreshing(false);
     }
@@ -872,7 +866,7 @@ export default function ServerManagement({
       toast.success("节点配置已保存并下发");
       closeEditor();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存节点配置失败");
+      toast.error(getErrorMessage(error, "保存节点配置失败"));
     } finally {
       setSaving(false);
     }
@@ -889,7 +883,7 @@ export default function ServerManagement({
       setDeleteDialogOpen(false);
       closeEditor();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除节点失败");
+      toast.error(getErrorMessage(error, "删除节点失败"));
     } finally {
       setDeleting(false);
     }
@@ -929,7 +923,7 @@ export default function ServerManagement({
       }
       toast.success("已完成 Agent 版本检查");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "检查 Agent 更新失败");
+      toast.error(getErrorMessage(error, "检查 Agent 更新失败"));
     } finally {
       setRefreshingAgentUpdate(false);
     }
@@ -958,7 +952,7 @@ export default function ServerManagement({
         published_at: current?.published_at,
       }));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "下发 Agent 更新失败");
+      toast.error(getErrorMessage(error, "下发 Agent 更新失败"));
     } finally {
       setUpdatingAgent(false);
     }
