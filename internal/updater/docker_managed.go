@@ -313,7 +313,7 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 	netCfg := &network.NetworkingConfig{}
 	extraNetworks := make(map[string]*network.EndpointSettings)
 	mode := strings.TrimSpace(string(inspect.HostConfig.NetworkMode))
-	if inspect.NetworkSettings != nil {
+	if shouldCloneEndpointConfig(mode) && inspect.NetworkSettings != nil {
 		for networkName, endpoint := range inspect.NetworkSettings.Networks {
 			copied := cloneEndpointSettings(endpoint)
 			if mode == networkName {
@@ -331,7 +331,28 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 			extraNetworks[networkName] = copied
 		}
 	}
+	if len(netCfg.EndpointsConfig) == 0 {
+		netCfg = nil
+	}
+	if len(extraNetworks) == 0 {
+		extraNetworks = nil
+	}
 	return cfg, &hostCfg, netCfg, extraNetworks
+}
+
+func shouldCloneEndpointConfig(mode string) bool {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return true
+	}
+	switch {
+	case mode == "host", mode == "none":
+		return false
+	case strings.HasPrefix(mode, "container:"):
+		return false
+	default:
+		return true
+	}
 }
 
 func newDockerClient(socketPath string) (*client.Client, error) {
