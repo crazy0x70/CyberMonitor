@@ -41,23 +41,13 @@ func (m *Manager) joinStoreOps(
 	runNetwork func(*NetworkStore) error,
 	runOffline func(*OfflineStore) error,
 ) error {
-	if m == nil {
-		return nil
-	}
 	return errors.Join(
-		runNetworkStoreOp(m.network, runNetwork),
-		runOfflineStoreOp(m.offline, runOffline),
+		runStoreOp(m.networkStore(), runNetwork),
+		runStoreOp(m.offlineStore(), runOffline),
 	)
 }
 
-func runNetworkStoreOp(store *NetworkStore, run func(*NetworkStore) error) error {
-	if store == nil || run == nil {
-		return nil
-	}
-	return run(store)
-}
-
-func runOfflineStoreOp(store *OfflineStore, run func(*OfflineStore) error) error {
+func runStoreOp[Store any](store *Store, run func(*Store) error) error {
 	if store == nil || run == nil {
 		return nil
 	}
@@ -65,10 +55,11 @@ func runOfflineStoreOp(store *OfflineStore, run func(*OfflineStore) error) error
 }
 
 func (m *Manager) AppendNetworkBatch(nodeID string, tests []metrics.NetworkTestResult, now time.Time) error {
-	if m == nil || m.network == nil {
+	store := m.networkStore()
+	if store == nil {
 		return nil
 	}
-	return m.network.AppendBatch(nodeID, tests, now)
+	return store.AppendBatch(nodeID, tests, now)
 }
 
 func (m *Manager) DeleteNode(nodeID string) error {
@@ -83,27 +74,37 @@ func (m *Manager) ClearNodes() error {
 }
 
 func (m *Manager) NetworkStore() *NetworkStore {
+	return m.networkStore()
+}
+
+func (m *Manager) AppendOfflineEvent(nodeID string, recoveredAt time.Time, duration time.Duration) error {
+	store := m.offlineStore()
+	if store == nil {
+		return nil
+	}
+	return store.AppendEvent(nodeID, recoveredAt, duration)
+}
+
+func (m *Manager) HasOfflineEventForSession(nodeID string, startedAt time.Time) (bool, error) {
+	store := m.offlineStore()
+	if store == nil {
+		return false, nil
+	}
+	return store.HasEventForSession(nodeID, startedAt)
+}
+
+func (m *Manager) OfflineStore() *OfflineStore {
+	return m.offlineStore()
+}
+
+func (m *Manager) networkStore() *NetworkStore {
 	if m == nil {
 		return nil
 	}
 	return m.network
 }
 
-func (m *Manager) AppendOfflineEvent(nodeID string, recoveredAt time.Time, duration time.Duration) error {
-	if m == nil || m.offline == nil {
-		return nil
-	}
-	return m.offline.AppendEvent(nodeID, recoveredAt, duration)
-}
-
-func (m *Manager) HasOfflineEventForSession(nodeID string, startedAt time.Time) (bool, error) {
-	if m == nil || m.offline == nil {
-		return false, nil
-	}
-	return m.offline.HasEventForSession(nodeID, startedAt)
-}
-
-func (m *Manager) OfflineStore() *OfflineStore {
+func (m *Manager) offlineStore() *OfflineStore {
 	if m == nil {
 		return nil
 	}

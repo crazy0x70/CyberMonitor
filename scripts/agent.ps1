@@ -29,6 +29,16 @@ function Ensure-Tls12 {
   }
 }
 
+function Get-TrimmedText {
+  param(
+    [string]$Value
+  )
+  if ($null -eq $Value) {
+    return ""
+  }
+  return $Value.Trim()
+}
+
 function New-WebRequestParams {
   param(
     [string]$Uri,
@@ -41,12 +51,13 @@ function New-WebRequestParams {
     $requestHeaders[$name] = $Headers[$name]
   }
   $params = @{
-    Uri     = $Uri
+    Uri     = (Get-TrimmedText -Value $Uri)
     Method  = $Method
     Headers = $requestHeaders
   }
-  if ($OutFile) {
-    $params.OutFile = $OutFile
+  $trimmedOutFile = Get-TrimmedText -Value $OutFile
+  if ($trimmedOutFile) {
+    $params.OutFile = $trimmedOutFile
   }
   if ($PSVersionTable.PSVersion.Major -lt 6) {
     $params.UseBasicParsing = $true
@@ -54,25 +65,20 @@ function New-WebRequestParams {
   return $params
 }
 
-function Invoke-WebRequestCompat {
+function Invoke-WebCall {
   param(
+    [ValidateSet("WebRequest", "RestMethod")]
+    [string]$Kind,
     [string]$Uri,
     [string]$Method = "Get",
     [hashtable]$Headers = @{},
     [string]$OutFile = ""
   )
   $params = New-WebRequestParams -Uri $Uri -Method $Method -Headers $Headers -OutFile $OutFile
+  if ($Kind -eq "RestMethod") {
+    return Invoke-RestMethod @params
+  }
   return Invoke-WebRequest @params
-}
-
-function Invoke-RestMethodCompat {
-  param(
-    [string]$Uri,
-    [string]$Method = "Get",
-    [hashtable]$Headers = @{}
-  )
-  $params = New-WebRequestParams -Uri $Uri -Method $Method -Headers $Headers
-  return Invoke-RestMethod @params
 }
 
 function Invoke-Sc {
@@ -99,6 +105,17 @@ function Wait-ServiceRunning {
     Start-Sleep -Seconds 1
   } while ((Get-Date) -lt $deadline)
   throw ('Service failed to reach Running state: {0}' -f $service.Status)
+}
+
+function Remove-ServiceIfExists {
+  param(
+    [string]$Name
+  )
+  if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) {
+    return
+  }
+  Stop-Service -Name $Name -Force
+  Invoke-Sc -Arguments @("delete", $Name)
 }
 
 function Get-InstallDir {
@@ -138,14 +155,14 @@ function Get-LatestVersion {
     return $FallbackVersion
   }
   try {
-    $release = Invoke-RestMethodCompat "https://api.github.com/repos/$Repo/releases/latest"
+    $release = Invoke-WebCall -Kind RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
     if ($release -and $release.tag_name) {
       return $release.tag_name
     }
   } catch {
   }
   try {
-    $resp = Invoke-WebRequestCompat "https://github.com/$Repo/releases/latest"
+    $resp = Invoke-WebCall -Kind WebRequest -Uri "https://github.com/$Repo/releases/latest"
     $final = $resp.BaseResponse.ResponseUri.AbsoluteUri
     $tag = $final.Split('/')[-1]
     if ($tag -and $tag -ne "latest") {
@@ -161,14 +178,15 @@ function Read-TrimmedFile {
   param(
     [string]$Path
   )
-  if (-not $Path) {
+  $trimmedPath = Get-TrimmedText -Value $Path
+  if (-not $trimmedPath) {
     return ""
   }
-  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+  if (-not (Test-Path -LiteralPath $trimmedPath -PathType Leaf)) {
     return ""
   }
   try {
-    return ([System.IO.File]::ReadAllText($Path)).Trim()
+    return Get-TrimmedText -Value ([System.IO.File]::ReadAllText($trimmedPath))
   } catch {
     return ""
   }
@@ -179,14 +197,8 @@ function Write-TrimmedFile {
     [string]$Path,
     [string]$Value
   )
-  $trimmedPath = ""
-  if ($Path) {
-    $trimmedPath = $Path.Trim()
-  }
-  $trimmedValue = ""
-  if ($Value) {
-    $trimmedValue = $Value.Trim()
-  }
+  $trimmedPath = Get-TrimmedText -Value $Path
+  $trimmedValue = Get-TrimmedText -Value $Value
   if (-not $trimmedPath) {
     throw "file path required"
   }
@@ -209,8 +221,9 @@ function Resolve-NodeId {
     [string]$ExplicitNodeId,
     [string]$NodeIdFile
   )
-  if ($ExplicitNodeId -and $ExplicitNodeId.Trim()) {
-    return $ExplicitNodeId.Trim()
+  $resolvedNodeId = Get-TrimmedText -Value $ExplicitNodeId
+  if ($resolvedNodeId) {
+    return $resolvedNodeId
   }
   $persisted = Read-TrimmedFile -Path $NodeIdFile
   if ($persisted) {
@@ -226,8 +239,9 @@ function Register-Agent {
     [string]$CurrentNodeId
   )
   $registerNodeId = [Uri]::EscapeDataString($CurrentNodeId)
-  $uri = "{0}/api/v1/agent/register?node_id={1}" -f $RegisterServerUrl.TrimEnd('/'), $registerNodeId
-  $response = Invoke-RestMethodCompat -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
+  $baseServerUrl = Get-TrimmedText -Value $RegisterServerUrl
+  $uri = "{0}/api/v1/agent/register?node_id={1}" -f $baseServerUrl.TrimEnd('/'), $registerNodeId
+  $response = Invoke-WebCall -Kind RestMethod -Method Post -Uri $uri -Headers @{ "X-AGENT-TOKEN" = $BootstrapToken }
   if (-not $response -or -not $response.agent_token) {
     Write-Host "Agent registration succeeded but the server did not return a dedicated token."
     exit 1
@@ -250,7 +264,7 @@ $NodeId = Resolve-NodeId -ExplicitNodeId $NodeId -NodeIdFile $nodeIDFile
 $nodeToken = Register-Agent -RegisterServerUrl $ServerUrl -BootstrapToken $AgentToken -CurrentNodeId $NodeId
 
 $url = "https://github.com/$repo/releases/download/$resolvedVersion/cyber-monitor-agent-windows-$arch.exe"
-Invoke-WebRequestCompat -Uri $url -OutFile $binary
+Invoke-WebCall -Kind WebRequest -Uri $url -OutFile $binary
 Write-TrimmedFile -Path $nodeIDFile -Value $NodeId
 Write-TrimmedFile -Path $tokenFile -Value $nodeToken
 
@@ -268,11 +282,7 @@ if ($DisableUpdate) {
 }
 $serviceBinPath = ('"{0}" {1}' -f $binary, ($serviceArgs -join ' '))
 
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-  Stop-Service -Name $serviceName -Force
-  Invoke-Sc -Arguments @("delete", $serviceName)
-}
-
+Remove-ServiceIfExists -Name $serviceName
 Invoke-Sc -Arguments @("create", $serviceName, "binPath=", $serviceBinPath, "start=", "auto")
 Invoke-Sc -Arguments @("failure", $serviceName, "reset=", "0", "actions=", "restart/5000/restart/5000/restart/5000")
 Invoke-Sc -Arguments @("failureflag", $serviceName, "1")

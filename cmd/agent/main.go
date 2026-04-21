@@ -23,14 +23,6 @@ var (
 	BuildTime = "unknown"
 )
 
-func resolvedVersion() string {
-	return cmdutil.EnvOrDefault("CM_VERSION", Version)
-}
-
-func resolvedCommit() string {
-	return cmdutil.EnvOrDefault("CM_COMMIT", Commit)
-}
-
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "docker-recreate-helper" {
 		if err := updater.RunDockerRecreateHelper(context.Background()); err != nil {
@@ -56,8 +48,8 @@ func main() {
 	hostRoot := flag.String("host-root", cmdutil.EnvOrDefault("CM_HOST_ROOT", "/host"), "宿主机挂载根目录")
 	flag.Parse()
 
-	agentVersion := resolvedVersion()
-	agentCommit := resolvedCommit()
+	agentVersion := cmdutil.EnvOrDefault("CM_VERSION", Version)
+	agentCommit := cmdutil.EnvOrDefault("CM_COMMIT", Commit)
 	if *showVersion {
 		printVersion(agentVersion, agentCommit)
 		return

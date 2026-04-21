@@ -615,6 +615,21 @@ func normalizeTagValues(tags []string) []string {
 	return normalizeUniqueStrings(tags, nil)
 }
 
+func normalizeGroupName(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "全部" {
+		return ""
+	}
+	return trimmed
+}
+
+func canonicalGroupSelection(group, tag string) string {
+	if tag == "" {
+		return group
+	}
+	return group + ":" + tag
+}
+
 func parseGroupSelection(value string) (string, string) {
 	raw := strings.TrimSpace(value)
 	if raw == "" || raw == "全部" {
@@ -635,7 +650,8 @@ func parseGroupSelection(value string) (string, string) {
 			tag = strings.TrimSpace(parts[1])
 		}
 	}
-	if group == "" || group == "全部" {
+	group = normalizeGroupName(group)
+	if group == "" {
 		return "", ""
 	}
 	return group, tag
@@ -645,9 +661,14 @@ func normalizeGroupSelections(selections []string) []string {
 	if len(selections) == 0 {
 		return nil
 	}
+	type selectionEntry struct {
+		group string
+		tag   string
+	}
+
 	seen := make(map[string]struct{})
 	tagsByGroup := make(map[string]map[string]struct{})
-	order := make([]string, 0, len(selections))
+	entries := make([]selectionEntry, 0, len(selections))
 
 	for _, raw := range selections {
 		group, tag := parseGroupSelection(raw)
@@ -662,41 +683,42 @@ func normalizeGroupSelections(selections []string) []string {
 				continue
 			}
 			tagsByGroup[group][tag] = struct{}{}
-			entry := fmt.Sprintf("%s:%s", group, tag)
+			entry := canonicalGroupSelection(group, tag)
 			if _, ok := seen[entry]; ok {
 				continue
 			}
 			seen[entry] = struct{}{}
-			order = append(order, entry)
+			entries = append(entries, selectionEntry{group: group, tag: tag})
 			continue
 		}
-		if _, ok := seen[group]; ok {
+		entry := canonicalGroupSelection(group, "")
+		if _, ok := seen[entry]; ok {
 			continue
 		}
-		seen[group] = struct{}{}
-		order = append(order, group)
+		seen[entry] = struct{}{}
+		entries = append(entries, selectionEntry{group: group})
 	}
 
 	if len(tagsByGroup) == 0 {
-		return order
+		normalized := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			normalized = append(normalized, canonicalGroupSelection(entry.group, entry.tag))
+		}
+		return normalized
 	}
-	filtered := make([]string, 0, len(order))
-	for _, value := range order {
-		group, tag := parseGroupSelection(value)
-		if group == "" {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.tag == "" && len(tagsByGroup[entry.group]) > 0 {
 			continue
 		}
-		if tag == "" && len(tagsByGroup[group]) > 0 {
-			continue
-		}
-		filtered = append(filtered, value)
+		filtered = append(filtered, canonicalGroupSelection(entry.group, entry.tag))
 	}
 	return filtered
 }
 
 func selectionsFromGroupTags(group string, tags []string) []string {
-	group = strings.TrimSpace(group)
-	if group == "" || group == "全部" {
+	group = normalizeGroupName(group)
+	if group == "" {
 		return nil
 	}
 	normalizedTags := normalizeTagValues(tags)
@@ -705,7 +727,7 @@ func selectionsFromGroupTags(group string, tags []string) []string {
 	}
 	result := make([]string, 0, len(normalizedTags))
 	for _, tag := range normalizedTags {
-		result = append(result, fmt.Sprintf("%s:%s", group, tag))
+		result = append(result, canonicalGroupSelection(group, tag))
 	}
 	return result
 }
@@ -732,10 +754,7 @@ func primaryGroupTagsFromNormalizedSelections(selections []string) (string, []st
 			return "", nil, false
 		}
 
-		canonical := group
-		if tag != "" {
-			canonical = fmt.Sprintf("%s:%s", group, tag)
-		}
+		canonical := canonicalGroupSelection(group, tag)
 		if raw != canonical {
 			return "", nil, false
 		}
@@ -792,8 +811,8 @@ func normalizeGroupTree(nodes []GroupNode) []GroupNode {
 	seen := make(map[string]struct{})
 	normalized := make([]GroupNode, 0, len(nodes))
 	for _, node := range nodes {
-		name := strings.TrimSpace(node.Name)
-		if name == "" || name == "全部" {
+		name := normalizeGroupName(node.Name)
+		if name == "" {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -815,8 +834,8 @@ func normalizeTagNodes(nodes []GroupNode) []GroupNode {
 	var walk func(items []GroupNode)
 	walk = func(items []GroupNode) {
 		for _, item := range items {
-			name := strings.TrimSpace(item.Name)
-			if name == "" || name == "全部" {
+			name := normalizeGroupName(item.Name)
+			if name == "" {
 				continue
 			}
 			if _, ok := seen[name]; !ok {
@@ -836,8 +855,8 @@ func flattenGroupTree(nodes []GroupNode) []string {
 	seen := make(map[string]struct{})
 	var result []string
 	for _, item := range nodes {
-		name := strings.TrimSpace(item.Name)
-		if name == "" || name == "全部" {
+		name := normalizeGroupName(item.Name)
+		if name == "" {
 			continue
 		}
 		if _, ok := seen[name]; ok {
@@ -857,7 +876,7 @@ func buildGroupTree(groups []string) []GroupNode {
 			continue
 		}
 		parts := strings.Split(trimmed, "/")
-		groupName := strings.TrimSpace(parts[0])
+		groupName := normalizeGroupName(parts[0])
 		if groupName == "" {
 			continue
 		}
@@ -873,7 +892,7 @@ func buildGroupTree(groups []string) []GroupNode {
 			index = len(root) - 1
 		}
 		if len(parts) > 1 {
-			tag := strings.TrimSpace(strings.Join(parts[1:], "/"))
+			tag := normalizeGroupName(strings.Join(parts[1:], "/"))
 			if tag != "" {
 				root[index].Children = append(root[index].Children, GroupNode{Name: tag})
 			}

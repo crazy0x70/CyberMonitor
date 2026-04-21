@@ -746,12 +746,13 @@ html[data-theme="dark"] .theme-toggle:hover {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.35fr);
   gap: 18px;
-  align-items: start;
-  margin-bottom: 18px;
+  align-items: stretch;
 }
 
 .detail-charts {
   min-width: 0;
+  display: flex;
+  align-self: stretch;
 }
 
 .detail-info {
@@ -764,6 +765,8 @@ html[data-theme="dark"] .theme-toggle:hover {
   border: 1px solid var(--panel-border);
   font-size: 12px;
   color: var(--muted);
+  align-content: start;
+  align-self: stretch;
 }
 
 .info-row {
@@ -791,6 +794,9 @@ html[data-theme="dark"] .theme-toggle:hover {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  flex: 1 1 auto;
+  align-content: stretch;
+  grid-auto-rows: minmax(0, 1fr);
 }
 
 .card {
@@ -938,6 +944,7 @@ html[data-theme="dark"] .theme-toggle:hover {
 .network-section {
   display: grid;
   gap: 14px;
+  margin-top: 18px;
 }
 
 .network-chart {

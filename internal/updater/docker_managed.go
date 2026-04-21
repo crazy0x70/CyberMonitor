@@ -152,25 +152,33 @@ func probeDockerManagedUpdateUncached() (dockerManagedProbe, error) {
 		return dockerManagedProbe{}, fmt.Errorf("当前部署模式不是 Docker")
 	}
 	socketPath := resolveDockerSocketPath()
-	if socketPath == "" {
-		return dockerManagedProbe{}, fmt.Errorf("未配置 docker socket")
-	}
-	if _, err := os.Stat(socketPath); err != nil {
+	if err := ensureDockerSocketAccessible(socketPath); err != nil {
 		return dockerManagedProbe{}, err
 	}
 	containerID, err := resolveCurrentContainerID()
 	if err != nil {
 		return dockerManagedProbe{}, err
 	}
-	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
-	if err != nil {
-		return dockerManagedProbe{}, err
-	}
-	_ = conn.Close()
 	return dockerManagedProbe{
 		socketPath:  socketPath,
 		containerID: containerID,
 	}, nil
+}
+
+func ensureDockerSocketAccessible(socketPath string) error {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" {
+		return fmt.Errorf("未配置 docker socket")
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		return err
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
 }
 
 func resolveCurrentContainerIDWithSources(
@@ -184,13 +192,18 @@ func resolveCurrentContainerIDWithSources(
 		return value, nil
 	}
 	if readFile != nil {
-		if raw, err := readFile(dockerSelfMountInfoPath); err == nil {
-			if value := parseContainerIDFromMountInfo(raw); value != "" {
-				return value, nil
+		for _, source := range [...]struct {
+			path  string
+			parse func([]byte) string
+		}{
+			{path: dockerSelfMountInfoPath, parse: parseContainerIDFromMountInfo},
+			{path: dockerSelfCgroupPath, parse: parseContainerIDFromCgroup},
+		} {
+			raw, err := readFile(source.path)
+			if err != nil {
+				continue
 			}
-		}
-		if raw, err := readFile(dockerSelfCgroupPath); err == nil {
-			if value := parseContainerIDFromCgroup(raw); value != "" {
+			if value := source.parse(raw); value != "" {
 				return value, nil
 			}
 		}
@@ -246,11 +259,8 @@ func NewDockerManagedUpdaterContext(ctx context.Context) (*DockerManagedUpdater,
 	if err != nil {
 		return nil, fmt.Errorf("读取当前容器信息失败: %w", err)
 	}
-	if inspect.Config == nil {
-		return nil, fmt.Errorf("当前容器缺少 Config 信息")
-	}
-	if inspect.HostConfig == nil {
-		return nil, fmt.Errorf("当前容器缺少 HostConfig 信息")
+	if err := validateContainerInspect(inspect, "当前容器"); err != nil {
+		return nil, err
 	}
 	socketSource := resolveDockerSocketSource(inspect.Mounts, probe.socketPath)
 	if socketSource == "" {
@@ -334,11 +344,8 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("读取目标容器信息失败: %w", err)
 	}
-	if inspect.Config == nil {
-		return fmt.Errorf("目标容器缺少 Config 信息")
-	}
-	if inspect.HostConfig == nil {
-		return fmt.Errorf("目标容器缺少 HostConfig 信息")
+	if err := validateContainerInspect(inspect, "目标容器"); err != nil {
+		return err
 	}
 	if err := pullDockerImage(ctx, cli, targetImage); err != nil {
 		return err
@@ -375,6 +382,17 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	return nil
 }
 
+func validateContainerInspect(inspect dockertypes.ContainerJSON, subject string) error {
+	switch {
+	case inspect.Config == nil:
+		return fmt.Errorf("%s缺少 Config 信息", subject)
+	case inspect.HostConfig == nil:
+		return fmt.Errorf("%s缺少 HostConfig 信息", subject)
+	default:
+		return nil
+	}
+}
+
 func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string, currentNodeID string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, map[string]*network.EndpointSettings) {
 	hostname := strings.TrimSpace(inspect.Config.Hostname)
 	shortID := strings.TrimSpace(inspect.ID)
@@ -408,26 +426,27 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 	hostCfg.RestartPolicy = inspect.HostConfig.RestartPolicy
 	hostCfg.AutoRemove = false
 	hostCfg.Mounts = append([]mount.Mount{}, inspect.HostConfig.Mounts...)
+	netCfg, extraNetworks := buildReplacementNetworking(inspect)
+	return cfg, &hostCfg, netCfg, extraNetworks
+}
+
+func buildReplacementNetworking(inspect dockertypes.ContainerJSON) (*network.NetworkingConfig, map[string]*network.EndpointSettings) {
+	mode := strings.TrimSpace(string(inspect.HostConfig.NetworkMode))
+	if !shouldCloneEndpointConfig(mode) || inspect.NetworkSettings == nil || len(inspect.NetworkSettings.Networks) == 0 {
+		return nil, nil
+	}
+	primaryNetworkName := resolvePrimaryNetworkName(mode, inspect.NetworkSettings.Networks)
 	netCfg := &network.NetworkingConfig{}
 	extraNetworks := make(map[string]*network.EndpointSettings)
-	mode := strings.TrimSpace(string(inspect.HostConfig.NetworkMode))
-	if shouldCloneEndpointConfig(mode) && inspect.NetworkSettings != nil {
-		for networkName, endpoint := range inspect.NetworkSettings.Networks {
-			copied := cloneEndpointSettings(endpoint)
-			if mode == networkName {
-				netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
-					networkName: copied,
-				}
-				continue
+	for networkName, endpoint := range inspect.NetworkSettings.Networks {
+		copied := cloneEndpointSettings(endpoint)
+		if networkName == primaryNetworkName {
+			netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+				networkName: copied,
 			}
-			if mode == "" && len(inspect.NetworkSettings.Networks) == 1 {
-				netCfg.EndpointsConfig = map[string]*network.EndpointSettings{
-					networkName: copied,
-				}
-				continue
-			}
-			extraNetworks[networkName] = copied
+			continue
 		}
+		extraNetworks[networkName] = copied
 	}
 	if len(netCfg.EndpointsConfig) == 0 {
 		netCfg = nil
@@ -435,7 +454,21 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 	if len(extraNetworks) == 0 {
 		extraNetworks = nil
 	}
-	return cfg, &hostCfg, netCfg, extraNetworks
+	return netCfg, extraNetworks
+}
+
+func resolvePrimaryNetworkName(mode string, networks map[string]*network.EndpointSettings) string {
+	mode = strings.TrimSpace(mode)
+	if mode != "" {
+		return mode
+	}
+	if len(networks) != 1 {
+		return ""
+	}
+	for networkName := range networks {
+		return networkName
+	}
+	return ""
 }
 
 func shouldCloneEndpointConfig(mode string) bool {

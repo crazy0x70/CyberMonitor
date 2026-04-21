@@ -112,6 +112,41 @@ export function flattenGroupTree(tree: GroupNode[]) {
     .filter((item) => item.group);
 }
 
+function trimSelectionPart(value?: string | null) {
+  return String(value || "").trim();
+}
+
+function splitSelectionValue(raw: string, separator: ":" | "/") {
+  const [group, ...rest] = raw.split(separator);
+  return {
+    group: group.trim(),
+    tag: rest.join(separator).trim(),
+  };
+}
+
+function normalizeParsedSelection(selection: GroupSelection) {
+  const group = trimSelectionPart(selection.group);
+  if (!group) {
+    return null;
+  }
+  return {
+    group,
+    tag: trimSelectionPart(selection.tag),
+  };
+}
+
+function parseNormalizedSelection(value: string) {
+  return normalizeParsedSelection(parseSelectionValue(value));
+}
+
+function buildSelectionKey(selection: GroupSelection) {
+  return `${selection.group}::${selection.tag}`;
+}
+
+function stringifySelectionValue(selection: GroupSelection) {
+  return selection.tag ? `${selection.group}:${selection.tag}` : selection.group;
+}
+
 export function buildSelectionValues(group: string, tags: string[]) {
   if (!group) return [];
   if (!tags.length) return [group];
@@ -119,15 +154,13 @@ export function buildSelectionValues(group: string, tags: string[]) {
 }
 
 export function parseSelectionValue(value: string) {
-  const raw = String(value || "").trim();
+  const raw = trimSelectionPart(value);
   if (!raw) return { group: "", tag: "" };
   if (raw.includes(":")) {
-    const [group, ...rest] = raw.split(":");
-    return { group: group.trim(), tag: rest.join(":").trim() };
+    return splitSelectionValue(raw, ":");
   }
   if (raw.includes("/")) {
-    const [group, ...rest] = raw.split("/");
-    return { group: group.trim(), tag: rest.join("/").trim() };
+    return splitSelectionValue(raw, "/");
   }
   return { group: raw, tag: "" };
 }
@@ -145,11 +178,10 @@ export function normalizeSelectionValues(values: string[]) {
 export function resolveNodeSelectionValues(
   node: Pick<NodeView, "group" | "groups" | "tags" | "stats">,
 ) {
-  if (Array.isArray(node.groups) && node.groups.length > 0) {
-    return normalizeSelectionValues(node.groups);
-  }
   return normalizeSelectionValues(
-    buildSelectionValues(node.group || node.stats.node_group || "", node.tags || []),
+    Array.isArray(node.groups) && node.groups.length > 0
+      ? node.groups
+      : buildSelectionValues(node.group || node.stats.node_group || "", node.tags || []),
   );
 }
 
@@ -157,10 +189,10 @@ export function resolveSelectionValues(values: string[]) {
   const seenSelections = new Set<string>();
 
   return normalizeSelectionValues(values)
-    .map(parseSelectionValue)
-    .filter((item): item is GroupSelection => Boolean(item.group))
+    .map(parseNormalizedSelection)
+    .filter((item): item is GroupSelection => Boolean(item))
     .filter((item) => {
-      const key = `${item.group}::${item.tag}`;
+      const key = buildSelectionKey(item);
       if (seenSelections.has(key)) {
         return false;
       }
@@ -176,16 +208,14 @@ export function resolveNodeSelections(
 }
 
 export function upsertSelectionValue(currentValues: string[], nextValue: string) {
-  const parsed = parseSelectionValue(nextValue);
-  const group = String(parsed.group || "").trim();
-  const tag = String(parsed.tag || "").trim();
-  if (!group) {
+  const nextSelection = parseNormalizedSelection(nextValue);
+  if (!nextSelection) {
     return normalizeSelectionValues(currentValues);
   }
   const filtered = currentValues.filter(
-    (value) => parseSelectionValue(value).group !== group,
+    (value) => parseSelectionValue(value).group !== nextSelection.group,
   );
-  return normalizeSelectionValues([...filtered, tag ? `${group}:${tag}` : group]);
+  return normalizeSelectionValues([...filtered, stringifySelectionValue(nextSelection)]);
 }
 
 export function resolveProbeLabel(item: TestCatalogItem) {

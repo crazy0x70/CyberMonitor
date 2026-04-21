@@ -42,6 +42,11 @@ type preparedNetworkSample struct {
 	availability    float64
 }
 
+type preparedNetworkMetric struct {
+	name  string
+	value float64
+}
+
 func OpenNetworkStore(dir string) (*NetworkStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, errors.New("network history dir required")
@@ -52,6 +57,7 @@ func OpenNetworkStore(dir string) (*NetworkStore, error) {
 
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = int64((networkRetentionDays * 24 * time.Hour) / time.Millisecond)
+	opts.OutOfOrderTimeWindow = opts.RetentionDuration
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {
@@ -75,7 +81,7 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	if s == nil || s.db == nil {
 		return errNilNetworkStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
+	nodeID = normalizeNodeID(nodeID)
 	if nodeID == "" || len(tests) == 0 {
 		return nil
 	}
@@ -86,7 +92,7 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	ctx := context.Background()
 	appender := s.db.Appender(ctx)
 	committed := false
-	appendedSeries := make(map[string]int64)
+	latestSeriesTimeUpdates := make(map[string]int64)
 	defer func() {
 		if !committed {
 			_ = appender.Rollback()
@@ -99,30 +105,13 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 			continue
 		}
 
-		if sample.latency != nil {
-			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkLatencyMetric, *sample.latency)
-			if err != nil {
-				return err
-			}
-			if appended {
-				appendedSeries[networkSeriesTimestampKey(networkLatencyMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
-			}
-		}
-		if sample.loss != nil {
-			appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkLossMetric, *sample.loss)
-			if err != nil {
-				return err
-			}
-			if appended {
-				appendedSeries[networkSeriesTimestampKey(networkLossMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
-			}
-		}
-		appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, networkAvailabilityMetric, sample.availability)
-		if err != nil {
+		if err := s.appendPreparedMetricSamples(
+			appender,
+			nodeID,
+			sample,
+			latestSeriesTimeUpdates,
+		); err != nil {
 			return err
-		}
-		if appended {
-			appendedSeries[networkSeriesTimestampKey(networkAvailabilityMetric, nodeID, sample.seriesKey)] = sample.timestampMillis
 		}
 	}
 
@@ -130,9 +119,7 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 		return err
 	}
 	committed = true
-	for key, tsMillis := range appendedSeries {
-		s.latestSeriesTime[key] = tsMillis
-	}
+	s.recordLatestSeriesTime(latestSeriesTimeUpdates)
 
 	return nil
 }
@@ -153,7 +140,7 @@ func (s *NetworkStore) queryRange(
 	if s == nil || s.db == nil {
 		return nil, errNilNetworkStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
+	nodeID = normalizeNodeID(nodeID)
 	if nodeID == "" {
 		return map[string]*NetworkHistoryEntry{}, nil
 	}
@@ -170,14 +157,15 @@ func (s *NetworkStore) queryRange(
 	defer querier.Close()
 
 	accumulators := make(map[string]*seriesAccumulator)
-	metricsToCollect := []string{
-		networkLatencyMetric,
-		networkLossMetric,
-	}
-	if includeAvailability {
-		metricsToCollect = append(metricsToCollect, networkAvailabilityMetric)
-	}
-	if err := collectMetricSeriesBatch(context.Background(), querier, nodeID, metricsToCollect, mint, maxt, accumulators); err != nil {
+	if err := collectMetricSeriesBatch(
+		context.Background(),
+		querier,
+		nodeID,
+		networkMetricNames(includeAvailability),
+		mint,
+		maxt,
+		accumulators,
+	); err != nil {
 		return nil, err
 	}
 
@@ -198,17 +186,10 @@ func (s *NetworkStore) Clear() error {
 	}
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
-	for _, metricName := range []string{networkLatencyMetric, networkLossMetric, networkAvailabilityMetric} {
-		matcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metricName)
-		if err != nil {
-			return err
-		}
-		if err := s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher); err != nil {
-			return err
-		}
+	if err := s.deleteMetricSeries(networkMetricNames(true)); err != nil {
+		return err
 	}
-	clear(s.latestSeriesTime)
-	s.latestLoaded = true
+	s.resetLatestSeriesTime()
 	return nil
 }
 
@@ -216,7 +197,7 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	if s == nil || s.db == nil {
 		return errNilNetworkStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
+	nodeID = normalizeNodeID(nodeID)
 	if nodeID == "" {
 		return nil
 	}
@@ -226,16 +207,10 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher); err != nil {
+	if err := s.deleteSeries(matcher); err != nil {
 		return err
 	}
-	if s.latestLoaded {
-		for key := range s.latestSeriesTime {
-			if networkSeriesTimestampNodeID(key) == nodeID {
-				delete(s.latestSeriesTime, key)
-			}
-		}
-	}
+	s.deleteLatestSeriesTimeForNode(nodeID)
 	return nil
 }
 
@@ -262,6 +237,45 @@ func appendMetricSample(
 		"name", sample.nameLabel,
 	), sample.timestampMillis, value)
 	return err
+}
+
+func (s *NetworkStore) appendPreparedMetricSamples(
+	appender storage.Appender,
+	nodeID string,
+	sample preparedNetworkSample,
+	latestSeriesTimeUpdates map[string]int64,
+) error {
+	for _, metric := range sample.metrics() {
+		if err := s.appendPreparedMetricSample(
+			appender,
+			nodeID,
+			sample,
+			latestSeriesTimeUpdates,
+			metric.name,
+			metric.value,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *NetworkStore) appendPreparedMetricSample(
+	appender storage.Appender,
+	nodeID string,
+	sample preparedNetworkSample,
+	latestSeriesTimeUpdates map[string]int64,
+	metricName string,
+	value float64,
+) error {
+	appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, metricName, value)
+	if err != nil {
+		return err
+	}
+	if appended {
+		latestSeriesTimeUpdates[networkSeriesTimestampKey(metricName, nodeID, sample.seriesKey)] = sample.timestampMillis
+	}
+	return nil
 }
 
 func (s *NetworkStore) appendMetricSampleIfFresh(
@@ -317,11 +331,7 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 	}
 	defer querier.Close()
 
-	nameMatcher, err := labels.NewMatcher(
-		labels.MatchRegexp,
-		labels.MetricName,
-		"^(?:"+networkLatencyMetric+"|"+networkLossMetric+"|"+networkAvailabilityMetric+")$",
-	)
+	nameMatcher, err := newMetricNameMatcher(networkMetricNames(true))
 	if err != nil {
 		return nil, err
 	}
@@ -369,12 +379,52 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 	return latestSeriesTime, nil
 }
 
+func (s *NetworkStore) recordLatestSeriesTime(latestSeriesTimeUpdates map[string]int64) {
+	for key, tsMillis := range latestSeriesTimeUpdates {
+		s.latestSeriesTime[key] = tsMillis
+	}
+}
+
+func (s *NetworkStore) deleteMetricSeries(metricNames []string) error {
+	for _, metricName := range metricNames {
+		matcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, metricName)
+		if err != nil {
+			return err
+		}
+		if err := s.deleteSeries(matcher); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *NetworkStore) deleteSeries(matchers ...*labels.Matcher) error {
+	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matchers...)
+}
+
+func (s *NetworkStore) resetLatestSeriesTime() {
+	clear(s.latestSeriesTime)
+	s.latestLoaded = true
+}
+
+func (s *NetworkStore) deleteLatestSeriesTimeForNode(nodeID string) {
+	if !s.latestLoaded {
+		return
+	}
+	nodeID = normalizeNodeID(nodeID)
+	for key := range s.latestSeriesTime {
+		if networkSeriesTimestampNodeID(key) == nodeID {
+			delete(s.latestSeriesTime, key)
+		}
+	}
+}
+
 func networkSeriesTimestampKey(metricName, nodeID, seriesKey string) string {
 	seriesKey = strings.TrimSpace(seriesKey)
 	if seriesKey == "" {
 		return ""
 	}
-	return metricName + "|" + strings.TrimSpace(nodeID) + "|" + seriesKey
+	return metricName + "|" + normalizeNodeID(nodeID) + "|" + seriesKey
 }
 
 func networkSeriesTimestampNodeID(key string) string {
@@ -386,7 +436,33 @@ func networkSeriesTimestampNodeID(key string) string {
 	if !found {
 		return ""
 	}
+	return normalizeNodeID(nodeID)
+}
+
+func normalizeNodeID(nodeID string) string {
 	return strings.TrimSpace(nodeID)
+}
+
+func networkMetricNames(includeAvailability bool) []string {
+	if includeAvailability {
+		return []string{
+			networkLatencyMetric,
+			networkLossMetric,
+			networkAvailabilityMetric,
+		}
+	}
+	return []string{
+		networkLatencyMetric,
+		networkLossMetric,
+	}
+}
+
+func newMetricNameMatcher(metricNames []string) (*labels.Matcher, error) {
+	return labels.NewMatcher(
+		labels.MatchRegexp,
+		labels.MetricName,
+		"^(?:"+strings.Join(metricNames, "|")+")$",
+	)
 }
 
 func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (preparedNetworkSample, bool) {
@@ -413,6 +489,26 @@ func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (prepar
 	return sample, true
 }
 
+func (sample preparedNetworkSample) metrics() []preparedNetworkMetric {
+	metrics := make([]preparedNetworkMetric, 0, 3)
+	if sample.latency != nil {
+		metrics = append(metrics, preparedNetworkMetric{
+			name:  networkLatencyMetric,
+			value: *sample.latency,
+		})
+	}
+	if sample.loss != nil {
+		metrics = append(metrics, preparedNetworkMetric{
+			name:  networkLossMetric,
+			value: *sample.loss,
+		})
+	}
+	return append(metrics, preparedNetworkMetric{
+		name:  networkAvailabilityMetric,
+		value: sample.availability,
+	})
+}
+
 func collectMetricSeriesBatch(
 	ctx context.Context,
 	querier storage.Querier,
@@ -426,11 +522,7 @@ func collectMetricSeriesBatch(
 		return nil
 	}
 
-	nameMatcher, err := labels.NewMatcher(
-		labels.MatchRegexp,
-		labels.MetricName,
-		"^(?:"+strings.Join(metricNames, "|")+")$",
-	)
+	nameMatcher, err := newMetricNameMatcher(metricNames)
 	if err != nil {
 		return err
 	}

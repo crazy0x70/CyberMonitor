@@ -47,12 +47,12 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 	if store == nil {
 		return LegacyMigrationResult{}, errNilNetworkStore
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return LegacyMigrationResult{}, errors.New("legacy history path required")
+	legacyPath, err := normalizeLegacyHistoryPath(path)
+	if err != nil {
+		return LegacyMigrationResult{}, err
 	}
 
-	sourcePath, exists, err := resolveLegacySourcePath(path)
+	sourcePath, exists, err := resolveLegacySourcePath(legacyPath)
 	if err != nil {
 		return LegacyMigrationResult{}, err
 	}
@@ -68,41 +68,85 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 	result := LegacyMigrationResult{
 		LegacyFound: true,
 		SourcePath:  sourcePath,
-		BackupPath:  legacyBackupPath(path),
-		MarkerPath:  legacyMarkerPath(path),
+		BackupPath:  legacyBackupPath(legacyPath),
+		MarkerPath:  legacyMarkerPath(legacyPath),
 	}
 
-	for nodeID, tests := range payload.Nodes {
-		existingTimesBySeries, err := loadExistingNodeHistoryTimestamps(store, nodeID, tests)
-		if err != nil {
-			return result, err
-		}
-		for key, entry := range tests {
-			identity, err := parseNetworkSeriesKey(key)
-			if err != nil {
-				return result, err
-			}
-			normalizeLegacyHistoryEntry(entry)
-			existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
-
-			batch := make([]metrics.NetworkTestResult, 0, len(entry.Times))
-			for idx, checkedAt := range entry.Times {
-				if _, ok := existingTimes[checkedAt]; ok {
-					continue
-				}
-				batch = append(batch, buildLegacyNetworkTestResult(identity, entry, idx, checkedAt))
-			}
-			if len(batch) == 0 {
-				continue
-			}
-			if err := store.AppendBatch(nodeID, batch, now); err != nil {
-				return result, fmt.Errorf("append migrated history for %s/%s: %w", nodeID, key, err)
-			}
-			result.Migrated = true
-		}
+	result.Migrated, err = migrateLegacyNodes(store, payload.Nodes, now)
+	if err != nil {
+		return result, err
 	}
 
 	return result, nil
+}
+
+func migrateLegacyNodes(
+	store networkHistoryStore,
+	nodes map[string]map[string]*legacyHistoryEntry,
+	now time.Time,
+) (bool, error) {
+	var migrated bool
+	for nodeID, tests := range nodes {
+		nodeMigrated, err := migrateLegacyNode(store, nodeID, tests, now)
+		if nodeMigrated {
+			migrated = true
+		}
+		if err != nil {
+			return migrated, err
+		}
+	}
+	return migrated, nil
+}
+
+func migrateLegacyNode(
+	store networkHistoryStore,
+	nodeID string,
+	tests map[string]*legacyHistoryEntry,
+	now time.Time,
+) (bool, error) {
+	existingTimesBySeries, err := loadExistingNodeHistoryTimestamps(store, nodeID, tests)
+	if err != nil {
+		return false, err
+	}
+
+	var migrated bool
+	for key, entry := range tests {
+		batch, err := buildLegacyMigrationBatch(key, entry, existingTimesBySeries)
+		if err != nil {
+			return migrated, err
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		if err := store.AppendBatch(nodeID, batch, now); err != nil {
+			return migrated, fmt.Errorf("append migrated history for %s/%s: %w", nodeID, key, err)
+		}
+		migrated = true
+	}
+
+	return migrated, nil
+}
+
+func buildLegacyMigrationBatch(
+	key string,
+	entry *legacyHistoryEntry,
+	existingTimesBySeries map[string]map[int64]struct{},
+) ([]metrics.NetworkTestResult, error) {
+	identity, err := parseNetworkSeriesKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	normalizeLegacyHistoryEntry(entry)
+	existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
+	batch := make([]metrics.NetworkTestResult, 0, len(entry.Times))
+	for idx, checkedAt := range entry.Times {
+		if _, ok := existingTimes[checkedAt]; ok {
+			continue
+		}
+		batch = append(batch, buildLegacyNetworkTestResult(identity, entry, idx, checkedAt))
+	}
+	return batch, nil
 }
 
 func buildLegacyNetworkTestResult(
@@ -139,16 +183,12 @@ func loadExistingNodeHistoryTimestamps(
 	tests map[string]*legacyHistoryEntry,
 ) (map[string]map[int64]struct{}, error) {
 	result := make(map[string]map[int64]struct{}, len(tests))
-	minTime, maxTime, ok := legacyNodeTimeBounds(tests)
+	from, to, ok := legacyNodeTimeWindow(tests)
 	if !ok {
 		return result, nil
 	}
 
-	seriesMap, err := store.QueryRange(
-		nodeID,
-		time.Unix(minTime, 0).UTC().Add(-time.Second),
-		time.Unix(maxTime, 0).UTC().Add(time.Second),
-	)
+	seriesMap, err := store.QueryRange(nodeID, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +205,7 @@ func loadExistingNodeHistoryTimestamps(
 	return result, nil
 }
 
-func legacyNodeTimeBounds(tests map[string]*legacyHistoryEntry) (int64, int64, bool) {
+func legacyNodeTimeWindow(tests map[string]*legacyHistoryEntry) (time.Time, time.Time, bool) {
 	var (
 		minTime int64
 		maxTime int64
@@ -185,7 +225,10 @@ func legacyNodeTimeBounds(tests map[string]*legacyHistoryEntry) (int64, int64, b
 			found = true
 		}
 	}
-	return minTime, maxTime, found
+	if !found {
+		return time.Time{}, time.Time{}, false
+	}
+	return time.Unix(minTime, 0).UTC().Add(-time.Second), time.Unix(maxTime, 0).UTC().Add(time.Second), true
 }
 
 func resolveLegacySourcePath(path string) (string, bool, error) {
@@ -211,32 +254,43 @@ func resolveLegacySourcePath(path string) (string, bool, error) {
 }
 
 func EnsureLegacyMigrationBackup(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return errors.New("legacy history path required")
+	legacyPath, err := normalizeLegacyHistoryPath(path)
+	if err != nil {
+		return err
 	}
-	backupPath := legacyBackupPath(path)
+	backupPath := legacyBackupPath(legacyPath)
 	if _, err := os.Stat(backupPath); err == nil {
 		return nil
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(legacyPath)
 	if err != nil {
 		return err
 	}
-	return writeLegacyFileAtomic(backupPath, data)
+	return writeLegacyMigrationArtifact(legacyPath, legacyBackupPath, data)
 }
 
 func MarkLegacyMigrationComplete(path string, now time.Time) error {
+	legacyPath, err := normalizeLegacyHistoryPath(path)
+	if err != nil {
+		return err
+	}
+	payload := []byte(strconv.FormatInt(now.Unix(), 10))
+	return writeLegacyMigrationArtifact(legacyPath, legacyMarkerPath, payload)
+}
+
+func normalizeLegacyHistoryPath(path string) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return errors.New("legacy history path required")
+		return "", errors.New("legacy history path required")
 	}
-	markerPath := legacyMarkerPath(path)
-	payload := []byte(strconv.FormatInt(now.Unix(), 10))
-	return writeLegacyFileAtomic(markerPath, payload)
+	return path, nil
+}
+
+func writeLegacyMigrationArtifact(path string, pathFunc func(string) string, payload []byte) error {
+	return writeLegacyFileAtomic(pathFunc(path), payload)
 }
 
 func writeLegacyFileAtomic(path string, payload []byte) error {

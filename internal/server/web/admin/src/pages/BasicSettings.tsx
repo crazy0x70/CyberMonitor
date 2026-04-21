@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -95,6 +95,9 @@ const compactConfirmHeaderClass = cn(adminDialogHeaderClass, "border-b-0 pb-3");
 
 const compactConfirmFooterClass = cn(adminDialogFooterClass, "border-t-0 bg-transparent pt-0");
 
+const toMinuteFieldValue = (seconds?: number) =>
+  seconds ? String(Math.round(seconds / 60)) : "";
+
 export default function BasicSettings({
   settings,
   onDirtyChange,
@@ -139,12 +142,8 @@ export default function BasicSettings({
     setHomeTitle(settings?.home_title || "");
     setHomeSubtitle(settings?.home_subtitle || "");
     setLoginFailLimit(String(settings?.login_fail_limit || 0));
-    setLoginFailWindow(
-      settings?.login_fail_window_sec ? String(Math.round(settings.login_fail_window_sec / 60)) : "",
-    );
-    setLoginLockMinutes(
-      settings?.login_lock_sec ? String(Math.round(settings.login_lock_sec / 60)) : "",
-    );
+    setLoginFailWindow(toMinuteFieldValue(settings?.login_fail_window_sec));
+    setLoginLockMinutes(toMinuteFieldValue(settings?.login_lock_sec));
     setIsDirty(false);
     setIsConfirmOpen(false);
   }, [settings]);
@@ -158,6 +157,20 @@ export default function BasicSettings({
       onDirtyChange?.(false);
     };
   }, [onDirtyChange]);
+
+  const handleTextInputChange =
+    (setter: (value: string) => void) =>
+    (event: ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value);
+      setIsDirty(true);
+    };
+
+  const resetDirtyState = (closeConfirm = false) => {
+    setIsDirty(false);
+    if (closeConfirm) {
+      setIsConfirmOpen(false);
+    }
+  };
 
   const buildPayload = () => {
     const payload: Record<string, unknown> = {
@@ -192,7 +205,7 @@ export default function BasicSettings({
       const previousPath = settings?.admin_path || "";
       const previousUser = settings?.admin_user || "";
       const next = await onSave(buildPayload());
-      setIsConfirmOpen(false);
+      resetDirtyState(true);
       const messages = ["基础设置已保存"];
       if (next.admin_path && next.admin_path !== previousPath) {
         messages.push(`后台路径已更新为 ${next.admin_path}`);
@@ -207,7 +220,6 @@ export default function BasicSettings({
         messages.push("密码已更新，登录态已自动刷新");
       }
       toast.success(messages.join("；"));
-      setIsDirty(false);
     } catch (error) {
       toast.error(getErrorMessage(error, "保存基础设置失败"));
     } finally {
@@ -228,7 +240,7 @@ export default function BasicSettings({
         messages.push("管理员登录态已自动刷新");
       }
       toast.success(messages.join("；"));
-      setIsDirty(false);
+      resetDirtyState();
     } catch (error) {
       toast.error(getErrorMessage(error, "导入配置失败"));
     } finally {
@@ -309,10 +321,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={adminPath}
-                    onChange={(event) => {
-                      setAdminPath(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setAdminPath)}
                     placeholder="例如：/cm-admin…"
                   />
                 </div>
@@ -325,10 +334,7 @@ export default function BasicSettings({
                       className={adminInputClass}
                       autoComplete="username"
                       value={adminUser}
-                      onChange={(event) => {
-                        setAdminUser(event.target.value);
-                        setIsDirty(true);
-                      }}
+                      onChange={handleTextInputChange(setAdminUser)}
                     />
                   </div>
                   <div className="grid gap-2">
@@ -340,10 +346,7 @@ export default function BasicSettings({
                       className={adminInputClass}
                       autoComplete="new-password"
                       value={adminPass}
-                      onChange={(event) => {
-                        setAdminPass(event.target.value);
-                        setIsDirty(true);
-                      }}
+                      onChange={handleTextInputChange(setAdminPass)}
                     />
                     <p className="text-xs text-slate-500 dark:text-slate-400">
                       留空则不修改当前密码。
@@ -371,10 +374,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={loginFailLimit}
-                    onChange={(event) => {
-                      setLoginFailLimit(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setLoginFailLimit)}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -387,10 +387,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={loginFailWindow}
-                    onChange={(event) => {
-                      setLoginFailWindow(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setLoginFailWindow)}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -403,10 +400,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={loginLockMinutes}
-                    onChange={(event) => {
-                      setLoginLockMinutes(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setLoginLockMinutes)}
                   />
                 </div>
               </CardContent>
@@ -428,10 +422,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={turnstileSiteKey}
-                    onChange={(event) => {
-                      setTurnstileSiteKey(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setTurnstileSiteKey)}
                     placeholder="0x4AAAAA…"
                   />
                 </div>
@@ -444,10 +435,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={turnstileSecretKey}
-                    onChange={(event) => {
-                      setTurnstileSecretKey(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setTurnstileSecretKey)}
                     placeholder="0x4AAAAA…"
                   />
                 </div>
@@ -477,10 +465,7 @@ export default function BasicSettings({
                     spellCheck={false}
                     className={adminInputClass}
                     value={agentEndpoint}
-                    onChange={(event) => {
-                      setAgentEndpoint(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setAgentEndpoint)}
                     placeholder="例如：https://monitor.example.com…"
                   />
                 </div>
@@ -493,10 +478,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={cn(adminInputClass, "font-mono")}
                     value={agentToken}
-                    onChange={(event) => {
-                      setAgentToken(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setAgentToken)}
                     placeholder="例如：cm-agent-token-abc123…"
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -526,10 +508,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={siteTitle}
-                    onChange={(event) => {
-                      setSiteTitle(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setSiteTitle)}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -543,10 +522,7 @@ export default function BasicSettings({
                     spellCheck={false}
                     className={adminInputClass}
                     value={siteIcon}
-                    onChange={(event) => {
-                      setSiteIcon(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setSiteIcon)}
                     placeholder="https://…"
                   />
                 </div>
@@ -558,10 +534,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={homeTitle}
-                    onChange={(event) => {
-                      setHomeTitle(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setHomeTitle)}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -572,10 +545,7 @@ export default function BasicSettings({
                     autoComplete="off"
                     className={adminInputClass}
                     value={homeSubtitle}
-                    onChange={(event) => {
-                      setHomeSubtitle(event.target.value);
-                      setIsDirty(true);
-                    }}
+                    onChange={handleTextInputChange(setHomeSubtitle)}
                   />
                 </div>
               </CardContent>

@@ -123,19 +123,23 @@ jobs:
 
       - name: Restore admin assets
         run: |
-          bash .github/scripts/restore-admin-assets.sh admin-web-sync.tar.gz
+          mkdir -p internal/server/web
+          tar -xzf admin-web-sync.tar.gz -C internal/server/web
 
       - name: Build ${{ matrix.output }}
         run: |
-          bash .github/scripts/build-go-binary.sh \
-            "${{ matrix.os }}" \
-            "${{ matrix.arch }}" \
-            "${{ matrix.goarm }}" \
-            "dist/${{ matrix.output }}" \
-            "${{ matrix.cmd_path }}" \
-            "${{ needs.version.outputs.version }}" \
-            "${{ github.sha }}" \
-            "${{ needs.version.outputs.build_time }}"
+          mkdir -p dist
+          export CGO_ENABLED=0
+          export GOOS="${{ matrix.os }}"
+          export GOARCH="${{ matrix.arch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM="${{ matrix.goarm }}"
+          fi
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o "dist/${{ matrix.output }}" \
+            "${{ matrix.cmd_path }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -205,15 +209,18 @@ jobs:
 
       - name: Build ${{ matrix.output }}
         run: |
-          bash .github/scripts/build-go-binary.sh \
-            "${{ matrix.os }}" \
-            "${{ matrix.arch }}" \
-            "${{ matrix.goarm }}" \
-            "dist/${{ matrix.output }}" \
-            "${{ matrix.cmd_path }}" \
-            "${{ needs.version.outputs.version }}" \
-            "${{ github.sha }}" \
-            "${{ needs.version.outputs.build_time }}"
+          mkdir -p dist
+          export CGO_ENABLED=0
+          export GOOS="${{ matrix.os }}"
+          export GOARCH="${{ matrix.arch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM="${{ matrix.goarm }}"
+          fi
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o "dist/${{ matrix.output }}" \
+            "${{ matrix.cmd_path }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -378,7 +385,8 @@ jobs:
 
       - name: Restore synced admin assets
         run: |
-          bash .github/scripts/restore-admin-assets.sh artifacts/admin-web-sync.tar.gz
+          mkdir -p internal/server/web
+          tar -xzf artifacts/admin-web-sync.tar.gz -C internal/server/web
 
       - name: Prepare release files
         run: |

@@ -109,56 +109,27 @@ func (s *OfflineStore) QuerySummary(nodeID string, from, to time.Time) (OfflineS
 	if s == nil || s.db == nil {
 		return OfflineSummary{}, errNilOfflineStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" || to.Before(from) {
-		return OfflineSummary{}, nil
-	}
 
-	var (
-		summary   OfflineSummary
-		totalSecs float64
-	)
-	err := s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
-		summary.TotalCount++
-		totalSecs += session.DurationSec
-		if session.DurationSec > summary.LongestDurationSec {
-			summary.LongestDurationSec = session.DurationSec
-		}
-		if summary.LastOfflineRecoveredAt.IsZero() || session.RecoveredAt.After(summary.LastOfflineRecoveredAt) {
-			summary.LastOfflineRecoveredAt = session.RecoveredAt
-		}
-		return true
-	})
-	if err != nil {
+	var stats offlineSessionStats
+	if err := s.collectSessions(nodeID, from, to, &stats, nil, nil); err != nil {
 		return OfflineSummary{}, err
 	}
-	if summary.TotalCount > 0 {
-		summary.AvgDurationSec = totalSecs / float64(summary.TotalCount)
-	}
-	return summary, nil
+	return stats.Summary(), nil
 }
 
 func (s *OfflineStore) QueryRecentSessions(nodeID string, from, to time.Time, limit int) ([]OfflineSession, error) {
 	if s == nil || s.db == nil {
 		return nil, errNilOfflineStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" || to.Before(from) || limit <= 0 {
+	if limit <= 0 {
 		return nil, nil
 	}
 
 	recent := newRecentOfflineSessions(limit)
-	if err := s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
-		recent.Append(session)
-		return true
-	}); err != nil {
+	if err := s.collectSessions(nodeID, from, to, nil, recent, nil); err != nil {
 		return nil, err
 	}
-	result := recent.NewestFirst()
-	if len(result) == 0 {
-		return nil, nil
-	}
-	return result, nil
+	return recent.NewestFirst(), nil
 }
 
 func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit int) (OfflineInsights, error) {
@@ -177,56 +148,47 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 	last30dStart := now.Add(-30 * 24 * time.Hour)
 
 	var (
-		insights  OfflineInsights
-		totalSecs float64
-		recent    *recentOfflineSessions
+		insights OfflineInsights
+		stats    offlineSessionStats
+		recent   *recentOfflineSessions
 	)
 	if recentLimit > 0 {
 		recent = newRecentOfflineSessions(recentLimit)
 	}
-	err := s.scanSessions(nodeID, time.Unix(0, 0).UTC(), now, func(session OfflineSession) bool {
-		insights.TotalCount++
-		totalSecs += session.DurationSec
-		if session.DurationSec > insights.LongestDurationSec {
-			insights.LongestDurationSec = session.DurationSec
-		}
-		if insights.LastOfflineRecoveredAt.IsZero() || session.RecoveredAt.After(insights.LastOfflineRecoveredAt) {
-			insights.LastOfflineRecoveredAt = session.RecoveredAt
-		}
+	if err := s.collectSessions(nodeID, time.Unix(0, 0).UTC(), now, &stats, recent, func(session OfflineSession) {
 		if !session.RecoveredAt.Before(last30dStart) && !session.RecoveredAt.After(now) {
 			insights.Last30dCount++
 		}
-		if recent != nil {
-			recent.Append(session)
-		}
-		return true
-	})
-	if err != nil {
+	}); err != nil {
 		return OfflineInsights{}, err
 	}
-	if insights.TotalCount > 0 {
-		insights.AvgDurationSec = totalSecs / float64(insights.TotalCount)
-	}
+	stats.FillInsights(&insights)
 	if recent != nil {
-		if recentSessions := recent.NewestFirst(); len(recentSessions) > 0 {
-			insights.RecentSessions = recentSessions
-		}
+		insights.RecentSessions = recent.NewestFirst()
 	}
 	return insights, nil
 }
 
 func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit func(OfflineSession) bool) error {
-	if s == nil || s.db == nil {
-		return errNilOfflineStore
+	nodeID, ok, err := s.scanNodeID(nodeID)
+	if err != nil {
+		return err
 	}
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" || to.Before(from) {
+	if !ok || to.Before(from) {
 		return nil
 	}
 	return s.scanSessionsMillis(nodeID, from.UnixMilli(), to.UnixMilli(), visit)
 }
 
 func (s *OfflineStore) scanSessionsMillis(nodeID string, mint, maxt int64, visit func(OfflineSession) bool) error {
+	nodeID, ok, err := s.scanNodeID(nodeID)
+	if err != nil {
+		return err
+	}
+	if !ok || maxt < mint {
+		return nil
+	}
+
 	querier, err := s.db.Querier(mint, maxt)
 	if err != nil {
 		return err
@@ -275,6 +237,85 @@ func (s *OfflineStore) scanSessionsMillis(nodeID string, mint, maxt int64, visit
 		return err
 	}
 	return nil
+}
+
+func (s *OfflineStore) scanNodeID(nodeID string) (string, bool, error) {
+	if s == nil || s.db == nil {
+		return "", false, errNilOfflineStore
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return "", false, nil
+	}
+	return nodeID, true, nil
+}
+
+func (s *OfflineStore) collectSessions(
+	nodeID string,
+	from, to time.Time,
+	stats *offlineSessionStats,
+	recent *recentOfflineSessions,
+	extra func(OfflineSession),
+) error {
+	return s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
+		if stats != nil {
+			stats.Append(session)
+		}
+		if recent != nil {
+			recent.Append(session)
+		}
+		if extra != nil {
+			extra(session)
+		}
+		return true
+	})
+}
+
+type offlineSessionStats struct {
+	totalCount             int
+	totalSecs              float64
+	longestDurationSec     float64
+	lastOfflineRecoveredAt time.Time
+}
+
+func (stats *offlineSessionStats) Append(session OfflineSession) {
+	if stats == nil {
+		return
+	}
+	stats.totalCount++
+	stats.totalSecs += session.DurationSec
+	if session.DurationSec > stats.longestDurationSec {
+		stats.longestDurationSec = session.DurationSec
+	}
+	if stats.lastOfflineRecoveredAt.IsZero() || session.RecoveredAt.After(stats.lastOfflineRecoveredAt) {
+		stats.lastOfflineRecoveredAt = session.RecoveredAt
+	}
+}
+
+func (stats offlineSessionStats) AvgDurationSec() float64 {
+	if stats.totalCount == 0 {
+		return 0
+	}
+	return stats.totalSecs / float64(stats.totalCount)
+}
+
+func (stats offlineSessionStats) Summary() OfflineSummary {
+	return OfflineSummary{
+		TotalCount:             stats.totalCount,
+		LongestDurationSec:     stats.longestDurationSec,
+		AvgDurationSec:         stats.AvgDurationSec(),
+		LastOfflineRecoveredAt: stats.lastOfflineRecoveredAt,
+	}
+}
+
+func (stats offlineSessionStats) FillInsights(insights *OfflineInsights) {
+	if insights == nil {
+		return
+	}
+	insights.TotalCount = stats.totalCount
+	insights.LongestDurationSec = stats.longestDurationSec
+	insights.AvgDurationSec = stats.AvgDurationSec()
+	insights.LastOfflineRecoveredAt = stats.lastOfflineRecoveredAt
 }
 
 type recentOfflineSessions struct {
@@ -361,7 +402,7 @@ func (s *OfflineStore) DeleteNode(nodeID string) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher)
+	return s.deleteAll(matcher)
 }
 
 func (s *OfflineStore) Clear() error {
@@ -372,7 +413,14 @@ func (s *OfflineStore) Clear() error {
 	if err != nil {
 		return err
 	}
-	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher)
+	return s.deleteAll(matcher)
+}
+
+func (s *OfflineStore) deleteAll(matchers ...*labels.Matcher) error {
+	if s == nil || s.db == nil {
+		return errNilOfflineStore
+	}
+	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matchers...)
 }
 
 func defaultOfflineStoreDir(dataDir string) string {

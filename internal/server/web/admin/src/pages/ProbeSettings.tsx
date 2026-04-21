@@ -295,18 +295,36 @@ export default function ProbeSettings({
     };
   }, [onDirtyChange]);
 
-  const openCreateDialog = () => {
-    setEditingIndex(null);
-    setFormState(toFormState());
-    setFormError(null);
-    setIsDialogOpen(true);
-  };
-
-  const openEditDialog = (item: TestCatalogItem, index: number) => {
+  const openDialog = (item?: TestCatalogItem, index: number | null = null) => {
     setEditingIndex(index);
     setFormState(toFormState(item));
     setFormError(null);
     setIsDialogOpen(true);
+  };
+
+  const closeDialog = () => {
+    setFormError(null);
+    setIsDialogOpen(false);
+  };
+
+  const openCreateDialog = () => {
+    openDialog();
+  };
+
+  const openEditDialog = (item: TestCatalogItem, index: number) => {
+    openDialog(item, index);
+  };
+
+  const updateFormField = <TField extends ProbeField>(
+    field: TField,
+    value: ProbeFormState[TField],
+  ) => {
+    setFormState((current) => ({ ...current, [field]: value }) as ProbeFormState);
+    setFormError((current) => (current?.field === field ? null : current));
+  };
+
+  const clearPendingDelete = () => {
+    setPendingDeleteIndex(null);
   };
 
   const focusProbeField = (field: ProbeField) => {
@@ -331,8 +349,7 @@ export default function ProbeSettings({
       return current.map((item, index) => (index === editingIndex ? result.item : item));
     });
     setIsDirty(true);
-    setIsDialogOpen(false);
-    setFormError(null);
+    closeDialog();
     toast.success(editingIndex === null ? "探测节点已添加" : "探测节点已更新");
   };
 
@@ -471,9 +488,8 @@ export default function ProbeSettings({
       <Dialog
         open={isDialogOpen}
         onOpenChange={(open) => {
-          setIsDialogOpen(open);
           if (!open) {
-            setFormError(null);
+            closeDialog();
           }
         }}
       >
@@ -496,12 +512,7 @@ export default function ProbeSettings({
                   aria-invalid={formError?.field === "name"}
                   aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
                   value={formState.name}
-                  onChange={(event) => {
-                    setFormState((current) => ({ ...current, name: event.target.value }));
-                    if (formError?.field === "name") {
-                      setFormError(null);
-                    }
-                  }}
+                  onChange={(event) => updateFormField("name", event.target.value)}
                   placeholder="例如：主站 TCP 443…"
                 />
                 {formError?.field === "name" ? (
@@ -554,12 +565,7 @@ export default function ProbeSettings({
                 aria-invalid={formError?.field === "host"}
                 aria-describedby={formError?.field === "host" ? "probe-host-error" : undefined}
                 value={formState.host}
-                onChange={(event) => {
-                  setFormState((current) => ({ ...current, host: event.target.value }));
-                  if (formError?.field === "host") {
-                    setFormError(null);
-                  }
-                }}
+                onChange={(event) => updateFormField("host", event.target.value)}
                 placeholder="例如：1.1.1.1 / example.com…"
               />
               {formError?.field === "host" ? (
@@ -585,12 +591,7 @@ export default function ProbeSettings({
                     aria-invalid={formError?.field === "port"}
                     aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
                     value={formState.port}
-                    onChange={(event) => {
-                      setFormState((current) => ({ ...current, port: event.target.value }));
-                      if (formError?.field === "port") {
-                        setFormError(null);
-                      }
-                    }}
+                    onChange={(event) => updateFormField("port", event.target.value)}
                     placeholder="例如：443…"
                   />
                   {formError?.field === "port" ? (
@@ -614,12 +615,7 @@ export default function ProbeSettings({
                     aria-invalid={formError?.field === "intervalSec"}
                     aria-describedby={formError?.field === "intervalSec" ? "probe-interval-error" : undefined}
                     value={formState.intervalSec}
-                    onChange={(event) => {
-                      setFormState((current) => ({ ...current, intervalSec: event.target.value }));
-                      if (formError?.field === "intervalSec") {
-                        setFormError(null);
-                      }
-                    }}
+                    onChange={(event) => updateFormField("intervalSec", event.target.value)}
                     placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -639,7 +635,7 @@ export default function ProbeSettings({
             <Button
               variant="outline"
               className={`${adminOutlineButtonClass} h-12 px-8 font-bold`}
-              onClick={() => setIsDialogOpen(false)}
+              onClick={closeDialog}
             >
               取消
             </Button>
@@ -657,7 +653,7 @@ export default function ProbeSettings({
         open={pendingDeleteIndex !== null}
         onOpenChange={(open) => {
           if (!open) {
-            setPendingDeleteIndex(null);
+            clearPendingDelete();
           }
         }}
       >
@@ -673,7 +669,7 @@ export default function ProbeSettings({
                 if (pendingDeleteIndex !== null) {
                   handleDelete(pendingDeleteIndex);
                 }
-                setPendingDeleteIndex(null);
+                clearPendingDelete();
               }}
             >
               确认删除

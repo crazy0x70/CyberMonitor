@@ -200,6 +200,23 @@ type BuildPayloadOptions = {
   clearLegacyTests?: boolean;
 };
 
+type TestDraftEntry = {
+  item: TestCatalogItem;
+  itemId: string;
+  active: boolean;
+  isTCP: boolean;
+  intervalValue: string;
+  defaultIntervalSec: number;
+};
+
+type TestDraftState = {
+  items: TestDraftEntry[];
+  summary: {
+    selected: number;
+    tcpCustom: number;
+  };
+};
+
 export interface ServerManagementProps {
   settings: SettingsView | null;
   nodes: NodeView[];
@@ -294,6 +311,84 @@ function defaultInterval(item?: TestCatalogItem) {
   return Math.min(Math.trunc(raw), 3600);
 }
 
+function isTCPTest(test?: Partial<NetworkTestConfig | TestCatalogItem>) {
+  return String(test?.type || "icmp").trim().toLowerCase() === "tcp";
+}
+
+function hasTestSelection(testSelections: SelectionDraft, testID?: string) {
+  return Boolean(testID && Object.prototype.hasOwnProperty.call(testSelections, testID));
+}
+
+function buildTestSelectionValue(item?: TestCatalogItem, intervalSec?: number) {
+  if (!isTCPTest(item)) {
+    return "0";
+  }
+  const rawInterval = Math.trunc(Number(intervalSec) || 0);
+  return String(
+    Number.isFinite(rawInterval) && rawInterval > 0
+      ? Math.min(rawInterval, 3600)
+      : defaultInterval(item),
+  );
+}
+
+function parseTestSelectionInterval(item: TestCatalogItem, rawValue: string) {
+  if (!isTCPTest(item)) {
+    return 0;
+  }
+  const parsedInterval = Number.parseInt(rawValue, 10);
+  return Number.isFinite(parsedInterval) && parsedInterval >= 0
+    ? Math.min(parsedInterval, 3600)
+    : defaultInterval(item);
+}
+
+function buildTestDraftEntries(
+  catalog: TestCatalogItem[],
+  testSelections?: SelectionDraft,
+): TestDraftEntry[] {
+  const draft = testSelections || {};
+
+  return catalog.map((item) => {
+    const itemId = item.id || "";
+    return {
+      item,
+      itemId,
+      active: hasTestSelection(draft, itemId),
+      isTCP: isTCPTest(item),
+      intervalValue: itemId ? draft[itemId] || "" : "",
+      defaultIntervalSec: defaultInterval(item),
+    };
+  });
+}
+
+function buildTestDraftState(
+  catalog: TestCatalogItem[],
+  testSelections?: SelectionDraft,
+): TestDraftState {
+  const items = buildTestDraftEntries(catalog, testSelections);
+  let selected = 0;
+  let tcpCustom = 0;
+
+  items.forEach(({ active, isTCP, intervalValue, defaultIntervalSec }) => {
+    if (active) {
+      selected += 1;
+      if (isTCP) {
+        const currentValue = Number.parseInt(intervalValue, 10);
+        if (Number.isFinite(currentValue) && currentValue !== defaultIntervalSec) {
+          tcpCustom += 1;
+        }
+      }
+    }
+  });
+
+  return {
+    items,
+    summary: {
+      selected,
+      tcpCustom,
+    },
+  };
+}
+
 function buildInitialSelections(node: NodeView, catalog: TestCatalogItem[]) {
   const selections: SelectionDraft = {};
   const meta = new Map<string, TestCatalogItem>();
@@ -310,10 +405,7 @@ function buildInitialSelections(node: NodeView, catalog: TestCatalogItem[]) {
         return;
       }
       const matched = meta.get(selection.test_id);
-      const isTCP = String(matched?.type || "icmp").toLowerCase() === "tcp";
-      selections[selection.test_id] = isTCP
-        ? String(Math.max(Number(selection.interval_sec) || defaultInterval(matched), 0))
-        : "0";
+      selections[selection.test_id] = buildTestSelectionValue(matched, selection.interval_sec);
     });
     return selections;
   }
@@ -332,15 +424,7 @@ function buildInitialSelections(node: NodeView, catalog: TestCatalogItem[]) {
     if (!matched?.id) {
       return;
     }
-    const isTCP = String(matched.type || "icmp").toLowerCase() === "tcp";
-    const legacyInterval = Math.trunc(Number(test.interval_sec) || 0);
-    selections[matched.id] = isTCP
-      ? String(
-          Number.isFinite(legacyInterval) && legacyInterval > 0
-            ? Math.min(legacyInterval, 3600)
-            : defaultInterval(matched),
-        )
-      : "0";
+    selections[matched.id] = buildTestSelectionValue(matched, test.interval_sec);
   });
 
   return selections;
@@ -373,23 +457,12 @@ function buildPayload(
   const autoRenew = expireAt > 0 && form.renewPlan !== "none";
   const renewIntervalSec = autoRenew ? planToSeconds(form.renewPlan) : 0;
   const normalizedSpeed = Number.parseInt(form.netSpeedMbps, 10);
-
-  const selections: TestSelection[] = catalog
-    .filter((item) => item.id && Object.prototype.hasOwnProperty.call(form.testSelections, item.id))
-    .map((item) => {
-      const isTCP = String(item.type || "icmp").toLowerCase() === "tcp";
-      const rawInterval = form.testSelections[item.id || ""] || "";
-      const parsedInterval = Number.parseInt(rawInterval, 10);
-      return {
-        test_id: item.id || "",
-        interval_sec: isTCP
-          ? Number.isFinite(parsedInterval) && parsedInterval >= 0
-            ? Math.min(parsedInterval, 3600)
-            : defaultInterval(item)
-          : 0,
-      };
-    })
-    .filter((item) => item.test_id);
+  const selections: TestSelection[] = buildTestDraftEntries(catalog, form.testSelections)
+    .filter((entry) => entry.active && entry.itemId)
+    .map(({ item, itemId, intervalValue }) => ({
+      test_id: itemId,
+      interval_sec: parseTestSelectionInterval(item, intervalValue),
+    }));
 
   const payload: NodeProfilePayload = {
     alias: form.alias.trim(),
@@ -712,37 +785,24 @@ export default function ServerManagement({
     formInitializationKeyRef.current = nextKey;
   }, [editingNode, editingNodeId, testCatalog, testCatalogSignature]);
 
-  const selectedTestIds = form ? new Set(Object.keys(form.testSelections)) : new Set<string>();
+  const patchForm = (updater: (current: FormState) => FormState) => {
+    setForm((current) => (current ? updater(current) : current));
+  };
+  const updateFormField = <Key extends keyof FormState>(key: Key, value: FormState[Key]) => {
+    patchForm((current) => ({
+      ...current,
+      [key]: value,
+    }));
+  };
   const selectedGroupState = useMemo(
     () => buildSelectedGroupState(form?.groups),
     [form?.groups],
   );
   const selectedGroupCount = selectedGroupState.count;
-  const testSelectionSummary = useMemo(() => {
-    if (!form) {
-      return { selected: 0, tcpCustom: 0 };
-    }
-
-    let selected = 0;
-    let tcpCustom = 0;
-
-    testCatalog.forEach((item) => {
-      if (!item.id || !Object.prototype.hasOwnProperty.call(form.testSelections, item.id)) {
-        return;
-      }
-      selected += 1;
-      const isTCP = String(item.type || "icmp").toLowerCase() === "tcp";
-      if (!isTCP) {
-        return;
-      }
-      const currentValue = Number.parseInt(form.testSelections[item.id] || "", 10);
-      if (Number.isFinite(currentValue) && currentValue !== defaultInterval(item)) {
-        tcpCustom += 1;
-      }
-    });
-
-    return { selected, tcpCustom };
-  }, [form, testCatalog]);
+  const testDraftState = useMemo(
+    () => buildTestDraftState(testCatalog, form?.testSelections),
+    [form?.testSelections, testCatalog],
+  );
   const usingLegacyTestsFallback = Boolean(
     editingNode &&
       (!Array.isArray(editingNode.test_selections) || editingNode.test_selections.length === 0) &&
@@ -806,10 +866,7 @@ export default function ServerManagement({
   };
 
   const handleToggleGroupSelection = (value: string) => {
-    setForm((current) => {
-      if (!current) {
-        return current;
-      }
+    patchForm((current) => {
       const normalized = normalizeSelectionValues(current.groups);
       if (normalized.includes(value)) {
         return {
@@ -822,35 +879,38 @@ export default function ServerManagement({
   };
 
   const handleRemoveGroupSelection = (value: string) => {
-    setForm((current) => {
-      if (!current) {
-        return current;
-      }
-      return {
-        ...current,
-        groups: normalizeSelectionValues(current.groups.filter((item) => item !== value)),
-      };
-    });
+    patchForm((current) => ({
+      ...current,
+      groups: normalizeSelectionValues(current.groups.filter((item) => item !== value)),
+    }));
   };
 
-  const handleToggleTest = (item: TestCatalogItem) => {
-    if (!item.id) {
+  const handleToggleTest = ({ item, itemId, active }: TestDraftEntry) => {
+    if (!itemId) {
       return;
     }
-    const itemID = item.id;
-    setForm((current) => {
-      if (!current) {
-        return current;
-      }
+    patchForm((current) => {
       const nextSelections = { ...current.testSelections };
-      if (Object.prototype.hasOwnProperty.call(nextSelections, itemID)) {
-        delete nextSelections[itemID];
+      if (active) {
+        delete nextSelections[itemId];
       } else {
-        const isTCP = String(item.type || "icmp").toLowerCase() === "tcp";
-        nextSelections[itemID] = isTCP ? String(defaultInterval(item)) : "0";
+        nextSelections[itemId] = buildTestSelectionValue(item);
       }
       return { ...current, testSelections: nextSelections };
     });
+  };
+
+  const handleTestIntervalChange = (itemId: string, value: string) => {
+    if (!itemId) {
+      return;
+    }
+    patchForm((current) => ({
+      ...current,
+      testSelections: {
+        ...current.testSelections,
+        [itemId]: value,
+      },
+    }));
   };
 
   const handleSave = async () => {
@@ -1290,9 +1350,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               className={formInputClass}
                               value={form.alias}
-                              onChange={(event) =>
-                                setForm((current) => current && ({ ...current, alias: event.target.value }))
-                              }
+                              onChange={(event) => updateFormField("alias", event.target.value)}
                               placeholder={editingNode.stats.node_name || editingNode.stats.hostname}
                             />
                           </div>
@@ -1305,9 +1363,7 @@ export default function ServerManagement({
                               className={formInputClass}
                               value={form.region}
                               onChange={(event) =>
-                                setForm((current) =>
-                                  current && ({ ...current, region: event.target.value.toUpperCase() })
-                                )
+                                updateFormField("region", event.target.value.toUpperCase())
                               }
                               placeholder="例如：US"
                             />
@@ -1338,9 +1394,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               className={formInputClass}
                               value={form.diskType}
-                              onChange={(event) =>
-                                setForm((current) => current && ({ ...current, diskType: event.target.value }))
-                              }
+                              onChange={(event) => updateFormField("diskType", event.target.value)}
                               placeholder="NVMe / SSD / HDD"
                             />
                           </div>
@@ -1355,7 +1409,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               value={form.netSpeedMbps}
                               onChange={(event) =>
-                                setForm((current) => current && ({ ...current, netSpeedMbps: event.target.value }))
+                                updateFormField("netSpeedMbps", event.target.value)
                               }
                               placeholder="1000"
                             />
@@ -1374,9 +1428,9 @@ export default function ServerManagement({
                     </CardHeader>
                     <CardContent className="space-y-5 p-6">
                       <div className={adminDetailHintPanelClass}>
-                        已选 {testSelectionSummary.selected} 个探测节点。
-                        {testSelectionSummary.tcpCustom > 0
-                          ? ` 其中 ${testSelectionSummary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
+                        已选 {testDraftState.summary.selected} 个探测节点。
+                        {testDraftState.summary.tcpCustom > 0
+                          ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
                           : ""}
                       </div>
 
@@ -1386,10 +1440,9 @@ export default function ServerManagement({
                         </div>
                       ) : (
                         <div className="space-y-3">
-                          {testCatalog.map((item) => {
-                            const active = Boolean(item.id && selectedTestIds.has(item.id));
-                            const isTCP = String(item.type || "icmp").toLowerCase() === "tcp";
-                            const intervalValue = item.id ? form.testSelections[item.id] || "" : "";
+                          {testDraftState.items.map((entry) => {
+                            const { item, itemId, active, isTCP, intervalValue, defaultIntervalSec } =
+                              entry;
                             return (
                               <div
                                 key={item.id || resolveProbeLabel(item)}
@@ -1405,8 +1458,8 @@ export default function ServerManagement({
                                       type="checkbox"
                                       className="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 dark:border-slate-700 dark:bg-slate-950"
                                       checked={active}
-                                      disabled={!item.id}
-                                      onChange={() => handleToggleTest(item)}
+                                      disabled={!itemId}
+                                      onChange={() => handleToggleTest(entry)}
                                     />
                                     <div className="min-w-0 space-y-1">
                                       <div className="flex flex-wrap items-center gap-2">
@@ -1434,33 +1487,18 @@ export default function ServerManagement({
                                           Interval
                                         </span>
                                         <Input
-                                          name={item.id ? `probe-interval-${item.id}` : "probe-interval"}
+                                          name={itemId ? `probe-interval-${itemId}` : "probe-interval"}
                                           className="h-10 w-[148px] rounded-xl border-slate-300 bg-white text-sm dark:border-slate-700 dark:bg-slate-950"
                                           type="number"
                                           min={0}
                                           max={3600}
                                           autoComplete="off"
-                                          disabled={!active || !item.id}
+                                          disabled={!active || !itemId}
                                           value={intervalValue}
-                                          onChange={(event) => {
-                                            const itemID = item.id;
-                                            if (!itemID) {
-                                              return;
-                                            }
-                                            const value = event.target.value;
-                                            setForm((current) =>
-                                              current
-                                                ? {
-                                                    ...current,
-                                                    testSelections: {
-                                                      ...current.testSelections,
-                                                      [itemID]: value,
-                                                    },
-                                                  }
-                                                : current,
-                                            );
-                                          }}
-                                          placeholder={`默认 ${defaultInterval(item)} 秒`}
+                                          onChange={(event) =>
+                                            handleTestIntervalChange(itemId, event.target.value)
+                                          }
+                                          placeholder={`默认 ${defaultIntervalSec} 秒`}
                                         />
                                       </>
                                     ) : (
@@ -1506,9 +1544,7 @@ export default function ServerManagement({
                               type="datetime-local"
                               autoComplete="off"
                               value={form.expireAt}
-                              onChange={(event) =>
-                                setForm((current) => current && ({ ...current, expireAt: event.target.value }))
-                              }
+                              onChange={(event) => updateFormField("expireAt", event.target.value)}
                             />
                           </div>
                           <div className="grid gap-2">
@@ -1519,7 +1555,7 @@ export default function ServerManagement({
                                 if (value === null) {
                                   return;
                                 }
-                                setForm((current) => current && ({ ...current, renewPlan: value as RenewPlan }));
+                                updateFormField("renewPlan", value as RenewPlan);
                               }}
                               disabled={!hasExpireAt}
                             >
@@ -1550,14 +1586,14 @@ export default function ServerManagement({
                           <div className="flex items-center gap-3 bg-white/50 dark:bg-slate-950/50 p-1.5 rounded-full border border-slate-200 dark:border-slate-800">
                             <button
                               type="button"
-                              onClick={() => setForm((current) => current && ({ ...current, alertEnabled: true }))}
+                              onClick={() => updateFormField("alertEnabled", true)}
                               className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
                               开启
                             </button>
                             <button
                               type="button"
-                              onClick={() => setForm((current) => current && ({ ...current, alertEnabled: false }))}
+                              onClick={() => updateFormField("alertEnabled", false)}
                               className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${!form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
                               关闭

@@ -506,16 +506,11 @@ func resolveAICompatibleSelection(provider AIProviderProfile) (aiProviderSelecti
 	if label == "" {
 		label = "OpenAI 兼容提供商"
 	}
-	selection := aiProviderSelection{
+	return finalizeAIProviderSelection(aiProviderSelection{
 		Provider: aiProviderOpenAICompatible,
 		Label:    label,
 		Config:   provider.AIProviderConfig,
-	}
-	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
-	if err := validateResolvedAISelection(selection); err != nil {
-		return aiProviderSelection{}, err
-	}
-	return selection, nil
+	})
 }
 
 func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSelection, error) {
@@ -523,11 +518,7 @@ func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSe
 	if err != nil {
 		return aiProviderSelection{}, err
 	}
-	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
-	if err := validateResolvedAISelection(selection); err != nil {
-		return aiProviderSelection{}, err
-	}
-	return selection, nil
+	return finalizeAIProviderSelection(selection)
 }
 
 func resolveAIProviderConfigWithOverride(settings AISettings, provider string, override AIProviderConfig) (aiProviderSelection, error) {
@@ -535,7 +526,20 @@ func resolveAIProviderConfigWithOverride(settings AISettings, provider string, o
 	if err != nil {
 		return aiProviderSelection{}, err
 	}
-	base := normalizeAIProviderConfig(selection.Config)
+	selection.Config = mergeAIProviderOverride(selection.Config, override)
+	return finalizeAIProviderSelection(selection)
+}
+
+func finalizeAIProviderSelection(selection aiProviderSelection) (aiProviderSelection, error) {
+	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
+	if err := validateResolvedAISelection(selection); err != nil {
+		return aiProviderSelection{}, err
+	}
+	return selection, nil
+}
+
+func mergeAIProviderOverride(base, override AIProviderConfig) AIProviderConfig {
+	base = normalizeAIProviderConfig(base)
 	override = normalizeAIProviderConfig(override)
 	if override.APIKey != "" {
 		base.APIKey = override.APIKey
@@ -546,11 +550,7 @@ func resolveAIProviderConfigWithOverride(settings AISettings, provider string, o
 	if override.Model != "" {
 		base.Model = override.Model
 	}
-	selection.Config = applyAIProviderDefaults(selection.Provider, base)
-	if err := validateResolvedAISelection(selection); err != nil {
-		return aiProviderSelection{}, err
-	}
-	return selection, nil
+	return base
 }
 
 func validateResolvedAISelection(selection aiProviderSelection) error {

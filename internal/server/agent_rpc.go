@@ -48,7 +48,27 @@ func newAgentAPI(store *Store, hub *Hub, cfg *Config) *agentAPI {
 	return &agentAPI{store: store, hub: hub, cfg: cfg}
 }
 
-func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) (bool, *agentAPIError) {
+func badAgentRequest(message string) *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusBadRequest, message: message}
+}
+
+func invalidAgentTokenError() *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+}
+
+func invalidBootstrapTokenError() *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid bootstrap token"}
+}
+
+func normalizeAgentNodeID(nodeID string) (string, *agentAPIError) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return "", badAgentRequest("node_id required")
+	}
+	return nodeID, nil
+}
+
+func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agentAPIError) {
 	if payload.NodeID == "" {
 		if payload.NodeName != "" {
 			payload.NodeID = payload.NodeName
@@ -56,26 +76,56 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 			payload.NodeID = payload.Hostname
 		}
 	}
-	if payload.NodeID == "" {
-		return false, &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+	nodeID, apiErr := normalizeAgentNodeID(payload.NodeID)
+	if apiErr != nil {
+		return metrics.NodeStats{}, apiErr
 	}
+	payload.NodeID = nodeID
 	if payload.NodeName == "" {
 		payload.NodeName = payload.NodeID
 	}
-	if !a.store.validateOrProvisionAgentAuthToken(payload.NodeID, token, a.cfg.AgentToken) {
-		return false, &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+	return payload, nil
+}
+
+func (a *agentAPI) validateAgentToken(nodeID, token string) *agentAPIError {
+	if a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
+		return nil
 	}
-	updateReconciled := a.store.Update(payload)
-	if delta, ok := a.store.PublicNodeDelta(payload.NodeID); ok && a.hub != nil {
+	return invalidAgentTokenError()
+}
+
+func (a *agentAPI) broadcastPublicDelta(nodeID string) {
+	if a.hub == nil {
+		return
+	}
+	if delta, ok := a.store.PublicNodeDelta(nodeID); ok {
 		if data, err := json.Marshal(delta); err == nil {
 			a.hub.BroadcastVariant(data, publicVariantBalanced)
 		}
 	}
-	if updateReconciled && a.hub != nil {
-		snapshot := storeSnapshot(a.store, false)
-		if data, err := json.Marshal(snapshot); err == nil {
-			a.hub.Broadcast(data)
-		}
+}
+
+func (a *agentAPI) broadcastSnapshot() {
+	if a.hub == nil {
+		return
+	}
+	if data, err := json.Marshal(storeSnapshot(a.store, false)); err == nil {
+		a.hub.Broadcast(data)
+	}
+}
+
+func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) (bool, *agentAPIError) {
+	payload, apiErr := normalizeStatsPayload(payload)
+	if apiErr != nil {
+		return false, apiErr
+	}
+	if apiErr := a.validateAgentToken(payload.NodeID, token); apiErr != nil {
+		return false, apiErr
+	}
+	updateReconciled := a.store.Update(payload)
+	a.broadcastPublicDelta(payload.NodeID)
+	if updateReconciled {
+		a.broadcastSnapshot()
 	}
 	if strings.TrimSpace(remoteAddr) == "" {
 		remoteAddr = "grpc"
@@ -84,42 +134,38 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 }
 
 func (a *agentAPI) config(nodeID, token string) (AgentConfig, bool, *agentAPIError) {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return AgentConfig{}, false, &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+	nodeID, apiErr := normalizeAgentNodeID(nodeID)
+	if apiErr != nil {
+		return AgentConfig{}, false, apiErr
 	}
 	usingDedicatedToken, ok := a.store.authorizeOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken)
 	if !ok {
-		return AgentConfig{}, false, &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+		return AgentConfig{}, false, invalidAgentTokenError()
 	}
 	return a.store.AgentConfig(nodeID), usingDedicatedToken, nil
 }
 
 func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIError) {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return "", &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+	nodeID, apiErr := normalizeAgentNodeID(nodeID)
+	if apiErr != nil {
+		return "", apiErr
 	}
 	if strings.TrimSpace(a.cfg.AgentToken) != "" && strings.TrimSpace(bootstrapToken) != strings.TrimSpace(a.cfg.AgentToken) {
-		return "", &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid bootstrap token"}
+		return "", invalidBootstrapTokenError()
 	}
 	return a.store.ensureAgentAuthToken(nodeID), nil
 }
 
 func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) *agentAPIError {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return &agentAPIError{statusCode: http.StatusBadRequest, message: "node_id required"}
+	nodeID, apiErr := normalizeAgentNodeID(nodeID)
+	if apiErr != nil {
+		return apiErr
 	}
-	if !a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
-		return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid agent token"}
+	if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+		return apiErr
 	}
 	a.store.ApplyAgentUpdateReport(nodeID, report)
-	if a.hub != nil {
-		snapshot := storeSnapshot(a.store, false)
-		payload, _ := json.Marshal(snapshot)
-		a.hub.Broadcast(payload)
-	}
+	a.broadcastSnapshot()
 	return nil
 }
 

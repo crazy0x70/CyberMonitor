@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -279,17 +278,9 @@ func (h *httpControlPlane) FetchConfig(ctx context.Context, nodeID, token string
 }
 
 func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
-	payload, err := json.Marshal(stats)
+	req, err := newAgentJSONRequest(ctx, http.MethodPost, h.statsEndpoint, stats, token)
 	if err != nil {
 		return false, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.statsEndpoint, bytes.NewReader(payload))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("X-AGENT-TOKEN", token)
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {

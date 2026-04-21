@@ -143,6 +143,55 @@ function createEditableID(prefix: "group" | "tag") {
   return `${prefix}-${editableNodeCounter}`;
 }
 
+function createEmptyEditableGroup(): EditableGroupNode {
+  return {
+    id: createEditableID("group"),
+    name: "",
+    children: [],
+  };
+}
+
+function createEmptyEditableTag(): EditableTagNode {
+  return {
+    id: createEditableID("tag"),
+    name: "",
+  };
+}
+
+function updateItemAt<T>(items: T[], index: number, updater: (item: T) => T): T[] {
+  return items.map((item, currentIndex) =>
+    currentIndex === index ? updater(item) : item,
+  );
+}
+
+function removeItemAt<T>(items: T[], index: number): T[] {
+  return items.filter((_, currentIndex) => currentIndex !== index);
+}
+
+function updateGroupChildren(
+  tree: EditableGroupNode[],
+  groupIndex: number,
+  updater: (children: EditableTagNode[]) => EditableTagNode[],
+): EditableGroupNode[] {
+  return updateItemAt(tree, groupIndex, (group) => ({
+    ...group,
+    children: updater(group.children || []),
+  }));
+}
+
+function reorderGroupsByID(
+  tree: EditableGroupNode[],
+  activeID: string,
+  overID: string,
+): EditableGroupNode[] {
+  const oldIndex = tree.findIndex((group) => group.id === activeID);
+  const newIndex = tree.findIndex((group) => group.id === overID);
+  if (oldIndex === -1 || newIndex === -1) {
+    return tree;
+  }
+  return arrayMove(tree, oldIndex, newIndex);
+}
+
 function toEditableTree(tree: GroupNode[]): EditableGroupNode[] {
   return Array.isArray(tree)
     ? tree.map((group) => ({
@@ -411,73 +460,59 @@ export default function GroupManagement({
     },
   ] as const;
 
+  const updateDraftTree = (updater: (current: EditableGroupNode[]) => EditableGroupNode[]) => {
+    setDraftTree(updater);
+  };
+
+  const updateDraftGroup = (
+    groupIndex: number,
+    updater: (group: EditableGroupNode) => EditableGroupNode,
+  ) => {
+    updateDraftTree((current) => updateItemAt(current, groupIndex, updater));
+  };
+
+  const updateDraftTags = (
+    groupIndex: number,
+    updater: (children: EditableTagNode[]) => EditableTagNode[],
+  ) => {
+    updateDraftTree((current) => updateGroupChildren(current, groupIndex, updater));
+  };
+
+  const finishSave = (nextTree: GroupNode[]) => {
+    setDraftTree(toEditableTree(nextTree));
+    toast.success("分组配置已保存。");
+  };
+
   const updateGroupName = (groupIndex: number, value: string) => {
-    setDraftTree((current) =>
-      current.map((group, index) =>
-        index === groupIndex
-          ? {
-              ...group,
-              name: value,
-            }
-          : group,
-      ),
-    );
+    updateDraftGroup(groupIndex, (group) => ({
+      ...group,
+      name: value,
+    }));
   };
 
   const updateTagName = (groupIndex: number, tagIndex: number, value: string) => {
-    setDraftTree((current) =>
-      current.map((group, index) => {
-        if (index !== groupIndex) {
-          return group;
-        }
-
-        return {
-          ...group,
-          children: (group.children || []).map((tag, currentTagIndex) =>
-            currentTagIndex === tagIndex
-              ? {
-                  ...tag,
-                  name: value,
-                }
-              : tag,
-          ),
-        };
-      }),
+    updateDraftTags(groupIndex, (children) =>
+      updateItemAt(children, tagIndex, (tag) => ({
+        ...tag,
+        name: value,
+      })),
     );
   };
 
   const addGroup = () => {
-    setDraftTree((current) => [...current, { id: createEditableID("group"), name: "", children: [] }]);
+    updateDraftTree((current) => [...current, createEmptyEditableGroup()]);
   };
 
   const addTag = (groupIndex: number) => {
-    setDraftTree((current) =>
-      current.map((group, index) =>
-        index === groupIndex
-          ? {
-              ...group,
-              children: [...(group.children || []), { id: createEditableID("tag"), name: "" }],
-            }
-          : group,
-      ),
-    );
+    updateDraftTags(groupIndex, (children) => [...children, createEmptyEditableTag()]);
   };
 
   const removeGroup = (groupIndex: number) => {
-    setDraftTree((current) => current.filter((_, index) => index !== groupIndex));
+    updateDraftTree((current) => removeItemAt(current, groupIndex));
   };
 
   const removeTag = (groupIndex: number, tagIndex: number) => {
-    setDraftTree((current) =>
-      current.map((group, index) =>
-        index === groupIndex
-          ? {
-              ...group,
-              children: (group.children || []).filter((_, currentTagIndex) => currentTagIndex !== tagIndex),
-            }
-          : group,
-      ),
-    );
+    updateDraftTags(groupIndex, (children) => removeItemAt(children, tagIndex));
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
@@ -485,14 +520,7 @@ export default function GroupManagement({
     if (!over || active.id === over.id) {
       return;
     }
-    setDraftTree((current) => {
-      const oldIndex = current.findIndex((group) => group.id === active.id);
-      const newIndex = current.findIndex((group) => group.id === over.id);
-      if (oldIndex === -1 || newIndex === -1) {
-        return current;
-      }
-      return arrayMove(current, oldIndex, newIndex);
-    });
+    updateDraftTree((current) => reorderGroupsByID(current, String(active.id), String(over.id)));
   };
 
   const handleSave = async () => {
@@ -519,8 +547,7 @@ export default function GroupManagement({
     setIsSaving(true);
     try {
       await onSave(nextTree);
-      setDraftTree(toEditableTree(nextTree));
-      toast.success("分组配置已保存。");
+      finishSave(nextTree);
     } catch (error) {
       toast.error(getErrorMessage(error, "保存分组失败。"));
     } finally {

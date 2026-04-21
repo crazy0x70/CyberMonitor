@@ -1,9 +1,7 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -225,32 +223,16 @@ func postAgentUpdateReport(
 	version string,
 	message string,
 ) error {
-	payload, err := json.Marshal(map[string]string{
+	req, err := newAgentJSONRequest(ctx, http.MethodPost, endpoint, map[string]string{
 		"node_id": nodeID,
 		"state":   state,
 		"version": version,
 		"message": message,
-	})
+	}, token)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("X-AGENT-TOKEN", token)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return readAgentAPIActionError(resp, "update report failed")
-	}
-	return nil
+	return performAgentStatusRequest(client, req, "update report failed")
 }
 
 type cachedTest struct {

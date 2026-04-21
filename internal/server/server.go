@@ -2711,6 +2711,126 @@ func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
 	return cloneTestHistory(s.testHistory)
 }
 
+func (s *Store) queryPublicNodeHistoryFromMemory(
+	nodeID string,
+	from, to time.Time,
+	maxPoints int,
+) map[string]*TestHistoryEntry {
+	if s == nil {
+		return nil
+	}
+
+	fromSec := from.Unix()
+	toSec := to.Unix()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nodeHistory := s.testHistory[nodeID]
+	if len(nodeHistory) == 0 {
+		return nil
+	}
+
+	result := make(map[string]*TestHistoryEntry, len(nodeHistory))
+	for key, entry := range nodeHistory {
+		projected := projectTestHistoryEntryRange(entry, fromSec, toSec, maxPoints)
+		if projected != nil {
+			result[key] = projected
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func projectTestHistoryEntryRange(
+	entry *TestHistoryEntry,
+	fromSec, toSec int64,
+	maxPoints int,
+) *TestHistoryEntry {
+	if entry == nil || len(entry.Times) == 0 {
+		return nil
+	}
+
+	start := 0
+	if fromSec > 0 {
+		start = sort.Search(len(entry.Times), func(i int) bool {
+			return entry.Times[i] >= fromSec
+		})
+	}
+	end := len(entry.Times)
+	if toSec > 0 {
+		end = sort.Search(len(entry.Times), func(i int) bool {
+			return entry.Times[i] > toSec
+		})
+	}
+	if start >= end {
+		return nil
+	}
+
+	total := end - start
+	indices := sampleHistoryIndices(total, maxPoints)
+	times := make([]int64, 0, len(indices))
+	latency := make([]*float64, 0, len(indices))
+	loss := make([]*float64, 0, len(indices))
+	for _, index := range indices {
+		sourceIndex := start + index
+		times = append(times, entry.Times[sourceIndex])
+		latency = append(latency, cloneHistorySampleAt(entry.Latency, sourceIndex))
+		loss = append(loss, cloneHistorySampleAt(entry.Loss, sourceIndex))
+	}
+	if len(times) == 0 {
+		return nil
+	}
+	minIntervalSec, avgIntervalSec := history.HistoryIntervalStats(times)
+	return &TestHistoryEntry{
+		Latency:        latency,
+		Loss:           loss,
+		Times:          times,
+		LastAt:         times[len(times)-1],
+		MinIntervalSec: minIntervalSec,
+		AvgIntervalSec: avgIntervalSec,
+	}
+}
+
+func cloneHistorySampleAt(samples []*float64, index int) *float64 {
+	if index < 0 || index >= len(samples) {
+		return nil
+	}
+	return normalizeFloatPointer(samples[index])
+}
+
+func mergePublicNodeHistory(
+	primary map[string]*TestHistoryEntry,
+	fallback map[string]*TestHistoryEntry,
+) map[string]*TestHistoryEntry {
+	if len(primary) == 0 {
+		if len(fallback) == 0 {
+			return map[string]*TestHistoryEntry{}
+		}
+		return fallback
+	}
+	if len(fallback) == 0 {
+		return primary
+	}
+
+	merged := make(map[string]*TestHistoryEntry, len(primary)+len(fallback))
+	for key, entry := range primary {
+		merged[key] = entry
+	}
+	for key, entry := range fallback {
+		if entry == nil {
+			continue
+		}
+		current := merged[key]
+		if current == nil || len(current.Times) < len(entry.Times) {
+			merged[key] = entry
+		}
+	}
+	return merged
+}
+
 func (s *Store) HasNode(nodeID string) bool {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
@@ -2727,14 +2847,26 @@ func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[s
 	if nodeID == "" {
 		return map[string]*TestHistoryEntry{}, nil
 	}
+	maxPoints := publicHistoryPointBudget(from, to)
+	fallback := s.queryPublicNodeHistoryFromMemory(nodeID, from, to, maxPoints)
 	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
-		return map[string]*TestHistoryEntry{}, nil
+		if len(fallback) == 0 {
+			return map[string]*TestHistoryEntry{}, nil
+		}
+		return fallback, nil
 	}
 	entries, err := s.historyManager.NetworkStore().QueryPublicRange(nodeID, from, to)
 	if err != nil {
+		if len(fallback) > 0 {
+			log.Printf("查询 public history TSDB 失败，回退内存历史：%v", err)
+			return fallback, nil
+		}
 		return nil, err
 	}
-	return convertNetworkHistoryToTestHistory(entries, publicHistoryPointBudget(from, to)), nil
+	return mergePublicNodeHistory(
+		convertNetworkHistoryToTestHistory(entries, maxPoints),
+		fallback,
+	), nil
 }
 
 func cloneTestHistory(

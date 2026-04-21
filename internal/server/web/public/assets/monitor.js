@@ -50,12 +50,7 @@ const remoteConfig = {
 
 function readViewStateFromURL() {
   const params = new URLSearchParams(window.location.search);
-  const selectedGroup = (params.get("group") || DEFAULT_GROUP).trim() || DEFAULT_GROUP;
-  const statusFilter = params.get("status") || DEFAULT_STATUS_FILTER;
-  return {
-    selectedGroup,
-    statusFilter: STATUS_FILTERS.has(statusFilter) ? statusFilter : DEFAULT_STATUS_FILTER,
-  };
+  return normalizeViewState(params.get("group"), params.get("status"));
 }
 
 const initialViewState = readViewStateFromURL();
@@ -203,14 +198,6 @@ function refreshOpenNodeHistoryViews(nodeId) {
     Array.isArray(card._fields._tests) ? card._fields._tests : [],
     card._nodeId
   );
-}
-
-function resetToAllGroups() {
-  applyViewState({ selectedGroup: DEFAULT_GROUP }, { history: "push" });
-}
-
-function setStatusFilter(mode) {
-  applyViewState({ statusFilter: mode }, { history: "push" });
 }
 
 function connectWS() {
@@ -1450,10 +1437,23 @@ function resolveNodeSourceKey(nodeId) {
   return String(targetNode.__sourceKey || "default");
 }
 
-function resolveHistoryTarget(nodeId) {
-  const sourceKey = resolveNodeSourceKey(nodeId);
+function resolveHistoryTargetBySourceKey(sourceKey) {
+  const normalizedSourceKey = normalizeHistorySourceKey(sourceKey);
   const targets = resolveTargets();
-  return targets.find((item) => item.key === sourceKey) || targets[0] || null;
+  return (
+    targets.find((item) => item.key === normalizedSourceKey) ||
+    targets[0] ||
+    null
+  );
+}
+
+function resolveNodeHistoryContext(nodeId) {
+  const sourceKey = resolveNodeSourceKey(nodeId);
+  return {
+    sourceKey,
+    cacheKey: resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rawNodeId: resolveHistoryNodeId(nodeId),
+  };
 }
 
 async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
@@ -1461,9 +1461,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
   if (!nodeId) {
     return null;
   }
-  const sourceKey = resolveNodeSourceKey(nodeId);
-  const cacheKey = resolveHistoryNodeCacheKey(nodeId, sourceKey);
-  const rawNodeId = resolveHistoryNodeId(nodeId);
+  const { sourceKey, cacheKey, rawNodeId } = resolveNodeHistoryContext(nodeId);
   if (!rawNodeId) {
     return null;
   }
@@ -1475,7 +1473,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     return state.testHistoryInflight.get(requestKey);
   }
 
-  const target = resolveHistoryTarget(nodeId);
+  const target = resolveHistoryTargetBySourceKey(sourceKey);
   const apiBase = target?.apiBase;
   if (!apiBase) {
     return null;
@@ -1554,7 +1552,7 @@ if (brandTitle) {
       return;
     }
     event.preventDefault();
-    resetToAllGroups();
+    applyViewState({ selectedGroup: DEFAULT_GROUP }, { history: "push" });
   });
 }
 
@@ -1563,13 +1561,19 @@ const statOnlineCard = statOnline ? statOnline.closest(".stat-card") : null;
 const statOfflineCard = statOffline ? statOffline.closest(".stat-card") : null;
 
 if (statTotalCard) {
-  statTotalCard.addEventListener("click", () => setStatusFilter("all"));
+  statTotalCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "all" }, { history: "push" });
+  });
 }
 if (statOnlineCard) {
-  statOnlineCard.addEventListener("click", () => setStatusFilter("online"));
+  statOnlineCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "online" }, { history: "push" });
+  });
 }
 if (statOfflineCard) {
-  statOfflineCard.addEventListener("click", () => setStatusFilter("offline"));
+  statOfflineCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "offline" }, { history: "push" });
+  });
 }
 
 window.addEventListener("popstate", () => {
@@ -1625,14 +1629,21 @@ function collectGroupNames(nodes, settingsGroups) {
   const set = new Set();
   (settingsGroups || []).forEach((group) => set.add(group));
   nodes.forEach((node) => {
-    const selections = extractGroupSelections(node);
-    selections.forEach((item) => {
+    getGroupSelections(node).forEach((item) => {
       if (item.group) {
         set.add(item.group);
       }
     });
   });
   return Array.from(set).filter(Boolean);
+}
+
+function getGroupSelections(node, group = DEFAULT_GROUP) {
+  const selections = extractGroupSelections(node);
+  if (!group || group === DEFAULT_GROUP) {
+    return selections;
+  }
+  return selections.filter((item) => item.group === group);
 }
 
 function buildGroupSelectionSignature(node) {
@@ -1740,8 +1751,10 @@ function renderGroupTabs(groups) {
   const allGroups = [DEFAULT_GROUP, ...groups];
   const signature = allGroups.join("\n");
   if (!allGroups.includes(state.selectedGroup)) {
-    state.selectedGroup = DEFAULT_GROUP;
-    syncViewStateToURL(true);
+    applyViewState(
+      { selectedGroup: DEFAULT_GROUP },
+      { history: "replace", render: false }
+    );
   }
   if (state.groupTabSignature !== signature) {
     state.groupTabSignature = signature;
@@ -1772,9 +1785,7 @@ function renderGroupTabs(groups) {
 
 function filterNodesByGroup(nodes, group) {
   if (!group || group === DEFAULT_GROUP) return nodes;
-  return nodes.filter((node) =>
-    extractGroupSelections(node).some((item) => item.group === group)
-  );
+  return nodes.filter((node) => getGroupSelections(node, group).length > 0);
 }
 
 function filterNodesByStatus(nodes, status) {
@@ -1959,8 +1970,7 @@ function cleanupInactive(activeIds) {
 function groupNodesByTag(nodes, group) {
   const groups = new Map();
   nodes.forEach((node) => {
-    const selections = extractGroupSelections(node);
-    const matches = selections.filter((item) => item.group === group);
+    const matches = getGroupSelections(node, group);
     let primary = "未配置";
     for (const match of matches) {
       if (match.tag) {
@@ -2552,23 +2562,26 @@ function renderNetworkSection(fields, nodeId) {
     entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
   });
 
-  const mergedTimeline = buildLatencyTimeline(testEntries);
-  const timeSeries = mergedTimeline.times;
+  const renderGrid = buildRenderedTestGrid(
+    activeRange,
+    rangeSec,
+    rangeEndSec,
+    testEntries
+  );
+  const timeSeries = renderGrid.times;
 
   testEntries.forEach((entry) => {
-    const timelineSeries = mergedTimeline.series.get(entry.key) || [];
-    const sampled = {
-      latency: timelineSeries,
-      times: timeSeries,
-    };
+    const sampled = resampleHistoryForGrid(entry.filtered, renderGrid);
+    const interpolationBaseGap = Math.max(
+      entry.history?.minIntervalSec || 0,
+      renderGrid.intervalSec || 0,
+      60
+    );
     const interpolatedLatency = interpolateLatencyGaps(sampled.latency, sampled.times, {
       multiplier: 6,
-      fallbackGapSec: Math.max(
-        entry.history?.minIntervalSec || 0,
-        60
-      ),
-      minGapSec: Math.max(entry.history?.minIntervalSec || 0, 60),
-      maxGapSecCap: Math.max((entry.history?.minIntervalSec || 60) * 6, 60),
+      fallbackGapSec: interpolationBaseGap,
+      minGapSec: interpolationBaseGap,
+      maxGapSecCap: Math.max(interpolationBaseGap * 6, 60),
     });
     const latencySeries = smoothEnabled
       ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
@@ -2606,6 +2619,15 @@ function renderNetworkSection(fields, nodeId) {
   const chart = buildLatencyChart(seriesList, colors, timeSeries, rangeSec);
   fields.testChart.innerHTML = chart.svg;
   setupLatencyHover(fields, chart.meta, labels);
+}
+
+function buildRenderedTestGrid(rangeKey, rangeSec, rangeEndSec, testEntries) {
+  return buildTestGrid(
+    rangeKey,
+    rangeSec,
+    rangeEndSec,
+    resolveObservedHistoryIntervalSec(testEntries)
+  );
 }
 
 function renderSmoothToggle(fields, nodeId, enabled) {
@@ -2724,83 +2746,7 @@ function hasSeriesData(series) {
   );
 }
 
-function buildLatencyTimeline(testEntries) {
-  if (!Array.isArray(testEntries) || testEntries.length === 0) {
-    return { times: [], series: new Map() };
-  }
-  const toleranceSec = resolveLatencyTimelineToleranceSec(testEntries);
-  const rawAnchors = [];
-
-  testEntries.forEach((entry) => {
-    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
-    times.forEach((timestamp) => {
-      const numeric = Number(timestamp);
-      if (!Number.isFinite(numeric)) return;
-      rawAnchors.push(numeric);
-    });
-  });
-
-  if (!rawAnchors.length) {
-    return { times: [], series: new Map() };
-  }
-
-  rawAnchors.sort((left, right) => left - right);
-  const anchors = [rawAnchors[0]];
-  for (let index = 1; index < rawAnchors.length; index += 1) {
-    if (rawAnchors[index] - anchors[anchors.length - 1] > toleranceSec) {
-      anchors.push(rawAnchors[index]);
-    }
-  }
-
-  const series = new Map();
-  testEntries.forEach((entry) => {
-    const values = Array.from({ length: anchors.length }, () => null);
-    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
-    const latency = Array.isArray(entry?.filtered?.latency) ? entry.filtered.latency : [];
-    let anchorIndex = 0;
-    for (let index = 0; index < times.length; index += 1) {
-      const timestamp = Number(times[index]);
-      if (!Number.isFinite(timestamp)) continue;
-      const resolvedIndex = resolveLatencyAnchorIndex(
-        anchors,
-        anchorIndex,
-        timestamp,
-        toleranceSec
-      );
-      if (resolvedIndex === -1) continue;
-      anchorIndex = resolvedIndex;
-      values[resolvedIndex] = normalizeNumber(latency[index]);
-    }
-    series.set(entry.key, values);
-  });
-
-  return { times: anchors, series };
-}
-
-function resolveLatencyAnchorIndex(anchors, startIndex, timestamp, toleranceSec) {
-  if (!Array.isArray(anchors) || anchors.length === 0) {
-    return -1;
-  }
-  let index = Math.max(0, Math.min(startIndex || 0, anchors.length - 1));
-  while (index < anchors.length - 1 && anchors[index] < timestamp - toleranceSec) {
-    index += 1;
-  }
-  if (Math.abs(anchors[index] - timestamp) <= toleranceSec) {
-    return index;
-  }
-  if (index > 0 && Math.abs(anchors[index - 1] - timestamp) <= toleranceSec) {
-    return index - 1;
-  }
-  if (
-    index < anchors.length - 1 &&
-    Math.abs(anchors[index + 1] - timestamp) <= toleranceSec
-  ) {
-    return index + 1;
-  }
-  return -1;
-}
-
-function resolveLatencyTimelineToleranceSec(testEntries) {
+function resolveObservedHistoryIntervalSec(testEntries) {
   const intervals = [];
   (Array.isArray(testEntries) ? testEntries : []).forEach((entry) => {
     const minInterval = Number(entry?.history?.minIntervalSec);
@@ -2819,11 +2765,10 @@ function resolveLatencyTimelineToleranceSec(testEntries) {
     }
   });
   if (!intervals.length) {
-    return 2;
+    return 0;
   }
   intervals.sort((left, right) => left - right);
-  const median = intervals[Math.floor(intervals.length / 2)];
-  return Math.max(1, Math.min(5, Math.round(median * 0.4)));
+  return intervals[Math.floor(intervals.length / 2)];
 }
 
 function resampleHistoryForGrid(history, grid) {
@@ -3034,8 +2979,8 @@ function updateTestHistory(nodeId, tests) {
     return;
   }
 
-  const sourceKey = resolveNodeSourceKey(nodeId);
-  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  const { sourceKey, cacheKey } = resolveNodeHistoryContext(nodeId);
+  const ranges = state.testHistory.get(cacheKey);
   if (!ranges || ranges.size === 0) {
     return;
   }

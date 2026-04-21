@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -109,20 +110,81 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 	req.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return RemoteConfig{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return RemoteConfig{}, readAgentAPIStatusError(resp, "config")
-	}
-
 	var payload RemoteConfig
-	if err := decodeStrictAgentJSON(resp.Body, &payload, "config response has trailing data"); err != nil {
+	if err := performAgentJSONRequest(client, req, "config", "config response has trailing data", &payload); err != nil {
 		return RemoteConfig{}, err
 	}
 	return payload, nil
+}
+
+func performAgentJSONRequest(
+	client *http.Client,
+	req *http.Request,
+	statusLabel string,
+	trailingMessage string,
+	target any,
+) error {
+	if client == nil {
+		return fmt.Errorf("http client required")
+	}
+	if req == nil {
+		return fmt.Errorf("http request required")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return readAgentAPIStatusError(resp, statusLabel)
+	}
+	return decodeStrictAgentJSON(resp.Body, target, trailingMessage)
+}
+
+func newAgentJSONRequest(
+	ctx context.Context,
+	method string,
+	endpoint string,
+	payload any,
+	token string,
+) (*http.Request, error) {
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("X-AGENT-TOKEN", token)
+	}
+	return req, nil
+}
+
+func performAgentStatusRequest(client *http.Client, req *http.Request, action string) error {
+	if client == nil {
+		return fmt.Errorf("http client required")
+	}
+	if req == nil {
+		return fmt.Errorf("http request required")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return readAgentAPIActionError(resp, action)
+	}
+	return nil
 }
 
 func readAgentAPIErrorMessage(resp *http.Response, fallback string) string {

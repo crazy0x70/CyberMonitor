@@ -354,18 +354,31 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 
 	next := c.publicIPs
 	next.checkedAt = now
-	if value, err := c.publicIPLookup(context.Background(), publicIPv4Family); err == nil {
-		if normalized := normalizePublicIPAddress(publicIPv4Family, value); normalized != "" {
-			next.IPv4 = normalized
+	for _, family := range []publicIPFamily{publicIPv4Family, publicIPv6Family} {
+		normalized, err := c.lookupPublicIPAt(family)
+		if err != nil || normalized == "" {
+			continue
 		}
-	}
-	if value, err := c.publicIPLookup(context.Background(), publicIPv6Family); err == nil {
-		if normalized := normalizePublicIPAddress(publicIPv6Family, value); normalized != "" {
+		switch family {
+		case publicIPv4Family:
+			next.IPv4 = normalized
+		case publicIPv6Family:
 			next.IPv6 = normalized
 		}
 	}
 	c.publicIPs = next
 	return c.publicIPs
+}
+
+func (c *Collector) lookupPublicIPAt(family publicIPFamily) (string, error) {
+	if c == nil || c.publicIPLookup == nil {
+		return "", nil
+	}
+	value, err := c.publicIPLookup(context.Background(), family)
+	if err != nil {
+		return "", err
+	}
+	return normalizePublicIPAddress(family, value), nil
 }
 
 func readConnectionCounts() (int, int) {
@@ -392,9 +405,9 @@ func newPublicIPLookup(timeout time.Duration) publicIPLookupFunc {
 func defaultPublicIPEndpointsForFamily(family publicIPFamily) []string {
 	switch family {
 	case publicIPv6Family:
-		return append([]string(nil), defaultPublicIPv6Endpoints...)
+		return defaultPublicIPv6Endpoints
 	default:
-		return append([]string(nil), defaultPublicIPv4Endpoints...)
+		return defaultPublicIPv4Endpoints
 	}
 }
 
@@ -658,16 +671,12 @@ func collectNetSpeedMbps(filter map[string]struct{}) float64 {
 	if err != nil {
 		return 0
 	}
-	candidates := make([]string, 0, len(ifaces))
+	maxSpeed := 0.0
 	for _, iface := range ifaces {
 		if !shouldCollectInterface(iface.Name, filter) {
 			continue
 		}
-		candidates = append(candidates, iface.Name)
-	}
-	maxSpeed := 0.0
-	for _, name := range candidates {
-		if speed := readInterfaceSpeedMbps(name); speed > maxSpeed {
+		if speed := readInterfaceSpeedMbps(iface.Name); speed > maxSpeed {
 			maxSpeed = speed
 		}
 	}

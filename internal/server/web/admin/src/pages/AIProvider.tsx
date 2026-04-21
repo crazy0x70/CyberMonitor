@@ -233,43 +233,86 @@ export default function AIProvider({
     }
   }, [commandProvider, providerOptions]);
 
-  const updateProvider = (id: string, updater: (current: ProviderDraft) => ProviderDraft) => {
-    setProviders((current) =>
-      current.map((item) => (item.id === id ? updater(item) : item)),
-    );
+  const markDirty = () => {
     setIsDirty(true);
+  };
+
+  const setProviderDrafts = (
+    updater: (current: ProviderDraft[]) => ProviderDraft[],
+    dirty = false,
+  ) => {
+    setProviders(updater);
+    if (dirty) {
+      markDirty();
+    }
+  };
+
+  const updateProviderDraft = (
+    id: string,
+    updater: (current: ProviderDraft) => ProviderDraft,
+    dirty = false,
+  ) => {
+    setProviderDrafts(
+      (current) => current.map((item) => (item.id === id ? updater(item) : item)),
+      dirty,
+    );
+  };
+
+  const updateProviderInput = (
+    id: string,
+    field: "name" | "apiKey" | "baseURL" | "model",
+    value: string,
+  ) => {
+    updateProviderDraft(id, (current) => {
+      if (field === "name") {
+        return { ...current, name: value };
+      }
+      if (field === "apiKey") {
+        return {
+          ...current,
+          apiKey: value,
+          status: value ? "unverified" : "unconfigured",
+        };
+      }
+      const next = {
+        ...current,
+        status: current.apiKey ? "unverified" : current.status,
+      };
+      return field === "baseURL"
+        ? { ...next, baseURL: value }
+        : { ...next, model: value };
+    }, true);
   };
 
   const addCompatible = () => {
     const id = `compatible-${Date.now()}`;
-    setProviders((current) => [
-      ...current,
-      {
-        id,
-        name: "新兼容服务商",
-        provider: "openai_compatible",
-        apiKey: "",
-        baseURL: "",
-        model: "",
-        models: [],
-        status: "unconfigured",
-      },
-    ]);
-    setIsDirty(true);
+    setProviderDrafts(
+      (current) => [
+        ...current,
+        {
+          id,
+          name: "新兼容服务商",
+          provider: "openai_compatible",
+          apiKey: "",
+          baseURL: "",
+          model: "",
+          models: [],
+          status: "unconfigured",
+        },
+      ],
+      true,
+    );
   };
 
   const removeCompatible = (id: string) => {
-    setProviders((current) => current.filter((item) => item.id !== id));
-    setIsDirty(true);
+    setProviderDrafts((current) => current.filter((item) => item.id !== id), true);
   };
 
   const handleTest = async (item: ProviderDraft) => {
     setTestingId(item.id);
     try {
       await onTestProvider(toProviderRequestKey(item), toConfig(item));
-      setProviders((current) =>
-        current.map((entry) => (entry.id === item.id ? { ...entry, status: "verified" } : entry)),
-      );
+      updateProviderDraft(item.id, (current) => ({ ...current, status: "verified" }));
       toast.success(`${item.name} 验证成功`);
     } catch (error) {
       toast.error(getErrorMessage(error, "验证失败"));
@@ -282,12 +325,16 @@ export default function AIProvider({
     setFetchingModelsId(item.id);
     try {
       const models = await onFetchModels(toProviderRequestKey(item), toConfig(item));
-      setProviders((current) =>
-        current.map((entry) => (entry.id === item.id ? { ...entry, models } : entry)),
+      const shouldFillModel = models.length > 0 && !item.model;
+      updateProviderDraft(
+        item.id,
+        (current) => ({
+          ...current,
+          models,
+          model: shouldFillModel ? models[0] : current.model,
+        }),
+        shouldFillModel,
       );
-      if (models.length > 0 && !item.model) {
-        updateProvider(item.id, (current) => ({ ...current, model: models[0] }));
-      }
       toast.success(`${item.name} 模型列表已刷新`);
     } catch (error) {
       toast.error(getErrorMessage(error, "获取模型列表失败"));
@@ -367,7 +414,7 @@ export default function AIProvider({
                   return;
                 }
                 setCommandProvider(value);
-                setIsDirty(true);
+                markDirty();
               }}
             >
               <SelectTrigger id="ai-command-provider" className={`w-full ${adminSelectTriggerClass}`}>
@@ -402,7 +449,7 @@ export default function AIProvider({
             value={prompt}
             onChange={(event) => {
               setPrompt(event.target.value);
-              setIsDirty(true);
+              markDirty();
             }}
             placeholder="例如：请重点关注网络流量、下载量与离线情况…"
           />
@@ -449,12 +496,7 @@ export default function AIProvider({
                         className={adminInputClass}
                         autoComplete="off"
                         value={item.name}
-                        onChange={(event) =>
-                          updateProvider(item.id, (current) => ({
-                            ...current,
-                            name: event.target.value,
-                          }))
-                        }
+                        onChange={(event) => updateProviderInput(item.id, "name", event.target.value)}
                       />
                     </div>
                     <div className="grid gap-2">
@@ -466,13 +508,7 @@ export default function AIProvider({
                         autoComplete="new-password"
                         spellCheck={false}
                         value={item.apiKey}
-                        onChange={(event) =>
-                          updateProvider(item.id, (current) => ({
-                            ...current,
-                            apiKey: event.target.value,
-                            status: event.target.value ? "unverified" : "unconfigured",
-                          }))
-                        }
+                        onChange={(event) => updateProviderInput(item.id, "apiKey", event.target.value)}
                       />
                     </div>
                     <div className="grid gap-2">
@@ -485,13 +521,7 @@ export default function AIProvider({
                         inputMode="url"
                         spellCheck={false}
                         value={item.baseURL}
-                        onChange={(event) =>
-                          updateProvider(item.id, (current) => ({
-                            ...current,
-                            baseURL: event.target.value,
-                            status: current.apiKey ? "unverified" : current.status,
-                          }))
-                        }
+                        onChange={(event) => updateProviderInput(item.id, "baseURL", event.target.value)}
                       />
                     </div>
                     <div className="grid gap-2">
@@ -503,13 +533,7 @@ export default function AIProvider({
                         autoComplete="off"
                         spellCheck={false}
                         value={item.model}
-                        onChange={(event) =>
-                          updateProvider(item.id, (current) => ({
-                            ...current,
-                            model: event.target.value,
-                            status: current.apiKey ? "unverified" : current.status,
-                          }))
-                        }
+                        onChange={(event) => updateProviderInput(item.id, "model", event.target.value)}
                       />
                       <datalist id={`models-${item.id}`}>
                         {item.models.map((model) => (

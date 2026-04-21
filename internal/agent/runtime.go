@@ -38,12 +38,8 @@ func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.
 func (r *agentRunner) bootstrapToken(ctx context.Context) {
 	bootstrapToken := strings.TrimSpace(r.cfg.AgentToken)
 
-	if r.cfg.TokenFile != "" {
-		if persisted, err := loadPersistedAgentToken(r.cfg.TokenFile); err == nil && persisted != "" {
-			r.agentToken = persisted
-		} else if err != nil && !os.IsNotExist(err) {
-			log.Printf("读取 Agent 凭据文件失败: %v", err)
-		}
+	if err := r.restorePersistedAgentToken(); err != nil {
+		log.Printf("读取 Agent 凭据文件失败: %v", err)
 	}
 
 	if bootstrapToken == "" || r.agentToken != bootstrapToken {
@@ -52,11 +48,8 @@ func (r *agentRunner) bootstrapToken(ctx context.Context) {
 
 	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, bootstrapToken)
 	if err == nil && issuedToken != "" {
-		r.agentToken = issuedToken
-		if r.cfg.TokenFile != "" {
-			if err := persistAgentToken(r.cfg.TokenFile, issuedToken); err != nil {
-				log.Printf("持久化 Agent 专属凭据失败: %v", err)
-			}
+		if err := r.updateAgentToken(issuedToken); err != nil {
+			log.Printf("持久化 Agent 专属凭据失败: %v", err)
 		}
 		return
 	}
@@ -72,10 +65,9 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 		return
 	}
 
-	nextToken, persistErr := applyRemoteConfig(r.cfg, r.runtimeCfg, r.agentToken, remote)
-	r.agentToken = nextToken
-	if persistErr != nil {
-		log.Printf("持久化 Agent 专属凭据失败: %v", persistErr)
+	r.runtimeCfg.Update(remote)
+	if err := r.updateAgentToken(resolveRemoteAgentToken(r.agentToken, remote)); err != nil {
+		log.Printf("持久化 Agent 专属凭据失败: %v", err)
 	}
 	if remote.Update == nil {
 		r.lastUpdateState = ""
@@ -154,15 +146,37 @@ func (r *agentRunner) reportStats(ctx context.Context, sample metrics.NodeStats)
 	return nil
 }
 
-func applyRemoteConfig(cfg Config, runtimeCfg *runtimeConfig, agentToken string, remote RemoteConfig) (string, error) {
-	nextToken := agentToken
-	if issuedToken := strings.TrimSpace(remote.AgentToken); issuedToken != "" && issuedToken != nextToken {
-		nextToken = issuedToken
+func (r *agentRunner) restorePersistedAgentToken() error {
+	if r.cfg.TokenFile == "" {
+		return nil
 	}
-	runtimeCfg.Update(remote)
+	persisted, err := loadPersistedAgentToken(r.cfg.TokenFile)
+	switch {
+	case err == nil && persisted != "":
+		r.agentToken = persisted
+		return nil
+	case err == nil, os.IsNotExist(err):
+		return nil
+	default:
+		return err
+	}
+}
 
-	if cfg.TokenFile == "" || nextToken == agentToken {
-		return nextToken, nil
+func (r *agentRunner) updateAgentToken(next string) error {
+	trimmed := strings.TrimSpace(next)
+	if trimmed == "" || trimmed == r.agentToken {
+		return nil
 	}
-	return nextToken, persistAgentToken(cfg.TokenFile, nextToken)
+	r.agentToken = trimmed
+	if r.cfg.TokenFile == "" {
+		return nil
+	}
+	return persistAgentToken(r.cfg.TokenFile, trimmed)
+}
+
+func resolveRemoteAgentToken(current string, remote RemoteConfig) string {
+	if issuedToken := strings.TrimSpace(remote.AgentToken); issuedToken != "" {
+		return issuedToken
+	}
+	return current
 }

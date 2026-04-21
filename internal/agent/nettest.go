@@ -36,53 +36,71 @@ func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 	items := strings.Split(raw, ",")
 	results := make([]metrics.NetworkTestConfig, 0, len(items))
 	for _, item := range items {
-		trimmed := strings.TrimSpace(item)
-		if trimmed == "" {
-			continue
+		config, ok := parseNetTestItem(item)
+		if ok {
+			results = append(results, config)
 		}
-
-		name := ""
-		if left, right, ok := strings.Cut(trimmed, "@"); ok {
-			name = strings.TrimSpace(left)
-			trimmed = strings.TrimSpace(right)
-		}
-
-		typePrefix := ""
-		if kind, target, ok := cutNetTestTypePrefix(trimmed); ok {
-			typePrefix = kind
-			trimmed = target
-		}
-
-		host, port := splitHostPort(trimmed)
-		if host == "" {
-			continue
-		}
-		if typePrefix == "" {
-			if port > 0 {
-				typePrefix = "tcp"
-			} else {
-				typePrefix = "icmp"
-			}
-		}
-		if typePrefix == "icmp" {
-			port = 0
-		}
-		if typePrefix == "tcp" && port == 0 {
-			port = defaultTCPPort
-		}
-
-		if name == "" {
-			name = host
-		}
-
-		results = append(results, metrics.NetworkTestConfig{
-			Name: name,
-			Type: typePrefix,
-			Host: host,
-			Port: port,
-		})
 	}
 	return results
+}
+
+func parseNetTestItem(item string) (metrics.NetworkTestConfig, bool) {
+	target := strings.TrimSpace(item)
+	if target == "" {
+		return metrics.NetworkTestConfig{}, false
+	}
+
+	name, target := splitNamedTarget(target)
+	kind, target := splitNetTestType(target)
+	host, port := splitHostPort(target)
+	if host == "" {
+		return metrics.NetworkTestConfig{}, false
+	}
+
+	kind, port = normalizeNetTestTarget(kind, port)
+	if name == "" {
+		name = host
+	}
+
+	return metrics.NetworkTestConfig{
+		Name: name,
+		Type: kind,
+		Host: host,
+		Port: port,
+	}, true
+}
+
+func splitNamedTarget(value string) (string, string) {
+	name, target, ok := strings.Cut(value, "@")
+	if !ok {
+		return "", value
+	}
+	return strings.TrimSpace(name), strings.TrimSpace(target)
+}
+
+func splitNetTestType(value string) (string, string) {
+	kind, target, ok := cutNetTestTypePrefix(value)
+	if !ok {
+		return "", value
+	}
+	return kind, target
+}
+
+func normalizeNetTestTarget(kind string, port int) (string, int) {
+	if kind == "" {
+		if port > 0 {
+			kind = "tcp"
+		} else {
+			kind = "icmp"
+		}
+	}
+	if kind == "icmp" {
+		return kind, 0
+	}
+	if port == 0 {
+		port = defaultTCPPort
+	}
+	return kind, port
 }
 
 func cutNetTestTypePrefix(value string) (kind, target string, ok bool) {
@@ -176,15 +194,7 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 		return nil, 100, "error", "ping 命令不可用"
 	}
 
-	var cmd *exec.Cmd
-	count := strconv.Itoa(pingSampleCount)
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, pingPath, "-n", count, "-w", "2000", host)
-	} else if runtime.GOOS == "darwin" {
-		cmd = exec.CommandContext(ctx, pingPath, "-c", count, "-W", "2000", host)
-	} else {
-		cmd = exec.CommandContext(ctx, pingPath, "-c", count, "-W", "2", host)
-	}
+	cmd := newPingCommand(ctx, pingPath, host)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil && len(output) == 0 {
@@ -205,26 +215,37 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	return latency, loss, status, parseErr
 }
 
+func newPingCommand(ctx context.Context, pingPath string, host string) *exec.Cmd {
+	count := strconv.Itoa(pingSampleCount)
+	switch runtime.GOOS {
+	case "windows":
+		return exec.CommandContext(ctx, pingPath, "-n", count, "-w", "2000", host)
+	case "darwin":
+		return exec.CommandContext(ctx, pingPath, "-c", count, "-W", "2000", host)
+	default:
+		return exec.CommandContext(ctx, pingPath, "-c", count, "-W", "2", host)
+	}
+}
+
 func parsePingOutput(output string) (*float64, float64, string, string) {
-	status := "ok"
 	packetLoss := parsePacketLoss(output)
 	latency := parsePingLatency(output)
-	lowerOutput := strings.ToLower(output)
+	status, loss := resolvePingStatus(output, packetLoss, latency)
+	return latency, loss, status, ""
+}
 
-	if strings.Contains(output, "100%") || strings.Contains(lowerOutput, "timeout") {
-		status = "timeout"
+func resolvePingStatus(output string, packetLoss float64, latency *float64) (string, float64) {
+	if strings.Contains(output, "100%") || strings.Contains(strings.ToLower(output), "timeout") {
 		packetLoss = 100
 	}
-
-	if packetLoss >= 100 {
-		status = "timeout"
-	} else if latency == nil && packetLoss > 0 {
-		status = "error"
-	} else if latency == nil {
-		status = "error"
+	switch {
+	case packetLoss >= 100:
+		return "timeout", 100
+	case latency == nil:
+		return "error", packetLoss
+	default:
+		return "ok", packetLoss
 	}
-
-	return latency, packetLoss, status, ""
 }
 
 func parsePacketLoss(output string) float64 {

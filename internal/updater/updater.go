@@ -230,21 +230,11 @@ func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
 }
 
 func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", c.Repo), nil)
+	resp, err := c.getOK(ctx, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", c.Repo), "application/vnd.github+json", "获取最新 Release 失败", "", "GitHub API 返回状态码 %d")
 	if err != nil {
 		return githubRelease{}, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", c.userAgent())
-
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return githubRelease{}, fmt.Errorf("获取最新 Release 失败: %w", err)
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return githubRelease{}, fmt.Errorf("%s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("GitHub API 返回状态码 %d", resp.StatusCode)))
-	}
 
 	var release githubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
@@ -254,20 +244,11 @@ func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) 
 }
 
 func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	resp, err := c.getOK(ctx, downloadURL, "", "下载更新文件失败", "", "下载返回状态码 %d")
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", c.userAgent())
-
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("下载更新文件失败: %w", err)
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("下载返回状态码 %d", resp.StatusCode)))
-	}
 	if resp.ContentLength > maxDownloadBytes {
 		return fmt.Errorf("更新文件过大: %d bytes", resp.ContentLength)
 	}
@@ -292,20 +273,11 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 }
 
 func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, downloadURL string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
+	resp, err := c.getOK(ctx, checksumURL, "", "下载校验文件失败", "下载校验文件失败", "状态码 %d")
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", c.userAgent())
-
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("下载校验文件失败: %w", err)
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载校验文件失败: %s", readUpdaterHTTPErrorMessage(resp, fmt.Sprintf("状态码 %d", resp.StatusCode)))
-	}
 	checksumBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumFileBytes))
 	if err != nil {
 		return fmt.Errorf("读取校验文件失败: %w", err)
@@ -330,6 +302,32 @@ func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, down
 		return fmt.Errorf("校验和不匹配")
 	}
 	return nil
+}
+
+func (c *Client) getOK(ctx context.Context, rawURL, accept, requestErrorPrefix, statusErrorPrefix, statusFallback string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	req.Header.Set("User-Agent", c.userAgent())
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", requestErrorPrefix, err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		return resp, nil
+	}
+	defer resp.Body.Close()
+
+	message := readUpdaterHTTPErrorMessage(resp, fmt.Sprintf(statusFallback, resp.StatusCode))
+	if statusErrorPrefix != "" {
+		return nil, fmt.Errorf("%s: %s", statusErrorPrefix, message)
+	}
+	return nil, fmt.Errorf("%s", message)
 }
 
 func readUpdaterHTTPErrorMessage(resp *http.Response, fallback string) string {

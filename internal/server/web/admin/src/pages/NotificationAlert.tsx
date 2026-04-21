@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -131,6 +131,16 @@ export default function NotificationAlert({
     }
   };
 
+  const createFieldChangeHandler =
+    (field: AlertField, setter: (value: string) => void) =>
+    (event: ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value);
+      setFieldErrors((current) =>
+        current[field] ? { ...current, [field]: undefined } : current,
+      );
+      setIsDirty(true);
+    };
+
   const validateAlertForm = ({
     requireTelegram = false,
     requireWebhook = false,
@@ -173,26 +183,50 @@ export default function NotificationAlert({
       errors: nextErrors,
       firstField,
       ids,
+      normalizedToken,
+      normalizedWebhook,
       normalizedMinutes: Number.isFinite(minutes) && minutes > 0 ? minutes : 5,
     };
   };
 
-  const handleSave = async () => {
-    const validation = validateAlertForm({});
+  const applyValidationResult = (validation: ReturnType<typeof validateAlertForm>) => {
     setFieldErrors(validation.errors);
     if (validation.firstField) {
       focusAlertField(validation.firstField);
+      return false;
+    }
+    return true;
+  };
+
+  const buildSavePayload = (validation: ReturnType<typeof validateAlertForm>) => ({
+    alert_webhook: validation.normalizedWebhook,
+    alert_telegram_token: validation.normalizedToken,
+    alert_telegram_user_ids: validation.ids,
+    alert_offline_sec: validation.normalizedMinutes * 60,
+  });
+
+  const buildTestPayload = (
+    channel: "telegram" | "feishu",
+    validation: ReturnType<typeof validateAlertForm>,
+  ): AlertTestPayload =>
+    channel === "telegram"
+      ? {
+          telegram_token: validation.normalizedToken,
+          telegram_user_ids: validation.ids,
+        }
+      : {
+          webhook: validation.normalizedWebhook,
+        };
+
+  const handleSave = async () => {
+    const validation = validateAlertForm({});
+    if (!applyValidationResult(validation)) {
       return;
     }
 
     setIsSaving(true);
     try {
-      await onSave({
-        alert_webhook: webhook.trim(),
-        alert_telegram_token: telegramToken.trim(),
-        alert_telegram_user_ids: validation.ids,
-        alert_offline_sec: validation.normalizedMinutes * 60,
-      });
+      await onSave(buildSavePayload(validation));
       toast.success("告警配置已保存");
       setIsDirty(false);
       setFieldErrors({});
@@ -208,23 +242,13 @@ export default function NotificationAlert({
       requireTelegram: channel === "telegram",
       requireWebhook: channel === "feishu",
     });
-    setFieldErrors(validation.errors);
-    if (validation.firstField) {
-      focusAlertField(validation.firstField);
+    if (!applyValidationResult(validation)) {
       return;
-    }
-    const payload: AlertTestPayload = {};
-    if (channel === "telegram") {
-      payload.telegram_token = telegramToken.trim();
-      payload.telegram_user_ids = validation.ids;
-    }
-    if (channel === "feishu") {
-      payload.webhook = webhook.trim();
     }
 
     setTestingChannel(channel);
     try {
-      await onTest(payload);
+      await onTest(buildTestPayload(channel, validation));
       toast.success("测试消息已发送");
     } catch (error) {
       toast.error(getErrorMessage(error, "测试发送失败"));
@@ -331,11 +355,7 @@ export default function NotificationAlert({
                   aria-invalid={Boolean(fieldErrors.offlineMinutes)}
                   aria-describedby={fieldErrors.offlineMinutes ? "offline-minutes-error" : undefined}
                   value={offlineMinutes}
-                  onChange={(event) => {
-                    setOfflineMinutes(event.target.value);
-                    setFieldErrors((current) => ({ ...current, offlineMinutes: undefined }));
-                    setIsDirty(true);
-                  }}
+                  onChange={createFieldChangeHandler("offlineMinutes", setOfflineMinutes)}
                 />
                 {fieldErrors.offlineMinutes ? (
                   <p id="offline-minutes-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
@@ -372,11 +392,7 @@ export default function NotificationAlert({
                     aria-invalid={Boolean(fieldErrors.telegramToken)}
                     aria-describedby={fieldErrors.telegramToken ? "telegram-token-error" : undefined}
                     value={telegramToken}
-                    onChange={(event) => {
-                      setTelegramToken(event.target.value);
-                      setFieldErrors((current) => ({ ...current, telegramToken: undefined }));
-                      setIsDirty(true);
-                    }}
+                    onChange={createFieldChangeHandler("telegramToken", setTelegramToken)}
                     placeholder="例如：123456789:ABC…"
                   />
                   {fieldErrors.telegramToken ? (
@@ -397,11 +413,7 @@ export default function NotificationAlert({
                     aria-invalid={Boolean(fieldErrors.telegramUserIds)}
                     aria-describedby={fieldErrors.telegramUserIds ? "telegram-user-ids-error" : undefined}
                     value={telegramUserIds}
-                    onChange={(event) => {
-                      setTelegramUserIds(event.target.value);
-                      setFieldErrors((current) => ({ ...current, telegramUserIds: undefined }));
-                      setIsDirty(true);
-                    }}
+                    onChange={createFieldChangeHandler("telegramUserIds", setTelegramUserIds)}
                     placeholder="例如：123456789,987654321…"
                   />
                   <p className="text-[11px] font-medium text-slate-400">
@@ -453,11 +465,7 @@ export default function NotificationAlert({
                   aria-invalid={Boolean(fieldErrors.webhook)}
                   aria-describedby={fieldErrors.webhook ? "feishu-webhook-error" : undefined}
                   value={webhook}
-                  onChange={(event) => {
-                    setWebhook(event.target.value);
-                    setFieldErrors((current) => ({ ...current, webhook: undefined }));
-                    setIsDirty(true);
-                  }}
+                  onChange={createFieldChangeHandler("webhook", setWebhook)}
                   placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
                 />
                 {fieldErrors.webhook ? (

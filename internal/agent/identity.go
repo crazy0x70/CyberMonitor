@@ -100,6 +100,7 @@ func migrateLegacyStateFile(targetPath, fileName string) error {
 }
 
 func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
+	opts = normalizeNodeIDOptions(opts)
 	nodeID, err := resolveNodeIDWithFallbacks(opts)
 	if err == nil {
 		return nodeID, nil
@@ -127,13 +128,20 @@ func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
 	return nodeID, nil
 }
 
+func normalizeNodeIDOptions(opts NodeIDOptions) NodeIDOptions {
+	opts.Explicit = strings.TrimSpace(opts.Explicit)
+	opts.ExplicitFile = strings.TrimSpace(opts.ExplicitFile)
+	opts.HostRoot = strings.TrimSpace(opts.HostRoot)
+	return opts
+}
+
 func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
-	if explicit := strings.TrimSpace(opts.Explicit); explicit != "" {
-		return explicit, nil
+	if opts.Explicit != "" {
+		return opts.Explicit, nil
 	}
 
-	if explicitFile := strings.TrimSpace(opts.ExplicitFile); explicitFile != "" {
-		return readTrimmedFile(explicitFile)
+	if opts.ExplicitFile != "" {
+		return readTrimmedFile(opts.ExplicitFile)
 	}
 
 	homePath, homeErr := defaultNodeIDHomePath()
@@ -161,8 +169,8 @@ func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
 }
 
 func resolveNodeIDCreatePath(opts NodeIDOptions) (string, error) {
-	if explicitFile := strings.TrimSpace(opts.ExplicitFile); explicitFile != "" {
-		return explicitFile, nil
+	if opts.ExplicitFile != "" {
+		return opts.ExplicitFile, nil
 	}
 	return defaultNodeIDHomePath()
 }
@@ -261,16 +269,8 @@ func registerNodeToken(ctx context.Context, client *http.Client, endpoint, nodeI
 		return "", err
 	}
 	req.Header.Set("X-AGENT-TOKEN", bootstrapToken)
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return "", readAgentAPIStatusError(resp, "register")
-	}
 	var payload nodeRegisterResponse
-	if err := decodeStrictAgentJSON(resp.Body, &payload, "register response has trailing data"); err != nil {
+	if err := performAgentJSONRequest(client, req, "register", "register response has trailing data", &payload); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(payload.AgentToken) == "" {

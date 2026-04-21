@@ -52,35 +52,24 @@ func BuildNetworkTestKey(test metrics.NetworkTestResult) string {
 }
 
 func buildNetworkSeriesKey(identity networkTestIdentity) string {
-	identity = normalizeNetworkIdentity(identity)
-	if identity.Host == "" && identity.Name == "" {
-		return ""
-	}
-	return fmt.Sprintf("%s|%s|%d|%s", identity.Type, identity.Host, identity.Port, identity.Name)
+	_, key := normalizeNetworkSeriesKey(identity)
+	return key
 }
 
 func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
-	kind, rest, found := strings.Cut(key, "|")
-	if !found {
+	parts := strings.Split(key, "|")
+	if len(parts) != 4 {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
 	}
-	host, rest, found := strings.Cut(rest, "|")
-	if !found {
-		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
-	}
-	portRaw, name, found := strings.Cut(rest, "|")
-	if !found || strings.Contains(name, "|") {
-		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
-	}
-	port, err := strconv.Atoi(portRaw)
+	port, err := strconv.Atoi(parts[2])
 	if err != nil {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history port in key %q: %w", key, err)
 	}
 	return networkTestIdentity{
-		Type: strings.TrimSpace(kind),
-		Host: strings.TrimSpace(host),
+		Type: strings.TrimSpace(parts[0]),
+		Host: strings.TrimSpace(parts[1]),
 		Port: port,
-		Name: strings.TrimSpace(name),
+		Name: strings.TrimSpace(parts[3]),
 	}, nil
 }
 
@@ -91,12 +80,19 @@ func normalizeNetworkIdentity(identity networkTestIdentity) networkTestIdentity 
 	return identity
 }
 
+func normalizeNetworkSeriesKey(identity networkTestIdentity) (networkTestIdentity, string) {
+	identity = normalizeNetworkIdentity(identity)
+	if identity.Host == "" && identity.Name == "" {
+		return identity, ""
+	}
+	return identity, fmt.Sprintf("%s|%s|%d|%s", identity.Type, identity.Host, identity.Port, identity.Name)
+}
+
 func ensureSeriesAccumulator(
 	result map[string]*seriesAccumulator,
 	identity networkTestIdentity,
 ) *seriesAccumulator {
-	identity = normalizeNetworkIdentity(identity)
-	key := buildNetworkSeriesKey(identity)
+	identity, key := normalizeNetworkSeriesKey(identity)
 	if key == "" {
 		return nil
 	}
@@ -154,37 +150,33 @@ func buildNetworkHistoryEntryWithCutoff(acc *seriesAccumulator, cutoffSeconds in
 	}
 
 	entry := &NetworkHistoryEntry{
-		Latency:      make([]*float64, len(times)),
-		Loss:         make([]*float64, len(times)),
-		Availability: make([]*float64, len(times)),
+		Latency:      cloneHistorySeriesValues(acc.latency, times),
+		Loss:         cloneHistorySeriesValues(acc.loss, times),
+		Availability: cloneHistorySeriesValues(acc.availability, times),
 		Times:        times,
 		LastAt:       times[len(times)-1],
-	}
-	for index, ts := range times {
-		entry.Latency[index] = cloneFloatPointer(acc.latency[ts])
-		entry.Loss[index] = cloneFloatPointer(acc.loss[ts])
-		entry.Availability[index] = cloneFloatPointer(acc.availability[ts])
 	}
 	entry.MinIntervalSec, entry.AvgIntervalSec = HistoryIntervalStats(times)
 	return entry
 }
 
+func cloneHistorySeriesValues(series map[int64]*float64, times []int64) []*float64 {
+	values := make([]*float64, len(times))
+	for idx, ts := range times {
+		values[idx] = cloneFloatPointer(series[ts])
+	}
+	return values
+}
+
 func collectNetworkHistoryTimes(acc *seriesAccumulator, cutoffSeconds int64) []int64 {
 	timeSet := make(map[int64]struct{}, len(acc.availability)+len(acc.latency)+len(acc.loss))
-	addVisibleTimestamp := func(ts int64) {
-		if cutoffSeconds > 0 && ts < cutoffSeconds {
-			return
+	for _, series := range [...]map[int64]*float64{acc.availability, acc.latency, acc.loss} {
+		for ts := range series {
+			if cutoffSeconds > 0 && ts < cutoffSeconds {
+				continue
+			}
+			timeSet[ts] = struct{}{}
 		}
-		timeSet[ts] = struct{}{}
-	}
-	for ts := range acc.availability {
-		addVisibleTimestamp(ts)
-	}
-	for ts := range acc.latency {
-		addVisibleTimestamp(ts)
-	}
-	for ts := range acc.loss {
-		addVisibleTimestamp(ts)
 	}
 	if len(timeSet) == 0 {
 		return nil
