@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: light)"
+      content="#f4f7fb"
+      id="theme-color-light"
+    />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: dark)"
+      content="#0b1220"
+      id="theme-color-dark"
+    />
+    <title>CyberMonitor</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#dashboard-main-content">跳转到主要内容</a>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <div class="bg-orb orb-c"></div>
+
+    <div id="app" class="app">
+      <header class="topbar">
+        <div>
+          <h1 class="brand-heading">
+            <span class="brand">CyberMonitor</span>
+          </h1>
+          <div class="subtitle">极简、多节点、实时服务器探针</div>
+        </div>
+        <div class="topbar-right">
+          <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换到深色模式">
+            <span class="theme-icon" id="theme-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z"></path>
+              </svg>
+            </span>
+          </button>
+          <div class="status-pill" id="ws-status">
+            <span class="dot"></span>
+            <span class="label">连接中…</span>
+          </div>
+          <div class="meta">
+            <span id="node-count">0</span> 节点 · <span id="last-updated">--</span>
+          </div>
+        </div>
+      </header>
+
+      <main id="dashboard-main-content">
+        <section id="grid" class="grid"></section>
+
+        <div id="empty" class="empty">
+          <h2>等待节点接入</h2>
+          <p>请启动 Agent 并指向当前管理端地址。</p>
+        </div>
+      </main>
+    </div>
+
+    <div id="login-modal" class="modal hidden">
+      <div class="modal-card">
+        <h3>管理端登录</h3>
+        <p>请输入管理员账号以获取实时监控视图。</p>
+        <form id="login-form">
+          <label>
+            账号
+            <input type="text" name="username" autocomplete="username" required />
+          </label>
+          <label>
+            密码
+            <input type="password" name="password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">登录</button>
+          <div id="login-error" class="error" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+
+    <script src="/assets/theme.js"></script>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

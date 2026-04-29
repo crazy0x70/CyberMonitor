@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./install-common.sh
+source "${SCRIPT_DIR}/install-common.sh"
+
+print_install_menu() {
+  cat <<'EOF'
+CyberMonitor 一键脚本
+1) 安装主控
+2) 安装被控
+0) 退出
+EOF
+}
+
+print_remove_menu() {
+  cat <<'EOF'
+卸载选项
+1) 卸载主控
+2) 卸载被控
+0) 退出
+EOF
+}
+
+write_server_conf() {
+  mkdir -p "${CONF_DIR}"
+  cat > "${CONF_DIR}/server.conf" <<EOF
+CM_LISTEN=${1}
+CM_DATA_DIR=${2}
+EOF
+}
+
+write_agent_conf() {
+  mkdir -p "${CONF_DIR}"
+  cat > "${CONF_DIR}/agent.conf" <<EOF
+CM_SERVER_URL=${1}
+CM_NODE_ID=${2}
+CM_AGENT_TOKEN_FILE=${INSTALL_DIR}/.cybermonitor-agent-token
+CM_NET_IFACE=${3}
+CM_DISABLE_UPDATE=${4}
+EOF
+}
+
+write_service_file() {
+  local service_file="$1"
+  local description="$2"
+  local env_file="$3"
+  local bin="$4"
+  cat > "${service_file}" <<EOF
+[Unit]
+Description=${description}
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=${env_file}
+ExecStart=${bin}
+Restart=on-failure
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+enable_service() {
+  local service="$1"
+  systemctl daemon-reload
+  systemctl enable --now "${service}"
+}
+
+read_admin_settings() {
+  local data_dir="$1"
+  local state_file="${data_dir}/state.json"
+  local admin_path=""
+  local admin_user=""
+  local admin_pass=""
+
+  for _ in {1..20}; do
+    if [[ -f "${state_file}" ]]; then
+      admin_path="$(sed -n 's/.*"admin_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
+      admin_user="$(sed -n 's/.*"admin_user"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
+      admin_pass="$(sed -n 's/.*"admin_pass"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
+      if [[ -n "${admin_path}" && -n "${admin_user}" && -n "${admin_pass}" ]]; then
+        break
+      fi
+    fi
+    sleep 1
+  done
+  if [[ -z "${admin_path}" || -z "${admin_user}" || -z "${admin_pass}" ]]; then
+    return 1
+  fi
+  echo -e "${admin_path}\t${admin_user}\t${admin_pass}"
+}
+
+is_valid_ipv4() {
+  local ip="$1"
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local o
+  IFS='.' read -r -a o <<< "${ip}"
+  for part in "${o[@]}"; do
+    if ((part < 0 || part > 255)); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+resolve_host_port() {
+  local listen="$1"
+  local host=""
+  local port=""
+  if [[ "${listen}" == *":"* ]]; then
+    if [[ "${listen}" == \[*\]*:* ]]; then
+      host="${listen%%]:*}"
+      host="${host#[}"
+      port="${listen##*:}"
+    else
+      host="${listen%:*}"
+      port="${listen##*:}"
+    fi
+  else
+    port="${listen}"
+  fi
+  if [[ -z "${port}" ]]; then
+    port="25012"
+  fi
+  if [[ -z "${host}" || "${host}" == "0.0.0.0" || "${host}" == "::" || "${host}" == "[::]" ]]; then
+    local public_ip=""
+    public_ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
+    if is_valid_ipv4 "${public_ip}"; then
+      host="${public_ip}"
+    else
+      host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      if [[ -z "${host}" ]]; then
+        host="127.0.0.1"
+      fi
+    fi
+  fi
+  echo "${host} ${port}"
+}
+
+print_admin_info() {
+  local listen="$1"
+  local data_dir="$2"
+  local admin_path admin_user admin_pass
+  if ! read -r admin_path admin_user admin_pass < <(read_admin_settings "${data_dir}"); then
+    echo "无法读取管理后台信息，请稍后查看服务日志。"
+    return
+  fi
+  if [[ "${admin_path}" != /* ]]; then
+    admin_path="/${admin_path}"
+  fi
+  local host port
+  read -r host port < <(resolve_host_port "${listen}")
+  local admin_url="http://${host}:${port}${admin_path}"
+  echo "管理后台地址: ${admin_url}"
+  echo "初始管理员账号: ${admin_user}"
+  echo "初始管理员密码: ${admin_pass}"
+}
+
+install_server() {
+  local listen="$1"
+  local data_dir="$2"
+  local version="$3"
+  local arch
+  arch="$(detect_arch)"
+  version="$(resolve_version "${version}")"
+  mkdir -p "${data_dir}"
+
+  local bin
+  bin="$(download_binary "server" "${version}" "${arch}")"
+  write_server_conf "${listen}" "${data_dir}"
+
+  local service="cyber-monitor-server"
+  local service_file="/etc/systemd/system/${service}.service"
+  write_service_file "${service_file}" "CyberMonitor Server" "${CONF_DIR}/server.conf" "${bin}"
+  enable_service "${service}"
+  echo "已安装并启动 ${service}"
+  print_admin_info "${listen}" "${data_dir}"
+}
+
+install_agent() {
+  local server_url="$1"
+  local bootstrap_token="$2"
+  local node_id="$3"
+  local net_iface="$4"
+  local disable_update="$5"
+  local version="$6"
+  [[ -z "${server_url}" ]] && die "被控需要填写 Server 地址"
+  [[ -z "${bootstrap_token}" ]] && die "被控需要填写 Token"
+
+  local arch
+  arch="$(detect_arch)"
+  version="$(resolve_version "${version}")"
+  [[ -n "${node_id}" ]] || node_id="$(generate_node_id)"
+  local node_token
+  node_token="$(register_agent "${server_url}" "${bootstrap_token}" "${node_id}")"
+
+  local bin
+  bin="$(download_binary "agent" "${version}" "${arch}")"
+  write_agent_token_file "${node_token}"
+  write_agent_conf "${server_url}" "${node_id}" "${net_iface}" "${disable_update}"
+
+  local service="cyber-monitor-agent"
+  local service_file="/etc/systemd/system/${service}.service"
+  write_service_file "${service_file}" "CyberMonitor Agent" "${CONF_DIR}/agent.conf" "${bin}"
+  enable_service "${service}"
+  echo "已安装并启动 ${service}"
+  echo "Node ID: ${node_id}"
+}
+
+uninstall_service() {
+  local type="$1"
+  local service="cyber-monitor-${type}"
+  local service_file="/etc/systemd/system/${service}.service"
+  systemctl disable --now "${service}" >/dev/null 2>&1 || true
+  rm -f "${service_file}"
+  rm -f "${INSTALL_DIR}/cyber-monitor-${type}"
+  systemctl daemon-reload
+  echo "已卸载 ${service}"
+}
+
+read_server_data_dir() {
+  local data_dir=""
+  if [[ -f "${CONF_DIR}/server.conf" ]]; then
+    data_dir="$(sed -n 's/^CM_DATA_DIR=//p' "${CONF_DIR}/server.conf" | head -n 1)"
+  fi
+  if [[ -z "${data_dir}" ]]; then
+    data_dir="/opt/CyberMonitor/data"
+  fi
+  echo "${data_dir}"
+}
+
+cleanup_server_config() {
+  local data_dir="$1"
+  rm -f "${CONF_DIR}/server.conf"
+  if [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
+    rm -rf "${data_dir}"
+  fi
+  if [[ -n "${INSTALL_DIR}" && "${INSTALL_DIR}" != "/" ]]; then
+    rm -rf "${INSTALL_DIR}"
+  fi
+  rmdir "${CONF_DIR}" 2>/dev/null || true
+}
+
+cleanup_agent_config() {
+  rm -f "${CONF_DIR}/agent.conf"
+  rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
+  rmdir "${CONF_DIR}" 2>/dev/null || true
+  rmdir "${INSTALL_DIR}" 2>/dev/null || true
+}
+
+uninstall_server() {
+  local keep=""
+  read -r -p "是否保留主控配置与数据目录? [y/N]: " keep
+  local data_dir
+  data_dir="$(read_server_data_dir)"
+  uninstall_service "server"
+  if [[ ! "${keep}" =~ ^[Yy]$ ]]; then
+    cleanup_server_config "${data_dir}"
+  fi
+}
+
+uninstall_agent() {
+  uninstall_service "agent"
+  cleanup_agent_config
+}
+
+run_install_menu() {
+  while true; do
+    print_install_menu
+    read -r -p "请选择: " choice
+    case "${choice}" in
+      1)
+        read -r -p "监听地址(默认 25012): " listen
+        read -r -p "数据目录(默认 /opt/CyberMonitor/data): " data_dir
+        read -r -p "版本号(默认 latest): " version
+        listen="${listen:-25012}"
+        data_dir="${data_dir:-/opt/CyberMonitor/data}"
+        install_server "${listen}" "${data_dir}" "${version}"
+        ;;
+      2)
+        read -r -p "Server 地址(统一接入地址，例如 http://1.2.3.4:25012；运行态会优先尝试 gRPC): " server_url
+        read -r -p "Agent Token: " token
+        read -r -p "Node ID（可空，留空则随机生成）: " node_id
+        read -r -p "指定网卡(可空): " net_iface
+        read -r -p "是否禁用服务端远程更新? [y/N]: " disable_update_answer
+        read -r -p "版本号(默认 latest): " version
+        disable_update="0"
+        if [[ "${disable_update_answer}" =~ ^[Yy]$ ]]; then
+          disable_update="1"
+        fi
+        install_agent "${server_url}" "${token}" "${node_id}" "${net_iface}" "${disable_update}" "${version}"
+        ;;
+      0)
+        exit 0
+        ;;
+      *)
+        echo "无效选项，请重试。"
+        ;;
+    esac
+    echo ""
+  done
+}
+
+run_remove_menu() {
+  while true; do
+    print_remove_menu
+    read -r -p "请选择: " choice
+    case "${choice}" in
+      1) uninstall_server ;;
+      2) uninstall_agent ;;
+      0) exit 0 ;;
+      *) echo "无效选项" ;;
+    esac
+    echo ""
+  done
+}
+
+main() {
+  require_root
+  require_systemd
+  require_curl
+  case "${1:-}" in
+    install)
+      run_install_menu
+      ;;
+    remove)
+      run_remove_menu
+      ;;
+    *)
+      run_install_menu
+      ;;
+  esac
+}
+
+main "$@"

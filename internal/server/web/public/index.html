@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: light)"
+      content="#f4f7fb"
+      id="theme-color-light"
+    />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: dark)"
+      content="#0b1220"
+      id="theme-color-dark"
+    />
+    <title>CyberMonitor</title>
+    <link rel="icon" id="site-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#public-main-content">跳转到主要内容</a>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <div class="bg-orb orb-c"></div>
+
+    <div class="app">
+      <header class="topbar">
+        <div>
+          <h1 class="brand-heading">
+            <a class="brand brand-link" id="brand-title" href="/">
+              CyberMonitor
+            </a>
+          </h1>
+          <p class="subtitle" id="brand-subtitle">主机监控</p>
+        </div>
+        <div class="topbar-right">
+          <button class="theme-toggle" id="theme-toggle" type="button" aria-label="切换到深色模式">
+            <span class="theme-icon" id="theme-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z"></path>
+              </svg>
+            </span>
+          </button>
+        </div>
+      </header>
+
+      <main id="public-main-content">
+      <section class="stats-grid">
+        <button class="stat-card stat-filter-button" type="button" data-filter="all">
+          <div class="stat-label">服务器总数</div>
+          <div class="stat-value">
+            <span class="stat-dot blue"></span>
+            <span id="stat-total">0</span>
+          </div>
+        </button>
+        <button class="stat-card stat-filter-button" type="button" data-filter="online">
+          <div class="stat-label">在线服务器</div>
+          <div class="stat-value">
+            <span class="stat-dot green"></span>
+            <span id="stat-online">0</span>
+          </div>
+        </button>
+        <button class="stat-card stat-filter-button" type="button" data-filter="offline">
+          <div class="stat-label">离线服务器</div>
+          <div class="stat-value">
+            <span class="stat-dot red"></span>
+            <span id="stat-offline">0</span>
+          </div>
+        </button>
+        <div class="stat-card">
+          <div class="stat-label">网络信息</div>
+          <div class="stat-lines">
+            <div id="stat-net-usage">--</div>
+            <div id="stat-net-rate">--</div>
+          </div>
+        </div>
+      </section>
+
+      <nav id="group-tabs" class="group-tabs" aria-label="节点分组导航"></nav>
+
+      <section id="list" class="node-list"></section>
+
+      <div id="empty" class="empty">
+        <h2>等待节点接入</h2>
+        <p>请启动 Agent 并指向当前管理端地址。</p>
+      </div>
+
+      <footer class="site-footer">
+        <div class="footer-left">
+          <span id="footer-year">©2025-2025</span>
+          <a href="https://github.com/crazy0x70/CyberMonitor" target="_blank" rel="noreferrer">CyberMonitor</a>
+        </div>
+        <div class="footer-right">
+          Powered by <a href="https://github.com/crazy0x70" target="_blank" rel="noreferrer">Crazy0x70</a>
+        </div>
+      </footer>
+      </main>
+    </div>
+
+    <script src="/assets/theme.js"></script>
+    <script src="/assets/monitor.js"></script>
+  </body>
+</html>

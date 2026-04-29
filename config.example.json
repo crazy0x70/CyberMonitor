@@ -1,0 +1,10 @@
+{
+  "cloudflare": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  },
+  "edgeone": {
+    "socket": "wss://example.com:25013/ws",
+    "apiURL": "https://example.com:25013"
+  }
+}

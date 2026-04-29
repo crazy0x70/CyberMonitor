@@ -1,0 +1,3827 @@
+const list = document.getElementById("list");
+const empty = document.getElementById("empty");
+const nodeCount = document.getElementById("node-count");
+const lastUpdated = document.getElementById("last-updated");
+const groupTabs = document.getElementById("group-tabs");
+const statTotal = document.getElementById("stat-total");
+const statOnline = document.getElementById("stat-online");
+const statOffline = document.getElementById("stat-offline");
+const statNetUsage = document.getElementById("stat-net-usage");
+const statNetRate = document.getElementById("stat-net-rate");
+const brandTitle = document.getElementById("brand-title");
+const brandSubtitle = document.getElementById("brand-subtitle");
+const siteIcon = document.getElementById("site-icon");
+const DEFAULT_SITE_ICON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
+const footerYear = document.getElementById("footer-year");
+const timeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+const regionDisplayNames =
+  typeof Intl !== "undefined" && Intl.DisplayNames
+    ? new Intl.DisplayNames(["en"], { type: "region" })
+    : null;
+const fallbackRegionNames = {
+  CA: "Canada",
+  CN: "China",
+  DE: "Germany",
+  FR: "France",
+  HK: "Hong Kong",
+  JP: "Japan",
+  NL: "Netherlands",
+  SG: "Singapore",
+  TW: "Taiwan",
+  UK: "United Kingdom",
+  US: "United States",
+};
+
+const CONFIG_PATH = "/config.json";
+const DEFAULT_GROUP = "全部";
+const DEFAULT_STATUS_FILTER = "all";
+const DEFAULT_TEST_RANGE_KEY = "1h";
+const DISPLAY_NODE_ID_SEPARATOR = "::";
+const STATUS_FILTERS = new Set(["all", "online", "offline"]);
+
+const remoteConfig = {
+  targets: [],
+};
+
+function readViewStateFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  return normalizeViewState(params.get("group"), params.get("status"));
+}
+
+const initialViewState = readViewStateFromURL();
+
+const state = {
+  wsConnections: new Map(),
+  nodes: new Map(),
+  nodeByDisplayId: new Map(),
+  reconnectTimers: new Map(),
+  wsReconnectAttempts: new Map(),
+  wsWatchdogs: new Map(),
+  wsLastMessageAt: new Map(),
+  snapshotFailures: new Map(),
+  selectedGroup: initialViewState.selectedGroup,
+  statusFilter: initialViewState.statusFilter,
+  lastNodes: [],
+  settingsGroups: [],
+  testHistory: new Map(),
+  testHistoryFetched: new Map(),
+  testHistoryInflight: new Map(),
+  testHistoryControllers: new Map(),
+  metricHistory: new Map(),
+  testRange: new Map(),
+  testSmooth: new Map(),
+  renderMode: "flat",
+  tagSections: new Map(),
+  historyCacheTimer: null,
+  historyCacheLoading: false,
+  sourceSnapshots: new Map(),
+  publicTrafficCounters: new Map(),
+  renderFrame: 0,
+  lastTransportAt: 0,
+  lastTransportType: "snapshot",
+  realtimeStatus: new Map(),
+  groupTabSignature: "",
+};
+
+const HISTORY_CACHE_KEY = "cm_test_history_v1";
+const HISTORY_CACHE_VERSION = 3;
+const HISTORY_CACHE_MAX_POINTS = 5000;
+const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
+const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 366;
+const HISTORY_CACHE_SAVE_DELAY = 1500;
+const WS_RECONNECT_BASE_DELAY = 500;
+const WS_RECONNECT_MAX_DELAY = 8000;
+const WS_WATCHDOG_MS = 15000;
+const LATENCY_SMOOTH_ALPHA = 0.2;
+
+function syncViewStateToURL(replace = false) {
+  const nextLocation = buildViewURL(state.selectedGroup, state.statusFilter);
+  const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextLocation === currentLocation) {
+    return;
+  }
+  if (replace) {
+    window.history.replaceState({}, "", nextLocation);
+  } else {
+    window.history.pushState({}, "", nextLocation);
+  }
+}
+
+function buildViewURL(group = state.selectedGroup, status = state.statusFilter) {
+  const nextURL = new URL(window.location.href);
+  if (!group || group === DEFAULT_GROUP) {
+    nextURL.searchParams.delete("group");
+  } else {
+    nextURL.searchParams.set("group", group);
+  }
+  if (!status || status === DEFAULT_STATUS_FILTER) {
+    nextURL.searchParams.delete("status");
+  } else {
+    nextURL.searchParams.set("status", status);
+  }
+  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
+}
+
+function normalizeViewState(selectedGroup = state.selectedGroup, statusFilter = state.statusFilter) {
+  return {
+    selectedGroup: String(selectedGroup || DEFAULT_GROUP).trim() || DEFAULT_GROUP,
+    statusFilter: STATUS_FILTERS.has(statusFilter) ? statusFilter : DEFAULT_STATUS_FILTER,
+  };
+}
+
+function applyViewState(nextState, options = {}) {
+  const normalized = normalizeViewState(
+    nextState?.selectedGroup,
+    nextState?.statusFilter,
+  );
+  const changed =
+    state.selectedGroup !== normalized.selectedGroup ||
+    state.statusFilter !== normalized.statusFilter;
+  if (!changed) {
+    return false;
+  }
+  state.selectedGroup = normalized.selectedGroup;
+  state.statusFilter = normalized.statusFilter;
+  if (options.history === "replace") {
+    syncViewStateToURL(true);
+  } else if (options.history === "push") {
+    syncViewStateToURL();
+  }
+  if (options.render !== false) {
+    scheduleRender();
+  }
+  return true;
+}
+
+function shouldHandleLocalNavigation(event) {
+  return !(
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
+}
+
+function scheduleRender() {
+  if (state.renderFrame) return;
+  state.renderFrame = window.requestAnimationFrame(() => {
+    state.renderFrame = 0;
+    render();
+  });
+}
+
+function refreshOpenNodeHistoryViews(nodeId) {
+  const normalized = String(nodeId || "").trim();
+  if (!normalized) {
+    return;
+  }
+  const card = state.nodes.get(normalized);
+  if (
+    !card ||
+    !card.isConnected ||
+    !card.open ||
+    card._nodeId !== normalized ||
+    !card._fields
+  ) {
+    return;
+  }
+  updateNetworkTests(
+    card._fields,
+    card._lastNode,
+    Array.isArray(card._fields._tests) ? card._fields._tests : [],
+    card._nodeId
+  );
+}
+
+function connectWS() {
+  const targets = resolveTargets();
+  targets.forEach((target) => {
+    connectWSForTarget(target);
+  });
+}
+
+function connectWSForTarget(target) {
+  if (!target || !target.socketURL) {
+    return;
+  }
+  const existing = state.wsConnections.get(target.key);
+  if (existing) {
+    if (
+      existing.readyState !== WebSocket.CLOSING &&
+      existing.readyState !== WebSocket.CLOSED
+    ) {
+      return;
+    }
+    state.wsConnections.delete(target.key);
+  }
+
+  let ws;
+  try {
+    ws = new WebSocket(target.socketURL);
+  } catch (error) {
+    console.error("WebSocket 初始化失败", target.socketURL, error);
+    dropSourceSnapshot(target.key);
+    scheduleReconnect(target);
+    return;
+  }
+  state.wsConnections.set(target.key, ws);
+
+  ws.onopen = () => {
+    clearReconnectTimer(target.key);
+    state.wsReconnectAttempts.delete(target.key);
+    state.snapshotFailures.delete(target.key);
+    state.wsLastMessageAt.set(target.key, Date.now());
+    armWSWatchdog(target, ws);
+    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
+  };
+
+  ws.onclose = () => {
+    clearWSWatchdog(target.key);
+    state.wsLastMessageAt.delete(target.key);
+    if (state.wsConnections.get(target.key) === ws) {
+      state.wsConnections.delete(target.key);
+    }
+    dropSourceSnapshot(target.key);
+    scheduleReconnect(target);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      state.wsLastMessageAt.set(target.key, Date.now());
+      armWSWatchdog(target, ws);
+      if (payload.type === "snapshot") {
+        handleSnapshot(payload, target.key);
+      } else if (payload.type === "node_delta") {
+        handleNodeDelta(payload, target.key);
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  };
+}
+
+function resolveTargets() {
+  if (Array.isArray(remoteConfig.targets) && remoteConfig.targets.length > 0) {
+    return remoteConfig.targets;
+  }
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  return [{
+    key: "default",
+    socketURL: `${protocol}://${location.host}/ws`,
+    apiBase: location.origin,
+  }];
+}
+
+function normalizeAPIBase(value) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch (error) {
+    return "";
+  }
+}
+
+function normalizeSocketURL(value) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+      return "";
+    }
+    return parsed.toString();
+  } catch (error) {
+    return "";
+  }
+}
+
+function buildPublicRequestHeaders() {
+  return {};
+}
+
+function pickConfigEntry(entry, key = "") {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  const socketURL = normalizeSocketURL(entry.socket);
+  const apiBase = normalizeAPIBase(entry.apiURL);
+  if (!socketURL || !apiBase) {
+    return null;
+  }
+  return {
+    key: key || "default",
+    socketURL,
+    apiBase,
+  };
+}
+
+function pickConfigTargets(data) {
+  if (!data || typeof data !== "object") {
+    return [];
+  }
+
+  const targets = [];
+  const seen = new Set();
+  const pushTarget = (entry) => {
+    if (!entry) {
+      return;
+    }
+    const signature = `${entry.socketURL}\n${entry.apiBase}`;
+    if (seen.has(signature)) {
+      return;
+    }
+    seen.add(signature);
+    targets.push(entry);
+  };
+  const direct = pickConfigEntry(data, "default");
+  pushTarget(direct);
+
+  for (const key of Object.keys(data)) {
+    const entry = pickConfigEntry(data[key], key);
+    pushTarget(entry);
+  }
+
+  return targets;
+}
+
+async function loadRemoteConfig() {
+  try {
+    const resp = await fetch(CONFIG_PATH, { cache: "no-store" });
+    if (!resp.ok) {
+      return;
+    }
+    const data = await resp.json();
+    const targets = pickConfigTargets(data);
+    if (!targets.length) return;
+    remoteConfig.targets = targets;
+  } catch (error) {
+    return;
+  }
+}
+
+async function fetchPublicSnapshotForTarget(target, options = {}) {
+  const { dropOnFailure = true } = options;
+  const base = target?.apiBase;
+  if (!base || !target?.key) return false;
+  try {
+    const resp = await fetch(`${base}/api/v1/public/snapshot`, {
+      cache: "no-store",
+      headers: buildPublicRequestHeaders(),
+    });
+    if (!resp.ok) {
+      state.snapshotFailures.set(
+        target.key,
+        (state.snapshotFailures.get(target.key) || 0) + 1
+      );
+      if (dropOnFailure) {
+        dropSourceSnapshot(target.key);
+      }
+      return false;
+    }
+    const payload = await resp.json();
+    if (payload && payload.type === "snapshot") {
+      state.snapshotFailures.delete(target.key);
+      state.wsLastMessageAt.set(target.key, Date.now());
+      handleSnapshot(payload, target.key);
+      return true;
+    }
+  } catch (error) {
+    state.snapshotFailures.set(
+      target.key,
+      (state.snapshotFailures.get(target.key) || 0) + 1
+    );
+    if (dropOnFailure) {
+      dropSourceSnapshot(target.key);
+    }
+  }
+  return false;
+}
+
+async function fetchPublicSnapshot() {
+  const targets = resolveTargets();
+  await Promise.all(targets.map((target) => fetchPublicSnapshotForTarget(target)));
+}
+
+function clearReconnectTimer(targetKey) {
+  const timer = state.reconnectTimers.get(targetKey);
+  if (timer) {
+    clearTimeout(timer);
+    state.reconnectTimers.delete(targetKey);
+  }
+}
+
+function clearWSWatchdog(targetKey) {
+  const timer = state.wsWatchdogs.get(targetKey);
+  if (timer) {
+    clearTimeout(timer);
+    state.wsWatchdogs.delete(targetKey);
+  }
+}
+
+function armWSWatchdog(target, socket) {
+  if (!target?.key || !socket) return;
+  clearWSWatchdog(target.key);
+  const timer = window.setTimeout(() => {
+    handleTargetSocketSilence(target, socket);
+  }, WS_WATCHDOG_MS);
+  state.wsWatchdogs.set(target.key, timer);
+}
+
+function handleTargetSocketSilence(target, socket) {
+  if (!target?.key || !socket) return;
+  clearWSWatchdog(target.key);
+  if (state.wsConnections.get(target.key) !== socket) {
+    return;
+  }
+  void fetchPublicSnapshotForTarget(target, { dropOnFailure: false }).then((ok) => {
+    if (state.wsConnections.get(target.key) !== socket) {
+      return;
+    }
+    if (ok && socket.readyState === WebSocket.OPEN) {
+      state.wsLastMessageAt.set(target.key, Date.now());
+      armWSWatchdog(target, socket);
+      return;
+    }
+    state.wsConnections.delete(target.key);
+    state.wsLastMessageAt.delete(target.key);
+    dropSourceSnapshot(target.key);
+    try {
+      socket.close();
+    } catch (error) {
+      console.warn("关闭静默 WebSocket 失败", error);
+    }
+    scheduleReconnect(target);
+  });
+}
+
+function scheduleReconnect(target) {
+  if (!target || !target.key) return;
+  if (state.reconnectTimers.has(target.key)) return;
+  const attempt = state.wsReconnectAttempts.get(target.key) || 0;
+  const delay = Math.min(
+    WS_RECONNECT_MAX_DELAY,
+    WS_RECONNECT_BASE_DELAY * Math.pow(2, attempt)
+  );
+  const timer = setTimeout(() => {
+    state.reconnectTimers.delete(target.key);
+    state.wsReconnectAttempts.set(target.key, attempt + 1);
+    connectWSForTarget(target);
+  }, delay);
+  state.reconnectTimers.set(target.key, timer);
+}
+
+function buildTrafficCounterKey(sourceKey, nodeID) {
+  const normalizedNodeID = String(nodeID || "").trim();
+  if (!normalizedNodeID) return "";
+  return `${String(sourceKey || "default")}::${normalizedNodeID}`;
+}
+
+function resolveBackendNodeId(node, fallback) {
+  if (!node) return fallback;
+  if (node.id) return String(node.id);
+  const stats = node.stats || {};
+  if (stats.node_id) return String(stats.node_id);
+  if (stats.node_name) return String(stats.node_name);
+  return fallback;
+}
+
+function resolveDisplayNodeId(node, fallback, sourceKey = node?.__sourceKey || "default") {
+  const nodeID = resolveBackendNodeId(node, "").trim();
+  if (!nodeID) return fallback;
+  return `${encodeURIComponent(
+    normalizeHistorySourceKey(sourceKey)
+  )}${DISPLAY_NODE_ID_SEPARATOR}${encodeURIComponent(nodeID)}`;
+}
+
+function parseDisplayNodeId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const separatorIndex = raw.indexOf(DISPLAY_NODE_ID_SEPARATOR);
+  if (separatorIndex <= 0) {
+    return null;
+  }
+  try {
+    const sourceKey = normalizeHistorySourceKey(
+      decodeURIComponent(raw.slice(0, separatorIndex))
+    );
+    const nodeID = decodeURIComponent(
+      raw.slice(separatorIndex + DISPLAY_NODE_ID_SEPARATOR.length)
+    ).trim();
+    if (!nodeID) {
+      return null;
+    }
+    return { sourceKey, nodeID };
+  } catch (error) {
+    return null;
+  }
+}
+
+function resolveNodeFreshness(node) {
+  const statsTimestamp = Number(node?.stats?.timestamp || 0);
+  if (Number.isFinite(statsTimestamp) && statsTimestamp > 0) {
+    return statsTimestamp;
+  }
+  const lastSeen = Number(node?.last_seen || 0);
+  return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
+}
+
+function shouldReplaceNode(existing, candidate) {
+  if (!existing) return true;
+  const candidateFreshness = resolveNodeFreshness(candidate);
+  const existingFreshness = resolveNodeFreshness(existing);
+  if (candidateFreshness !== existingFreshness) {
+    return candidateFreshness > existingFreshness;
+  }
+  const candidateLastSeen = Number(candidate?.last_seen || 0);
+  const existingLastSeen = Number(existing?.last_seen || 0);
+  return candidateLastSeen >= existingLastSeen;
+}
+
+function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
+  const candidate = node && typeof node === "object" ? node : {};
+  const nodeID = resolveBackendNodeId(candidate, "").trim();
+  const trafficKey = buildTrafficCounterKey(sourceKey, nodeID);
+  const network = candidate.stats?.network || {};
+  const uptimeSec = Number(candidate.stats?.uptime_sec || 0);
+  const rawSent = Number(network.bytes_sent || 0);
+  const rawRecv = Number(network.bytes_recv || 0);
+  const freshness = resolveNodeFreshness(candidate);
+  const previous = trafficKey ? state.publicTrafficCounters.get(trafficKey) : null;
+
+  let offsetSent = previous?.offsetSent || 0;
+  let offsetRecv = previous?.offsetRecv || 0;
+  const lastRawSent = previous?.lastRawSent ?? rawSent;
+  const lastRawRecv = previous?.lastRawRecv ?? rawRecv;
+  const lastDisplaySent = previous?.lastDisplaySent ?? rawSent;
+  const lastDisplayRecv = previous?.lastDisplayRecv ?? rawRecv;
+  const lastFreshness = previous?.lastFreshness || 0;
+  const lastUptimeSec = previous?.lastUptimeSec || 0;
+
+  if (previous && freshness > 0 && lastFreshness > 0 && freshness < lastFreshness) {
+    return {
+      ...candidate,
+      __sourceKey: sourceKey,
+      stats: {
+        ...(candidate.stats || {}),
+        network: {
+          ...network,
+          bytes_sent: lastDisplaySent,
+          bytes_recv: lastDisplayRecv,
+        },
+      },
+    };
+  }
+
+  if (previous) {
+    const restarted = freshness > lastFreshness && uptimeSec > 0 && lastUptimeSec > 0 && uptimeSec < lastUptimeSec;
+    if (freshness > lastFreshness && rawSent < lastRawSent && restarted) {
+      offsetSent = lastDisplaySent;
+    }
+    if (freshness > lastFreshness && rawRecv < lastRawRecv && restarted) {
+      offsetRecv = lastDisplayRecv;
+    }
+  }
+
+  let displaySent = offsetSent + rawSent;
+  let displayRecv = offsetRecv + rawRecv;
+  if (previous && freshness >= lastFreshness) {
+    displaySent = Math.max(lastDisplaySent, displaySent);
+    displayRecv = Math.max(lastDisplayRecv, displayRecv);
+  }
+
+  if (trafficKey) {
+    state.publicTrafficCounters.set(trafficKey, {
+      offsetSent,
+      offsetRecv,
+      lastRawSent: rawSent,
+      lastRawRecv: rawRecv,
+      lastDisplaySent: displaySent,
+      lastDisplayRecv: displayRecv,
+      lastFreshness: freshness,
+      lastUptimeSec: uptimeSec,
+    });
+  }
+
+  return {
+    ...candidate,
+    __sourceKey: sourceKey,
+    stats: {
+      ...(candidate.stats || {}),
+      network: {
+        ...network,
+        bytes_sent: displaySent,
+        bytes_recv: displayRecv,
+      },
+    },
+  };
+}
+
+function prunePublicTrafficCounters(nodes) {
+  const activeKeys = new Set();
+  (nodes || []).forEach((node) => {
+    const trafficKey = buildTrafficCounterKey(
+      node?.__sourceKey || "default",
+      resolveBackendNodeId(node, "").trim()
+    );
+    if (trafficKey) {
+      activeKeys.add(trafficKey);
+    }
+  });
+  Array.from(state.publicTrafficCounters.keys()).forEach((trafficKey) => {
+    if (!activeKeys.has(trafficKey)) {
+      state.publicTrafficCounters.delete(trafficKey);
+    }
+  });
+}
+
+function attachSourceKeyToNodes(nodes, sourceKey = "default") {
+  const list = Array.isArray(nodes) ? nodes : [];
+  return list.map((node) => ({
+    ...(node && typeof node === "object" ? node : {}),
+    __sourceKey: sourceKey,
+  }));
+}
+
+function dedupeNodesByID(nodes) {
+  const merged = new Map();
+  const list = Array.isArray(nodes) ? nodes : [];
+  list.forEach((node) => {
+    const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || "default").trim();
+    if (!nodeID) return;
+    const existing = merged.get(nodeID);
+    if (shouldReplaceNode(existing, node)) {
+      merged.set(nodeID, node);
+    }
+  });
+  return Array.from(merged.values());
+}
+
+function mergeByNodeID(sourceSnapshots) {
+  const merged = new Map();
+  sourceSnapshots.forEach(([sourceKey, snapshot]) => {
+    const sourceNodes = dedupeNodesByID(snapshot?.nodes);
+    sourceNodes.forEach((node) => {
+      const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || sourceKey).trim();
+      if (!nodeID) return;
+      const candidate = {
+        ...node,
+        __sourceKey: sourceKey,
+      };
+      const existing = merged.get(nodeID);
+      if (shouldReplaceNode(existing, candidate)) {
+        merged.set(nodeID, candidate);
+      }
+    });
+  });
+  return Array.from(merged.values()).map((node) =>
+    cloneNodeWithDisplayTraffic(node, node.__sourceKey || "default")
+  );
+}
+
+function mergeGroups(groupsBySource) {
+  const unique = new Set();
+  groupsBySource.forEach((groups) => {
+    (groups || []).forEach((item) => {
+      const name = String(item || "").trim();
+      if (name) unique.add(name);
+    });
+  });
+  return Array.from(unique);
+}
+
+function rebuildMergedSnapshotState() {
+  const sourceSnapshots = Array.from(state.sourceSnapshots.entries());
+  const snapshots = sourceSnapshots.map(([, snapshot]) => snapshot);
+  const mergedNodes = mergeByNodeID(sourceSnapshots);
+  const nodeByDisplayId = new Map();
+  const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
+
+  mergedNodes.forEach((node) => {
+    const displayId = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    if (displayId) {
+      nodeByDisplayId.set(displayId, node);
+    }
+  });
+
+  prunePublicTrafficCounters(mergedNodes);
+
+  state.lastNodes = mergedNodes;
+  state.nodeByDisplayId = nodeByDisplayId;
+  state.settingsGroups = mergedGroups;
+
+  const latestSnapshot = snapshots
+    .slice()
+    .sort((a, b) => (b.generated_at || 0) - (a.generated_at || 0))[0];
+
+  if (latestSnapshot) {
+    applyPublicSettings(latestSnapshot.settings || {});
+  } else {
+    applyPublicSettings({});
+  }
+
+  cleanupDetachedHistory(state.lastNodes);
+
+  if (lastUpdated) {
+    const ts = latestSnapshot ? (latestSnapshot.generated_at || 0) : 0;
+    lastUpdated.textContent = ts ? timeFormatter.format(new Date(ts * 1000)) : "--";
+  }
+  syncRealtimeStatus(mergedNodes);
+  scheduleRender();
+}
+
+function resolveNodeStatus(node) {
+  if (!node) return "offline";
+  const lastSeen = Number(node.last_seen || 0);
+  if (!lastSeen) {
+    return node.status === "offline" ? "offline" : "online";
+  }
+  return Math.floor(Date.now() / 1000) - lastSeen > 5 ? "offline" : "online";
+}
+
+function syncRealtimeStatus(nodes) {
+  const active = new Set();
+  (nodes || []).forEach((node) => {
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    if (!id) return;
+    active.add(id);
+    state.realtimeStatus.set(id, resolveNodeStatus(node));
+  });
+  Array.from(state.realtimeStatus.keys()).forEach((id) => {
+    if (!active.has(id)) {
+      state.realtimeStatus.delete(id);
+    }
+  });
+}
+
+function refreshRealtimeStatus() {
+  let changed = false;
+  state.lastNodes.forEach((node) => {
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    if (!id) return;
+    const next = resolveNodeStatus(node);
+    if (state.realtimeStatus.get(id) !== next) {
+      state.realtimeStatus.set(id, next);
+      changed = true;
+    }
+  });
+  if (changed) {
+    scheduleRender();
+  }
+}
+
+function dropSourceSnapshot(sourceKey) {
+  if (!sourceKey || !state.sourceSnapshots.has(sourceKey)) {
+    return;
+  }
+  state.sourceSnapshots.delete(sourceKey);
+  rebuildMergedSnapshotState();
+}
+
+function updateTransportState(type, generatedAt) {
+  state.lastTransportType = type || "snapshot";
+  state.lastTransportAt = Number(generatedAt) || Math.floor(Date.now() / 1000);
+  const live = document.querySelector('[data-field="demo-variant-live"]');
+  if (!live) return;
+  const label = state.lastTransportType === "delta" ? "delta" : "snapshot";
+  live.textContent = `最近 ${label}：${formatTime(state.lastTransportAt)}`;
+}
+
+function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
+  const list = Array.isArray(nodes) ? nodes.slice() : [];
+  const nodeID = resolveDisplayNodeId(nextNode, "", sourceKey).trim();
+  if (!nodeID) return list;
+  const index = list.findIndex(
+    (item) => resolveDisplayNodeId(item, "", sourceKey).trim() === nodeID
+  );
+  if (index === -1) {
+    list.push(nextNode);
+    return list;
+  }
+  if (shouldReplaceNode(list[index], nextNode)) {
+    list[index] = nextNode;
+  }
+  return list;
+}
+
+function handleSnapshot(payload, sourceKey = "default") {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+  payload = {
+    ...payload,
+    nodes: attachSourceKeyToNodes(payload.nodes, sourceKey),
+  };
+
+  state.sourceSnapshots.set(sourceKey, {
+    ...payload,
+    nodes: dedupeNodesByID(payload.nodes),
+  });
+  state.snapshotFailures.delete(sourceKey);
+  updateTransportState("snapshot", payload.generated_at);
+  applyTestHistory(payload.test_history, sourceKey);
+  rebuildMergedSnapshotState();
+}
+
+function handleNodeDelta(payload, sourceKey = "default") {
+  if (!payload || typeof payload !== "object" || !payload.node) {
+    return;
+  }
+  const stampedNode = {
+    ...(payload.node && typeof payload.node === "object" ? payload.node : {}),
+    __sourceKey: sourceKey,
+  };
+  const previous = state.sourceSnapshots.get(sourceKey) || {
+    type: "snapshot",
+    nodes: [],
+    groups: [],
+    settings: {},
+  };
+  const next = {
+    ...previous,
+    type: "snapshot",
+    generated_at: payload.generated_at || Math.floor(Date.now() / 1000),
+    nodes: upsertNodeInSnapshot(previous.nodes, stampedNode, sourceKey),
+  };
+  state.sourceSnapshots.set(sourceKey, next);
+  state.snapshotFailures.delete(sourceKey);
+  updateTransportState("delta", payload.generated_at);
+  rebuildMergedSnapshotState();
+}
+
+function render() {
+  const groups = collectGroupNames(state.lastNodes, state.settingsGroups);
+  renderGroupTabs(groups);
+  const groupNodes = filterNodesByGroup(state.lastNodes, state.selectedGroup);
+  const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
+  if (nodeCount) {
+    nodeCount.textContent = visibleNodes.length;
+  }
+  updateStats(groupNodes);
+  updateEmptyState(visibleNodes.length, groupNodes.length);
+  const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
+  if (state.renderMode !== mode) {
+    resetRenderMode(mode);
+  }
+  if (mode === "flat") {
+    renderFlatList(visibleNodes);
+  } else {
+    renderTagSections(visibleNodes, state.selectedGroup);
+  }
+}
+
+function updateEmptyState(visibleCount, totalCount) {
+  if (visibleCount > 0) {
+    empty.style.display = "none";
+    return;
+  }
+  empty.style.display = "block";
+  if (totalCount > 0 && state.selectedGroup !== DEFAULT_GROUP) {
+    empty.querySelector("h2").textContent = "当前分组暂无节点";
+    empty.querySelector("p").textContent = "请选择其他分组或返回全部查看。";
+  } else {
+    empty.querySelector("h2").textContent = "等待节点接入";
+    empty.querySelector("p").textContent = "请启动 Agent 并指向当前管理端地址。";
+  }
+}
+
+const RANGE_OPTIONS = [
+  { key: "1h", label: "1H", seconds: 60 * 60 },
+  { key: "24h", label: "1D", seconds: 60 * 60 * 24 },
+  { key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },
+  { key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },
+  { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 366 },
+];
+
+function applyPublicSettings(settings) {
+  if (!settings) return;
+  const title = (settings.site_title || "").trim();
+  const icon = (settings.site_icon || "").trim();
+  const homeTitle = (settings.home_title || "").trim();
+  const homeSubtitle = (settings.home_subtitle || "").trim();
+  const resolvedTitle = title || "CyberMonitor";
+  const resolvedHomeTitle = homeTitle || resolvedTitle;
+  const resolvedSubtitle = homeSubtitle || "主机监控";
+
+  if (resolvedTitle) {
+    document.title = resolvedTitle;
+  }
+  if (brandTitle) {
+    brandTitle.textContent = resolvedHomeTitle;
+    if (brandTitle.tagName === "A") {
+      brandTitle.setAttribute("href", buildViewURL(DEFAULT_GROUP, state.statusFilter));
+    }
+  }
+  if (brandSubtitle) {
+    brandSubtitle.textContent = resolvedSubtitle;
+  }
+  if (siteIcon) {
+    if (icon) {
+      siteIcon.setAttribute("href", icon);
+    } else {
+      siteIcon.setAttribute("href", DEFAULT_SITE_ICON);
+    }
+  }
+
+  updateFooter();
+}
+
+function loadTestHistoryCache() {
+  if (!window.localStorage) return;
+  try {
+    const raw = localStorage.getItem(HISTORY_CACHE_KEY);
+    if (!raw) return;
+    const payload = JSON.parse(raw);
+    if (!payload || typeof payload !== "object") return;
+    if (payload.version !== HISTORY_CACHE_VERSION && payload.version !== undefined) {
+      localStorage.removeItem(HISTORY_CACHE_KEY);
+    }
+    if (payload.version !== HISTORY_CACHE_VERSION) {
+      return;
+    }
+    const nodes = payload.nodes;
+    if (!nodes || typeof nodes !== "object") return;
+    state.historyCacheLoading = true;
+    applyTestHistory(nodes);
+  } catch (error) {
+    return;
+  } finally {
+    state.historyCacheLoading = false;
+  }
+}
+
+function scheduleHistoryCacheSave() {
+  if (state.historyCacheLoading) return;
+  if (state.historyCacheTimer) return;
+  state.historyCacheTimer = setTimeout(() => {
+    state.historyCacheTimer = null;
+    persistHistoryCache();
+  }, HISTORY_CACHE_SAVE_DELAY);
+}
+
+function persistHistoryCache() {
+  if (!window.localStorage) return;
+  const nodes = {};
+  state.testHistory.forEach((ranges, cacheKey) => {
+    if (!ranges || ranges.size === 0) return;
+    const serializedRanges = {};
+    ranges.forEach((tests, rangeKey) => {
+      if (!tests || tests.size === 0) return;
+      const entries = {};
+      tests.forEach((entry, key) => {
+        if (!entry) return;
+        trimTestHistoryEntry(entry);
+        const serialized = serializeTestHistoryEntry(entry);
+        if (serialized) {
+          entries[key] = serialized;
+        }
+      });
+      if (Object.keys(entries).length > 0) {
+        serializedRanges[rangeKey] = entries;
+      }
+    });
+    if (Object.keys(serializedRanges).length > 0) {
+      nodes[cacheKey] = serializedRanges;
+    }
+  });
+  const payload = {
+    version: HISTORY_CACHE_VERSION,
+    saved_at: Math.floor(Date.now() / 1000),
+    nodes,
+  };
+  try {
+    localStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify(payload));
+  } catch (error) {
+    return;
+  }
+}
+
+function serializeTestHistoryEntry(entry) {
+  if (!entry || !Array.isArray(entry.times)) return null;
+  const normalizeValue = (value) => {
+    if (value === null || value === undefined) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  return {
+    latency: Array.isArray(entry.latency)
+      ? entry.latency.map(normalizeValue)
+      : [],
+    loss: Array.isArray(entry.loss) ? entry.loss.map(normalizeValue) : [],
+    times: entry.times.slice(),
+    last_at: entry.lastAt || 0,
+    min_interval_sec: entry.minIntervalSec || 0,
+    avg_interval_sec: entry.avgIntervalSec || 0,
+  };
+}
+
+function normalizeHistoryRangeKey(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return DEFAULT_TEST_RANGE_KEY;
+  if (raw === "1d") return "24h";
+  return RANGE_OPTIONS.some((item) => item.key === raw)
+    ? raw
+    : DEFAULT_TEST_RANGE_KEY;
+}
+
+function normalizeHistorySourceKey(sourceKey) {
+  const raw = String(sourceKey || "").trim();
+  return raw || "default";
+}
+
+function historyNodeCacheKey(nodeId, sourceKey) {
+  return `${normalizeHistorySourceKey(sourceKey)}::${String(nodeId || "").trim()}`;
+}
+
+function resolveHistoryNodeId(nodeId) {
+  const targetNode = findNodeByDisplayId(nodeId);
+  if (targetNode) {
+    return resolveBackendNodeId(targetNode, "").trim();
+  }
+  return parseDisplayNodeId(nodeId)?.nodeID || String(nodeId || "").trim();
+}
+
+function resolveHistoryNodeCacheKey(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey);
+}
+
+function historyRequestKey(nodeId, sourceKey, rangeKey) {
+  return `${historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
+}
+
+function ensureNodeHistoryRangesByKey(cacheKey) {
+  if (!state.testHistory.has(cacheKey)) {
+    state.testHistory.set(cacheKey, new Map());
+  }
+  return state.testHistory.get(cacheKey);
+}
+
+function ensureNodeHistoryRanges(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return ensureNodeHistoryRangesByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+}
+
+function ensureHistoryRangeMapByKey(cacheKey, rangeKey) {
+  const normalizedRange = normalizeHistoryRangeKey(rangeKey);
+  const ranges = ensureNodeHistoryRangesByKey(cacheKey);
+  if (!ranges.has(normalizedRange)) {
+    ranges.set(normalizedRange, new Map());
+  }
+  return ranges.get(normalizedRange);
+}
+
+function ensureHistoryRangeMap(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return ensureHistoryRangeMapByKey(
+    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rangeKey
+  );
+}
+
+function getNodeHistoryRange(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges) {
+    return new Map();
+  }
+  return ranges.get(normalizeHistoryRangeKey(rangeKey)) || new Map();
+}
+
+function getFallbackHistoryMap(
+  nodeId,
+  rangeKey,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  const preferred = getNodeHistoryRange(nodeId, rangeKey, sourceKey);
+  if (preferred.size > 0) {
+    return preferred;
+  }
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges) {
+    return preferred;
+  }
+  for (const entry of ranges.values()) {
+    if (entry && entry.size > 0) {
+      return entry;
+    }
+  }
+  return preferred;
+}
+
+function hasAnyHistoryForNode(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  if (!ranges || ranges.size === 0) {
+    return false;
+  }
+  for (const entry of ranges.values()) {
+    if (entry && entry.size > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function trimHistoryRequestState(nodeId, sourceKey) {
+  const prefix = `${historyNodeCacheKey(nodeId, sourceKey)}::`;
+  for (const key of state.testHistoryFetched.keys()) {
+    if (String(key).startsWith(prefix)) {
+      state.testHistoryFetched.delete(key);
+    }
+  }
+  for (const key of state.testHistoryInflight.keys()) {
+    if (String(key).startsWith(prefix)) {
+      state.testHistoryInflight.delete(key);
+    }
+  }
+}
+
+function isHistoryRangeFetched(
+  nodeId,
+  rangeKey,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  return state.testHistoryFetched.has(
+    historyRequestKey(nodeId, sourceKey, rangeKey)
+  );
+}
+
+function trimTestHistoryEntry(entry) {
+  if (!entry || !Array.isArray(entry.times)) return entry;
+  let times = entry.times;
+  let latency = Array.isArray(entry.latency) ? entry.latency : [];
+  let loss = Array.isArray(entry.loss) ? entry.loss : [];
+  if (times.length === 0) return entry;
+
+  let nowSec = entry.lastAt || times[times.length - 1] || 0;
+  if (!nowSec) {
+    nowSec = Math.floor(Date.now() / 1000);
+  }
+  const cutoff = nowSec - HISTORY_CACHE_MAX_AGE_SECONDS;
+  if (cutoff > 0) {
+    let startIndex = 0;
+    while (startIndex < times.length && times[startIndex] < cutoff) {
+      startIndex += 1;
+    }
+    if (startIndex > 0) {
+      times = times.slice(startIndex);
+      latency = latency.slice(startIndex);
+      loss = loss.slice(startIndex);
+    }
+  }
+
+  const total = times.length;
+  if (total <= HISTORY_CACHE_MAX_POINTS) {
+    entry.times = times;
+    entry.latency = latency;
+    entry.loss = loss;
+    if (!entry.lastAt && total > 0) {
+      entry.lastAt = times[total - 1];
+    }
+    return entry;
+  }
+
+  const hotCutoff = nowSec - HISTORY_CACHE_HOT_SECONDS;
+  let hotIndex = 0;
+  while (hotIndex < total && times[hotIndex] < hotCutoff) {
+    hotIndex += 1;
+  }
+  const hotCount = total - hotIndex;
+  if (hotCount >= HISTORY_CACHE_MAX_POINTS) {
+    const start = total - HISTORY_CACHE_MAX_POINTS;
+    entry.times = times.slice(start);
+    entry.latency = latency.slice(start);
+    entry.loss = loss.slice(start);
+    entry.lastAt = entry.times[entry.times.length - 1];
+    return entry;
+  }
+
+  const remaining = HISTORY_CACHE_MAX_POINTS - hotCount;
+  const olderCount = hotIndex;
+  const step = Math.max(1, Math.ceil(olderCount / remaining));
+  const sampledTimes = [];
+  const sampledLatency = [];
+  const sampledLoss = [];
+  for (let i = 0; i < olderCount; i += step) {
+    sampledTimes.push(times[i]);
+    sampledLatency.push(latency[i] ?? null);
+    sampledLoss.push(loss[i] ?? null);
+  }
+  if (olderCount > 0) {
+    const lastOlder = olderCount - 1;
+    if (sampledTimes[sampledTimes.length - 1] !== times[lastOlder]) {
+      sampledTimes.push(times[lastOlder]);
+      sampledLatency.push(latency[lastOlder] ?? null);
+      sampledLoss.push(loss[lastOlder] ?? null);
+    }
+  }
+  entry.times = sampledTimes.concat(times.slice(hotIndex));
+  entry.latency = sampledLatency.concat(latency.slice(hotIndex));
+  entry.loss = sampledLoss.concat(loss.slice(hotIndex));
+  entry.lastAt = entry.times[entry.times.length - 1];
+  return entry;
+}
+
+function cleanupDetachedHistory(nodes) {
+  if (!Array.isArray(nodes)) return;
+  const activeHistoryKeys = new Set();
+  const activeNodeIDs = new Set();
+  nodes.forEach((node) => {
+    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default");
+    if (id) {
+      activeNodeIDs.add(id);
+      activeHistoryKeys.add(resolveHistoryNodeCacheKey(id, node.__sourceKey || "default"));
+    }
+  });
+  let changed = false;
+  for (const cacheKey of state.testHistory.keys()) {
+    if (!activeHistoryKeys.has(cacheKey)) {
+      state.testHistory.delete(cacheKey);
+      const separator = String(cacheKey).indexOf("::");
+      if (separator > -1) {
+        const sourceKey = cacheKey.slice(0, separator);
+        const nodeId = cacheKey.slice(separator + 2);
+        trimHistoryRequestState(nodeId, sourceKey);
+      }
+      changed = true;
+    }
+  }
+  for (const id of state.testRange.keys()) {
+    if (!activeNodeIDs.has(id)) {
+      state.testRange.delete(id);
+      changed = true;
+    }
+  }
+  for (const id of state.testSmooth.keys()) {
+    if (!activeNodeIDs.has(id)) {
+      state.testSmooth.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) {
+    scheduleHistoryCacheSave();
+  }
+}
+
+function applyTestHistory(history, sourceKey) {
+  if (!history || typeof history !== "object") return;
+  let updated = false;
+  Object.entries(history).forEach(([nodeId, rangeBuckets]) => {
+    const cacheKey =
+      sourceKey === undefined
+        ? String(nodeId || "").trim()
+        : historyNodeCacheKey(nodeId, sourceKey);
+    if (!cacheKey) return;
+    if (!rangeBuckets || typeof rangeBuckets !== "object") return;
+    if (isLegacyHistoryBucket(rangeBuckets)) {
+      if (mergeHistoryRangeByKey(cacheKey, DEFAULT_TEST_RANGE_KEY, rangeBuckets)) {
+        updated = true;
+      }
+      return;
+    }
+    Object.entries(rangeBuckets).forEach(([rangeKey, tests]) => {
+      if (mergeHistoryRangeByKey(cacheKey, rangeKey, tests)) {
+        updated = true;
+      }
+    });
+  });
+  if (updated) {
+    scheduleHistoryCacheSave();
+  }
+}
+
+function isLegacyHistoryBucket(value) {
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((entry) => looksLikeTestHistoryEntry(entry));
+}
+
+function looksLikeTestHistoryEntry(entry) {
+  return (
+    entry &&
+    typeof entry === "object" &&
+    (Array.isArray(entry.times) ||
+      Array.isArray(entry.latency) ||
+      Array.isArray(entry.loss))
+  );
+}
+
+function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
+  if (!tests || typeof tests !== "object") {
+    return false;
+  }
+  const map = ensureHistoryRangeMapByKey(cacheKey, rangeKey);
+  let updated = false;
+  Object.entries(tests).forEach(([key, entry]) => {
+    const normalized = normalizeTestHistoryEntry(entry);
+    if (!normalized) return;
+    const existing = map.get(key);
+    const incomingLast = normalized.lastAt || 0;
+    const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
+    const incomingSize = normalized.times.length;
+    const existingSize =
+      existing && Array.isArray(existing.times) ? existing.times.length : 0;
+    if (
+      !existing ||
+      incomingLast > existingLast ||
+      (incomingLast === existingLast && incomingSize > existingSize)
+    ) {
+      trimTestHistoryEntry(normalized);
+      map.set(key, normalized);
+      updated = true;
+    }
+  });
+  return updated;
+}
+
+function mergeHistoryRange(nodeId, rangeKey, tests, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return mergeHistoryRangeByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey), rangeKey, tests);
+}
+
+function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
+  if (!tests || typeof tests !== "object") {
+    return false;
+  }
+  const map = new Map();
+  Object.entries(tests).forEach(([key, entry]) => {
+    const normalized = normalizeTestHistoryEntry(entry);
+    if (!normalized) return;
+    trimTestHistoryEntry(normalized);
+    map.set(key, normalized);
+  });
+  const ranges = ensureNodeHistoryRangesByKey(cacheKey);
+  ranges.set(normalizeHistoryRangeKey(rangeKey), map);
+  return true;
+}
+
+function replaceHistoryRange(
+  nodeId,
+  rangeKey,
+  tests,
+  sourceKey = resolveNodeSourceKey(nodeId)
+) {
+  return replaceHistoryRangeByKey(
+    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rangeKey,
+    tests
+  );
+}
+
+function normalizeTestHistoryEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const times = Array.isArray(entry.times)
+    ? entry.times.map((value) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : 0;
+      })
+    : [];
+  const size = times.length;
+  const latency = normalizeTestHistorySeries(entry.latency, size);
+  const loss = normalizeTestHistorySeries(entry.loss, size);
+  const lastAt = Number(
+    entry.last_at ??
+      entry.lastAt ??
+      (size > 0 ? times[times.length - 1] : 0)
+  );
+  const minIntervalSec = Number(entry.min_interval_sec ?? entry.minIntervalSec ?? 0);
+  const avgIntervalSec = Number(entry.avg_interval_sec ?? entry.avgIntervalSec ?? 0);
+  return {
+    latency,
+    loss,
+    times,
+    lastAt: Number.isFinite(lastAt) ? lastAt : 0,
+    minIntervalSec: Number.isFinite(minIntervalSec) ? minIntervalSec : 0,
+    avgIntervalSec: Number.isFinite(avgIntervalSec) ? avgIntervalSec : 0,
+  };
+}
+
+function normalizeTestHistorySeries(series, size) {
+  const source = Array.isArray(series) ? series : [];
+  const normalized = [];
+  for (let i = 0; i < size; i += 1) {
+    const value = source[i];
+    if (value === null || value === undefined) {
+      normalized.push(null);
+      continue;
+    }
+    const number = Number(value);
+    normalized.push(Number.isFinite(number) ? number : null);
+  }
+  return normalized;
+}
+
+function findNodeByDisplayId(nodeId) {
+  const normalized = String(nodeId || "").trim();
+  if (!normalized) {
+    return null;
+  }
+  return state.nodeByDisplayId.get(normalized) || null;
+}
+
+function resolveNodeSourceKey(nodeId) {
+  const targetNode = findNodeByDisplayId(nodeId);
+  if (!targetNode) {
+    return parseDisplayNodeId(nodeId)?.sourceKey || "default";
+  }
+  return String(targetNode.__sourceKey || "default");
+}
+
+function resolveHistoryTargetBySourceKey(sourceKey) {
+  const normalizedSourceKey = normalizeHistorySourceKey(sourceKey);
+  const targets = resolveTargets();
+  return (
+    targets.find((item) => item.key === normalizedSourceKey) ||
+    targets[0] ||
+    null
+  );
+}
+
+function resolveNodeHistoryContext(nodeId) {
+  const sourceKey = resolveNodeSourceKey(nodeId);
+  return {
+    sourceKey,
+    cacheKey: resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    rawNodeId: resolveHistoryNodeId(nodeId),
+  };
+}
+
+async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
+  const normalizedRange = normalizeHistoryRangeKey(rangeKey);
+  if (!nodeId) {
+    return null;
+  }
+  const { sourceKey, cacheKey, rawNodeId } = resolveNodeHistoryContext(nodeId);
+  if (!rawNodeId) {
+    return null;
+  }
+  const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);
+  if (state.testHistoryFetched.has(requestKey)) {
+    return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
+  }
+  if (state.testHistoryInflight.has(requestKey)) {
+    return state.testHistoryInflight.get(requestKey);
+  }
+
+  const target = resolveHistoryTargetBySourceKey(sourceKey);
+  const apiBase = target?.apiBase;
+  if (!apiBase) {
+    return null;
+  }
+
+  const controllerEntry = state.testHistoryControllers.get(cacheKey);
+  if (controllerEntry && controllerEntry.requestKey !== requestKey) {
+    controllerEntry.controller.abort();
+    state.testHistoryControllers.delete(cacheKey);
+  }
+  const controller = new AbortController();
+  state.testHistoryControllers.set(cacheKey, { requestKey, controller });
+
+  const request = fetch(
+    `${apiBase}/api/v1/public/nodes/${encodeURIComponent(
+      rawNodeId
+    )}/history?range=${encodeURIComponent(normalizedRange)}`,
+    {
+      cache: "no-store",
+      headers: buildPublicRequestHeaders(),
+      signal: controller.signal,
+    })
+    .then(async (resp) => {
+      if (!resp.ok) {
+        throw new Error(`history request failed: ${resp.status}`);
+      }
+      return resp.json();
+    })
+    .then((payload) => {
+      const resolvedRange = normalizeHistoryRangeKey(
+        payload?.range_key || normalizedRange
+      );
+      if (resolveNodeSourceKey(nodeId) !== sourceKey) {
+        return null;
+      }
+      if (payload?.tests && typeof payload.tests === "object") {
+        replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);
+        scheduleHistoryCacheSave();
+      }
+      state.testHistoryFetched.set(
+        historyRequestKey(nodeId, sourceKey, resolvedRange),
+        true
+      );
+      refreshOpenNodeHistoryViews(nodeId);
+      return getNodeHistoryRange(nodeId, resolvedRange, sourceKey);
+    })
+    .catch((error) => {
+      if (error?.name === "AbortError") {
+        return null;
+      }
+      console.warn("加载节点历史失败", nodeId, normalizedRange, error);
+      return null;
+    })
+    .finally(() => {
+      state.testHistoryInflight.delete(requestKey);
+      const activeController = state.testHistoryControllers.get(cacheKey);
+      if (activeController && activeController.requestKey === requestKey) {
+        state.testHistoryControllers.delete(cacheKey);
+      }
+    });
+
+  state.testHistoryInflight.set(requestKey, request);
+  return request;
+}
+
+function updateFooter() {
+  if (footerYear) {
+    const currentYear = new Date().getFullYear();
+    footerYear.textContent = `©2025-${currentYear}`;
+  }
+}
+
+if (brandTitle) {
+  brandTitle.addEventListener("click", (event) => {
+    if (!shouldHandleLocalNavigation(event)) {
+      return;
+    }
+    event.preventDefault();
+    applyViewState({ selectedGroup: DEFAULT_GROUP }, { history: "push" });
+  });
+}
+
+const statTotalCard = statTotal ? statTotal.closest(".stat-card") : null;
+const statOnlineCard = statOnline ? statOnline.closest(".stat-card") : null;
+const statOfflineCard = statOffline ? statOffline.closest(".stat-card") : null;
+
+if (statTotalCard) {
+  statTotalCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "all" }, { history: "push" });
+  });
+}
+if (statOnlineCard) {
+  statOnlineCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "online" }, { history: "push" });
+  });
+}
+if (statOfflineCard) {
+  statOfflineCard.addEventListener("click", () => {
+    applyViewState({ statusFilter: "offline" }, { history: "push" });
+  });
+}
+
+window.addEventListener("popstate", () => {
+  applyViewState(readViewStateFromURL());
+});
+
+function rangeSeconds(key) {
+  const match = RANGE_OPTIONS.find((item) => item.key === key);
+  return match ? match.seconds : RANGE_OPTIONS[0].seconds;
+}
+
+const TEST_RANGE_INTERVALS = {
+  "1h": 5,
+  "24h": 30,
+  "7d": 60 * 15,
+  "30d": 60 * 60,
+  "1y": 60 * 60 * 12,
+};
+
+function resolveTestRangeInterval(rangeKey, rangeSec) {
+  const base = TEST_RANGE_INTERVALS[rangeKey];
+  if (Number.isFinite(base) && base > 0) {
+    return base;
+  }
+  const derived = Math.round(rangeSec / 720);
+  return Math.max(5, derived || 5);
+}
+
+function buildTestGrid(rangeKey, rangeSec, nowSec, observedIntervalSec) {
+  const safeRangeSec =
+    Number.isFinite(rangeSec) && rangeSec > 0 ? rangeSec : 3600;
+  const baseInterval = resolveTestRangeInterval(rangeKey, safeRangeSec);
+  const observed =
+    Number.isFinite(observedIntervalSec) && observedIntervalSec > 0
+      ? observedIntervalSec
+      : 0;
+  const intervalSec = Math.max(baseInterval, observed);
+  const points = Math.max(2, Math.round(safeRangeSec / intervalSec));
+  const startSec = nowSec - safeRangeSec;
+  const times = Array.from({ length: points }, (_, index) => {
+    return startSec + index * intervalSec;
+  });
+  return {
+    points,
+    intervalSec,
+    startSec,
+    times,
+    rangeSec: safeRangeSec,
+  };
+}
+
+function collectGroupNames(nodes, settingsGroups) {
+  const set = new Set();
+  (settingsGroups || []).forEach((group) => set.add(group));
+  nodes.forEach((node) => {
+    getGroupSelections(node).forEach((item) => {
+      if (item.group) {
+        set.add(item.group);
+      }
+    });
+  });
+  return Array.from(set).filter(Boolean);
+}
+
+function getGroupSelections(node, group = DEFAULT_GROUP) {
+  const selections = extractGroupSelections(node);
+  if (!group || group === DEFAULT_GROUP) {
+    return selections;
+  }
+  return selections.filter((item) => item.group === group);
+}
+
+function buildGroupSelectionSignature(node) {
+  if (!node || typeof node !== "object") {
+    return "";
+  }
+  const groups = Array.isArray(node.groups) ? node.groups.join("\n") : "";
+  const group = String(resolveFallbackGroup(node) || "").trim();
+  const tags = Array.isArray(node.tags) ? node.tags.join("\n") : "";
+  return `${groups}||${group}||${tags}`;
+}
+
+function extractGroupSelections(node) {
+  const signature = buildGroupSelectionSignature(node);
+  if (
+    node &&
+    typeof node === "object" &&
+    node.__groupSelectionSignature === signature &&
+    Array.isArray(node.__groupSelections)
+  ) {
+    return node.__groupSelections;
+  }
+  const selections = [];
+  const seen = new Set();
+  const raw = Array.isArray(node.groups) ? node.groups : [];
+  if (raw.length > 0) {
+    raw.forEach((value) => {
+      const parsed = parseGroupSelection(value);
+      if (!parsed) return;
+      const key = `${parsed.group}:${parsed.tag}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      selections.push(parsed);
+    });
+    if (node && typeof node === "object") {
+      node.__groupSelectionSignature = signature;
+      node.__groupSelections = selections;
+    }
+    return selections;
+  }
+  const group = resolveFallbackGroup(node);
+  if (group) {
+    const tags = resolveFallbackTags(node);
+    if (tags.length > 0) {
+      tags.forEach((tag) => {
+        const key = `${group}:${tag}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        selections.push({ group, tag });
+      });
+    } else {
+      selections.push({ group, tag: "" });
+    }
+  }
+  if (node && typeof node === "object") {
+    node.__groupSelectionSignature = signature;
+    node.__groupSelections = selections;
+  }
+  return selections;
+}
+
+function parseGroupSelection(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "全部") return null;
+  let group = raw;
+  let tag = "";
+  if (raw.includes(":")) {
+    const parts = raw.split(":");
+    group = (parts.shift() || "").trim();
+    tag = parts.join(":").trim();
+  } else if (raw.includes("/")) {
+    const parts = raw.split("/");
+    group = (parts.shift() || "").trim();
+    tag = parts.join("/").trim();
+  }
+  if (!group) return null;
+  return { group, tag };
+}
+
+function resolveFallbackGroup(node) {
+  if (node.group) {
+    return node.group;
+  }
+  if (node.stats && node.stats.node_group) {
+    return node.stats.node_group;
+  }
+  return "";
+}
+
+function resolveFallbackTags(node) {
+  if (Array.isArray(node.tags) && node.tags.length > 0) {
+    return normalizeTagList(node.tags);
+  }
+  return [];
+}
+
+function resetRenderMode(mode) {
+  list.innerHTML = "";
+  state.tagSections = new Map();
+  state.renderMode = mode;
+}
+
+function renderGroupTabs(groups) {
+  if (!groupTabs) return;
+  const allGroups = [DEFAULT_GROUP, ...groups];
+  const signature = allGroups.join("\n");
+  if (!allGroups.includes(state.selectedGroup)) {
+    applyViewState(
+      { selectedGroup: DEFAULT_GROUP },
+      { history: "replace", render: false }
+    );
+  }
+  if (state.groupTabSignature !== signature) {
+    state.groupTabSignature = signature;
+    groupTabs.innerHTML = "";
+    allGroups.forEach((group) => {
+      const link = document.createElement("a");
+      link.className = "group-tab";
+      link.dataset.group = group;
+      link.href = buildViewURL(group, state.statusFilter);
+      link.textContent = formatGroupLabel(group);
+      link.addEventListener("click", (event) => {
+        if (!shouldHandleLocalNavigation(event)) {
+          return;
+        }
+        event.preventDefault();
+        applyViewState({ selectedGroup: group }, { history: "push" });
+      });
+      groupTabs.appendChild(link);
+    });
+  }
+  Array.from(groupTabs.querySelectorAll(".group-tab")).forEach((button) => {
+    button.classList.toggle("active", button.dataset.group === state.selectedGroup);
+    if (button.tagName === "A") {
+      button.setAttribute("href", buildViewURL(button.dataset.group || DEFAULT_GROUP, state.statusFilter));
+    }
+  });
+}
+
+function filterNodesByGroup(nodes, group) {
+  if (!group || group === DEFAULT_GROUP) return nodes;
+  return nodes.filter((node) => getGroupSelections(node, group).length > 0);
+}
+
+function filterNodesByStatus(nodes, status) {
+  if (status === "online") {
+    return nodes.filter((node) => resolveNodeStatus(node) !== "offline");
+  }
+  if (status === "offline") {
+    return nodes.filter((node) => resolveNodeStatus(node) === "offline");
+  }
+  return nodes;
+}
+
+function formatGroupLabel(groupPath) {
+  if (!groupPath || groupPath === "全部") return "全部";
+  const parts = String(groupPath).split("/").filter(Boolean);
+  return parts[parts.length - 1] || groupPath;
+}
+
+function normalizeTagList(tags) {
+  const seen = new Set();
+  const list = [];
+  (tags || []).forEach((tag) => {
+    const value = String(tag || "").trim();
+    if (!value || value === "全部") {
+      return;
+    }
+    if (seen.has(value)) return;
+    seen.add(value);
+    list.push(value);
+  });
+  return list;
+}
+
+function updateStats(nodes) {
+  let online = 0;
+  let totalUpRate = 0;
+  let totalDownRate = 0;
+  let totalUp = 0;
+  let totalDown = 0;
+
+  nodes.forEach((node) => {
+    if (resolveNodeStatus(node) !== "offline") {
+      online += 1;
+    }
+    const network = node.stats?.network || {};
+    totalUpRate += Number(network.tx_bytes_per_sec || 0);
+    totalDownRate += Number(network.rx_bytes_per_sec || 0);
+    totalUp += Number(network.bytes_sent || 0);
+    totalDown += Number(network.bytes_recv || 0);
+  });
+
+  const total = nodes.length;
+  const offline = total - online;
+  statTotal.textContent = String(total);
+  statOnline.textContent = String(online);
+  statOffline.textContent = String(offline);
+  statNetUsage.textContent = `流量 ↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(
+    totalDown
+  )}`;
+  statNetRate.textContent = `带宽 ↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
+    totalDownRate
+  )}`;
+}
+
+function upsertRenderedCard(container, node, id, animationIndex) {
+  let card = state.nodes.get(id);
+  if (!card) {
+    card = createCard();
+    state.nodes.set(id, card);
+    card.classList.add("animate");
+    card.addEventListener(
+      "animationend",
+      () => {
+        card.classList.remove("animate");
+      },
+      { once: true }
+    );
+    card.style.animationDelay = `${animationIndex * 0.03}s`;
+  }
+  updateCard(card, node, id);
+  if (card.parentElement !== container) {
+    container.appendChild(card);
+  }
+}
+
+function renderFlatList(nodes) {
+  const activeIds = new Set();
+  nodes.forEach((node, index) => {
+    const id = resolveDisplayNodeId(
+      node,
+      `node-flat-${index}`,
+      node.__sourceKey || "default"
+    );
+    activeIds.add(id);
+    upsertRenderedCard(list, node, id, index);
+  });
+  cleanupInactive(activeIds);
+}
+
+function renderTagSections(nodes, group) {
+  const activeIds = new Set();
+  const activeTags = new Set();
+  const sections = groupNodesByTag(nodes, group);
+
+  sections.forEach((section, sectionIndex) => {
+    const entry = ensureTagSection(section.tag, sectionIndex);
+    entry.count.textContent = `(${section.nodes.length})`;
+    activeTags.add(section.tag);
+    section.nodes.forEach((node, index) => {
+      const id = resolveDisplayNodeId(
+        node,
+        `node-${sectionIndex}-${index}`,
+        node.__sourceKey || "default"
+      );
+      activeIds.add(id);
+      upsertRenderedCard(entry.list, node, id, sectionIndex + index);
+    });
+    if (entry.wrapper.parentElement !== list) {
+      list.appendChild(entry.wrapper);
+    }
+  });
+
+  cleanupInactive(activeIds);
+  cleanupTagSections(activeTags);
+}
+
+function ensureTagSection(tag, index) {
+  let entry = state.tagSections.get(tag);
+  if (!entry) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "tag-section";
+
+    const header = document.createElement("div");
+    header.className = "tag-header";
+    const dot = document.createElement("span");
+    dot.className = "tag-dot";
+    const name = document.createElement("span");
+    name.className = "tag-name";
+    const count = document.createElement("span");
+    count.className = "tag-count";
+    header.appendChild(dot);
+    header.appendChild(name);
+    header.appendChild(count);
+    wrapper.appendChild(header);
+
+    const list = document.createElement("div");
+    list.className = "tag-list";
+    wrapper.appendChild(list);
+
+    entry = {
+      wrapper,
+      list,
+      dot,
+      name,
+      count,
+    };
+    state.tagSections.set(tag, entry);
+  }
+  entry.dot.style.background = tagColor(tag, index);
+  entry.name.textContent = tag;
+  return entry;
+}
+
+function cleanupTagSections(activeTags) {
+  for (const [tag, entry] of state.tagSections.entries()) {
+    if (!activeTags.has(tag)) {
+      entry.wrapper.remove();
+      state.tagSections.delete(tag);
+    }
+  }
+}
+
+function cleanupInactive(activeIds) {
+  for (const [id, card] of state.nodes.entries()) {
+    if (!activeIds.has(id)) {
+      card.remove();
+      state.nodes.delete(id);
+    }
+  }
+}
+
+function groupNodesByTag(nodes, group) {
+  const groups = new Map();
+  nodes.forEach((node) => {
+    const matches = getGroupSelections(node, group);
+    let primary = "未配置";
+    for (const match of matches) {
+      if (match.tag) {
+        primary = match.tag;
+        break;
+      }
+    }
+    if (!groups.has(primary)) {
+      groups.set(primary, []);
+    }
+    groups.get(primary).push(node);
+  });
+  const sorted = Array.from(groups.entries())
+    .map(([tag, list]) => ({ tag, nodes: list }))
+    .sort((a, b) => {
+      if (a.tag === "未配置") return 1;
+      if (b.tag === "未配置") return -1;
+      return a.tag.localeCompare(b.tag, "zh-Hans-CN");
+    });
+  return sorted;
+}
+
+function createCard() {
+  const card = document.createElement("details");
+  card.className = "node-card";
+  card.innerHTML = `
+    <summary class="node-summary">
+      <div class="node-summary-left">
+        <div class="node-title">
+          <span class="node-name" data-field="name"></span>
+          <span class="status-dot" data-field="status-dot"></span>
+        </div>
+        <div class="node-meta">
+          <span class="node-meta-text" data-field="meta"></span>
+        </div>
+      </div>
+      <div class="node-summary-metrics">
+        <div class="summary-metric cpu">
+          <div class="summary-inline">
+            <span class="summary-label">CPU</span>
+            <span class="summary-text" data-field="cpu-meta">--</span>
+            <span class="summary-value" data-field="cpu-summary">--</span>
+          </div>
+          <div class="summary-bar-line">
+            <div class="summary-bar">
+              <span class="summary-fill cpu" data-field="cpu-mini"></span>
+            </div>
+          </div>
+        </div>
+        <div class="summary-metric">
+          <div class="summary-inline">
+            <span class="summary-label">内存</span>
+            <span class="summary-text" data-field="mem-meta">--</span>
+            <span class="summary-value" data-field="mem-summary">--</span>
+          </div>
+          <div class="summary-bar-line">
+            <div class="summary-bar">
+              <span class="summary-fill mem" data-field="mem-mini"></span>
+            </div>
+          </div>
+        </div>
+        <div class="summary-metric">
+          <div class="summary-inline">
+            <span class="summary-label">硬盘</span>
+            <span class="summary-text" data-field="disk-meta">--</span>
+            <span class="summary-value" data-field="disk-summary">--</span>
+          </div>
+          <div class="summary-bar-line">
+            <div class="summary-bar">
+              <span class="summary-fill disk" data-field="disk-mini"></span>
+            </div>
+          </div>
+        </div>
+        <div class="summary-metric">
+          <div class="summary-inline">
+            <span class="summary-label">网络</span>
+            <span class="summary-text" data-field="net-meta">--</span>
+            <span class="summary-value" data-field="net-summary">--</span>
+          </div>
+          <div class="summary-bar-line">
+            <div class="summary-bar">
+              <span class="summary-fill net" data-field="net-mini"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="node-summary-right">
+        <div class="summary-right-line" data-field="summary-uptime"></div>
+        <div class="summary-right-line" data-field="summary-tests"></div>
+      </div>
+    </summary>
+    <div class="node-details">
+      <div class="detail-layout">
+        <div class="detail-info">
+          <div class="info-row"><span>状态</span><strong data-field="detail-status">--</strong></div>
+          <div class="info-row"><span>运行时间</span><strong data-field="detail-uptime">--</strong></div>
+          <div class="info-row"><span>剩余时间</span><strong data-field="detail-remaining">--</strong></div>
+          <div class="info-row"><span>系统架构</span><strong data-field="detail-arch">--</strong></div>
+          <div class="info-row"><span>内存</span><strong data-field="detail-mem">--</strong></div>
+          <div class="info-row"><span>硬盘</span><strong data-field="detail-disk">--</strong></div>
+          <div class="info-row"><span>地区</span><strong data-field="detail-region">--</strong></div>
+          <div class="info-row"><span>系统信息</span><strong data-field="detail-os">--</strong></div>
+          <div class="info-row"><span>CPU</span><strong data-field="detail-cpu">--</strong></div>
+          <div class="info-row"><span>负载</span><strong data-field="detail-load">--</strong></div>
+          <div class="info-row"><span>累计上传</span><strong data-field="detail-upload">--</strong></div>
+          <div class="info-row"><span>累计下载</span><strong data-field="detail-download">--</strong></div>
+          <div class="info-row"><span>首次上报</span><strong data-field="detail-first">--</strong></div>
+          <div class="info-row"><span>末次上报</span><strong data-field="detail-last">--</strong></div>
+        </div>
+        <div class="detail-charts">
+          <div class="detail-grid">
+            <div class="metric">
+              <div class="metric-head">
+                <span>CPU</span>
+                <span data-field="cpu-value">--</span>
+              </div>
+              <div class="meter"><span class="fill" data-field="cpu-bar"></span></div>
+              <div class="metric-sub" data-field="cpu-load">Load --</div>
+              <div class="metric-chart" data-field="cpu-chart"></div>
+            </div>
+            <div class="metric">
+              <div class="metric-head">
+                <span>进程</span>
+                <span data-field="proc-value">--</span>
+              </div>
+              <div class="metric-sub" data-field="proc-detail">--</div>
+              <div class="metric-chart" data-field="proc-chart"></div>
+            </div>
+            <div class="metric">
+              <div class="metric-head">
+                <span>内存</span>
+                <span data-field="mem-value">--</span>
+              </div>
+              <div class="meter"><span class="fill mem" data-field="mem-bar"></span></div>
+              <div class="metric-sub" data-field="mem-detail">--</div>
+              <div class="metric-chart" data-field="mem-chart"></div>
+            </div>
+            <div class="metric">
+              <div class="metric-head">
+                <span>磁盘</span>
+                <span data-field="disk-value">--</span>
+              </div>
+              <div class="meter"><span class="fill disk" data-field="disk-bar"></span></div>
+              <div class="metric-sub" data-field="disk-detail">--</div>
+              <div class="metric-chart" data-field="disk-chart"></div>
+            </div>
+            <div class="metric">
+              <div class="metric-head">
+                <span>网络</span>
+                <span data-field="net-total">--</span>
+              </div>
+              <div class="metric-sub" data-field="net-detail">--</div>
+              <div class="metric-chart" data-field="net-chart"></div>
+            </div>
+            <div class="metric">
+              <div class="metric-head">
+                <span>连接</span>
+                <span data-field="conn-value">--</span>
+              </div>
+              <div class="metric-sub" data-field="conn-detail">--</div>
+              <div class="metric-chart" data-field="conn-chart"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+        <div class="network-section">
+        <div class="network-chart">
+          <div class="network-chart-toolbar">
+            <div class="network-controls">
+              <div class="smooth-control">
+                <span class="smooth-control-label">平滑</span>
+                <button
+                  type="button"
+                  class="smooth-toggle"
+                  data-field="test-smooth"
+                  aria-label="切换平滑"
+                >
+                  <span class="smooth-toggle-track">
+                    <span class="smooth-toggle-thumb"></span>
+                  </span>
+                </button>
+              </div>
+            </div>
+            <div class="network-range" data-field="test-range"></div>
+          </div>
+          <div class="network-canvas" data-field="test-chart"></div>
+          <div class="network-crosshair" data-field="test-crosshair"></div>
+          <div class="network-tooltip" data-field="test-tooltip"></div>
+        </div>
+        <div class="network-cards" data-field="test-cards"></div>
+      </div>
+      <div class="footer">
+        <div data-field="uptime">--</div>
+        <div data-field="last-seen">--</div>
+      </div>
+    </div>
+  `;
+
+  const fields = {
+    name: card.querySelector('[data-field="name"]'),
+    meta: card.querySelector('[data-field="meta"]'),
+    statusDot: card.querySelector('[data-field="status-dot"]'),
+    summaryUptime: card.querySelector('[data-field="summary-uptime"]'),
+    summaryTests: card.querySelector('[data-field="summary-tests"]'),
+    cpuSummary: card.querySelector('[data-field="cpu-summary"]'),
+    memSummary: card.querySelector('[data-field="mem-summary"]'),
+    diskSummary: card.querySelector('[data-field="disk-summary"]'),
+    netSummary: card.querySelector('[data-field="net-summary"]'),
+    cpuMini: card.querySelector('[data-field="cpu-mini"]'),
+    memMini: card.querySelector('[data-field="mem-mini"]'),
+    diskMini: card.querySelector('[data-field="disk-mini"]'),
+    netMini: card.querySelector('[data-field="net-mini"]'),
+    cpuMeta: card.querySelector('[data-field="cpu-meta"]'),
+    memMeta: card.querySelector('[data-field="mem-meta"]'),
+    diskMeta: card.querySelector('[data-field="disk-meta"]'),
+    netMeta: card.querySelector('[data-field="net-meta"]'),
+    cpuValue: card.querySelector('[data-field="cpu-value"]'),
+    cpuBar: card.querySelector('[data-field="cpu-bar"]'),
+    cpuLoad: card.querySelector('[data-field="cpu-load"]'),
+    cpuChart: card.querySelector('[data-field="cpu-chart"]'),
+    memValue: card.querySelector('[data-field="mem-value"]'),
+    memBar: card.querySelector('[data-field="mem-bar"]'),
+    memDetail: card.querySelector('[data-field="mem-detail"]'),
+    memChart: card.querySelector('[data-field="mem-chart"]'),
+    diskValue: card.querySelector('[data-field="disk-value"]'),
+    diskBar: card.querySelector('[data-field="disk-bar"]'),
+    diskDetail: card.querySelector('[data-field="disk-detail"]'),
+    diskChart: card.querySelector('[data-field="disk-chart"]'),
+    netTotal: card.querySelector('[data-field="net-total"]'),
+    netDetail: card.querySelector('[data-field="net-detail"]'),
+    netChart: card.querySelector('[data-field="net-chart"]'),
+    procValue: card.querySelector('[data-field="proc-value"]'),
+    procDetail: card.querySelector('[data-field="proc-detail"]'),
+    procChart: card.querySelector('[data-field="proc-chart"]'),
+    connValue: card.querySelector('[data-field="conn-value"]'),
+    connDetail: card.querySelector('[data-field="conn-detail"]'),
+    connChart: card.querySelector('[data-field="conn-chart"]'),
+    networkSection: card.querySelector(".network-section"),
+    testSmooth: card.querySelector('[data-field="test-smooth"]'),
+    testRange: card.querySelector('[data-field="test-range"]'),
+    testChart: card.querySelector('[data-field="test-chart"]'),
+    testCrosshair: card.querySelector('[data-field="test-crosshair"]'),
+    testTooltip: card.querySelector('[data-field="test-tooltip"]'),
+    testCards: card.querySelector('[data-field="test-cards"]'),
+    uptime: card.querySelector('[data-field="uptime"]'),
+    lastSeen: card.querySelector('[data-field="last-seen"]'),
+    detailStatus: card.querySelector('[data-field="detail-status"]'),
+    detailUptime: card.querySelector('[data-field="detail-uptime"]'),
+    detailArch: card.querySelector('[data-field="detail-arch"]'),
+    detailOS: card.querySelector('[data-field="detail-os"]'),
+    detailCPU: card.querySelector('[data-field="detail-cpu"]'),
+    detailLoad: card.querySelector('[data-field="detail-load"]'),
+    detailMem: card.querySelector('[data-field="detail-mem"]'),
+    detailDisk: card.querySelector('[data-field="detail-disk"]'),
+    detailRegion: card.querySelector('[data-field="detail-region"]'),
+    detailRemaining: card.querySelector('[data-field="detail-remaining"]'),
+    detailUpload: card.querySelector('[data-field="detail-upload"]'),
+    detailDownload: card.querySelector('[data-field="detail-download"]'),
+    detailFirst: card.querySelector('[data-field="detail-first"]'),
+    detailLast: card.querySelector('[data-field="detail-last"]'),
+  };
+
+  card._fields = fields;
+  card._detailSignature = "";
+  card.addEventListener("toggle", () => {
+    if (!card.open) {
+      card._detailSignature = "";
+      return;
+    }
+    if (!card._lastNode || !card._nodeId) {
+      return;
+    }
+    const detailSignature = buildCardDetailSignature(card._lastNode, card._nodeId);
+    if (card._detailSignature === detailSignature) {
+      return;
+    }
+    renderCardDetails(card, card._lastNode, card._nodeId);
+    card._detailSignature = detailSignature;
+  });
+  return card;
+}
+
+function updateCard(card, node, nodeId) {
+  const fields = card._fields;
+  const stats = node.stats || {};
+  const cpu = stats.cpu || {};
+  const mem = stats.memory || {};
+  const diskList = stats.disk || [];
+  const diskIO = stats.disk_io || {};
+  const net = stats.network || {};
+  const tests = stats.network_tests || [];
+
+  const displayName = resolveDisplayName(node, stats);
+  const flag = flagEmoji(node.region);
+  fields.name.textContent = `${flag}${displayName}`.trim();
+
+  fields.meta.textContent = `${stats.os || "--"} · ${stats.arch || "--"}`;
+
+  const status = resolveNodeStatus(node) === "offline" ? "离线" : "在线";
+  fields.statusDot.classList.toggle("offline", status === "离线");
+
+  const cpuPercent = clamp(cpu.usage_percent || 0);
+  fields.cpuSummary.textContent = `${cpuPercent.toFixed(0)}%`;
+  if (fields.cpuMini) {
+    fields.cpuMini.style.width = `${cpuPercent}%`;
+  }
+  fields.cpuValue.textContent = `${cpuPercent.toFixed(1)}%`;
+  fields.cpuBar.style.width = `${cpuPercent}%`;
+  fields.cpuLoad.textContent = `Load ${formatLoad(cpu)}`;
+
+  const processCount = stats.process_count || 0;
+  fields.procValue.textContent = `${processCount}`;
+  fields.procDetail.textContent = "当前进程数";
+
+  const memPercent = clamp(mem.used_percent || 0);
+  fields.memSummary.textContent = `${memPercent.toFixed(0)}%`;
+  if (fields.memMini) {
+    fields.memMini.style.width = `${memPercent}%`;
+  }
+  fields.memValue.textContent = `${memPercent.toFixed(1)}%`;
+  fields.memBar.style.width = `${memPercent}%`;
+  fields.memDetail.textContent = `${formatBytes(mem.used)} / ${formatBytes(
+    mem.total
+  )}`;
+
+  const diskAgg = aggregateDisk(diskList);
+  const diskPercent = clamp(diskAgg.percent);
+  fields.diskSummary.textContent = `${diskPercent.toFixed(0)}%`;
+  if (fields.diskMini) {
+    fields.diskMini.style.width = `${diskPercent}%`;
+  }
+  fields.diskValue.textContent = `${diskPercent.toFixed(1)}%`;
+  fields.diskBar.style.width = `${diskPercent}%`;
+  fields.diskDetail.textContent = `${formatBytes(diskAgg.used)} / ${formatBytes(
+    diskAgg.total
+  )}`;
+
+  const netSpeed =
+    Number.isFinite(node.net_speed_mbps) && node.net_speed_mbps > 0
+      ? node.net_speed_mbps
+      : stats.net_speed_mbps;
+  const hasNetSpeed = Number.isFinite(netSpeed) && netSpeed > 0;
+  const netPercent = hasNetSpeed ? calcNetPercent(net, netSpeed) : 0;
+  fields.netSummary.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : "";
+  if (fields.netMini) {
+    fields.netMini.style.width = `${hasNetSpeed ? netPercent : 0}%`;
+  }
+  fields.cpuMeta.textContent = formatCPUModel(cpu);
+  fields.memMeta.textContent = formatBytes(mem.total || 0);
+  fields.diskMeta.textContent = formatDiskMeta(node, stats, diskAgg.total);
+  fields.netMeta.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
+    net.rx_bytes_per_sec
+  )}`;
+  fields.netTotal.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : "--";
+  fields.netDetail.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
+    net.rx_bytes_per_sec
+  )}`;
+
+  const tcpCount = stats.tcp_conns || 0;
+  const udpCount = stats.udp_conns || 0;
+  fields.connValue.textContent = `${tcpCount} / ${udpCount}`;
+  fields.connDetail.textContent = "TCP / UDP";
+
+  card._nodeId = nodeId;
+  card._lastNode = node;
+
+  updateMetricHistory(nodeId, stats, {
+    cpu: cpuPercent,
+    mem: mem.used || 0,
+    disk: diskAgg.used || 0,
+    netUp: net.tx_bytes_per_sec || 0,
+    netDown: net.rx_bytes_per_sec || 0,
+    process: stats.process_count || 0,
+    tcp: stats.tcp_conns || 0,
+    udp: stats.udp_conns || 0,
+  });
+  fields.uptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
+  fields.lastSeen.textContent = `更新 ${formatTime(node.last_seen || 0)}`;
+  fields.summaryUptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
+  fields.summaryTests.textContent = formatRemainingSummary(
+    node.expire_at || 0,
+    node.auto_renew,
+    node.renew_interval_sec || 0
+  );
+
+  fields.detailStatus.textContent = status;
+  fields.detailUptime.textContent = formatUptime(stats.uptime_sec || 0);
+  fields.detailArch.textContent = stats.arch || "--";
+  fields.detailOS.textContent = stats.os || "--";
+  fields.detailCPU.textContent = formatCPUModel(cpu);
+  fields.detailLoad.textContent = formatLoad(cpu);
+  fields.detailMem.textContent = `${formatBytes(mem.used)} / ${formatBytes(
+    mem.total
+  )}`;
+  fields.detailDisk.textContent = `${formatBytes(diskAgg.used)} / ${formatBytes(
+    diskAgg.total
+  )} ${formatDiskType(node, stats)}`;
+  fields.detailRegion.textContent = formatRegion(node.region);
+  fields.detailRemaining.textContent = formatRemaining(
+    node.expire_at || 0,
+    node.auto_renew,
+    node.renew_interval_sec || 0
+  );
+  fields.detailUpload.textContent = formatBytes(net.bytes_sent);
+  fields.detailDownload.textContent = formatBytes(net.bytes_recv);
+  fields.detailFirst.textContent = formatTimeFull(node.first_seen || 0);
+  fields.detailLast.textContent = formatTimeFull(node.last_seen || 0);
+  updateTestHistory(nodeId, tests);
+
+  const detailSignature = buildCardDetailSignature(node, nodeId);
+  if (card.open && card._detailSignature !== detailSignature) {
+    renderCardDetails(card, node, nodeId);
+    card._detailSignature = detailSignature;
+  }
+}
+
+function renderCardDetails(card, node, nodeId) {
+  const fields = card._fields;
+  const stats = node.stats || {};
+  const cpu = stats.cpu || {};
+  const mem = stats.memory || {};
+  const diskAgg = aggregateDisk(stats.disk || []);
+  const net = stats.network || {};
+  const history = state.metricHistory.get(nodeId) || updateMetricHistory(nodeId, stats, {
+    cpu: clamp(cpu.usage_percent || 0),
+    mem: mem.used || 0,
+    disk: diskAgg.used || 0,
+    netUp: net.tx_bytes_per_sec || 0,
+    netDown: net.rx_bytes_per_sec || 0,
+    process: stats.process_count || 0,
+    tcp: stats.tcp_conns || 0,
+    udp: stats.udp_conns || 0,
+  });
+
+  fields.cpuChart.innerHTML = renderSparklineMulti([history.cpu], ["#4f7cff"]);
+  fields.procChart.innerHTML = renderSparklineMulti([history.process], ["#f97316"]);
+  fields.memChart.innerHTML = renderSparklineMulti(
+    [history.mem],
+    ["#22c55e"],
+    mem.total || 0
+  );
+  fields.diskChart.innerHTML = renderSparklineMulti(
+    [history.disk],
+    ["#f97316"],
+    diskAgg.total || 0
+  );
+  fields.netChart.innerHTML = renderSparklineMulti(
+    [history.netUp, history.netDown],
+    ["#38bdf8", "#a855f7"]
+  );
+  fields.connChart.innerHTML = renderSparklineMulti(
+    [history.tcp, history.udp],
+    ["#60a5fa", "#a855f7"]
+  );
+
+  updateNetworkTests(fields, node, stats.network_tests || [], nodeId);
+}
+
+function hasConfiguredNetworkTestPolicy(node) {
+  if (!node || typeof node !== "object") {
+    return false;
+  }
+  if (Array.isArray(node.test_selections) && node.test_selections.length > 0) {
+    return true;
+  }
+  return Array.isArray(node.tests) && node.tests.length > 0;
+}
+
+function clearNetworkSection(fields) {
+  fields.testChart.innerHTML = "";
+  fields.testCards.innerHTML = "";
+  if (fields.testRange) {
+    fields.testRange.innerHTML = "";
+  }
+  if (fields.testSmooth) {
+    fields.testSmooth.disabled = true;
+    fields.testSmooth.classList.remove("active");
+    fields.testSmooth.setAttribute("aria-pressed", "false");
+  }
+  if (fields.testTooltip) {
+    fields.testTooltip.classList.remove("visible");
+  }
+  if (fields.testCrosshair) {
+    fields.testCrosshair.classList.remove("visible");
+  }
+}
+
+function setNetworkSectionVisibility(fields, visible) {
+  if (!fields.networkSection) {
+    return;
+  }
+  fields.networkSection.hidden = !visible;
+}
+
+function updateNetworkTests(fields, node, tests, nodeId) {
+  fields._tests = tests;
+  if (!hasConfiguredNetworkTestPolicy(node)) {
+    clearNetworkSection(fields);
+    setNetworkSectionVisibility(fields, false);
+    return;
+  }
+
+  setNetworkSectionVisibility(fields, true);
+  if (!tests.length && !hasAnyHistoryForNode(nodeId)) {
+    clearNetworkSection(fields);
+    return;
+  }
+
+  renderNetworkSection(fields, nodeId);
+}
+
+function resolveNetworkRenderContext(
+  nodeId,
+  rangeKey = state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
+) {
+  const activeRange = normalizeHistoryRangeKey(rangeKey);
+  const renderHistoryMap = getFallbackHistoryMap(nodeId, activeRange);
+  let latestHistoryAt = 0;
+  renderHistoryMap.forEach((history) => {
+    const historyLastAt = resolveHistoryLastAt(history);
+    if (historyLastAt > latestHistoryAt) {
+      latestHistoryAt = historyLastAt;
+    }
+  });
+  return {
+    activeRange,
+    renderHistoryMap,
+    latestHistoryAt,
+  };
+}
+
+function buildCardDetailSignature(node, nodeId) {
+  const stats = node?.stats || {};
+  const { activeRange, latestHistoryAt } = resolveNetworkRenderContext(nodeId);
+  return [
+    String(nodeId || ""),
+    Number(node?.last_seen || 0),
+    Number(stats?.uptime_sec || 0),
+    Number(stats?.process_count || 0),
+    hasConfiguredNetworkTestPolicy(node) ? "1" : "0",
+    activeRange,
+    state.testSmooth.get(nodeId) ? "1" : "0",
+    latestHistoryAt,
+  ].join("|");
+}
+
+function renderNetworkSection(fields, nodeId) {
+  const context = resolveNetworkRenderContext(nodeId);
+  const { activeRange, renderHistoryMap, latestHistoryAt } = context;
+  if (!state.testRange.has(nodeId)) {
+    state.testRange.set(nodeId, DEFAULT_TEST_RANGE_KEY);
+  }
+  void fetchNodeHistory(nodeId, activeRange);
+
+  const baseTests = fields._tests || [];
+  const tests =
+    baseTests.length > 0
+      ? baseTests
+      : buildTestsFromHistory(renderHistoryMap);
+  const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
+  renderRangeTabs(fields, nodeId, activeRange);
+  renderSmoothToggle(fields, nodeId, smoothEnabled);
+  fields.testCards.innerHTML = "";
+
+  const seriesList = [];
+  const colors = [];
+  const labels = [];
+  const now = Math.floor(Date.now() / 1000);
+  const rangeSec = rangeSeconds(activeRange);
+  const testEntries = [];
+
+  tests.forEach((test, index) => {
+    const key = testKey(test);
+    const history =
+      renderHistoryMap.get(key) || { latency: [], loss: [], times: [] };
+    const color = testColor(key, index);
+    testEntries.push({
+      key,
+      test,
+      history,
+      filtered: null,
+      color,
+      label: formatTestName(test),
+    });
+  });
+
+  const rangeEndSec = resolveRangeEndSec(now, latestHistoryAt, rangeSec);
+  testEntries.forEach((entry) => {
+    entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
+  });
+
+  const renderGrid = buildRenderedTestGrid(
+    activeRange,
+    rangeSec,
+    rangeEndSec,
+    testEntries
+  );
+  const timeSeries = renderGrid.times;
+
+  testEntries.forEach((entry) => {
+    const sampled = resampleHistoryForGrid(entry.filtered, renderGrid);
+    const interpolationBaseGap = Math.max(
+      entry.history?.minIntervalSec || 0,
+      renderGrid.intervalSec || 0,
+      60
+    );
+    const interpolatedLatency = interpolateLatencyGaps(sampled.latency, sampled.times, {
+      multiplier: 6,
+      fallbackGapSec: interpolationBaseGap,
+      minGapSec: interpolationBaseGap,
+      maxGapSecCap: Math.max(interpolationBaseGap * 6, 60),
+    });
+    const latencySeries = smoothEnabled
+      ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
+      : interpolatedLatency.slice();
+    if (hasSeriesData(latencySeries)) {
+      seriesList.push(latencySeries);
+      colors.push(entry.color);
+      labels.push(entry.label);
+    }
+
+    const card = document.createElement("div");
+    card.className = "network-card";
+
+    const cardName = document.createElement("div");
+    cardName.className = "network-card-name";
+    cardName.textContent = entry.label;
+
+    const cardStats = document.createElement("div");
+    cardStats.className = "network-card-stats";
+    const snapshot = summarizeTestSnapshot(entry.test, entry.history);
+    cardStats.innerHTML = `
+      <span>${snapshot.latency}</span>
+    `;
+
+    const loss = document.createElement("div");
+    loss.className = "network-card-loss";
+    loss.textContent = snapshot.loss;
+
+    card.appendChild(cardName);
+    card.appendChild(cardStats);
+    card.appendChild(loss);
+    fields.testCards.appendChild(card);
+  });
+
+  const chart = buildLatencyChart(seriesList, colors, timeSeries, rangeSec);
+  fields.testChart.innerHTML = chart.svg;
+  setupLatencyHover(fields, chart.meta, labels);
+}
+
+function buildRenderedTestGrid(rangeKey, rangeSec, rangeEndSec, testEntries) {
+  return buildTestGrid(
+    rangeKey,
+    rangeSec,
+    rangeEndSec,
+    resolveObservedHistoryIntervalSec(testEntries)
+  );
+}
+
+function renderSmoothToggle(fields, nodeId, enabled) {
+  const button = fields.testSmooth;
+  if (!button) return;
+  button.disabled = false;
+  button.classList.toggle("active", enabled);
+  button.setAttribute("aria-pressed", enabled ? "true" : "false");
+  button.onclick = () => {
+    const next = !Boolean(state.testSmooth.get(nodeId));
+    if (next) {
+      state.testSmooth.set(nodeId, true);
+    } else {
+      state.testSmooth.delete(nodeId);
+    }
+    renderNetworkSection(fields, nodeId);
+  };
+}
+
+function renderRangeTabs(fields, nodeId, active) {
+  if (!fields.testRange) return;
+  fields.testRange.innerHTML = "";
+  RANGE_OPTIONS.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "range-btn";
+    if (item.key === active) {
+      button.classList.add("active");
+    }
+    button.textContent = item.label;
+    button.addEventListener("click", () => {
+      if (item.key === active) return;
+      state.testRange.set(nodeId, item.key);
+      renderNetworkSection(fields, nodeId);
+    });
+    fields.testRange.appendChild(button);
+  });
+}
+
+function buildTestsFromHistory(historyMap) {
+  if (!historyMap || historyMap.size === 0) return [];
+  return Array.from(historyMap.keys())
+    .filter(Boolean)
+    .sort()
+    .map((key) => testFromHistoryKey(key))
+    .filter(Boolean);
+}
+
+function testFromHistoryKey(key) {
+  if (!key) return null;
+  const parts = String(key).split("|");
+  const type = (parts[0] || "icmp").toLowerCase();
+  const host = parts[1] || "";
+  const port = Number(parts[2]) || 0;
+  const name = parts.slice(3).join("|").trim();
+  const displayName =
+    name || (host ? (port ? `${host}:${port}` : host) : "");
+  return { type, host, port, name: displayName };
+}
+
+function resolveHistoryLastAt(history) {
+  if (!history) return 0;
+  const direct = Number(history.lastAt ?? history.last_at ?? 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  const times = Array.isArray(history.times) ? history.times : [];
+  if (!times.length) return 0;
+  const tail = Number(times[times.length - 1]);
+  return Number.isFinite(tail) ? tail : 0;
+}
+
+function resolveRangeEndSec(nowSec, latestHistorySec, rangeSec) {
+  const safeNow = Number.isFinite(nowSec)
+    ? nowSec
+    : Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(rangeSec) || rangeSec <= 0) return safeNow;
+  if (!Number.isFinite(latestHistorySec) || latestHistorySec <= 0) {
+    return safeNow;
+  }
+  if (latestHistorySec >= safeNow - rangeSec) return safeNow;
+  return latestHistorySec;
+}
+
+function filterHistoryByRange(history, rangeSec, nowSec) {
+  if (!history) return { latency: [], loss: [], times: [] };
+  const latency = Array.isArray(history.latency) ? history.latency : [];
+  const loss = Array.isArray(history.loss) ? history.loss : [];
+  const times = Array.isArray(history.times) ? history.times : [];
+  if (!rangeSec || times.length === 0) {
+    return { latency: latency.slice(), loss: loss.slice(), times: times.slice() };
+  }
+  const filtered = { latency: [], loss: [], times: [] };
+  const minTime = nowSec - rangeSec;
+  for (let i = 0; i < times.length; i += 1) {
+    const ts = times[i];
+    if (!ts || ts < minTime) {
+      continue;
+    }
+    filtered.times.push(ts);
+    filtered.latency.push(latency[i] ?? null);
+    filtered.loss.push(loss[i] ?? null);
+  }
+  return filtered;
+}
+
+function normalizeNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (Number.isFinite(value)) return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasSeriesData(series) {
+  return (
+    Array.isArray(series) &&
+    series.some((value) => value !== null && value !== undefined)
+  );
+}
+
+function resolveObservedHistoryIntervalSec(testEntries) {
+  const intervals = [];
+  (Array.isArray(testEntries) ? testEntries : []).forEach((entry) => {
+    const minInterval = Number(entry?.history?.minIntervalSec);
+    if (Number.isFinite(minInterval) && minInterval > 0) {
+      intervals.push(minInterval);
+      return;
+    }
+    const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
+    for (let index = 1; index < times.length; index += 1) {
+      const previous = Number(times[index - 1]);
+      const current = Number(times[index]);
+      if (!Number.isFinite(previous) || !Number.isFinite(current) || current <= previous) {
+        continue;
+      }
+      intervals.push(current - previous);
+    }
+  });
+  if (!intervals.length) {
+    return 0;
+  }
+  intervals.sort((left, right) => left - right);
+  return intervals[Math.floor(intervals.length / 2)];
+}
+
+function resampleHistoryForGrid(history, grid) {
+  const latency = Array.from({ length: grid.points }, () => null);
+  const loss = Array.from({ length: grid.points }, () => null);
+  if (!history || !grid || !grid.points || !grid.intervalSec) {
+    return { latency, loss, times: grid.times || [] };
+  }
+  const times = Array.isArray(history.times) ? history.times : [];
+  const srcLatency = Array.isArray(history.latency) ? history.latency : [];
+  const srcLoss = Array.isArray(history.loss) ? history.loss : [];
+  const endSec = grid.startSec + grid.rangeSec;
+  for (let i = 0; i < times.length; i += 1) {
+    const ts = times[i];
+    if (!Number.isFinite(ts)) continue;
+    if (ts < grid.startSec || ts > endSec) continue;
+    let index = Math.round((ts - grid.startSec) / grid.intervalSec);
+    if (index < 0) index = 0;
+    if (index >= grid.points) index = grid.points - 1;
+    latency[index] = normalizeNumber(srcLatency[i]);
+    loss[index] = normalizeNumber(srcLoss[i]);
+  }
+  return { latency, loss, times: grid.times || [] };
+}
+
+function interpolateLatencyGaps(series, times, options = {}) {
+  if (!Array.isArray(series) || series.length === 0) {
+    return [];
+  }
+  const out = series.map((value) => normalizeNumber(value));
+  const validIndices = [];
+  for (let index = 0; index < out.length; index += 1) {
+    if (out[index] !== null && Number.isFinite(Number(times?.[index]))) {
+      validIndices.push(index);
+    }
+  }
+  if (validIndices.length < 2) {
+    return out;
+  }
+
+  const maxGapSec = resolveLatencyInterpolationGapSec(times, validIndices, options);
+  if (!Number.isFinite(maxGapSec) || maxGapSec <= 0) {
+    return out;
+  }
+
+  for (let pair = 0; pair < validIndices.length - 1; pair += 1) {
+    const leftIndex = validIndices[pair];
+    const rightIndex = validIndices[pair + 1];
+    const leftTime = Number(times?.[leftIndex]);
+    const rightTime = Number(times?.[rightIndex]);
+    const leftValue = out[leftIndex];
+    const rightValue = out[rightIndex];
+    if (
+      !Number.isFinite(leftTime) ||
+      !Number.isFinite(rightTime) ||
+      rightTime <= leftTime ||
+      leftValue === null ||
+      rightValue === null
+    ) {
+      continue;
+    }
+    if (rightTime - leftTime > maxGapSec) {
+      continue;
+    }
+    for (let fillIndex = leftIndex + 1; fillIndex < rightIndex; fillIndex += 1) {
+      const fillTime = Number(times?.[fillIndex]);
+      if (!Number.isFinite(fillTime)) continue;
+      const ratio = (fillTime - leftTime) / (rightTime - leftTime);
+      out[fillIndex] = leftValue + (rightValue - leftValue) * ratio;
+    }
+  }
+
+  return out;
+}
+
+function resolveLatencyInterpolationGapSec(times, validIndices, options = {}) {
+  const explicitMax = Number(options.maxGapSec);
+  if (Number.isFinite(explicitMax) && explicitMax > 0) {
+    return explicitMax;
+  }
+
+  const multiplier = Number(options.multiplier) || 6;
+  const fallbackGapSec = Number(options.fallbackGapSec) || 0;
+  const minGapSec = Number(options.minGapSec) || Math.max(fallbackGapSec, 60);
+  const maxGapSecCap =
+    Number(options.maxGapSecCap) ||
+    Math.max(minGapSec, fallbackGapSec > 0 ? fallbackGapSec * multiplier : minGapSec);
+
+  const gapsSec = [];
+  for (let index = 0; index < validIndices.length - 1; index += 1) {
+    const leftTime = Number(times?.[validIndices[index]]);
+    const rightTime = Number(times?.[validIndices[index + 1]]);
+    if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime) || rightTime <= leftTime) {
+      continue;
+    }
+    gapsSec.push(rightTime - leftTime);
+  }
+  gapsSec.sort((left, right) => left - right);
+  const medianGapSec =
+    gapsSec.length > 0 ? gapsSec[Math.floor(gapsSec.length / 2)] : 0;
+  const derivedGapSec = Math.max(medianGapSec, fallbackGapSec || 0, minGapSec);
+  return Math.min(derivedGapSec * multiplier, maxGapSecCap);
+}
+
+function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
+  if (!Array.isArray(series) || series.length === 0) {
+    return [];
+  }
+  const normalizedAlpha = Math.min(Math.max(Number(alpha) || 0, 0.05), 1);
+  const result = [];
+  let carry = null;
+  series.forEach((value) => {
+    const numeric = normalizeNumber(value);
+    if (numeric === null) {
+      result.push(null);
+      return;
+    }
+    carry = carry === null ? numeric : carry + normalizedAlpha * (numeric - carry);
+    result.push(carry);
+  });
+  return result;
+}
+
+function buildSummaryExtra(stats, tests) {
+  const parts = [`已运行 ${formatUptime(stats.uptime_sec || 0)}`];
+  const summary = summarizeTests(tests, 2);
+  if (summary) {
+    parts.push(summary);
+  }
+  return parts.join(" · ");
+}
+
+function renderSummaryTests(fields, tests) {
+  if (!fields.summaryTests) return;
+  fields.summaryTests.innerHTML = "";
+  const list = Array.isArray(tests)
+    ? tests.filter((test) => test.latency_ms !== null && test.latency_ms !== undefined).slice(0, 3)
+    : [];
+  if (!list.length) return;
+  list.forEach((test) => {
+    const chip = document.createElement("div");
+    chip.className = "summary-test";
+
+    const name = document.createElement("span");
+    name.className = "summary-test-name";
+    name.textContent = formatTestName(test);
+
+    const value = document.createElement("span");
+    value.className = "summary-test-value";
+    value.textContent = formatLatencyValue(test);
+
+    chip.appendChild(name);
+    chip.appendChild(value);
+    fields.summaryTests.appendChild(chip);
+  });
+}
+
+function summarizeTests(tests, limit) {
+  const list = Array.isArray(tests)
+    ? tests.filter((test) => test.latency_ms !== null && test.latency_ms !== undefined).slice(0, limit)
+    : [];
+  if (!list.length) return "";
+  return list
+    .map((test) => `${formatTestName(test)} ${formatLatencyValue(test)}`)
+    .join(" · ");
+}
+
+function updateMetricHistory(nodeId, stats, values) {
+  if (!state.metricHistory.has(nodeId)) {
+    state.metricHistory.set(nodeId, {
+      lastAt: 0,
+      cpu: [],
+      process: [],
+      mem: [],
+      disk: [],
+      netUp: [],
+      netDown: [],
+      tcp: [],
+      udp: [],
+    });
+  }
+  const entry = state.metricHistory.get(nodeId);
+  const timestamp = stats.timestamp || Math.floor(Date.now() / 1000);
+  if (timestamp > entry.lastAt) {
+    pushHistory(entry.cpu, values.cpu);
+    pushHistory(entry.process, values.process);
+    pushHistory(entry.mem, values.mem);
+    pushHistory(entry.disk, values.disk);
+    pushHistory(entry.netUp, values.netUp);
+    pushHistory(entry.netDown, values.netDown);
+    pushHistory(entry.tcp, values.tcp);
+    pushHistory(entry.udp, values.udp);
+    entry.lastAt = timestamp;
+  }
+  return entry;
+}
+
+function pushHistory(list, value) {
+  if (!Array.isArray(list)) return;
+  list.push(value);
+  if (list.length > 40) {
+    list.splice(0, list.length - 40);
+  }
+}
+
+function updateTestHistory(nodeId, tests) {
+  if (!Array.isArray(tests) || tests.length === 0) {
+    return;
+  }
+
+  const { sourceKey, cacheKey } = resolveNodeHistoryContext(nodeId);
+  const ranges = state.testHistory.get(cacheKey);
+  if (!ranges || ranges.size === 0) {
+    return;
+  }
+  const targetRanges = Array.from(ranges.keys()).filter((rangeKey) =>
+    isHistoryRangeFetched(nodeId, rangeKey, sourceKey)
+  );
+  if (targetRanges.length === 0) {
+    return;
+  }
+  let updated = false;
+  targetRanges.forEach((rangeKey) => {
+    const map = ensureHistoryRangeMap(nodeId, rangeKey, sourceKey);
+    tests.forEach((test) => {
+      const key = testKey(test);
+      if (!key) return;
+      const entry = map.get(key) || {
+        latency: [],
+        loss: [],
+        times: [],
+        lastAt: 0,
+        minIntervalSec: 0,
+        avgIntervalSec: 0,
+      };
+      const checkedAt = test.checked_at || 0;
+      if (checkedAt <= entry.lastAt) {
+        return;
+      }
+      const intervalSec =
+        entry.lastAt > 0 && checkedAt > entry.lastAt
+          ? checkedAt - entry.lastAt
+          : 0;
+      if (intervalSec > 0) {
+        if (!entry.minIntervalSec || intervalSec < entry.minIntervalSec) {
+          entry.minIntervalSec = intervalSec;
+        }
+        if (!entry.avgIntervalSec) {
+          entry.avgIntervalSec = intervalSec;
+        } else {
+          entry.avgIntervalSec = entry.avgIntervalSec * 0.9 + intervalSec * 0.1;
+        }
+      }
+      const value =
+        test.latency_ms !== null && test.latency_ms !== undefined
+          ? test.latency_ms
+          : null;
+      let loss =
+        test.packet_loss !== null && test.packet_loss !== undefined
+          ? test.packet_loss
+          : null;
+      if (loss === null || loss === undefined || !Number.isFinite(loss)) {
+        loss = value === null ? 100 : 0;
+      }
+      entry.latency.push(value);
+      entry.loss.push(loss);
+      entry.times.push(checkedAt || Math.floor(Date.now() / 1000));
+      entry.lastAt = checkedAt;
+      trimTestHistoryEntry(entry);
+      map.set(key, entry);
+      updated = true;
+    });
+  });
+  if (updated) {
+    scheduleHistoryCacheSave();
+  }
+}
+
+function renderSparklineMulti(seriesList, colors, maxValueOverride) {
+  const width = 260;
+  const height = 70;
+  const normalized = seriesList
+    .map((series) => (Array.isArray(series) ? series : []))
+    .filter((series) => series.length > 0);
+  if (!normalized.length) {
+    return '<div class="sparkline-empty">--</div>';
+  }
+  const maxLen = Math.max(...normalized.map((series) => series.length));
+  const pointsList = normalized.map((series) =>
+    padSeries(series, maxLen).map((value) =>
+      value === null || value === undefined ? 0 : value
+    )
+  );
+  const flatValues = pointsList.flatMap((series) => series);
+  const computedMax = Math.max(1, ...flatValues);
+  const maxValue =
+    Number.isFinite(maxValueOverride) && maxValueOverride > 0
+      ? maxValueOverride
+      : computedMax;
+  const step = width / Math.max(maxLen - 1, 1);
+  const lines = pointsList
+    .map((series, seriesIndex) => {
+      const points = series
+        .map((value, index) => {
+          const safeValue = Math.min(value, maxValue);
+          const x = index * step;
+          const y = height - (safeValue / maxValue) * height;
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(" ");
+      const color = colors[seriesIndex] || "#4f7cff";
+      return `<polyline fill="none" stroke="${color}" stroke-width="2" points="${points}" />`;
+    })
+    .join("");
+  return `
+    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      ${lines}
+    </svg>
+  `;
+}
+
+function buildLatencyChart(seriesList, colors, times, rangeSec) {
+  const width = 680;
+  const height = 220;
+  const padding = { top: 20, right: 18, bottom: 18, left: 46 };
+  const normalized = seriesList
+    .map((series) => (Array.isArray(series) ? series : []))
+    .filter((series) => series.length > 0);
+  if (!normalized.length) {
+    return { svg: '<div class="sparkline-empty">--</div>', meta: null };
+  }
+
+  const maxLen = Math.max(...normalized.map((series) => series.length));
+  const paddedSeries = normalized.map((series) => padSeries(series, maxLen));
+  const paddedTimes = padSeries(Array.isArray(times) ? times : [], maxLen);
+  const flatValues = paddedSeries
+    .flatMap((series) => series)
+    .filter((value) => value !== null && value !== undefined && Number.isFinite(value));
+  const rawMax = flatValues.length ? Math.max(...flatValues) : 1;
+  const paddedMax = rawMax * 1.1;
+  const stepValue = niceStep(paddedMax / 4 || 1);
+  const maxValue = Math.max(stepValue * 4, paddedMax, 1);
+
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const stepX = plotWidth / Math.max(maxLen - 1, 1);
+
+  const gridLines = [];
+  const yLabels = [];
+  for (let i = 0; i <= 4; i += 1) {
+    const value = stepValue * i;
+    const y = padding.top + plotHeight - (value / maxValue) * plotHeight;
+    gridLines.push(
+      `<line x1="${padding.left}" x2="${width - padding.right}" y1="${y.toFixed(
+        1
+      )}" y2="${y.toFixed(1)}" />`
+    );
+    yLabels.push(
+      `<text x="${padding.left - 4}" y="${y.toFixed(
+        1
+      )}" text-anchor="end" dominant-baseline="middle">${formatLatencyTick(
+        value
+      )}</text>`
+    );
+  }
+
+  const lines = paddedSeries
+    .map((series, idx) => {
+      const path = buildLinePath(
+        series,
+        stepX,
+        padding,
+        plotWidth,
+        plotHeight,
+        maxValue
+      );
+      if (!path) return "";
+      const color = colors[idx] || "#4f7cff";
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
+    })
+    .join("");
+
+  const svg = `
+    <svg class="latency-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <g class="latency-grid">${gridLines.join("")}</g>
+      <g class="latency-axis">${yLabels.join("")}</g>
+      <g class="latency-lines">${lines}</g>
+    </svg>
+  `;
+  return {
+    svg,
+    meta: {
+      maxLen,
+      paddedSeries,
+      paddedTimes,
+      padding,
+      plotWidth,
+      plotHeight,
+      colors: colors.slice(),
+    },
+  };
+}
+
+function setupLatencyHover(fields, meta, labels) {
+  const container = fields.testChart;
+  const tooltip = fields.testTooltip;
+  const crosshair = fields.testCrosshair;
+  if (!container || !tooltip || !crosshair) return;
+  const host = fields.testChart.parentElement;
+  if (typeof container.__latencyHoverCleanup === "function") {
+    container.__latencyHoverCleanup();
+  }
+  if (!meta || !meta.maxLen || !meta.paddedTimes.length) {
+    tooltip.classList.remove("visible");
+    crosshair.classList.remove("visible");
+    return;
+  }
+  const svg = container.querySelector("svg");
+  if (!svg) return;
+
+  const hide = () => {
+    tooltip.classList.remove("visible");
+    crosshair.classList.remove("visible");
+    tooltip.__latencyTooltipSignature = "";
+    tooltip.__latencyTooltipSize = null;
+  };
+
+  const handleLeave = () => hide();
+  const handleGlobalPointerMove = (event) => {
+    if (!tooltip.classList.contains("visible") && !crosshair.classList.contains("visible")) {
+      return;
+    }
+    const hostRect = host ? host.getBoundingClientRect() : svg.getBoundingClientRect();
+    if (
+      event.clientX < hostRect.left ||
+      event.clientX > hostRect.right ||
+      event.clientY < hostRect.top ||
+      event.clientY > hostRect.bottom
+    ) {
+      hide();
+    }
+  };
+  const handleScrollOrBlur = () => hide();
+
+  container.addEventListener("mouseleave", handleLeave);
+  container.addEventListener("pointerleave", handleLeave);
+  if (host) {
+    host.addEventListener("mouseleave", handleLeave);
+    host.addEventListener("pointerleave", handleLeave);
+  }
+  window.addEventListener("pointermove", handleGlobalPointerMove, true);
+  window.addEventListener("scroll", handleScrollOrBlur, true);
+  window.addEventListener("blur", handleScrollOrBlur);
+  container.__latencyHoverCleanup = () => {
+    container.removeEventListener("mouseleave", handleLeave);
+    container.removeEventListener("pointerleave", handleLeave);
+    if (host) {
+      host.removeEventListener("mouseleave", handleLeave);
+      host.removeEventListener("pointerleave", handleLeave);
+    }
+    window.removeEventListener("pointermove", handleGlobalPointerMove, true);
+    window.removeEventListener("scroll", handleScrollOrBlur, true);
+    window.removeEventListener("blur", handleScrollOrBlur);
+  };
+
+  container.onmousemove = (event) => {
+    const rect = svg.getBoundingClientRect();
+    const hostRect = (host || fields.testChart).getBoundingClientRect();
+    const offsetX = rect.left - hostRect.left;
+    const scaleX = rect.width / 680;
+    const paddingLeft = meta.padding.left * scaleX;
+    const paddingRight = meta.padding.right * scaleX;
+    const plotWidth = rect.width - paddingLeft - paddingRight;
+    const x = event.clientX - rect.left;
+    if (x < paddingLeft || x > rect.width - paddingRight) {
+      hide();
+      return;
+    }
+    const stepX = plotWidth / Math.max(meta.maxLen - 1, 1);
+    const index = Math.max(
+      0,
+      Math.min(meta.maxLen - 1, Math.round((x - paddingLeft) / stepX))
+    );
+    const hoverIndex = resolveLatencyHoverIndex(meta.paddedSeries, index);
+    let activeIndex = hoverIndex;
+    let rows = buildLatencyTooltipRows(meta, labels, activeIndex);
+    if (!rows) {
+      activeIndex = resolveLatestLatencySampleIndex(meta.paddedSeries);
+      rows = buildLatencyTooltipRows(meta, labels, activeIndex);
+    }
+    const time = meta.paddedTimes[activeIndex] || meta.paddedTimes[hoverIndex];
+    if (!time || !rows) {
+      hide();
+      return;
+    }
+
+    const tooltipSignature = `${activeIndex}|${time}|${rows}`;
+    let tooltipSize = tooltip.__latencyTooltipSize;
+    if (tooltip.__latencyTooltipSignature !== tooltipSignature) {
+      tooltip.innerHTML = `
+        <div class="latency-tooltip-time">${formatTimeFull(time)}</div>
+        ${rows}
+      `;
+      tooltip.__latencyTooltipSignature = tooltipSignature;
+      const tooltipRect = tooltip.getBoundingClientRect();
+      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
+      tooltip.__latencyTooltipSize = tooltipSize;
+    }
+    tooltip.classList.add("visible");
+    if (!tooltipSize) {
+      const tooltipRect = tooltip.getBoundingClientRect();
+      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
+      tooltip.__latencyTooltipSize = tooltipSize;
+    }
+
+    const containerRect = hostRect;
+    let left = event.clientX - containerRect.left + 12;
+    let top = event.clientY - containerRect.top + 12;
+    if (left + tooltipSize.width > containerRect.width) {
+      left = containerRect.width - tooltipSize.width - 12;
+    }
+    if (top + tooltipSize.height > containerRect.height) {
+      top = containerRect.height - tooltipSize.height - 12;
+    }
+    tooltip.style.left = `${Math.max(left, 8)}px`;
+    tooltip.style.top = `${Math.max(top, 8)}px`;
+
+    const crossX = offsetX + paddingLeft + activeIndex * stepX;
+    crosshair.style.left = `${crossX}px`;
+    crosshair.classList.add("visible");
+  };
+}
+
+function buildLatencyTooltipRows(meta, labels, hoverIndex) {
+  if (!meta || !Array.isArray(meta.paddedSeries) || hoverIndex < 0) {
+    return "";
+  }
+  return meta.paddedSeries
+    .map((series, idx) => {
+      const value = series[hoverIndex];
+      if (value === null || value === undefined) return "";
+      const color = meta.colors[idx] || "#4f7cff";
+      const name = labels[idx] || "未命名";
+      return `
+        <div class="latency-tooltip-row">
+          <span class="latency-tooltip-dot" style="background:${color}"></span>
+          <span class="latency-tooltip-name">${name}</span>
+          <strong>${formatLatencyStat(value)}</strong>
+        </div>
+      `;
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+function resolveLatencyHoverIndex(seriesList, preferredIndex) {
+  const normalizedIndex = Number(preferredIndex);
+  if (!Array.isArray(seriesList) || seriesList.length === 0 || !Number.isFinite(normalizedIndex)) {
+    return 0;
+  }
+  const maxLen = seriesList.reduce(
+    (max, series) => Math.max(max, Array.isArray(series) ? series.length : 0),
+    0
+  );
+  if (maxLen <= 0) {
+    return 0;
+  }
+  const clampedIndex = Math.max(0, Math.min(maxLen - 1, Math.round(normalizedIndex)));
+  const hasPointAt = (targetIndex) =>
+    seriesList.some(
+      (series) =>
+        Array.isArray(series) &&
+        targetIndex >= 0 &&
+        targetIndex < series.length &&
+        series[targetIndex] !== null &&
+        series[targetIndex] !== undefined
+    );
+
+  if (hasPointAt(clampedIndex)) {
+    return clampedIndex;
+  }
+
+  for (let distance = 1; distance < maxLen; distance += 1) {
+    const left = clampedIndex - distance;
+    if (left >= 0 && hasPointAt(left)) {
+      return left;
+    }
+    const right = clampedIndex + distance;
+    if (right < maxLen && hasPointAt(right)) {
+      return right;
+    }
+  }
+  return clampedIndex;
+}
+
+function resolveLatestLatencySampleIndex(seriesList) {
+  if (!Array.isArray(seriesList) || seriesList.length === 0) {
+    return -1;
+  }
+  const maxLen = seriesList.reduce(
+    (max, series) => Math.max(max, Array.isArray(series) ? series.length : 0),
+    0
+  );
+  for (let index = maxLen - 1; index >= 0; index -= 1) {
+    const hasPoint = seriesList.some(
+      (series) =>
+        Array.isArray(series) &&
+        index >= 0 &&
+        index < series.length &&
+        series[index] !== null &&
+        series[index] !== undefined
+    );
+    if (hasPoint) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function buildLinePath(series, stepX, padding, plotWidth, plotHeight, maxValue) {
+  const plotStartX = padding.left;
+  const plotEndX = padding.left + plotWidth;
+  const segments = [];
+  let segment = [];
+
+  const flushSegment = () => {
+    if (!segment.length) {
+      return;
+    }
+    if (segment.length === 1) {
+      segments.push(buildSinglePointLatencySegment(segment[0], stepX, plotStartX, plotEndX, plotWidth));
+    } else {
+      segments.push(segment.join(" "));
+    }
+    segment = [];
+  };
+
+  series.forEach((value, index) => {
+    if (value === null || value === undefined) {
+      flushSegment();
+      return;
+    }
+    const clamped = Math.max(0, Math.min(maxValue, value));
+    const x = padding.left + index * stepX;
+    const y = padding.top + plotHeight - (clamped / maxValue) * plotHeight;
+    const command = segment.length
+      ? `L${x.toFixed(1)},${y.toFixed(1)}`
+      : `M${x.toFixed(1)},${y.toFixed(1)}`;
+    segment.push(command);
+  });
+  flushSegment();
+  return segments.join(" ");
+}
+
+function buildSinglePointLatencySegment(command, stepX, plotStartX, plotEndX, plotWidth) {
+  const match = /^M([0-9.]+),([0-9.]+)$/.exec(command);
+  if (!match) {
+    return command;
+  }
+  const x = Number(match[1]);
+  const y = Number(match[2]);
+  const halfSpan = Math.max(Math.min(stepX * 0.38, 10), 4);
+  const minVisibleSpan = Math.min(Math.max(stepX * 0.25, 8), plotWidth);
+  let startX = Math.max(plotStartX, x - halfSpan);
+  let endX = Math.min(plotEndX, x + halfSpan);
+  if (endX - startX < minVisibleSpan) {
+    if (x <= plotStartX + 1) {
+      endX = Math.min(plotEndX, startX + minVisibleSpan);
+    } else if (x >= plotEndX - 1) {
+      startX = Math.max(plotStartX, endX - minVisibleSpan);
+    } else {
+      startX = Math.max(plotStartX, x - minVisibleSpan / 2);
+      endX = Math.min(plotEndX, x + minVisibleSpan / 2);
+      if (endX - startX < minVisibleSpan) {
+        startX = Math.max(plotStartX, endX - minVisibleSpan);
+      }
+    }
+  }
+  return `M${startX.toFixed(1)},${y.toFixed(1)} L${endX.toFixed(1)},${y.toFixed(1)}`;
+}
+
+function padSeries(series, length) {
+  if (series.length >= length) {
+    return series.slice(-length);
+  }
+  const padding = Array.from({ length: length - series.length }, () => null);
+  return padding.concat(series);
+}
+
+function buildTimeLabels(times, maxLen, count, rangeSec) {
+  if (!Array.isArray(times) || times.length === 0) {
+    return [];
+  }
+  if (!maxLen || maxLen < 2) {
+    return [];
+  }
+  const valid = times.filter(
+    (value) => value !== null && value !== undefined && Number.isFinite(value)
+  );
+  const now = Math.floor(Date.now() / 1000);
+  const end = valid.length ? valid[valid.length - 1] : now;
+  const fallbackRange = rangeSec && rangeSec > 0 ? rangeSec : 3600;
+  const start = rangeSec && rangeSec > 0 ? end - rangeSec : (valid.length ? valid[0] : end - fallbackRange);
+  const safeCount = Math.max(count, 2);
+  const steps = Math.max(safeCount - 1, 1);
+  const labels = [];
+  for (let i = 0; i < safeCount; i += 1) {
+    const ratio = steps === 0 ? 0 : i / steps;
+    const index = ratio * (maxLen - 1);
+    const ts = start + (end - start) * ratio;
+    labels.push({ index, label: formatTimeLabel(ts, rangeSec) });
+  }
+  return labels;
+}
+
+function niceStep(value) {
+  if (!value || !Number.isFinite(value)) {
+    return 1;
+  }
+  const pow = Math.pow(10, Math.floor(Math.log10(value)));
+  const fraction = value / pow;
+  let niceFraction = 1;
+  if (fraction <= 1) niceFraction = 1;
+  else if (fraction <= 2) niceFraction = 2;
+  else if (fraction <= 5) niceFraction = 5;
+  else niceFraction = 10;
+  return niceFraction * pow;
+}
+
+function formatTimeLabel(timestamp, rangeSec) {
+  if (!timestamp) return "";
+  const date = new Date(timestamp * 1000);
+  const pad = (num) => String(num).padStart(2, "0");
+  if (!rangeSec || rangeSec <= 86400) {
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+  if (rangeSec <= 86400 * 30) {
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
+}
+
+function formatTimeFull(timestamp) {
+  if (!timestamp) return "--";
+  const date = new Date(timestamp * 1000);
+  const pad = (num) => String(num).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatLatencyTick(value) {
+  return formatLatency(value);
+}
+
+function summarizeLatency(series) {
+  const values = (Array.isArray(series) ? series : []).filter(
+    (value) => value !== null && value !== undefined && Number.isFinite(value)
+  );
+  if (!values.length) {
+    return { min: null, avg: null, max: null };
+  }
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return { min, avg, max };
+}
+
+function summarizeLoss(series) {
+  const values = (Array.isArray(series) ? series : []).filter(
+    (value) => value !== null && value !== undefined && Number.isFinite(value)
+  );
+  if (!values.length) {
+    return null;
+  }
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return avg;
+}
+
+function formatLatencyStat(value) {
+  return formatLatency(value);
+}
+
+function formatLossValue(loss) {
+  if (loss === null || loss === undefined || !Number.isFinite(loss)) {
+    return "丢包 --";
+  }
+  return `丢包 ${loss.toFixed(1)}%`;
+}
+
+function resolveLatestHistoryValue(series) {
+  if (!Array.isArray(series)) return null;
+  for (let index = series.length - 1; index >= 0; index -= 1) {
+    const value = series[index];
+    if (value !== null && value !== undefined && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function summarizeTestSnapshot(test, history) {
+  const latestLatency =
+    resolveLatestHistoryValue(history?.latency) ??
+    normalizeNumber(test?.latency_ms);
+  let latestLoss =
+    resolveLatestHistoryValue(history?.loss) ??
+    normalizeNumber(test?.packet_loss);
+  if (latestLoss === null || latestLoss === undefined || !Number.isFinite(latestLoss)) {
+    latestLoss = latestLatency === null ? 100 : 0;
+  }
+  return {
+    latency:
+      latestLatency === null
+        ? "当前 --"
+        : `当前 ${formatLatencyStat(latestLatency)}`,
+    loss: formatLossValue(latestLoss),
+  };
+}
+
+function formatCPUModel(cpu) {
+  if (!cpu) return "--";
+  const model = stripCPUFrequency(cpu.model || "");
+  const cores = cpu.cores || 0;
+  const parts = [];
+  if (model) parts.push(model);
+  if (cores) parts.push(`${cores} 核`);
+  return parts.length ? parts.join(" · ") : "--";
+}
+
+function stripCPUFrequency(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const atIndex = value.indexOf("@");
+  if (atIndex !== -1) {
+    return value.slice(0, atIndex).trim();
+  }
+  return value.replace(/\s*\d+(?:\.\d+)?\s*GHz$/i, "").trim();
+}
+
+function formatDiskType(node, stats) {
+  const raw = (node?.disk_type || stats?.disk_type || "").trim();
+  return raw || "未知";
+}
+
+function formatDiskMeta(node, stats, total) {
+  const typeLabel = formatDiskType(node, stats);
+  if (Number.isFinite(total) && total > 0) {
+    return `${typeLabel} · ${formatBytes(total)} total`;
+  }
+  return typeLabel;
+}
+
+function calcNetPercent(net, speedMbps) {
+  const maxMbps = Number(speedMbps || 0);
+  if (!maxMbps || maxMbps <= 0) {
+    return 0;
+  }
+  const totalMbps = ((net?.tx_bytes_per_sec || 0) + (net?.rx_bytes_per_sec || 0)) * 8 / 1_000_000;
+  return clamp((totalMbps / maxMbps) * 100);
+}
+
+function formatTestName(test) {
+  const name = (test.name || "").trim();
+  if (name) return name;
+  return "未命名";
+}
+
+function formatLatencyValue(test) {
+  if (test.latency_ms !== null && test.latency_ms !== undefined) {
+    return formatLatency(test.latency_ms);
+  }
+  return "--";
+}
+
+function formatLatency(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "--";
+  }
+  const unit = "ms";
+  if (Math.abs(value) < Number.EPSILON) {
+    return `0${unit}`;
+  }
+  if (value >= 1) return `${Math.round(value)}${unit}`;
+  return `${value.toFixed(1)}${unit}`;
+}
+
+function testKey(test) {
+  const type = (test.type || "icmp").toLowerCase();
+  const host = (test.host || "").toLowerCase();
+  const port = test.port || 0;
+  const name = (test.name || "").toLowerCase();
+  return `${type}|${host}|${port}|${name}`;
+}
+
+function testColor(key, index) {
+  const palette = ["#4f7cff", "#22c55e", "#f97316", "#a855f7", "#facc15", "#14b8a6"];
+  if (!key) {
+    return palette[index % palette.length];
+  }
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  }
+  return palette[hash % palette.length];
+}
+
+function tagColor(tag, index) {
+  return testColor(tag, index);
+}
+
+function flagEmoji(code) {
+  const normalized = (code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(normalized)) {
+    return "";
+  }
+  const base = 0x1f1e6;
+  const first = base + normalized.charCodeAt(0) - 65;
+  const second = base + normalized.charCodeAt(1) - 65;
+  return String.fromCodePoint(first, second) + " ";
+}
+
+function formatRegion(code) {
+  const normalized = (code || "").trim().toUpperCase();
+  if (!normalized) return "--";
+  const resolved =
+    (regionDisplayNames && typeof regionDisplayNames.of === "function"
+      ? regionDisplayNames.of(normalized)
+      : "") ||
+    fallbackRegionNames[normalized] ||
+    normalized;
+  return `${flagEmoji(normalized)}${resolved}`.trim();
+}
+
+function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
+  if (!expireAt) {
+    return "未设置";
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const diff = expireAt - now;
+  if (diff <= 0) {
+    if (autoRenew && renewIntervalSec > 0) {
+      const elapsed = now - expireAt;
+      const remain = renewIntervalSec - (elapsed % renewIntervalSec);
+      return formatDuration(remain);
+    }
+    return autoRenew ? "续费中" : "已到期";
+  }
+  const days = Math.floor(diff / 86400);
+  const hours = Math.floor((diff % 86400) / 3600);
+  const minutes = Math.floor((diff % 3600) / 60);
+  if (days > 0) return `${days}天 ${hours}小时`;
+  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
+  return `${minutes}分钟`;
+}
+
+function formatRemainingSummary(expireAt, autoRenew, renewIntervalSec) {
+  if (!expireAt) {
+    return "--";
+  }
+  const value = formatRemaining(expireAt, autoRenew, renewIntervalSec);
+  if (value === "未设置") {
+    return "--";
+  }
+  if (value === "已到期" || value === "续费中") {
+    return value;
+  }
+  return `剩余 ${value}`;
+}
+
+function formatDuration(seconds) {
+  const safe = Math.max(0, Math.floor(seconds || 0));
+  const days = Math.floor(safe / 86400);
+  const hours = Math.floor((safe % 86400) / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  if (days > 0) return `${days}天 ${hours}小时`;
+  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
+  return `${minutes}分钟`;
+}
+
+function resolveDisplayName(node, stats) {
+  const alias = node.alias || stats.node_alias;
+  if (alias) return alias;
+  const hostname = (stats.hostname || "").trim();
+  const nodeName = (stats.node_name || "").trim();
+  if (nodeName && nodeName !== hostname) {
+    return nodeName;
+  }
+  const nodeID = (stats.node_id || "").trim();
+  if (nodeID && nodeID !== hostname) {
+    return nodeID;
+  }
+  return "未命名节点";
+}
+
+function clamp(value) {
+  if (Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function formatLoad(cpu) {
+  const l1 = cpu.load1 ?? 0;
+  const l5 = cpu.load5 ?? 0;
+  const l15 = cpu.load15 ?? 0;
+  return `${l1.toFixed(2)} / ${l5.toFixed(2)} / ${l15.toFixed(2)}`;
+}
+
+function formatBytes(bytes = 0) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes);
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatRate(bytes = 0) {
+  return `${formatBytes(bytes)}/s`;
+}
+
+function formatTime(timestamp) {
+  if (!timestamp) return "--";
+  return timeFormatter.format(new Date(timestamp * 1000));
+}
+
+function formatUptime(seconds = 0) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function aggregateDisk(list) {
+  let total = 0;
+  let used = 0;
+  list.forEach((item) => {
+    total += item.total || 0;
+    used += item.used || 0;
+  });
+  const percent = total ? (used / total) * 100 : 0;
+  return { total, used, percent };
+}
+
+updateFooter("");
+loadTestHistoryCache();
+window.setInterval(refreshRealtimeStatus, 1000);
+
+loadRemoteConfig().finally(() => {
+  fetchPublicSnapshot().finally(() => {
+    connectWS();
+  });
+});

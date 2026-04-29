@@ -1,0 +1,10 @@
+.git
+.gitignore
+.serena
+output
+dist
+internal/server/web/admin/node_modules
+internal/server/web/dist
+internal/server/web/admin/.DS_Store
+**/.DS_Store
+tmp

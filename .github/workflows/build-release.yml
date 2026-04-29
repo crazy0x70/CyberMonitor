@@ -1,0 +1,428 @@
+name: Build, Release and Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（例如 0.1.0）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCKER_BUILD_SUMMARY: 'false'
+
+concurrency:
+  group: "release-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      build_time: ${{ steps.version.outputs.build_time }}
+      image_repo: ${{ steps.version.outputs.image_repo }}
+    steps:
+      - name: 计算版本号
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            if [ -z "$VERSION" ]; then
+              VERSION="0.0.0-${{ github.run_number }}"
+            fi
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          fi
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          REPO_OWNER="$(printf '%s' "${GITHUB_REPOSITORY%/*}" | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME_KEBAB="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | sed -E 's/([[:lower:][:digit:]])([[:upper:]])/\1-\2/g; s/[[:space:]_]+/-/g' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPO="${REPO_OWNER}/${REPO_NAME_KEBAB}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+          echo "image_repo=$IMAGE_REPO" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+  build-server:
+    needs: [version, build-admin]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: amd64
+            output: cyber-monitor-server-linux-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: arm64
+            output: cyber-monitor-server-linux-arm64
+          - name: server
+            cmd_path: ./cmd/server
+            os: linux
+            arch: arm
+            goarm: 7
+            output: cyber-monitor-server-linux-armv7
+          - name: server
+            cmd_path: ./cmd/server
+            os: darwin
+            arch: amd64
+            output: cyber-monitor-server-darwin-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: darwin
+            arch: arm64
+            output: cyber-monitor-server-darwin-arm64
+          - name: server
+            cmd_path: ./cmd/server
+            os: windows
+            arch: amd64
+            output: cyber-monitor-server-windows-amd64.exe
+          - name: server
+            cmd_path: ./cmd/server
+            os: freebsd
+            arch: amd64
+            output: cyber-monitor-server-freebsd-amd64
+          - name: server
+            cmd_path: ./cmd/server
+            os: freebsd
+            arch: arm64
+            output: cyber-monitor-server-freebsd-arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Download admin assets
+        uses: actions/download-artifact@v8
+        with:
+          name: admin-web-sync
+          path: .
+
+      - name: Restore admin assets
+        run: |
+          mkdir -p internal/server/web
+          tar -xzf admin-web-sync.tar.gz -C internal/server/web
+
+      - name: Build ${{ matrix.output }}
+        run: |
+          mkdir -p dist
+          export CGO_ENABLED=0
+          export GOOS="${{ matrix.os }}"
+          export GOARCH="${{ matrix.arch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM="${{ matrix.goarm }}"
+          fi
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o "dist/${{ matrix.output }}" \
+            "${{ matrix.cmd_path }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          retention-days: 30
+
+  build-agent:
+    needs: [version]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: amd64
+            output: cyber-monitor-agent-linux-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: arm64
+            output: cyber-monitor-agent-linux-arm64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: linux
+            arch: arm
+            goarm: 7
+            output: cyber-monitor-agent-linux-armv7
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: darwin
+            arch: amd64
+            output: cyber-monitor-agent-darwin-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: darwin
+            arch: arm64
+            output: cyber-monitor-agent-darwin-arm64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: windows
+            arch: amd64
+            output: cyber-monitor-agent-windows-amd64.exe
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: freebsd
+            arch: amd64
+            output: cyber-monitor-agent-freebsd-amd64
+          - name: agent
+            cmd_path: ./cmd/agent
+            os: freebsd
+            arch: arm64
+            output: cyber-monitor-agent-freebsd-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build ${{ matrix.output }}
+        run: |
+          mkdir -p dist
+          export CGO_ENABLED=0
+          export GOOS="${{ matrix.os }}"
+          export GOARCH="${{ matrix.arch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            export GOARM="${{ matrix.goarm }}"
+          fi
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${{ needs.version.outputs.version }} -X main.Commit=${{ github.sha }} -X main.BuildTime=${{ needs.version.outputs.build_time }}" \
+            -o "dist/${{ matrix.output }}" \
+            "${{ matrix.cmd_path }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          retention-days: 30
+
+  build-admin:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Verify build inputs
+        id: build-inputs
+        run: |
+          GO_VERSION="$(awk '/^go / { print $2; exit }' go.mod)"
+          DOCKER_GO_VERSION="$(awk -F= '/^ARG GO_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
+          DOCKER_NODE_VERSION="$(awk '/^FROM --platform=\$BUILDPLATFORM node:/ { line=$0; sub(/^FROM --platform=\$BUILDPLATFORM node:/, "", line); sub(/-.*/, "", line); print line; exit }' Dockerfile)"
+          if [ -z "$GO_VERSION" ] || [ -z "$DOCKER_GO_VERSION" ]; then
+            echo "Unable to resolve Go version from go.mod or Dockerfile" >&2
+            exit 1
+          fi
+          if [ -z "$DOCKER_NODE_VERSION" ]; then
+            echo "Unable to resolve Node version from Dockerfile" >&2
+            exit 1
+          fi
+          if [ "$GO_VERSION" != "$DOCKER_GO_VERSION" ]; then
+            echo "Go version drift detected: go.mod=$GO_VERSION, Dockerfile GO_IMAGE_VERSION=$DOCKER_GO_VERSION" >&2
+            exit 1
+          fi
+          for path in \
+            internal/server/web/admin/package.json \
+            internal/server/web/admin/package-lock.json \
+            internal/server/web/admin/src/App.tsx \
+            internal/server/web/admin/lib/admin-ui.ts \
+            internal/server/web/public/index.html
+          do
+            test -e "$path"
+            git ls-files --error-unmatch "$path" >/dev/null 2>&1
+          done
+          echo "node_version=$DOCKER_NODE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.build-inputs.outputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: internal/server/web/admin/package-lock.json
+
+      - name: Build admin assets
+        run: |
+          npm --prefix internal/server/web/admin ci
+          npm --prefix internal/server/web/admin run lint
+          npm --prefix internal/server/web/admin run build:admin
+
+      - name: Package synced admin assets
+        run: |
+          tar -czf admin-web-sync.tar.gz -C internal/server/web dist/admin
+
+      - name: Upload synced admin assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: admin-web-sync
+          path: admin-web-sync.tar.gz
+          retention-days: 30
+
+  docker-images:
+    needs: [version]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    env:
+      IMAGE_PREFIX: ghcr.io/${{ needs.version.outputs.image_repo }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - target: release-server
+            suffix: server
+            scope: server
+          - target: release-agent
+            suffix: agent
+            scope: agent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.suffix }}:${{ needs.version.outputs.version }}
+            ${{ env.IMAGE_PREFIX }}-${{ matrix.suffix }}:latest
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ needs.version.outputs.build_time }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
+  release:
+    needs: [version, build-server, build-agent, docker-images]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve changelog range
+        id: changelog
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          PREV=$(git tag --sort=version:refname | grep -v "^${TAG}$" | tail -1)
+          if [ -z "$PREV" ]; then
+            PREV="$TAG"
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          else
+            URL="https://github.com/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+          fi
+          echo "prev_tag=$PREV" >> $GITHUB_OUTPUT
+          echo "prev_version=${PREV#v}" >> $GITHUB_OUTPUT
+          echo "compare_url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+          pattern: "cyber-monitor-*"
+
+      - name: Download synced admin assets
+        uses: actions/download-artifact@v8
+        with:
+          name: admin-web-sync
+          path: artifacts
+
+      - name: Restore synced admin assets
+        run: |
+          mkdir -p internal/server/web
+          tar -xzf artifacts/admin-web-sync.tar.gz -C internal/server/web
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name "cyber-monitor-*" -exec cp {} release/ \;
+          find release -type f -name "cyber-monitor-*" ! -name "*.exe" -exec chmod +x {} \;
+
+      - name: Package web assets for release
+        run: |
+          tar -czf release/web-dist.tar.gz -C internal/server/web public dist/admin
+          (cd internal/server/web && zip -r ../../../release/web-dist.zip public dist/admin)
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -la
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          NOTES="Full Changelog: [${{ steps.changelog.outputs.prev_tag }}...${TAG}](${{ steps.changelog.outputs.compare_url }})"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/cyber-monitor-* release/SHA256SUMS --clobber
+            gh release edit "$TAG" \
+              --title "$TAG" \
+              --notes "$NOTES"
+          else
+            gh release create "$TAG" release/cyber-monitor-* release/SHA256SUMS \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              --target "${GITHUB_SHA}"
+          fi
+
+      - name: Attach web archives to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          gh release upload "$TAG" release/web-dist.tar.gz release/web-dist.zip --clobber
