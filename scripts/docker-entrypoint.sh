@@ -27,7 +27,7 @@ prepare_data_dir() {
   fi
 
   mkdir -p "${DATA_DIR}"
-  if ! chown "${RUNTIME_USER}:${RUNTIME_USER}" "${DATA_DIR}"; then
+  if ! chown -R "${RUNTIME_USER}:${RUNTIME_USER}" "${DATA_DIR}"; then
     echo "Failed to prepare data directory permissions for ${DATA_DIR}" >&2
     exit 1
   fi

@@ -4,7 +4,7 @@
 
   <p>
     <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.25-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/Go-1.26.2-blue" alt="Go Version">
     <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
   </p>
 </div>
@@ -16,7 +16,11 @@
 如需自动配置 systemd 服务或交互式选择安装类型（Server 或 Agent），请执行：
 
 ```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh)" @ install
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o "$tmp/one-click.sh"
+sudo bash "$tmp/one-click.sh" install
+rm -rf "$tmp"
 ```
 
 ### 2. Docker 部署主控 (Server)
@@ -68,10 +72,14 @@ Agent 同时兼容历史版本环境变量（如 `server-url`、`agent-token`）
 
 初次安装时，系统会自动生成并持久化 `Node ID`。如需统一资产管理，也可在安装时手动指定。探针的握手过程使用 `HTTP` 完成，随后运行态优先尝试 `gRPC`。
 
-**Linux / macOS**
+**Linux（systemd）**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<主控IP>:25012 --agent-token <你的Token>
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
+sudo bash "$tmp/agent.sh" --server-url http://<主控IP>:25012 --agent-token <你的Token>
+rm -rf "$tmp"
 ```
 
 **Windows**
@@ -82,11 +90,11 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
 ```
 
-如需传入 `--node-id` 或 `--disable-update` 等自定义参数，直接追加至上述命令结尾即可。
+Linux 自定义参数使用 `--node-id`、`--disable-update` 等 shell 参数。Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
 
 ### 5. 卸载探针 (Agent)
 
-**Linux / macOS**
+**Linux（systemd）**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh

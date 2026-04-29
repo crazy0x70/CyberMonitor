@@ -1,8 +1,12 @@
 .git
 .gitignore
+.cache
 .serena
 output
 dist
+/agent
+/server
+/cyber-monitor
 internal/server/web/admin/node_modules
 internal/server/web/dist
 internal/server/web/admin/.DS_Store

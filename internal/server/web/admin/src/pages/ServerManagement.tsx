@@ -820,12 +820,19 @@ export default function ServerManagement({
       : !editingAgentVersion
         ? "当前节点还没有上报 Agent 版本"
         : "";
+  const agentAlreadyLatest = Boolean(
+    editingNode?.agent_update_supported && agentUpdateInfo?.latest_version && !agentUpdateInfo.available,
+  );
+  const agentUpdateActionDisabledReason =
+    agentUpdateDisabledReason || (agentAlreadyLatest ? "当前 Agent 已是最新版" : "");
   const agentLatestVersionLabel = !editingNode
     ? "--"
     : !editingNode.agent_update_supported
       ? "已禁用更新"
       : refreshingAgentUpdate && !agentUpdateInfo
         ? "检查中…"
+        : agentAlreadyLatest
+          ? "当前已为最新版"
         : agentUpdateInfo?.latest_version
           ? formatVersionLabel(agentUpdateInfo.latest_version)
           : editingNode.agent_update_target_version
@@ -977,7 +984,7 @@ export default function ServerManagement({
         toast.success(
           info.available
             ? `已检查到最新版本 ${info.latest_version}`
-            : `当前 Agent 已是最新版本 ${info.latest_version}`,
+            : "当前 Agent 已是最新版本",
         );
         return;
       }
@@ -1315,8 +1322,8 @@ export default function ServerManagement({
                             type="button"
                             className={`${adminPrimaryButtonClass} h-11 px-5`}
                             onClick={handleAgentUpdate}
-                            disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
-                            title={agentUpdateDisabledReason || undefined}
+                            disabled={Boolean(agentUpdateActionDisabledReason) || refreshingAgentUpdate || updatingAgent}
+                            title={agentUpdateActionDisabledReason || undefined}
                           >
                             {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                             {updatingAgent ? "更新中" : "立即更新"}

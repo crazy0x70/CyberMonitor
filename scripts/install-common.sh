@@ -48,7 +48,7 @@ resolve_version() {
   fi
   if [[ -z "${version}" ]]; then
     version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | \
-      sed -n 's/.*"tag_name": *"\\([^"]*\\)".*/\\1/p' | head -n 1)"
+      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
   fi
   if [[ -z "${version}" ]]; then
     die "无法获取最新版本，请使用版本号手动指定"

@@ -24,6 +24,8 @@ import (
 const (
 	dockerSocketEnvKey             = "CM_DOCKER_SOCKET"
 	containerIDEnvKey              = "CM_CONTAINER_ID"
+	containerVersionEnvKey         = "CM_VERSION"
+	containerCommitEnvKey          = "CM_COMMIT"
 	dockerHelperCommand            = "docker-recreate-helper"
 	dockerHelperTargetContainerEnv = "CM_DOCKER_HELPER_TARGET_CONTAINER"
 	dockerHelperTargetImageEnv     = "CM_DOCKER_HELPER_TARGET_IMAGE"
@@ -322,7 +324,7 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 	return nil
 }
 
-func RunDockerRecreateHelper(ctx context.Context) error {
+func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	targetContainerID := strings.TrimSpace(os.Getenv(dockerHelperTargetContainerEnv))
 	targetImage := strings.TrimSpace(os.Getenv(dockerHelperTargetImageEnv))
 	currentNodeID := strings.TrimSpace(os.Getenv(dockerHelperNodeIDEnv))
@@ -356,9 +358,19 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("创建替换容器失败: %w", err)
 	}
+	originalName := strings.TrimPrefix(inspect.Name, "/")
+	rollbackReplacement := true
+	oldRenamed := false
 	defer func() {
-		if err != nil {
-			_ = cli.ContainerRemove(context.Background(), created.ID, container.RemoveOptions{Force: true})
+		if !rollbackReplacement {
+			return
+		}
+		rollbackCtx := context.Background()
+		_ = cli.ContainerRemove(rollbackCtx, created.ID, container.RemoveOptions{Force: true})
+		if oldRenamed {
+			if renameErr := cli.ContainerRename(rollbackCtx, inspect.ID, originalName); renameErr == nil {
+				_ = cli.ContainerStart(rollbackCtx, inspect.ID, container.StartOptions{})
+			}
 		}
 	}()
 	for networkName, endpoint := range extraNetworks {
@@ -368,16 +380,27 @@ func RunDockerRecreateHelper(ctx context.Context) error {
 		}
 	}
 	timeout := 20
-	_ = cli.ContainerStop(ctx, inspect.ID, container.StopOptions{Timeout: &timeout})
-	if removeErr := cli.ContainerRemove(ctx, inspect.ID, container.RemoveOptions{Force: true}); removeErr != nil {
-		return fmt.Errorf("移除旧容器失败: %w", removeErr)
+	if stopErr := cli.ContainerStop(ctx, inspect.ID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
+		err = fmt.Errorf("停止旧容器失败: %w", stopErr)
+		return err
 	}
-	originalName := strings.TrimPrefix(inspect.Name, "/")
+	backupName := fmt.Sprintf("%s-prev-%d", sanitizeContainerName(originalName), time.Now().Unix())
+	if renameErr := cli.ContainerRename(ctx, inspect.ID, backupName); renameErr != nil {
+		err = fmt.Errorf("备份旧容器名称失败: %w", renameErr)
+		return err
+	}
+	oldRenamed = true
 	if renameErr := cli.ContainerRename(ctx, created.ID, originalName); renameErr != nil {
-		return fmt.Errorf("恢复容器名称失败: %w", renameErr)
+		err = fmt.Errorf("恢复容器名称失败: %w", renameErr)
+		return err
 	}
 	if startErr := cli.ContainerStart(ctx, created.ID, container.StartOptions{}); startErr != nil {
-		return fmt.Errorf("启动新容器失败: %w", startErr)
+		err = fmt.Errorf("启动新容器失败: %w", startErr)
+		return err
+	}
+	rollbackReplacement = false
+	if removeErr := cli.ContainerRemove(ctx, inspect.ID, container.RemoveOptions{Force: true}); removeErr != nil {
+		return fmt.Errorf("清理旧容器失败: %w", removeErr)
 	}
 	return nil
 }
@@ -402,7 +425,7 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 	if hostname == shortID {
 		hostname = ""
 	}
-	env := append([]string{}, inspect.Config.Env...)
+	env := sanitizeReplacementEnv(inspect.Config.Env)
 	env = backfillEnvValueIfEmpty(env, "CM_NODE_ID", currentNodeID)
 	cfg := &container.Config{
 		Hostname:     hostname,
@@ -428,6 +451,24 @@ func buildReplacementSpec(inspect dockertypes.ContainerJSON, targetImage string,
 	hostCfg.Mounts = append([]mount.Mount{}, inspect.HostConfig.Mounts...)
 	netCfg, extraNetworks := buildReplacementNetworking(inspect)
 	return cfg, &hostCfg, netCfg, extraNetworks
+}
+
+func sanitizeReplacementEnv(env []string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		switch strings.TrimSpace(key) {
+		case containerVersionEnvKey, containerCommitEnvKey:
+			// Let the replacement image provide its own baked version metadata.
+			continue
+		default:
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func buildReplacementNetworking(inspect dockertypes.ContainerJSON) (*network.NetworkingConfig, map[string]*network.EndpointSettings) {
@@ -459,8 +500,13 @@ func buildReplacementNetworking(inspect dockertypes.ContainerJSON) (*network.Net
 
 func resolvePrimaryNetworkName(mode string, networks map[string]*network.EndpointSettings) string {
 	mode = strings.TrimSpace(mode)
-	if mode != "" {
+	if _, ok := networks[mode]; ok {
 		return mode
+	}
+	if mode == "default" {
+		if _, ok := networks["bridge"]; ok {
+			return "bridge"
+		}
 	}
 	if len(networks) != 1 {
 		return ""

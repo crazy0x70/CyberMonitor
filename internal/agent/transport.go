@@ -184,6 +184,9 @@ func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token s
 }
 
 func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
+	if t.useHTTPForStats() {
+		return t.http.ReportStats(ctx, stats, token)
+	}
 	return callWithFallback(
 		t,
 		ctx,
@@ -208,6 +211,12 @@ func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token,
 		},
 	)
 	return err
+}
+
+func (t *controlPlaneTransport) useHTTPForStats() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastMode == "http"
 }
 
 func (t *controlPlaneTransport) Close() error {

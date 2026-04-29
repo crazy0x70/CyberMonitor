@@ -763,40 +763,42 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			store.mu.RLock()
 			node, exists := store.nodes[nodeID]
+			profile := store.profiles[nodeID]
 			store.mu.RUnlock()
 			if !exists {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
 				return
 			}
+			updateStats := withEffectiveAgentVersion(node.Stats, profile)
 
 			if r.Method == http.MethodGet {
-				if !resolveAgentUpdateSupported(node.Stats) {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(node.Stats)))
+				if !resolveAgentUpdateSupported(updateStats) {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(updateStats)))
 					return
 				}
-				if strings.TrimSpace(node.Stats.AgentVersion) == "" {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
+				if strings.TrimSpace(updateStats.AgentVersion) == "" {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
 					return
 				}
-				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
+				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(updateStats.AgentVersion))
 				releaseInfo, err := client.CheckLatest(r.Context())
 				if err != nil {
 					writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 					return
 				}
-				writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, releaseInfo, ""))
+				writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, releaseInfo, ""))
 				return
 			}
 
-			if !resolveAgentUpdateSupported(node.Stats) {
-				message := resolveAgentUpdateUnsupportedReason(node.Stats)
+			if !resolveAgentUpdateSupported(updateStats) {
+				message := resolveAgentUpdateUnsupportedReason(updateStats)
 				if strings.TrimSpace(message) == "" {
 					message = "当前节点平台暂不支持后台自更新"
 				}
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 				return
 			}
-			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
+			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(updateStats.AgentVersion))
 			releaseInfo, err := client.CheckLatest(r.Context())
 			if err != nil {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -1280,16 +1282,6 @@ func Run(ctx context.Context, cfg Config) error {
 		adminMux.Handle("/assets/", assetsHandler)
 	}
 
-	if !splitMode {
-		publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/dashboard" {
-				http.NotFound(w, r)
-				return
-			}
-			http.Redirect(w, r, "/", http.StatusFound)
-		})
-	}
-
 	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
 		data, err := webFS.ReadFile("web/public/index.html")
 		if err != nil {
@@ -1369,7 +1361,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
-			case "/", "/dashboard":
+			case "/":
 				writePublicIndexHTML(w, r)
 				return
 			default:
@@ -2455,6 +2447,26 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	}
 }
 
+func resolveEffectiveAgentVersion(stats metrics.NodeStats, profile *NodeProfile) string {
+	currentVersion := strings.TrimSpace(stats.AgentVersion)
+	if profile == nil {
+		return currentVersion
+	}
+	if strings.TrimSpace(profile.AgentUpdateState) != "succeeded" {
+		return currentVersion
+	}
+	targetVersion := strings.TrimSpace(profile.AgentUpdateTargetVersion)
+	if targetVersion == "" {
+		return currentVersion
+	}
+	return targetVersion
+}
+
+func withEffectiveAgentVersion(stats metrics.NodeStats, profile *NodeProfile) metrics.NodeStats {
+	stats.AgentVersion = resolveEffectiveAgentVersion(stats, profile)
+	return stats
+}
+
 func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
 	if profile == nil {
 		supported := resolveAgentUpdateSupported(stats)
@@ -2964,10 +2976,11 @@ func buildNodeView(node NodeState, profile *NodeProfile, now time.Time) NodeView
 			resolved.TestIntervalSec = defaultTestIntervalSec
 		}
 	}
-	group, tags := resolveProfileGroupTags(&resolved, node.Stats)
-	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(&resolved, node.Stats)
+	viewStats := withEffectiveAgentVersion(node.Stats, &resolved)
+	group, tags := resolveProfileGroupTags(&resolved, viewStats)
+	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(&resolved, viewStats)
 	return NodeView{
-		Stats:                    node.Stats,
+		Stats:                    viewStats,
 		LastSeen:                 node.LastSeen.Unix(),
 		FirstSeen:                node.FirstSeen.Unix(),
 		Status:                   resolveNodeStatus(node.LastSeen, now),
@@ -3209,8 +3222,7 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		if r.TLS != nil {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws: wss:")
-		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com; connect-src 'self' ws: wss: https://challenges.cloudflare.com")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
@@ -3464,7 +3476,7 @@ func (s *Store) ExportConfig() ConfigTransferData {
 	view.SessionToken = ""
 	view.SessionExpiresAt = 0
 	s.mu.RLock()
-	profiles := cloneProfiles(s.profiles)
+	profiles := cloneProfilesForExport(s.profiles)
 	s.mu.RUnlock()
 	return ConfigTransferData{
 		Version:    configExportVersion,
@@ -4391,6 +4403,7 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 	var data PersistedData
 	s.mu.Lock()
 	profile := s.ensureProfileLocked(nodeID)
+	node, hasNode := s.nodes[nodeID]
 	reportedAt := time.Now().Unix()
 	state := strings.TrimSpace(report.State)
 	if state == "" {
@@ -4399,6 +4412,10 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 	profile.AgentUpdateState = state
 	if version := strings.TrimSpace(report.Version); version != "" {
 		profile.AgentUpdateTargetVersion = version
+		if hasNode && strings.EqualFold(state, "succeeded") {
+			node.Stats.AgentVersion = version
+			s.nodes[nodeID] = node
+		}
 	}
 	profile.AgentUpdateMessage = strings.TrimSpace(report.Message)
 	profile.AgentUpdateReportedAt = reportedAt
