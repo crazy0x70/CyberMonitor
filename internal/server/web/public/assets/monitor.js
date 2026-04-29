@@ -2608,7 +2608,7 @@ function renderNetworkSection(fields, nodeId) {
     cardStats.appendChild(latency);
 
     const loss = document.createElement("div");
-    loss.className = `network-card-loss ${snapshot.lossTone}`;
+    loss.className = "network-card-loss";
     loss.textContent = snapshot.loss;
 
     card.appendChild(cardName);
@@ -3585,20 +3585,6 @@ function latencyToneClass(value) {
   return "latency-bad";
 }
 
-function lossToneClass(value) {
-  const loss = normalizeNumber(value);
-  if (loss === null) {
-    return "loss-unknown";
-  }
-  if (loss <= 1) {
-    return "loss-good";
-  }
-  if (loss <= 5) {
-    return "loss-warn";
-  }
-  return "loss-bad";
-}
-
 function summarizeTestSnapshot(test, rangeHistory, fallbackHistory) {
   const latestLatency =
     resolveLatestHistoryValue(rangeHistory?.latency) ??
@@ -3613,15 +3599,13 @@ function summarizeTestSnapshot(test, rangeHistory, fallbackHistory) {
     latestLoss = latestLatency === null ? 100 : 0;
   }
   const displayLoss = averageLoss ?? latestLoss;
-  const lossLabel = averageLoss === null ? "丢包" : "平均丢包";
   return {
     latency:
       latestLatency === null
         ? "当前 --"
         : `当前 ${formatLatencyStat(latestLatency)}`,
     latencyTone: latencyToneClass(latestLatency),
-    loss: formatLossValue(displayLoss, lossLabel),
-    lossTone: lossToneClass(displayLoss),
+    loss: formatLossValue(displayLoss, "丢包率"),
   };
 }
 

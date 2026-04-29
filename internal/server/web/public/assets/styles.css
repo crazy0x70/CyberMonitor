@@ -1147,26 +1147,22 @@ html[data-theme="dark"] .theme-toggle:hover {
   font-variant-numeric: tabular-nums;
 }
 
-.network-card-latency.latency-good,
-.network-card-loss.loss-good {
+.network-card-latency.latency-good {
   color: #22c55e;
   font-weight: 300;
 }
 
-.network-card-latency.latency-warn,
-.network-card-loss.loss-warn {
+.network-card-latency.latency-warn {
   color: #f59e0b;
   font-weight: 300;
 }
 
-.network-card-latency.latency-bad,
-.network-card-loss.loss-bad {
+.network-card-latency.latency-bad {
   color: #ef4444;
   font-weight: 300;
 }
 
-.network-card-latency.latency-unknown,
-.network-card-loss.loss-unknown {
+.network-card-latency.latency-unknown {
   color: var(--muted);
   font-weight: 300;
 }
@@ -1175,6 +1171,7 @@ html[data-theme="dark"] .theme-toggle:hover {
   margin-top: 6px;
   text-align: center;
   font-size: 11px;
+  color: var(--muted);
 }
 
 .network-crosshair {
