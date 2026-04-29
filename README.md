@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.25-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/Go-1.26.2-blue" alt="Go Version">
     <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
   </p>
 </div>
@@ -18,7 +18,11 @@
 To automatically configure the systemd service and interactively choose between installing the Server or Agent, run:
 
 ```bash
-bash -c "$(curl -L https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh)" @ install
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o "$tmp/one-click.sh"
+sudo bash "$tmp/one-click.sh" install
+rm -rf "$tmp"
 ```
 
 ### 2. Deploying the Server via Docker
@@ -79,10 +83,14 @@ A default `Node ID` is generated and persisted during first-time installation. Y
 
 Note: The installation process uses HTTP for the initial bootstrap handshake. Once running, the Agent favors gRPC but falls back to HTTP when necessary. When using an HTTPS address, maintaining HTTP/2 through your proxy is recommended for optimal performance.
 
-**Linux / macOS**
+**Linux (systemd)**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url http://<server-ip>:25012 --agent-token <your-token>
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
+sudo bash "$tmp/agent.sh" --server-url http://<server-ip>:25012 --agent-token <your-token>
+rm -rf "$tmp"
 ```
 
 **Windows**
@@ -93,11 +101,11 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script -ServerUrl 'http://<server-ip>:25012' -AgentToken '<your-token>'
 ```
 
-To provide custom parameters such as `--node-id` or `--disable-update`, append them to the command above as appropriate.
+Linux custom parameters use shell flags such as `--node-id` and `--disable-update`. Windows custom parameters use PowerShell flags such as `-NodeId` and `-DisableUpdate`.
 
 ### 5. Uninstalling the Agent
 
-**Linux / macOS**
+**Linux (systemd)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh

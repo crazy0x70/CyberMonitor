@@ -2,7 +2,17 @@ export function buildAgentInstallCommand(endpoint: string, token: string) {
   const normalizedEndpoint = endpoint.trim();
   const normalizedToken = token.trim();
   if (!normalizedEndpoint || !normalizedToken) return "";
-  return `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o /tmp/agent.sh && bash /tmp/agent.sh --server-url ${normalizedEndpoint} --agent-token ${normalizedToken}`;
+
+  const escapeShell = (value: string) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  const safeEndpoint = escapeShell(normalizedEndpoint);
+  const safeToken = escapeShell(normalizedToken);
+  return [
+    `tmp="$(mktemp -d)"`,
+    `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"`,
+    `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"`,
+    `sudo bash "$tmp/agent.sh" --server-url ${safeEndpoint} --agent-token ${safeToken}`,
+    `rm -rf "$tmp"`,
+  ].join("\n");
 }
 
 export function buildAgentWindowsInstallCommand(endpoint: string, token: string) {

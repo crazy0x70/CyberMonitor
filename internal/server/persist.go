@@ -375,6 +375,16 @@ func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 	return cloned
 }
 
+func cloneProfilesForExport(profiles map[string]*NodeProfile) map[string]*NodeProfile {
+	cloned := cloneProfiles(profiles)
+	for _, profile := range cloned {
+		if profile != nil {
+			profile.AgentAuthToken = ""
+		}
+	}
+	return cloned
+}
+
 func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]OfflineSessionState {
 	if len(sessions) == 0 {
 		return map[string]OfflineSessionState{}

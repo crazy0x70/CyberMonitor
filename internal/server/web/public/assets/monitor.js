@@ -2601,13 +2601,14 @@ function renderNetworkSection(fields, nodeId) {
 
     const cardStats = document.createElement("div");
     cardStats.className = "network-card-stats";
-    const snapshot = summarizeTestSnapshot(entry.test, entry.history);
-    cardStats.innerHTML = `
-      <span>${snapshot.latency}</span>
-    `;
+    const snapshot = summarizeTestSnapshot(entry.test, entry.filtered, entry.history);
+    const latency = document.createElement("span");
+    latency.className = `network-card-latency ${snapshot.latencyTone}`;
+    latency.textContent = snapshot.latency;
+    cardStats.appendChild(latency);
 
     const loss = document.createElement("div");
-    loss.className = "network-card-loss";
+    loss.className = `network-card-loss ${snapshot.lossTone}`;
     loss.textContent = snapshot.loss;
 
     card.appendChild(cardName);
@@ -3552,11 +3553,11 @@ function formatLatencyStat(value) {
   return formatLatency(value);
 }
 
-function formatLossValue(loss) {
+function formatLossValue(loss, label = "丢包") {
   if (loss === null || loss === undefined || !Number.isFinite(loss)) {
-    return "丢包 --";
+    return `${label} --`;
   }
-  return `丢包 ${loss.toFixed(1)}%`;
+  return `${label} ${loss.toFixed(1)}%`;
 }
 
 function resolveLatestHistoryValue(series) {
@@ -3570,22 +3571,57 @@ function resolveLatestHistoryValue(series) {
   return null;
 }
 
-function summarizeTestSnapshot(test, history) {
+function latencyToneClass(value) {
+  const latency = normalizeNumber(value);
+  if (latency === null) {
+    return "latency-unknown";
+  }
+  if (latency <= 100) {
+    return "latency-good";
+  }
+  if (latency <= 300) {
+    return "latency-warn";
+  }
+  return "latency-bad";
+}
+
+function lossToneClass(value) {
+  const loss = normalizeNumber(value);
+  if (loss === null) {
+    return "loss-unknown";
+  }
+  if (loss <= 1) {
+    return "loss-good";
+  }
+  if (loss <= 5) {
+    return "loss-warn";
+  }
+  return "loss-bad";
+}
+
+function summarizeTestSnapshot(test, rangeHistory, fallbackHistory) {
   const latestLatency =
-    resolveLatestHistoryValue(history?.latency) ??
+    resolveLatestHistoryValue(rangeHistory?.latency) ??
+    resolveLatestHistoryValue(fallbackHistory?.latency) ??
     normalizeNumber(test?.latency_ms);
+  const averageLoss = summarizeLoss(rangeHistory?.loss);
   let latestLoss =
-    resolveLatestHistoryValue(history?.loss) ??
+    resolveLatestHistoryValue(rangeHistory?.loss) ??
+    resolveLatestHistoryValue(fallbackHistory?.loss) ??
     normalizeNumber(test?.packet_loss);
   if (latestLoss === null || latestLoss === undefined || !Number.isFinite(latestLoss)) {
     latestLoss = latestLatency === null ? 100 : 0;
   }
+  const displayLoss = averageLoss ?? latestLoss;
+  const lossLabel = averageLoss === null ? "丢包" : "平均丢包";
   return {
     latency:
       latestLatency === null
         ? "当前 --"
         : `当前 ${formatLatencyStat(latestLatency)}`,
-    loss: formatLossValue(latestLoss),
+    latencyTone: latencyToneClass(latestLatency),
+    loss: formatLossValue(displayLoss, lossLabel),
+    lossTone: lossToneClass(displayLoss),
   };
 }
 

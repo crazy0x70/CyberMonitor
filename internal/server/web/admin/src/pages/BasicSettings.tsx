@@ -251,6 +251,18 @@ export default function BasicSettings({
     }
   };
 
+  const systemAlreadyLatest = Boolean(
+    systemUpdateInfo?.supported !== false &&
+      systemUpdateInfo?.latest_version &&
+      !systemUpdateInfo.available,
+  );
+  const systemUpdateActionDisabled =
+    startingSystemUpdate ||
+    refreshingSystemUpdate ||
+    systemUpdateInfo?.supported === false ||
+    systemUpdateInfo?.updating ||
+    systemAlreadyLatest;
+
   return (
     <div className={adminPageShellClass}>
       <div className={adminPageHeaderClass}>
@@ -598,6 +610,8 @@ export default function BasicSettings({
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                       {refreshingSystemUpdate && !systemUpdateInfo
                         ? "检查中…"
+                        : systemAlreadyLatest
+                          ? "当前已为最新版"
                         : systemUpdateInfo?.latest_version
                           ? formatVersionLabel(systemUpdateInfo.latest_version)
                           : "未检查"}
@@ -627,12 +641,7 @@ export default function BasicSettings({
                   <Button
                     type="button"
                     className={cn(adminPrimaryButtonClass, "h-11 px-5")}
-                    disabled={
-                      startingSystemUpdate ||
-                      refreshingSystemUpdate ||
-                      systemUpdateInfo?.supported === false ||
-                      systemUpdateInfo?.updating
-                    }
+                    disabled={systemUpdateActionDisabled}
                     onClick={() => {
                       onTriggerSystemUpdate().catch((error) => {
                         toast.error(getErrorMessage(error, "服务端更新操作失败"));

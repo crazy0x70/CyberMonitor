@@ -101,6 +101,9 @@ func migrateLegacyStateFile(targetPath, fileName string) error {
 
 func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
 	opts = normalizeNodeIDOptions(opts)
+	if err := migrateDefaultNodeIDIfNeeded(opts); err != nil {
+		return "", err
+	}
 	nodeID, err := resolveNodeIDWithFallbacks(opts)
 	if err == nil {
 		return nodeID, nil
@@ -133,6 +136,17 @@ func normalizeNodeIDOptions(opts NodeIDOptions) NodeIDOptions {
 	opts.ExplicitFile = strings.TrimSpace(opts.ExplicitFile)
 	opts.HostRoot = strings.TrimSpace(opts.HostRoot)
 	return opts
+}
+
+func migrateDefaultNodeIDIfNeeded(opts NodeIDOptions) error {
+	if opts.Explicit != "" || opts.ExplicitFile != "" {
+		return nil
+	}
+	homePath, err := defaultNodeIDHomePath()
+	if err != nil {
+		return err
+	}
+	return migrateLegacyStateFile(homePath, defaultNodeIDFileName)
 }
 
 func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
