@@ -100,7 +100,7 @@ function readProviderLabel(settings: SettingsView | null, provider: string) {
 function summarizeAI(settings: SettingsView | null) {
   const ai = settings?.ai_settings;
   if (!ai) return "未配置";
-  return readProviderLabel(settings, ai.command_provider || ai.default_provider || "openai");
+  return readProviderLabel(settings, ai.command_provider || "openai");
 }
 
 function countUngrouped(nodes: NodeView[]) {

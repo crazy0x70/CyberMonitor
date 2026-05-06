@@ -293,17 +293,42 @@ jobs:
             internal/server/web/admin/src/App.tsx \
             internal/server/web/admin/lib/admin-ui.ts \
             internal/server/web/public/index.html \
+            internal/server/web/public/assets/styles.css \
+            internal/server/web/public/assets/theme.js \
+            internal/server/web/public/assets/monitor.js \
             scripts/install-common.sh \
             scripts/agent.sh \
             scripts/one-click.sh \
             scripts/agent-uninstall.sh \
+            scripts/docker-entrypoint.sh \
             scripts/agent.ps1 \
             scripts/agent-uninstall.ps1
           do
             test -e "$path"
-            git ls-files --error-unmatch "$path" >/dev/null 2>&1
+            git ls-files --error-unmatch -- "$path" >/dev/null
           done
           echo "node_version=$DOCKER_NODE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify install scripts
+        run: |
+          bash -n scripts/install-common.sh
+          bash -n scripts/agent.sh
+          bash -n scripts/one-click.sh
+          bash -n scripts/agent-uninstall.sh
+          bash -n scripts/docker-entrypoint.sh
+
+      - name: Verify PowerShell install scripts
+        shell: pwsh
+        run: |
+          foreach ($file in @("scripts/agent.ps1", "scripts/agent-uninstall.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error ("{0}: {1}" -f $file, $_.Message) }
+              exit 1
+            }
+          }
 
       - name: Set up Node
         uses: actions/setup-node@v6

@@ -36,14 +36,7 @@ func ResolveAgentTokenFilePath(explicit string) (string, error) {
 	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
 		return trimmed, nil
 	}
-	homePath, err := defaultAgentTokenHomePath()
-	if err != nil {
-		return "", err
-	}
-	if err := migrateLegacyStateFile(homePath, defaultAgentTokenFileName); err != nil {
-		return "", err
-	}
-	return homePath, nil
+	return defaultAgentTokenHomePath()
 }
 
 func defaultStateHomePath(fileName string) (string, error) {
@@ -58,53 +51,9 @@ func defaultStateHomePath(fileName string) (string, error) {
 	return filepath.Join(home, fileName), nil
 }
 
-func defaultLegacyStateFilePath(fileName string) (string, error) {
-	exePath, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(exePath)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(filepath.Dir(resolved), fileName), nil
-}
-
-func migrateLegacyStateFile(targetPath, fileName string) error {
-	if strings.TrimSpace(targetPath) == "" {
-		return fmt.Errorf("target path required")
-	}
-	if _, err := os.Stat(targetPath); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	legacyPath, err := defaultLegacyStateFilePath(fileName)
-	if err != nil {
-		return nil
-	}
-	if legacyPath == targetPath {
-		return nil
-	}
-
-	value, err := readTrimmedFile(legacyPath)
-	switch {
-	case err == nil:
-		return writeTrimmedFile(targetPath, value)
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	default:
-		return err
-	}
-}
-
 func ResolveOrCreateNodeIDWithOptions(opts NodeIDOptions) (string, error) {
 	opts = normalizeNodeIDOptions(opts)
-	if err := migrateDefaultNodeIDIfNeeded(opts); err != nil {
-		return "", err
-	}
-	nodeID, err := resolveNodeIDWithFallbacks(opts)
+	nodeID, err := resolveNodeID(opts)
 	if err == nil {
 		return nodeID, nil
 	}
@@ -138,18 +87,7 @@ func normalizeNodeIDOptions(opts NodeIDOptions) NodeIDOptions {
 	return opts
 }
 
-func migrateDefaultNodeIDIfNeeded(opts NodeIDOptions) error {
-	if opts.Explicit != "" || opts.ExplicitFile != "" {
-		return nil
-	}
-	homePath, err := defaultNodeIDHomePath()
-	if err != nil {
-		return err
-	}
-	return migrateLegacyStateFile(homePath, defaultNodeIDFileName)
-}
-
-func resolveNodeIDWithFallbacks(opts NodeIDOptions) (string, error) {
+func resolveNodeID(opts NodeIDOptions) (string, error) {
 	if opts.Explicit != "" {
 		return opts.Explicit, nil
 	}

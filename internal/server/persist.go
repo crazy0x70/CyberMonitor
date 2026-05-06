@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"cyber_monitor/internal/metrics"
 )
 
 const (
@@ -124,6 +126,10 @@ type PersistedData struct {
 	Profiles        map[string]*NodeProfile        `json:"profiles"`
 	Nodes           map[string]NodeState           `json:"nodes,omitempty"`
 	OfflineSessions map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+}
+
+type legacyPersistedProfile struct {
+	Tests []metrics.NetworkTestConfig `json:"tests,omitempty"`
 }
 
 type OfflineSessionState struct {
@@ -250,6 +256,9 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if err := strictUnmarshalJSON(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
+	if err := migrateLegacyProfileTests(data, &payload); err != nil {
+		return PersistedData{}, false, err
+	}
 	return applyPersistedDataDefaults(payload), true, nil
 }
 
@@ -319,10 +328,6 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 	return payload, true, needsRewrite, nil
 }
 
-func saveTestHistoryData(path string, payload TestHistoryData) error {
-	return writeJSONFileAtomic(path, payload)
-}
-
 func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	if payload.Profiles == nil {
 		payload.Profiles = make(map[string]*NodeProfile)
@@ -334,6 +339,147 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 		payload.OfflineSessions = make(map[string]OfflineSessionState)
 	}
 	return payload
+}
+
+func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
+	if payload == nil || len(payload.Profiles) == 0 {
+		return nil
+	}
+
+	legacyTests, err := readLegacyProfileTests(data)
+	if err != nil {
+		return err
+	}
+	if len(legacyTests) == 0 {
+		return nil
+	}
+
+	if payload.Settings.TestCatalog == nil {
+		payload.Settings.TestCatalog = []TestCatalogItem{}
+	}
+	catalogIndex := legacyTestCatalogIndex(payload.Settings.TestCatalog)
+
+	for nodeID, tests := range legacyTests {
+		if len(tests) == 0 {
+			continue
+		}
+		profile := payload.Profiles[nodeID]
+		if profile == nil || len(profile.TestSelections) > 0 {
+			continue
+		}
+		selections := make([]TestSelection, 0, len(tests))
+		seenSelections := make(map[string]struct{}, len(tests))
+		for _, test := range tests {
+			item, ok := legacyTestCatalogItem(test, catalogIndex)
+			if !ok {
+				continue
+			}
+			if item.ID == "" {
+				item.ID = randomToken(10)
+				payload.Settings.TestCatalog = append(payload.Settings.TestCatalog, item)
+				catalogIndex[legacyTestCatalogKey(item.Name, item.Type, item.Host, item.Port)] = item
+			}
+			if _, exists := seenSelections[item.ID]; exists {
+				continue
+			}
+			seenSelections[item.ID] = struct{}{}
+			selections = append(selections, TestSelection{
+				TestID:      item.ID,
+				IntervalSec: normalizeSelectionInterval(item, test.IntervalSec),
+			})
+		}
+		if len(selections) > 0 {
+			profile.TestSelections = selections
+		}
+	}
+	return nil
+}
+
+func readLegacyProfileTests(data []byte) (map[string][]metrics.NetworkTestConfig, error) {
+	var raw struct {
+		Profiles map[string]json.RawMessage `json:"profiles"`
+	}
+	if err := strictUnmarshalJSON(data, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw.Profiles) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[string][]metrics.NetworkTestConfig)
+	for nodeID, rawProfile := range raw.Profiles {
+		var profile legacyPersistedProfile
+		if err := strictUnmarshalJSON(rawProfile, &profile); err != nil {
+			return nil, err
+		}
+		if len(profile.Tests) > 0 {
+			result[nodeID] = profile.Tests
+		}
+	}
+	return result, nil
+}
+
+func legacyTestCatalogIndex(items []TestCatalogItem) map[string]TestCatalogItem {
+	index := make(map[string]TestCatalogItem, len(items))
+	for _, item := range items {
+		key := legacyTestCatalogKey(item.Name, item.Type, item.Host, item.Port)
+		if key == "" {
+			continue
+		}
+		if _, exists := index[key]; !exists {
+			index[key] = item
+		}
+	}
+	return index
+}
+
+func legacyTestCatalogItem(test metrics.NetworkTestConfig, index map[string]TestCatalogItem) (TestCatalogItem, bool) {
+	candidate := TestCatalogItem{
+		Name:        strings.TrimSpace(test.Name),
+		Type:        strings.ToLower(strings.TrimSpace(test.Type)),
+		Host:        strings.TrimSpace(test.Host),
+		Port:        test.Port,
+		IntervalSec: test.IntervalSec,
+	}
+	if candidate.Host == "" {
+		return TestCatalogItem{}, false
+	}
+	if candidate.Type != "icmp" && candidate.Type != "tcp" {
+		if candidate.Port > 0 {
+			candidate.Type = "tcp"
+		} else {
+			candidate.Type = "icmp"
+		}
+	}
+	if candidate.Type == "icmp" {
+		candidate.Port = 0
+	}
+	if candidate.Name == "" {
+		candidate.Name = candidate.Host
+	}
+	key := legacyTestCatalogKey(candidate.Name, candidate.Type, candidate.Host, candidate.Port)
+	if item, ok := index[key]; ok {
+		return item, true
+	}
+	normalized, err := normalizeTestCatalog([]TestCatalogItem{candidate})
+	if err != nil || len(normalized) == 0 {
+		return TestCatalogItem{}, false
+	}
+	normalized[0].ID = ""
+	return normalized[0], true
+}
+
+func legacyTestCatalogKey(name, testType, host string, port int) string {
+	kind := strings.ToLower(strings.TrimSpace(testType))
+	trimmedHost := strings.TrimSpace(host)
+	trimmedName := strings.TrimSpace(name)
+	if trimmedHost == "" {
+		return ""
+	}
+	if kind == "icmp" {
+		port = 0
+	}
+	return strings.ToLower(fmt.Sprintf("%s|%s|%s|%d", trimmedName, kind, trimmedHost, port))
 }
 
 func writeJSONFileAtomic(path string, payload any) error {
@@ -363,7 +509,6 @@ func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 		copyProfile := *profile
 		copyProfile.Tags = cloneStringSlice(profile.Tags)
 		copyProfile.Groups = cloneStringSlice(profile.Groups)
-		copyProfile.Tests = cloneNetworkTestConfigs(profile.Tests)
 		copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
 		copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
 		if profile.AlertEnabled != nil {

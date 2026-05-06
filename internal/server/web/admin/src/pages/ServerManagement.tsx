@@ -59,7 +59,6 @@ import {
 import { Separator } from "@/components/ui/separator";
 import type {
   AgentUpdateInfo,
-  NetworkTestConfig,
   NodeProfilePayload,
   NodeView,
   SettingsView,
@@ -196,10 +195,6 @@ type FormState = {
   testSelections: SelectionDraft;
 };
 
-type BuildPayloadOptions = {
-  clearLegacyTests?: boolean;
-};
-
 type TestDraftEntry = {
   item: TestCatalogItem;
   itemId: string;
@@ -296,13 +291,6 @@ function resolveRenewPlan(autoRenew?: boolean, renewIntervalSec?: number): Renew
   ).key;
 }
 
-function testKey(test?: Partial<NetworkTestConfig | TestCatalogItem>) {
-  const type = String(test?.type || "icmp").trim().toLowerCase();
-  const host = String(test?.host || "").trim().toLowerCase();
-  const port = Number(test?.port || 0);
-  return `${type}|${host}|${port}`;
-}
-
 function defaultInterval(item?: TestCatalogItem) {
   const raw = Number(item?.interval_sec || 0);
   if (!Number.isFinite(raw) || raw <= 0) {
@@ -311,7 +299,7 @@ function defaultInterval(item?: TestCatalogItem) {
   return Math.min(Math.trunc(raw), 3600);
 }
 
-function isTCPTest(test?: Partial<NetworkTestConfig | TestCatalogItem>) {
+function isTCPTest(test?: Partial<TestCatalogItem>) {
   return String(test?.type || "icmp").trim().toLowerCase() === "tcp";
 }
 
@@ -410,23 +398,6 @@ function buildInitialSelections(node: NodeView, catalog: TestCatalogItem[]) {
     return selections;
   }
 
-  if (!Array.isArray(node.tests) || node.tests.length === 0) {
-    return selections;
-  }
-
-  const byKey = new Map<string, TestCatalogItem>();
-  catalog.forEach((item) => {
-    byKey.set(testKey(item), item);
-  });
-
-  node.tests.forEach((test) => {
-    const matched = byKey.get(testKey(test));
-    if (!matched?.id) {
-      return;
-    }
-    selections[matched.id] = buildTestSelectionValue(matched, test.interval_sec);
-  });
-
   return selections;
 }
 
@@ -444,11 +415,7 @@ function buildFormState(node: NodeView, catalog: TestCatalogItem[]): FormState {
   };
 }
 
-function buildPayload(
-  form: FormState,
-  catalog: TestCatalogItem[],
-  options: BuildPayloadOptions = {},
-): NodeProfilePayload {
+function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfilePayload {
   const expireAt = parseDateTimeLocalValue(form.expireAt);
   if (form.expireAt && !expireAt) {
     throw new Error("到期时间格式无效，请重新选择");
@@ -475,10 +442,6 @@ function buildPayload(
     region: form.region.trim().toUpperCase(),
     test_selections: selections,
   };
-
-  if (options.clearLegacyTests) {
-    payload.tests = [];
-  }
 
   if (expireAt > 0) {
     payload.expire_at = expireAt;
@@ -803,12 +766,6 @@ export default function ServerManagement({
     () => buildTestDraftState(testCatalog, form?.testSelections),
     [form?.testSelections, testCatalog],
   );
-  const usingLegacyTestsFallback = Boolean(
-    editingNode &&
-      (!Array.isArray(editingNode.test_selections) || editingNode.test_selections.length === 0) &&
-      Array.isArray(editingNode.tests) &&
-      editingNode.tests.length > 0,
-  );
   const hasExpireAt = Boolean(form?.expireAt.trim());
   const renewActive = Boolean(hasExpireAt && form?.renewPlan !== "none");
   const alertStatusLabel = form?.alertEnabled ? "已启用离线告警" : "已关闭离线告警";
@@ -926,9 +883,7 @@ export default function ServerManagement({
     }
     setSaving(true);
     try {
-      const payload = buildPayload(form, testCatalog, {
-        clearLegacyTests: usingLegacyTestsFallback,
-      });
+      const payload = buildPayload(form, testCatalog);
       await onSaveNode(resolveNodeId(editingNode), payload);
       toast.success("节点配置已保存并下发");
       closeEditor();
@@ -1521,11 +1476,6 @@ export default function ServerManagement({
                         </div>
                       )}
 
-                      {usingLegacyTestsFallback ? (
-                        <div className={adminDetailHintPanelClass}>
-                          当前节点沿用了旧版探测字段，本页已自动回填到新的探测选择器中。
-                        </div>
-                      ) : null}
                     </CardContent>
                   </Card>
 

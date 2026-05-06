@@ -8,7 +8,10 @@ RUN test -f internal/server/web/admin/package.json && \
     test -f internal/server/web/admin/package-lock.json && \
     test -f internal/server/web/admin/src/App.tsx && \
     test -f internal/server/web/admin/lib/admin-ui.ts && \
-    test -f internal/server/web/public/index.html
+    test -f internal/server/web/public/index.html && \
+    test -f internal/server/web/public/assets/styles.css && \
+    test -f internal/server/web/public/assets/theme.js && \
+    test -f internal/server/web/public/assets/monitor.js
 RUN --mount=type=cache,target=/root/.npm \
     npm --prefix internal/server/web/admin ci && \
     npm --prefix internal/server/web/admin run lint && \

@@ -66,7 +66,7 @@ docker run -d \
 
 此操作将容器内的 `~/.cybermonitor-node-id` 映射至宿主机，防止容器重建导致 ID 变化。
 
-Agent 同时兼容历史版本环境变量（如 `server-url`、`agent-token`），但推荐优先使用 `CM_*` 前缀的新写法。若需禁止后台远程更新，请添加配置 `-e CM_DISABLE_UPDATE=1`，该节点将继续上报数据，但会在管理后台被标记为已禁用更新。
+若需禁止后台远程更新，请添加配置 `-e CM_DISABLE_UPDATE=1`，该节点将继续上报数据，但会在管理后台被标记为已禁用更新。
 
 ### 4. 安装探针 (Agent)
 

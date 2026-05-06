@@ -39,40 +39,11 @@ func EnvBool(key string, def bool) bool {
 }
 
 func lookupEnv(key string) (string, bool) {
-	for _, candidate := range envCandidates(key) {
-		value := strings.TrimSpace(os.Getenv(candidate))
-		if value != "" {
-			return value, true
-		}
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return "", false
 	}
-	return "", false
-}
-
-func envCandidates(key string) []string {
-	candidates := []string{key}
-	if strings.HasPrefix(key, "CM_") {
-		base := strings.TrimPrefix(key, "CM_")
-		lowerUnderscore := strings.ToLower(base)
-		lowerHyphen := strings.ReplaceAll(lowerUnderscore, "_", "-")
-		candidates = append(candidates, base, lowerUnderscore, lowerHyphen)
-	}
-	return uniqueStrings(candidates)
-}
-
-func uniqueStrings(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	return result
+	return value, true
 }
 
 func ParseCommaList(raw string) []string {

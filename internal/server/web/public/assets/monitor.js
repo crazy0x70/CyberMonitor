@@ -2436,7 +2436,7 @@ function hasConfiguredNetworkTestPolicy(node) {
   if (Array.isArray(node.test_selections) && node.test_selections.length > 0) {
     return true;
   }
-  return Array.isArray(node.tests) && node.tests.length > 0;
+  return false;
 }
 
 function clearNetworkSection(fields) {

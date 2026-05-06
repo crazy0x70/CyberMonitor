@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/server/history"
@@ -195,7 +194,6 @@ type Store struct {
 	buildVersion    string
 	buildCommit     string
 	dataPath        string
-	historyPath     string
 	lastPersist     time.Time
 	persistInterval time.Duration
 	alerted         map[string]alertState
@@ -212,29 +210,28 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID                 string                      `json:"server_id,omitempty"`
-	AgentAuthToken           string                      `json:"agent_auth_token,omitempty"`
-	AlertEnabled             *bool                       `json:"alert_enabled,omitempty"`
-	Alias                    string                      `json:"alias,omitempty"`
-	Group                    string                      `json:"group,omitempty"`
-	Tags                     []string                    `json:"tags,omitempty"`
-	Groups                   []string                    `json:"groups,omitempty"`
-	Region                   string                      `json:"region,omitempty"`
-	DiskType                 string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                       `json:"expire_at,omitempty"`
-	AutoRenew                bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int                         `json:"test_interval_sec"`
-	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
-	AgentUpdate              *AgentUpdateInstruction     `json:"agent_update,omitempty"`
-	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
-	AgentUpdateLeaseUntil    int64                       `json:"agent_update_lease_until,omitempty"`
-	AgentUpdateReportedAt    int64                       `json:"agent_update_reported_at,omitempty"`
-	UpdatedAt                int64                       `json:"updated_at,omitempty"`
+	ServerID                 string                  `json:"server_id,omitempty"`
+	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
+	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
+	Alias                    string                  `json:"alias,omitempty"`
+	Group                    string                  `json:"group,omitempty"`
+	Tags                     []string                `json:"tags,omitempty"`
+	Groups                   []string                `json:"groups,omitempty"`
+	Region                   string                  `json:"region,omitempty"`
+	DiskType                 string                  `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                   `json:"expire_at,omitempty"`
+	AutoRenew                bool                    `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                   `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                     `json:"test_interval_sec"`
+	TestSelections           []TestSelection         `json:"test_selections,omitempty"`
+	AgentUpdate              *AgentUpdateInstruction `json:"agent_update,omitempty"`
+	AgentUpdateState         string                  `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                  `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                  `json:"agent_update_message,omitempty"`
+	AgentUpdateLeaseUntil    int64                   `json:"agent_update_lease_until,omitempty"`
+	AgentUpdateReportedAt    int64                   `json:"agent_update_reported_at,omitempty"`
+	UpdatedAt                int64                   `json:"updated_at,omitempty"`
 }
 
 type AgentUpdateInstruction struct {
@@ -259,30 +256,29 @@ type AgentConfig struct {
 }
 
 type NodeView struct {
-	Stats                    metrics.NodeStats           `json:"stats"`
-	LastSeen                 int64                       `json:"last_seen"`
-	FirstSeen                int64                       `json:"first_seen,omitempty"`
-	Status                   string                      `json:"status"`
-	ServerID                 string                      `json:"server_id,omitempty"`
-	AlertEnabled             bool                        `json:"alert_enabled"`
-	Alias                    string                      `json:"alias,omitempty"`
-	Group                    string                      `json:"group,omitempty"`
-	Tags                     []string                    `json:"tags,omitempty"`
-	Groups                   []string                    `json:"groups,omitempty"`
-	Region                   string                      `json:"region,omitempty"`
-	DiskType                 string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                       `json:"expire_at,omitempty"`
-	AutoRenew                bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int                         `json:"test_interval_sec,omitempty"`
-	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
-	AgentUpdateSupported     bool                        `json:"agent_update_supported"`
-	AgentUpdateMode          string                      `json:"agent_update_mode,omitempty"`
-	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
+	Stats                    metrics.NodeStats `json:"stats"`
+	LastSeen                 int64             `json:"last_seen"`
+	FirstSeen                int64             `json:"first_seen,omitempty"`
+	Status                   string            `json:"status"`
+	ServerID                 string            `json:"server_id,omitempty"`
+	AlertEnabled             bool              `json:"alert_enabled"`
+	Alias                    string            `json:"alias,omitempty"`
+	Group                    string            `json:"group,omitempty"`
+	Tags                     []string          `json:"tags,omitempty"`
+	Groups                   []string          `json:"groups,omitempty"`
+	Region                   string            `json:"region,omitempty"`
+	DiskType                 string            `json:"disk_type,omitempty"`
+	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64             `json:"expire_at,omitempty"`
+	AutoRenew                bool              `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64             `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int               `json:"test_interval_sec,omitempty"`
+	TestSelections           []TestSelection   `json:"test_selections,omitempty"`
+	AgentUpdateSupported     bool              `json:"agent_update_supported"`
+	AgentUpdateMode          string            `json:"agent_update_mode,omitempty"`
+	AgentUpdateState         string            `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string            `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string            `json:"agent_update_message,omitempty"`
 }
 
 type PublicSettings struct {
@@ -471,7 +467,6 @@ func Run(ctx context.Context, cfg Config) error {
 		buildVersion:    version,
 		buildCommit:     commit,
 		dataPath:        dataPath,
-		historyPath:     historyPath,
 		persistInterval: defaultPersistInterval,
 		alerted:         make(map[string]alertState),
 		offlineSessions: offlineSessions,
@@ -815,6 +810,10 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前节点平台对应的 Agent 安装包"})
 				return
 			}
+			if strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS，已阻止下发必失败的 Agent 更新任务"})
+				return
+			}
 			store.QueueAgentUpdate(nodeID, AgentUpdateInstruction{
 				Version:     releaseInfo.LatestVersion,
 				DownloadURL: releaseInfo.DownloadURL,
@@ -1146,12 +1145,12 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		nodeID := r.URL.Query().Get("node_id")
 		token := r.Header.Get("X-AGENT-TOKEN")
-		config, usingDedicatedToken, err := agentAPI.config(nodeID, token)
+		config, err := agentAPI.config(nodeID, token)
 		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		writeJSON(w, http.StatusOK, httpAgentConfigResponse(config, r.Header.Get(agentrpc.AgentCapabilitiesHeader), usingDedicatedToken))
+		writeJSON(w, http.StatusOK, config)
 	})
 
 	publicMux.HandleFunc("/api/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
@@ -1280,6 +1279,16 @@ func Run(ctx context.Context, cfg Config) error {
 	publicMux.Handle("/assets/", assetsHandler)
 	if splitMode {
 		adminMux.Handle("/assets/", assetsHandler)
+	}
+
+	if !splitMode {
+		publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/dashboard" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, "/", http.StatusFound)
+		})
 	}
 
 	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
@@ -2282,15 +2291,6 @@ func cloneNodeStates(values map[string]NodeState) map[string]NodeState {
 	return cloned
 }
 
-func cloneNetworkTestConfigs(values []metrics.NetworkTestConfig) []metrics.NetworkTestConfig {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]metrics.NetworkTestConfig, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
 func cloneTestSelections(values []TestSelection) []TestSelection {
 	if len(values) == 0 {
 		return nil
@@ -2997,7 +2997,6 @@ func buildNodeView(node NodeState, profile *NodeProfile, now time.Time) NodeView
 		AutoRenew:                resolved.AutoRenew,
 		RenewIntervalSec:         resolved.RenewIntervalSec,
 		TestIntervalSec:          resolved.TestIntervalSec,
-		Tests:                    resolved.Tests,
 		TestSelections:           resolved.TestSelections,
 		AgentUpdateSupported:     updateSupported,
 		AgentUpdateMode:          updateMode,
@@ -3235,20 +3234,19 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 }
 
 type NodeProfileUpdate struct {
-	Alias            *string                      `json:"alias"`
-	Group            *string                      `json:"group"`
-	Tags             *[]string                    `json:"tags"`
-	Groups           *[]string                    `json:"groups"`
-	Region           *string                      `json:"region"`
-	DiskType         *string                      `json:"disk_type"`
-	NetSpeedMbps     *int                         `json:"net_speed_mbps"`
-	ExpireAt         *int64                       `json:"expire_at"`
-	AutoRenew        *bool                        `json:"auto_renew"`
-	RenewIntervalSec *int64                       `json:"renew_interval_sec"`
-	TestIntervalSec  *int                         `json:"test_interval_sec"`
-	Tests            *[]metrics.NetworkTestConfig `json:"tests"`
-	TestSelections   *[]TestSelection             `json:"test_selections"`
-	AlertEnabled     *bool                        `json:"alert_enabled"`
+	Alias            *string          `json:"alias"`
+	Group            *string          `json:"group"`
+	Tags             *[]string        `json:"tags"`
+	Groups           *[]string        `json:"groups"`
+	Region           *string          `json:"region"`
+	DiskType         *string          `json:"disk_type"`
+	NetSpeedMbps     *int             `json:"net_speed_mbps"`
+	ExpireAt         *int64           `json:"expire_at"`
+	AutoRenew        *bool            `json:"auto_renew"`
+	RenewIntervalSec *int64           `json:"renew_interval_sec"`
+	TestIntervalSec  *int             `json:"test_interval_sec"`
+	TestSelections   *[]TestSelection `json:"test_selections"`
+	AlertEnabled     *bool            `json:"alert_enabled"`
 }
 
 func (s *Store) AdminPath() string {
@@ -3812,7 +3810,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
-		if len(s.settings.GroupTree) == 0 {
+		if update.GroupTree == nil {
 			s.settings.GroupTree = buildGroupTree(s.settings.Groups)
 		}
 	}
@@ -3961,7 +3959,6 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if profile.TestIntervalSec <= 0 {
 			profile.TestIntervalSec = defaultTestIntervalSec
 		}
-		profile.Tests = cloneNetworkTestConfigs(profile.Tests)
 		profile.TestSelections = s.normalizeSelectionsLocked(cloneTestSelections(profile.TestSelections))
 		if profile.AlertEnabled == nil {
 			profile.AlertEnabled = boolPointer(true)
@@ -4047,17 +4044,6 @@ func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
 }
 
-func (s *Store) authorizeOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) (bool, bool) {
-	if s.validateAgentAuthToken(nodeID, token) {
-		return true, true
-	}
-	if !isBootstrapAgentToken(bootstrapToken, token) {
-		return false, false
-	}
-	s.ensureAgentAuthToken(nodeID)
-	return false, true
-}
-
 func isBootstrapAgentToken(expected, token string) bool {
 	expected = strings.TrimSpace(expected)
 	token = strings.TrimSpace(token)
@@ -4068,8 +4054,14 @@ func isBootstrapAgentToken(expected, token string) bool {
 }
 
 func (s *Store) validateOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) bool {
-	_, ok := s.authorizeOrProvisionAgentAuthToken(nodeID, token, bootstrapToken)
-	return ok
+	if s.validateAgentAuthToken(nodeID, token) {
+		return true
+	}
+	if !isBootstrapAgentToken(bootstrapToken, token) {
+		return false
+	}
+	s.ensureAgentAuthToken(nodeID)
+	return true
 }
 
 func (s *Store) generateAgentAuthTokenLocked() string {
@@ -4267,9 +4259,6 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfi
 	}
 	if update.TestIntervalSec != nil && *update.TestIntervalSec > 0 {
 		profile.TestIntervalSec = *update.TestIntervalSec
-	}
-	if update.Tests != nil {
-		profile.Tests = *update.Tests
 	}
 	if update.TestSelections != nil {
 		profile.TestSelections = s.normalizeSelectionsLocked(*update.TestSelections)
@@ -4560,7 +4549,7 @@ func resolveSelectionInterval(item TestCatalogItem, requested, fallback int) int
 
 func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
 	if len(profile.TestSelections) == 0 {
-		return profile.Tests
+		return nil
 	}
 	catalog := testCatalogByID(s.settings.TestCatalog)
 	results := make([]metrics.NetworkTestConfig, 0, len(profile.TestSelections))

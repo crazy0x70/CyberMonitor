@@ -354,27 +354,48 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 
 	next := c.publicIPs
 	next.checkedAt = now
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultPublicIPLookupTimeout)
+	defer cancel()
+	type lookupResult struct {
+		family publicIPFamily
+		ip     string
+	}
+	results := make(chan lookupResult, 2)
 	for _, family := range []publicIPFamily{publicIPv4Family, publicIPv6Family} {
-		normalized, err := c.lookupPublicIPAt(family)
-		if err != nil || normalized == "" {
+		go func(family publicIPFamily) {
+			normalized, err := c.lookupPublicIPAt(ctx, family)
+			if err != nil || normalized == "" {
+				results <- lookupResult{family: family}
+				return
+			}
+			results <- lookupResult{family: family, ip: normalized}
+		}(family)
+	}
+	for range 2 {
+		result := <-results
+		if result.ip == "" {
 			continue
 		}
-		switch family {
+		switch result.family {
 		case publicIPv4Family:
-			next.IPv4 = normalized
+			next.IPv4 = result.ip
 		case publicIPv6Family:
-			next.IPv6 = normalized
+			next.IPv6 = result.ip
 		}
 	}
 	c.publicIPs = next
 	return c.publicIPs
 }
 
-func (c *Collector) lookupPublicIPAt(family publicIPFamily) (string, error) {
+func (c *Collector) lookupPublicIPAt(ctx context.Context, family publicIPFamily) (string, error) {
 	if c == nil || c.publicIPLookup == nil {
 		return "", nil
 	}
-	value, err := c.publicIPLookup(context.Background(), family)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	value, err := c.publicIPLookup(ctx, family)
 	if err != nil {
 		return "", err
 	}

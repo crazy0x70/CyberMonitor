@@ -42,8 +42,7 @@ type OfflineInsights struct {
 }
 
 type OfflineStore struct {
-	db  *tsdb.DB
-	dir string
+	db *tsdb.DB
 }
 
 func OpenOfflineStore(dir string) (*OfflineStore, error) {
@@ -62,8 +61,7 @@ func OpenOfflineStore(dir string) (*OfflineStore, error) {
 		return nil, err
 	}
 	return &OfflineStore{
-		db:  db,
-		dir: dir,
+		db: db,
 	}, nil
 }
 

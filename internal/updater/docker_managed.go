@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -547,8 +548,28 @@ func pullDockerImage(ctx context.Context, cli *client.Client, targetImage string
 		return fmt.Errorf("拉取目标镜像失败: %w", err)
 	}
 	defer reader.Close()
-	_, _ = io.Copy(io.Discard, reader)
-	return nil
+	decoder := json.NewDecoder(reader)
+	for {
+		var event struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("读取 Docker 拉取响应失败: %w", err)
+		}
+		message := strings.TrimSpace(event.Error)
+		if message == "" {
+			message = strings.TrimSpace(event.ErrorDetail.Message)
+		}
+		if message != "" {
+			return fmt.Errorf("拉取目标镜像失败: %s", message)
+		}
+	}
 }
 
 func resolveDockerSocketSource(mounts []container.MountPoint, target string) string {

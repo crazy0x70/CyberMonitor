@@ -182,10 +182,12 @@ func (c *Client) ApplyAsset(ctx context.Context, downloadURL, checksumURL string
 	if err := c.downloadFile(ctx, downloadURL, tmpBinary); err != nil {
 		return err
 	}
-	if checksumURL = strings.TrimSpace(checksumURL); checksumURL != "" {
-		if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
-			return err
-		}
+	checksumURL = strings.TrimSpace(checksumURL)
+	if checksumURL == "" {
+		return fmt.Errorf("缺少更新校验地址")
+	}
+	if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
+		return err
 	}
 	if err := os.Chmod(tmpBinary, 0o755); err != nil {
 		return fmt.Errorf("设置新二进制权限失败: %w", err)

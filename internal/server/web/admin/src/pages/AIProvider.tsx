@@ -200,9 +200,7 @@ export default function AIProvider({
 
   useEffect(() => {
     setProviders(makeProviderDrafts(settings));
-    setCommandProvider(
-      settings?.ai_settings?.command_provider || settings?.ai_settings?.default_provider || "openai",
-    );
+    setCommandProvider(settings?.ai_settings?.command_provider || "openai");
     setPrompt(settings?.ai_settings?.prompt || "");
     setIsDirty(false);
   }, [settings]);
@@ -353,7 +351,6 @@ export default function AIProvider({
     try {
       await onSave({
         ai_settings: {
-          default_provider: commandProvider,
           command_provider: commandProvider,
           prompt,
           openai: openai ? toConfig(openai) : {},

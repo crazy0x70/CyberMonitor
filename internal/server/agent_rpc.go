@@ -37,13 +37,6 @@ type agentAPI struct {
 	cfg   *Config
 }
 
-type legacyAgentConfigResponse struct {
-	Alias           string                      `json:"alias"`
-	Group           string                      `json:"group"`
-	Tests           []metrics.NetworkTestConfig `json:"tests"`
-	TestIntervalSec int                         `json:"test_interval_sec"`
-}
-
 func newAgentAPI(store *Store, hub *Hub, cfg *Config) *agentAPI {
 	return &agentAPI{store: store, hub: hub, cfg: cfg}
 }
@@ -133,16 +126,15 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	return a.store.HasPendingAgentUpdate(payload.NodeID), nil
 }
 
-func (a *agentAPI) config(nodeID, token string) (AgentConfig, bool, *agentAPIError) {
+func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
 	nodeID, apiErr := normalizeAgentNodeID(nodeID)
 	if apiErr != nil {
-		return AgentConfig{}, false, apiErr
+		return AgentConfig{}, apiErr
 	}
-	usingDedicatedToken, ok := a.store.authorizeOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken)
-	if !ok {
-		return AgentConfig{}, false, invalidAgentTokenError()
+	if !a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
+		return AgentConfig{}, invalidAgentTokenError()
 	}
-	return a.store.AgentConfig(nodeID), usingDedicatedToken, nil
+	return a.store.AgentConfig(nodeID), nil
 }
 
 func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIError) {
@@ -217,7 +209,7 @@ func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterReq
 }
 
 func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequest) (*agentrpc.ConfigResponse, error) {
-	config, _, apiErr := s.api.config(req.NodeID, req.AgentToken)
+	config, apiErr := s.api.config(req.NodeID, req.AgentToken)
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
@@ -267,31 +259,6 @@ func toRPCUpdateInstruction(update *AgentUpdateInstruction) *agentrpc.UpdateInst
 		ChecksumURL: update.ChecksumURL,
 		RequestedAt: update.RequestedAt,
 	}
-}
-
-func httpAgentConfigResponse(config AgentConfig, capabilities string, usingDedicatedToken bool) any {
-	if usingDedicatedToken || supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityDedicatedToken) || supportsAgentConfigExtension(capabilities, agentrpc.AgentCapabilityRemoteUpdate) {
-		return config
-	}
-	return legacyAgentConfigResponse{
-		Alias:           config.Alias,
-		Group:           config.Group,
-		Tests:           config.Tests,
-		TestIntervalSec: config.TestIntervalSec,
-	}
-}
-
-func supportsAgentConfigExtension(capabilities, capability string) bool {
-	capability = strings.TrimSpace(strings.ToLower(capability))
-	if capability == "" {
-		return false
-	}
-	for _, item := range strings.Split(capabilities, ",") {
-		if strings.TrimSpace(strings.ToLower(item)) == capability {
-			return true
-		}
-	}
-	return false
 }
 
 func grpcStatusFromAPIError(err *agentAPIError) error {

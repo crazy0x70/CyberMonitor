@@ -23,7 +23,6 @@ var errNilNetworkStore = errors.New("network history store is nil")
 
 type NetworkStore struct {
 	db               *tsdb.DB
-	dir              string
 	appendMu         sync.Mutex
 	latestSeriesTime map[string]int64
 	latestLoaded     bool
@@ -65,7 +64,6 @@ func OpenNetworkStore(dir string) (*NetworkStore, error) {
 	}
 	return &NetworkStore{
 		db:               db,
-		dir:              dir,
 		latestSeriesTime: make(map[string]int64),
 	}, nil
 }

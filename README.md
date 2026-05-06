@@ -69,7 +69,7 @@ To persist the node identity on the host, mount a local directory:
 
 This ensures the container's `~/.cybermonitor-node-id` is mapped to your host, allowing identification reuse upon container recreation.
 
-For backward compatibility, the Agent continues to support legacy environment variables (`server-url`, `agent-token`, `node-id`), though the new `CM_*` prefixed variables are recommended. To disable remote updates initiated by the management panel, add:
+To disable remote updates initiated by the management panel, add:
 
 ```bash
 -e CM_DISABLE_UPDATE=1

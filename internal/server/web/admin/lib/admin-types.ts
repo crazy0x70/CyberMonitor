@@ -42,13 +42,11 @@ export interface AIProviderProfile extends AIProviderConfig {
 }
 
 export interface AISettings {
-  default_provider?: string;
   command_provider?: string;
   prompt?: string;
   openai?: AIProviderConfig;
   gemini?: AIProviderConfig;
   volcengine?: AIProviderConfig;
-  openai_compatible?: AIProviderConfig;
   openai_compatibles?: AIProviderProfile[];
 }
 
@@ -86,14 +84,6 @@ export interface SettingsView {
 export interface ConfigImportResponse {
   settings?: SettingsView;
   reauth_required?: boolean;
-}
-
-export interface NetworkTestConfig {
-  name: string;
-  type: string;
-  host: string;
-  port?: number;
-  interval_sec?: number;
 }
 
 export interface NetworkTestResult {
@@ -197,7 +187,6 @@ export interface NodeView {
   auto_renew?: boolean;
   renew_interval_sec?: number;
   test_interval_sec?: number;
-  tests?: NetworkTestConfig[];
   test_selections?: TestSelection[];
   agent_update_supported: boolean;
   agent_update_mode?: string;
@@ -266,7 +255,6 @@ export interface NodeProfilePayload {
   auto_renew?: boolean;
   renew_interval_sec?: number;
   test_interval_sec?: number;
-  tests?: NetworkTestConfig[];
   test_selections?: TestSelection[];
   alert_enabled?: boolean;
 }

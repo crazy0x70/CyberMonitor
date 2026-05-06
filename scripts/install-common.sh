@@ -40,20 +40,43 @@ resolve_version() {
     echo "${version}"
     return
   fi
-  local latest_url
-  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
-  version="${latest_url##*/}"
-  if [[ "${version}" == "latest" ]]; then
-    version=""
+  local latest_url=""
+  if latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null)"; then
+    version="${latest_url##*/}"
+    if [[ "${version}" == "latest" ]]; then
+      version=""
+    fi
   fi
   if [[ -z "${version}" ]]; then
-    version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | \
-      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+    if ! version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"; then
+      version=""
+    fi
   fi
   if [[ -z "${version}" ]]; then
     die "无法获取最新版本，请使用版本号手动指定"
   fi
   echo "${version}"
+}
+
+urlencode() {
+  local raw="$1"
+  local out=""
+  local char
+  local encoded
+  local i
+  for ((i = 0; i < ${#raw}; i++)); do
+    char="${raw:i:1}"
+    case "${char}" in
+      [a-zA-Z0-9.~_-])
+        out+="${char}"
+        ;;
+      *)
+        printf -v encoded '%%%02X' "'${char}"
+        out+="${encoded}"
+        ;;
+    esac
+  done
+  printf '%s' "${out}"
 }
 
 download_binary() {
@@ -86,7 +109,7 @@ register_agent() {
   local bootstrap_token="$2"
   local node_id="$3"
   # 安装阶段首次注册仍走 HTTP；安装完成后的 Agent 运行态会对同一 server-url 优先尝试 gRPC。
-  local endpoint="${server_url%/}/api/v1/agent/register?node_id=${node_id}"
+  local endpoint="${server_url%/}/api/v1/agent/register?node_id=$(urlencode "${node_id}")"
   local response
   response="$(curl -fsSL -X POST -H "X-AGENT-TOKEN: ${bootstrap_token}" "${endpoint}")" || \
     die "Agent 注册失败，请检查 Server 地址与 Agent Token"
