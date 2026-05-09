@@ -81,6 +81,8 @@ const state = {
   historyCacheLoading: false,
   sourceSnapshots: new Map(),
   publicTrafficCounters: new Map(),
+  snapshotFallbackTimer: null,
+  snapshotFallbackInflight: false,
   renderFrame: 0,
   lastTransportAt: 0,
   lastTransportType: "snapshot",
@@ -97,6 +99,8 @@ const HISTORY_CACHE_SAVE_DELAY = 1500;
 const WS_RECONNECT_BASE_DELAY = 500;
 const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
+const PUBLIC_SNAPSHOT_FALLBACK_INTERVAL_MS = 3000;
+const PUBLIC_NODE_STALE_GRACE_SECONDS = 12;
 const LATENCY_SMOOTH_ALPHA = 0.2;
 
 function safeLocalStorage() {
@@ -185,7 +189,7 @@ function scheduleRender() {
   });
 }
 
-function refreshOpenNodeHistoryViews(nodeId) {
+function refreshOpenNodeHistoryViews(nodeId, options = {}) {
   const normalized = String(nodeId || "").trim();
   if (!normalized) {
     return;
@@ -200,12 +204,19 @@ function refreshOpenNodeHistoryViews(nodeId) {
   ) {
     return;
   }
+  if (options.force && card._detailSignature !== undefined) {
+    card._detailSignature = "";
+  }
   updateNetworkTests(
     card._fields,
     card._lastNode,
     Array.isArray(card._fields._tests) ? card._fields._tests : [],
     card._nodeId
   );
+}
+
+function forceRefreshOpenNodeHistoryViews(nodeId) {
+  refreshOpenNodeHistoryViews(nodeId, { force: true });
 }
 
 function connectWS() {
@@ -425,6 +436,48 @@ async function fetchPublicSnapshotForTarget(target, options = {}) {
 async function fetchPublicSnapshot() {
   const targets = resolveTargets();
   await Promise.all(targets.map((target) => fetchPublicSnapshotForTarget(target)));
+}
+
+function targetHasHealthySocket(target) {
+  if (!target?.key) {
+    return false;
+  }
+  const socket = state.wsConnections.get(target.key);
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  const lastMessageAt = Number(state.wsLastMessageAt.get(target.key) || 0);
+  return lastMessageAt > 0 && Date.now() - lastMessageAt <= WS_WATCHDOG_MS;
+}
+
+async function fetchPublicSnapshotFallback() {
+  if (state.snapshotFallbackInflight) {
+    return;
+  }
+  const targets = resolveTargets().filter((target) => !targetHasHealthySocket(target));
+  if (!targets.length) {
+    return;
+  }
+  state.snapshotFallbackInflight = true;
+  try {
+    await Promise.all(
+      targets.map((target) =>
+        fetchPublicSnapshotForTarget(target, { dropOnFailure: false })
+      )
+    );
+  } finally {
+    state.snapshotFallbackInflight = false;
+  }
+}
+
+function startPublicSnapshotFallbackPolling() {
+  if (state.snapshotFallbackTimer) {
+    return;
+  }
+  state.snapshotFallbackTimer = window.setInterval(
+    fetchPublicSnapshotFallback,
+    PUBLIC_SNAPSHOT_FALLBACK_INTERVAL_MS
+  );
 }
 
 function clearReconnectTimer(targetKey) {
@@ -759,7 +812,17 @@ function resolveNodeStatus(node) {
   if (!lastSeen) {
     return node.status === "offline" ? "offline" : "online";
   }
-  return Math.floor(Date.now() / 1000) - lastSeen > 5 ? "offline" : "online";
+  return Math.floor(Date.now() / 1000) - lastSeen > resolveNodeStaleSeconds(node)
+    ? "offline"
+    : "online";
+}
+
+function resolveNodeStaleSeconds(node) {
+  const interval = Number(node?.test_interval_sec || 0);
+  if (Number.isFinite(interval) && interval > 0) {
+    return Math.max(PUBLIC_NODE_STALE_GRACE_SECONDS, Math.ceil(interval * 2.5));
+  }
+  return PUBLIC_NODE_STALE_GRACE_SECONDS;
 }
 
 function syncRealtimeStatus(nodes) {
@@ -1167,6 +1230,12 @@ function isHistoryRangeFetched(
   );
 }
 
+function isNodeHistoryInflight(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  return state.testHistoryInflight.has(
+    historyRequestKey(nodeId, sourceKey, rangeKey)
+  );
+}
+
 function trimTestHistoryEntry(entry) {
   if (!entry || !Array.isArray(entry.times)) return entry;
   let times = entry.times;
@@ -1526,7 +1595,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
         historyRequestKey(nodeId, sourceKey, resolvedRange),
         true
       );
-      refreshOpenNodeHistoryViews(nodeId);
+      forceRefreshOpenNodeHistoryViews(nodeId);
       return getNodeHistoryRange(nodeId, resolvedRange, sourceKey);
     })
     .catch((error) => {
@@ -2467,6 +2536,32 @@ function clearNetworkSection(fields) {
   }
 }
 
+function renderNetworkLoadingState(fields) {
+  if (fields.testRange) {
+    fields.testRange.innerHTML = "";
+  }
+  if (fields.testSmooth) {
+    fields.testSmooth.disabled = true;
+    fields.testSmooth.classList.remove("active");
+    fields.testSmooth.setAttribute("aria-pressed", "false");
+  }
+  if (fields.testTooltip) {
+    fields.testTooltip.classList.remove("visible");
+  }
+  if (fields.testCrosshair) {
+    fields.testCrosshair.classList.remove("visible");
+  }
+  fields.testChart.innerHTML = `
+    <div class="network-loading-state">
+      <span></span>
+      <span></span>
+      <span></span>
+      <strong>正在加载网络连通性数据</strong>
+    </div>
+  `;
+  fields.testCards.innerHTML = "";
+}
+
 function setNetworkSectionVisibility(fields, visible) {
   if (!fields.networkSection) {
     return;
@@ -2484,6 +2579,14 @@ function updateNetworkTests(fields, node, tests, nodeId) {
 
   setNetworkSectionVisibility(fields, true);
   if (!tests.length && !hasAnyHistoryForNode(nodeId)) {
+    const activeRange = normalizeHistoryRangeKey(
+      state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
+    );
+    void fetchNodeHistory(nodeId, activeRange);
+    if (isNodeHistoryInflight(nodeId, activeRange)) {
+      renderNetworkLoadingState(fields);
+      return;
+    }
     clearNetworkSection(fields);
     return;
   }
@@ -3867,6 +3970,7 @@ function aggregateDisk(list) {
 updateFooter("");
 loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);
+startPublicSnapshotFallbackPolling();
 
 loadRemoteConfig().finally(() => {
   fetchPublicSnapshot().finally(() => {

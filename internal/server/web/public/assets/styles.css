@@ -1084,6 +1084,59 @@ html[data-theme="dark"] .theme-toggle:hover {
   min-height: 180px;
 }
 
+.network-loading-state {
+  min-height: 180px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(44px, 1fr));
+  align-items: end;
+  gap: 14px;
+  padding: 28px 24px 20px;
+  border-radius: 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.network-loading-state span {
+  display: block;
+  border-radius: 999px 999px 6px 6px;
+  background: linear-gradient(180deg, rgba(96, 165, 250, 0.45), rgba(34, 197, 94, 0.18));
+  min-height: 44px;
+  animation: network-loading-pulse 1.2s ease-in-out infinite;
+}
+
+.network-loading-state span:nth-child(1) {
+  height: 64px;
+}
+
+.network-loading-state span:nth-child(2) {
+  height: 108px;
+  animation-delay: 0.12s;
+}
+
+.network-loading-state span:nth-child(3) {
+  height: 82px;
+  animation-delay: 0.24s;
+}
+
+.network-loading-state strong {
+  grid-column: 1 / -1;
+  justify-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+@keyframes network-loading-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .network-canvas svg {
   width: 100%;
   height: 180px;
