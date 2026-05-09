@@ -99,6 +99,14 @@ const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
 const LATENCY_SMOOTH_ALPHA = 0.2;
 
+function safeLocalStorage() {
+  try {
+    return window.localStorage || null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function syncViewStateToURL(replace = false) {
   const nextLocation = buildViewURL(state.selectedGroup, state.statusFilter);
   const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -943,14 +951,15 @@ function applyPublicSettings(settings) {
 }
 
 function loadTestHistoryCache() {
-  if (!window.localStorage) return;
+  const storage = safeLocalStorage();
+  if (!storage) return;
   try {
-    const raw = localStorage.getItem(HISTORY_CACHE_KEY);
+    const raw = storage.getItem(HISTORY_CACHE_KEY);
     if (!raw) return;
     const payload = JSON.parse(raw);
     if (!payload || typeof payload !== "object") return;
     if (payload.version !== HISTORY_CACHE_VERSION && payload.version !== undefined) {
-      localStorage.removeItem(HISTORY_CACHE_KEY);
+      storage.removeItem(HISTORY_CACHE_KEY);
     }
     if (payload.version !== HISTORY_CACHE_VERSION) {
       return;
@@ -976,7 +985,8 @@ function scheduleHistoryCacheSave() {
 }
 
 function persistHistoryCache() {
-  if (!window.localStorage) return;
+  const storage = safeLocalStorage();
+  if (!storage) return;
   const nodes = {};
   state.testHistory.forEach((ranges, cacheKey) => {
     if (!ranges || ranges.size === 0) return;
@@ -1006,7 +1016,7 @@ function persistHistoryCache() {
     nodes,
   };
   try {
-    localStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify(payload));
+    storage.setItem(HISTORY_CACHE_KEY, JSON.stringify(payload));
   } catch (error) {
     return;
   }
@@ -3256,23 +3266,22 @@ function setupLatencyHover(fields, meta, labels) {
     const hoverIndex = resolveLatencyHoverIndex(meta.paddedSeries, index);
     let activeIndex = hoverIndex;
     let rows = buildLatencyTooltipRows(meta, labels, activeIndex);
-    if (!rows) {
+    if (rows.length === 0) {
       activeIndex = resolveLatestLatencySampleIndex(meta.paddedSeries);
       rows = buildLatencyTooltipRows(meta, labels, activeIndex);
     }
     const time = meta.paddedTimes[activeIndex] || meta.paddedTimes[hoverIndex];
-    if (!time || !rows) {
+    if (!time || rows.length === 0) {
       hide();
       return;
     }
 
-    const tooltipSignature = `${activeIndex}|${time}|${rows}`;
+    const tooltipSignature = `${activeIndex}|${time}|${rows
+      .map((row) => `${row.name}:${row.color}:${row.value}`)
+      .join("|")}`;
     let tooltipSize = tooltip.__latencyTooltipSize;
     if (tooltip.__latencyTooltipSignature !== tooltipSignature) {
-      tooltip.innerHTML = `
-        <div class="latency-tooltip-time">${formatTimeFull(time)}</div>
-        ${rows}
-      `;
+      renderLatencyTooltip(tooltip, formatTimeFull(time), rows);
       tooltip.__latencyTooltipSignature = tooltipSignature;
       const tooltipRect = tooltip.getBoundingClientRect();
       tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
@@ -3305,24 +3314,44 @@ function setupLatencyHover(fields, meta, labels) {
 
 function buildLatencyTooltipRows(meta, labels, hoverIndex) {
   if (!meta || !Array.isArray(meta.paddedSeries) || hoverIndex < 0) {
-    return "";
+    return [];
   }
   return meta.paddedSeries
     .map((series, idx) => {
       const value = series[hoverIndex];
-      if (value === null || value === undefined) return "";
+      if (value === null || value === undefined) return null;
       const color = meta.colors[idx] || "#4f7cff";
       const name = labels[idx] || "未命名";
-      return `
-        <div class="latency-tooltip-row">
-          <span class="latency-tooltip-dot" style="background:${color}"></span>
-          <span class="latency-tooltip-name">${name}</span>
-          <strong>${formatLatencyStat(value)}</strong>
-        </div>
-      `;
+      return { color, name, value: formatLatencyStat(value) };
     })
     .filter(Boolean)
-    .join("");
+}
+
+function renderLatencyTooltip(tooltip, timeLabel, rows) {
+  tooltip.replaceChildren();
+  const timeElement = document.createElement("div");
+  timeElement.className = "latency-tooltip-time";
+  timeElement.textContent = timeLabel;
+  tooltip.appendChild(timeElement);
+
+  rows.forEach((row) => {
+    const line = document.createElement("div");
+    line.className = "latency-tooltip-row";
+
+    const dot = document.createElement("span");
+    dot.className = "latency-tooltip-dot";
+    dot.style.background = row.color;
+
+    const name = document.createElement("span");
+    name.className = "latency-tooltip-name";
+    name.textContent = row.name;
+
+    const value = document.createElement("strong");
+    value.textContent = row.value;
+
+    line.append(dot, name, value);
+    tooltip.appendChild(line);
+  });
 }
 
 function resolveLatencyHoverIndex(seriesList, preferredIndex) {

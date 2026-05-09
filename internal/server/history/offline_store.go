@@ -17,6 +17,8 @@ import (
 
 const offlineDurationMetric = "cm_node_offline_duration_seconds"
 
+const offlineRetention = 2 * 365 * 24 * time.Hour
+
 var errNilOfflineStore = errors.New("offline history store is nil")
 
 type OfflineSummary struct {
@@ -54,7 +56,7 @@ func OpenOfflineStore(dir string) (*OfflineStore, error) {
 	}
 
 	opts := tsdb.DefaultOptions()
-	opts.RetentionDuration = 0
+	opts.RetentionDuration = int64(offlineRetention / time.Millisecond)
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {

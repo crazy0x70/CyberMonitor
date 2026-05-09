@@ -57,6 +57,8 @@ cleanup_script() {
 
 cleanup_common_files() {
   rm -f "${INSTALL_DIR}/cyber-monitor-agent"
+  rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
+  rm -f "${INSTALL_DIR}/.cybermonitor-node-id"
   rm -f "${CONF_DIR}/agent.conf"
   rmdir "${CONF_DIR}" 2>/dev/null || true
   rmdir "${INSTALL_DIR}" 2>/dev/null || true

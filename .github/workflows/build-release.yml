@@ -296,6 +296,7 @@ jobs:
             internal/server/web/public/assets/styles.css \
             internal/server/web/public/assets/theme.js \
             internal/server/web/public/assets/monitor.js \
+            scripts/build-local.sh \
             scripts/install-common.sh \
             scripts/agent.sh \
             scripts/one-click.sh \
@@ -305,12 +306,12 @@ jobs:
             scripts/agent-uninstall.ps1
           do
             test -e "$path"
-            git ls-files --error-unmatch -- "$path" >/dev/null
           done
           echo "node_version=$DOCKER_NODE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify install scripts
         run: |
+          bash -n scripts/build-local.sh
           bash -n scripts/install-common.sh
           bash -n scripts/agent.sh
           bash -n scripts/one-click.sh
@@ -473,20 +474,13 @@ jobs:
           TAG="${{ needs.version.outputs.tag }}"
           NOTES="Full Changelog: [${{ steps.changelog.outputs.prev_tag }}...${TAG}](${{ steps.changelog.outputs.compare_url }})"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/cyber-monitor-* release/SHA256SUMS --clobber
+            gh release upload "$TAG" release/cyber-monitor-* release/web-dist.tar.gz release/web-dist.zip release/SHA256SUMS --clobber
             gh release edit "$TAG" \
               --title "$TAG" \
               --notes "$NOTES"
           else
-            gh release create "$TAG" release/cyber-monitor-* release/SHA256SUMS \
+            gh release create "$TAG" release/cyber-monitor-* release/web-dist.tar.gz release/web-dist.zip release/SHA256SUMS \
               --title "$TAG" \
               --notes "$NOTES" \
               --target "${GITHUB_SHA}"
           fi
-
-      - name: Attach web archives to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.version.outputs.tag }}"
-          gh release upload "$TAG" release/web-dist.tar.gz release/web-dist.zip --clobber

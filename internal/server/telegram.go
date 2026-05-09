@@ -16,13 +16,18 @@ import (
 	"time"
 )
 
-const telegramSendConcurrency = 4
+const (
+	telegramSendConcurrency = 4
+	telegramPollIdleDelay   = 2 * time.Second
+	telegramAIWindow        = time.Minute
+	telegramAILimit         = 3
+)
 
 var telegramSendFunc = sendTelegramMessage
 
 func telegramBackoffDelay(err error) time.Duration {
 	if err == nil {
-		return 900 * time.Millisecond
+		return telegramPollIdleDelay
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
@@ -33,6 +38,22 @@ func telegramBackoffDelay(err error) time.Duration {
 	default:
 		return 2 * time.Second
 	}
+}
+
+func telegramRequestErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Err != nil {
+			return urlErr.Err.Error()
+		}
+		if urlErr.Op != "" {
+			return urlErr.Op
+		}
+	}
+	return err.Error()
 }
 
 type telegramUpdateResponse struct {
@@ -130,7 +151,7 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				if command == "" {
 					continue
 				}
-				reply := handleTelegramCommand(command, store)
+				reply := handleTelegramCommand(command, store, update.Message.From.ID, update.Message.Chat.ID)
 				if reply == "" {
 					continue
 				}
@@ -138,7 +159,7 @@ func startTelegramBot(ctx context.Context, store *Store) {
 					log.Printf("Telegram 回复失败: %v", err)
 				}
 			}
-			if !waitTelegramPoll(ctx, 900*time.Millisecond) {
+			if !waitTelegramPoll(ctx, telegramPollIdleDelay) {
 				return
 			}
 		}
@@ -175,7 +196,7 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?%s", token, values.Encode())
 	resp, err := client.Get(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("请求更新失败: %w", err)
+		return nil, fmt.Errorf("请求更新失败: %s", telegramRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -268,13 +289,13 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("telegram 请求创建失败: %w", err)
+		return fmt.Errorf("telegram 请求创建失败: %s", telegramRequestErrorMessage(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram 发送失败: %w", err)
+		return fmt.Errorf("telegram 发送失败: %s", telegramRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -291,7 +312,7 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 	return nil
 }
 
-func handleTelegramCommand(command string, store *Store) string {
+func handleTelegramCommand(command string, store *Store, userID, chatID int64) string {
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
 		return ""
@@ -317,7 +338,7 @@ func handleTelegramCommand(command string, store *Store) string {
 	case "/alarmsoff":
 		return handleTelegramAlarmToggle(store, parts, false)
 	case "/ai":
-		return handleTelegramAICommand(command, store)
+		return handleTelegramAICommand(command, store, userID, chatID)
 	default:
 		return buildTelegramHelp()
 	}
@@ -336,7 +357,7 @@ func buildTelegramHelp() string {
 	}, "\n")
 }
 
-func handleTelegramAICommand(command string, store *Store) string {
+func handleTelegramAICommand(command string, store *Store, userID, chatID int64) string {
 	parts := strings.Fields(command)
 	if len(parts) < 2 {
 		return "用法: /ai 你的问题"
@@ -349,6 +370,10 @@ func handleTelegramAICommand(command string, store *Store) string {
 		return toggleAlertForServer(store, serverID, enabled)
 	} else if message != "" {
 		return message
+	}
+	rateKey := fmt.Sprintf("telegram-ai:%d:%d", userID, chatID)
+	if !store.allowAgentRate(rateKey, telegramAIWindow, telegramAILimit, time.Now(), false) {
+		return "AI 查询过于频繁，请稍后再试"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
 	defer cancel()
@@ -596,13 +621,13 @@ func setTelegramCommands(token string) error {
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", token)
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("telegram 菜单请求创建失败: %w", err)
+		return fmt.Errorf("telegram 菜单请求创建失败: %s", telegramRequestErrorMessage(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram 菜单设置失败: %w", err)
+		return fmt.Errorf("telegram 菜单设置失败: %s", telegramRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

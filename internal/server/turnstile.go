@@ -14,6 +14,8 @@ import (
 
 const turnstileVerifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
+var turnstileHTTPClient = &http.Client{Timeout: 8 * time.Second}
+
 type turnstileVerifyResponse struct {
 	Success    bool     `json:"success"`
 	ErrorCodes []string `json:"error-codes"`
@@ -57,7 +59,7 @@ func verifyTurnstileToken(ctx context.Context, secretKey, token, remoteIP string
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := turnstileHTTPClient.Do(req)
 	if err != nil {
 		return errors.New("Turnstile 校验失败，请稍后重试")
 	}

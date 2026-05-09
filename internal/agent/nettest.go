@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os/exec"
 	"regexp"
@@ -15,10 +16,11 @@ import (
 )
 
 const (
-	defaultTCPPort  = 80
-	icmpTimeout     = 3 * time.Second
-	tcpTimeout      = 3 * time.Second
-	pingSampleCount = 3
+	defaultTCPPort    = 80
+	icmpTimeout       = 3 * time.Second
+	tcpTimeout        = 3 * time.Second
+	pingSampleCount   = 3
+	maxNetTestWorkers = 16
 )
 
 var (
@@ -122,11 +124,20 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 	}
 	results := make([]metrics.NetworkTestResult, len(configs))
 	var wg sync.WaitGroup
+	workers := maxNetTestWorkers
+	if len(configs) < workers {
+		workers = len(configs)
+	}
+	sem := make(chan struct{}, workers)
 
 	for i, cfg := range configs {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(index int, config metrics.NetworkTestConfig) {
-			defer wg.Done()
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
 			results[index] = runSingleNetworkTest(ctx, config, time.Now, testTCP, pingHost)
 		}(i, cfg)
 	}
@@ -186,6 +197,10 @@ func testTCP(host string, port int) (*float64, string, string) {
 }
 
 func pingHost(ctx context.Context, host string) (*float64, float64, string, string) {
+	if err := validateProbeHost(host); err != nil {
+		return nil, 100, "error", err.Error()
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, icmpTimeout)
 	defer cancel()
 
@@ -213,6 +228,42 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	}
 
 	return latency, loss, status, parseErr
+}
+
+func validateProbeHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return errors.New("host 不能为空")
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !isValidDNSLabel(label) {
+			return errors.New("host 格式无效")
+		}
+	}
+	return nil
+}
+
+func isValidDNSLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for _, char := range label {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func newPingCommand(ctx context.Context, pingPath string, host string) *exec.Cmd {

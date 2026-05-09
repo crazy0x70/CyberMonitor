@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ import (
 	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
+
+const maxAgentNetworkTests = 128
 
 type agentAPIError struct {
 	statusCode int
@@ -77,14 +80,104 @@ func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agent
 	if payload.NodeName == "" {
 		payload.NodeName = payload.NodeID
 	}
+	payload.NetworkTests = normalizeAgentNetworkTestResults(payload.NetworkTests)
 	return payload, nil
 }
 
 func (a *agentAPI) validateAgentToken(nodeID, token string) *agentAPIError {
-	if a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
+	if a.store.validateAgentAuthToken(nodeID, token) {
 		return nil
 	}
 	return invalidAgentTokenError()
+}
+
+func normalizeAgentNetworkTestResults(items []metrics.NetworkTestResult) []metrics.NetworkTestResult {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > maxAgentNetworkTests {
+		items = items[:maxAgentNetworkTests]
+	}
+	normalized := make([]metrics.NetworkTestResult, 0, len(items))
+	for _, item := range items {
+		name := cleanAgentText(item.Name, 120)
+		host := cleanAgentText(item.Host, 253)
+		if name == "" && host == "" {
+			continue
+		}
+		if name == "" {
+			name = host
+		}
+		kind := strings.ToLower(strings.TrimSpace(item.Type))
+		if kind != "tcp" && kind != "icmp" {
+			if item.Port > 0 {
+				kind = "tcp"
+			} else {
+				kind = "icmp"
+			}
+		}
+		port := item.Port
+		if kind == "icmp" {
+			port = 0
+		} else if port < 0 || port > 65535 {
+			continue
+		}
+		statusText := cleanAgentText(strings.ToLower(strings.TrimSpace(item.Status)), 32)
+		if statusText != "ok" && statusText != "error" && statusText != "timeout" {
+			statusText = "error"
+		}
+		item.Name = name
+		item.Host = host
+		item.Type = kind
+		item.Port = port
+		item.Status = statusText
+		item.Error = cleanAgentText(item.Error, 240)
+		if item.PacketLoss < 0 {
+			item.PacketLoss = 0
+		} else if item.PacketLoss > 100 || math.IsNaN(item.PacketLoss) || math.IsInf(item.PacketLoss, 0) {
+			item.PacketLoss = 100
+		}
+		if item.LatencyMs != nil && (math.IsNaN(*item.LatencyMs) || math.IsInf(*item.LatencyMs, 0) || *item.LatencyMs < 0) {
+			item.LatencyMs = nil
+		}
+		normalized = append(normalized, item)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func cleanAgentText(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '<', '>', '"', '\'', '`':
+			return -1
+		case '\r', '\n', '\t':
+			return ' '
+		default:
+			if r < 32 {
+				return -1
+			}
+			return r
+		}
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
+	if maxLen > 0 {
+		runes := []rune(value)
+		if len(runes) > maxLen {
+			value = string(runes[:maxLen])
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func agentRateLimitError() *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusTooManyRequests, message: "rate limit exceeded"}
 }
 
 func (a *agentAPI) broadcastPublicDelta(nodeID string) {
@@ -115,6 +208,9 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if apiErr := a.validateAgentToken(payload.NodeID, token); apiErr != nil {
 		return false, apiErr
 	}
+	if !a.store.allowAgentRate("ingest:"+payload.NodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), true) {
+		return false, agentRateLimitError()
+	}
 	updateReconciled := a.store.Update(payload)
 	a.broadcastPublicDelta(payload.NodeID)
 	if updateReconciled {
@@ -123,7 +219,7 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if strings.TrimSpace(remoteAddr) == "" {
 		remoteAddr = "grpc"
 	}
-	return a.store.HasPendingAgentUpdate(payload.NodeID), nil
+	return a.store.HasPendingAgentConfigRefresh(payload.NodeID), nil
 }
 
 func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
@@ -131,8 +227,8 @@ func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
 	if apiErr != nil {
 		return AgentConfig{}, apiErr
 	}
-	if !a.store.validateOrProvisionAgentAuthToken(nodeID, token, a.cfg.AgentToken) {
-		return AgentConfig{}, invalidAgentTokenError()
+	if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+		return AgentConfig{}, apiErr
 	}
 	return a.store.AgentConfig(nodeID), nil
 }
@@ -142,8 +238,14 @@ func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIErr
 	if apiErr != nil {
 		return "", apiErr
 	}
-	if strings.TrimSpace(a.cfg.AgentToken) != "" && strings.TrimSpace(bootstrapToken) != strings.TrimSpace(a.cfg.AgentToken) {
+	if strings.TrimSpace(a.cfg.AgentToken) != "" && !isBootstrapAgentToken(a.cfg.AgentToken, bootstrapToken) {
 		return "", invalidBootstrapTokenError()
+	}
+	if !a.store.allowAgentRate("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, time.Now(), false) {
+		return "", agentRateLimitError()
+	}
+	if !a.store.allowAgentRate("register:"+nodeID, agentRegisterWindow, defaultAgentRegisterLimit, time.Now(), false) {
+		return "", agentRateLimitError()
 	}
 	return a.store.ensureAgentAuthToken(nodeID), nil
 }
@@ -213,6 +315,7 @@ func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequ
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
+	s.api.store.MarkAgentConfigRefreshed(req.NodeID)
 	return &agentrpc.ConfigResponse{
 		Alias:           config.Alias,
 		Group:           config.Group,
@@ -272,6 +375,8 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 		return status.Error(codes.Unauthenticated, err.message)
 	case http.StatusNotFound:
 		return status.Error(codes.NotFound, err.message)
+	case http.StatusTooManyRequests:
+		return status.Error(codes.ResourceExhausted, err.message)
 	default:
 		return status.Error(codes.Internal, err.message)
 	}

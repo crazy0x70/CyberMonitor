@@ -294,14 +294,48 @@ func writeLegacyMigrationArtifact(path string, pathFunc func(string) string, pay
 }
 
 func writeLegacyFileAtomic(path string, payload []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	committed = true
+	syncLegacyParentDir(dir)
+	return nil
+}
+
+func syncLegacyParentDir(dir string) {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer handle.Close()
+	_ = handle.Sync()
 }
 
 func legacyMigrationMarked(path string) (bool, error) {

@@ -27,6 +27,7 @@ const (
 	checksumAssetName        = "SHA256SUMS"
 	maxUpdaterErrorBodyBytes = 4096
 	maxChecksumFileBytes     = 1024 * 1024
+	defaultHTTPTimeout       = 20 * time.Second
 )
 
 type Kind string
@@ -450,7 +451,7 @@ func (c *Client) httpClient() *http.Client {
 	if c != nil && c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	return &http.Client{Timeout: defaultHTTPTimeout}
 }
 
 func (c *Client) userAgent() string {

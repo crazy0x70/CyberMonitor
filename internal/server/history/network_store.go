@@ -55,8 +55,8 @@ func OpenNetworkStore(dir string) (*NetworkStore, error) {
 	}
 
 	opts := tsdb.DefaultOptions()
-	opts.RetentionDuration = int64((networkRetentionDays * 24 * time.Hour) / time.Millisecond)
-	opts.OutOfOrderTimeWindow = opts.RetentionDuration
+	opts.RetentionDuration = int64(networkRetention / time.Millisecond)
+	opts.OutOfOrderTimeWindow = int64(networkOutOfOrderWindow / time.Millisecond)
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {

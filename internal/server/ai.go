@@ -45,6 +45,24 @@ func readResponseBodyLimited(body io.Reader) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(body, maxHTTPErrorBodyBytes))
 }
 
+func aiRequestErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return "请求失败"
+	}
+	if len(msg) > 180 {
+		msg = msg[:180]
+	}
+	return msg
+}
+
 type AIProviderConfig struct {
 	APIKey  string `json:"api_key,omitempty"`
 	BaseURL string `json:"base_url,omitempty"`
@@ -379,17 +397,19 @@ func validateAIBaseURL(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Host == "" {
+	if err := validateHTTPCallbackURL(raw); err != nil {
+		if errors.Is(err, errCallbackURLScheme) {
+			return errors.New("AI base url 需为 http 或 https")
+		}
 		return errors.New("AI base url 无效")
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("AI base url 需为 http 或 https")
 	}
 	return nil
 }
 
 func validateAISettings(settings AISettings) error {
+	if err := validateAICommandProvider(settings); err != nil {
+		return err
+	}
 	configs := []AIProviderConfig{
 		settings.OpenAI,
 		settings.Gemini,
@@ -407,6 +427,30 @@ func validateAISettings(settings AISettings) error {
 		return err
 	}
 	return nil
+}
+
+func validateAICommandProvider(settings AISettings) error {
+	provider, providerID := parseAIProviderSelector(settings.CommandProvider)
+	switch provider {
+	case aiProviderOpenAI, aiProviderGemini, aiProviderVolcengine:
+		if providerID != "" {
+			return errors.New("AI 指令服务商无效")
+		}
+		return nil
+	case aiProviderOpenAICompatible:
+		if providerID == "" {
+			if len(settings.OpenAICompatibles) == 0 {
+				return errors.New("未配置 OpenAI 兼容服务商")
+			}
+			return nil
+		}
+		if _, ok := findAICompatibleProvider(settings, providerID); !ok {
+			return errors.New("未找到指定的兼容服务商")
+		}
+		return nil
+	default:
+		return errors.New("AI 指令服务商无效")
+	}
 }
 
 func validateAICompatibles(items []AIProviderProfile) error {
@@ -650,7 +694,7 @@ func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, e
 	client := &http.Client{Timeout: 18 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("AI 请求失败: %w", err)
+		return nil, fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	body, _ := readResponseBodyLimited(resp.Body)
@@ -696,7 +740,7 @@ func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, e
 	client := &http.Client{Timeout: 18 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("AI 请求失败: %w", err)
+		return nil, fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	body, _ := readResponseBodyLimited(resp.Body)
@@ -755,74 +799,94 @@ func buildAISnapshot(store *Store) aiSnapshot {
 	offlineStore := resolveAIOfflineStore(store)
 	servers := make([]aiServerSummary, 0, len(nodes))
 	for _, node := range nodes {
-		stats := node.Stats
-		diskUsed := 0.0
-		for _, disk := range stats.Disk {
-			if disk.UsedPercent > diskUsed {
-				diskUsed = disk.UsedPercent
-			}
-		}
-		name := resolveNodeDisplayNameForAI(node)
-		offlineSummary := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
-		hostName := strings.TrimSpace(stats.Hostname)
-		if hostName == "" {
-			hostName = strings.TrimSpace(stats.NodeName)
-		}
-		if hostName == "" {
-			hostName = strings.TrimSpace(stats.NodeID)
-		}
-		group := strings.TrimSpace(node.Group)
-		tags := append([]string{}, node.Tags...)
-		groups := append([]string{}, node.Groups...)
-		diskType := strings.TrimSpace(node.DiskType)
-		if diskType == "" {
-			diskType = strings.TrimSpace(stats.DiskType)
-		}
-		netSpeedMbps := float64(node.NetSpeedMbps)
-		if netSpeedMbps <= 0 {
-			netSpeedMbps = stats.NetSpeedMbps
-		}
-		testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
-		testTrends := buildAINetworkTrendSummaries(testsByKey, queryAINetworkHistory(store, stats.NodeID, snapshotTime))
-		servers = append(servers, aiServerSummary{
-			ServerID:          node.ServerID,
-			DisplayName:       name,
-			Hostname:          hostName,
-			Status:            node.Status,
-			Group:             group,
-			Tags:              tags,
-			Groups:            groups,
-			Region:            strings.TrimSpace(node.Region),
-			OS:                stats.OS,
-			Arch:              stats.Arch,
-			AgentVersion:      strings.TrimSpace(stats.AgentVersion),
-			CPUUsage:          stats.CPU.UsagePercent,
-			MemUsage:          stats.Memory.UsedPercent,
-			DiskUsed:          diskUsed,
-			DiskType:          diskType,
-			NetSpeedMbps:      netSpeedMbps,
-			NetRecvBytes:      stats.Network.BytesRecv,
-			NetSendBytes:      stats.Network.BytesSent,
-			RxBytesPerSec:     stats.Network.RxBytesPerSec,
-			TxBytesPerSec:     stats.Network.TxBytesPerSec,
-			ProcessCount:      stats.ProcessCount,
-			TCPConns:          stats.TCPConns,
-			UDPConns:          stats.UDPConns,
-			UptimeSec:         stats.UptimeSec,
-			LastSeen:          node.LastSeen,
-			FirstSeen:         node.FirstSeen,
-			ExpireAt:          node.ExpireAt,
-			RenewIntervalSec:  node.RenewIntervalSec,
-			AlertEnabled:      node.AlertEnabled,
-			OfflineSummary:    offlineSummary,
-			NetworkTests:      testSummaries,
-			NetworkTestTrends: testTrends,
-		})
+		servers = append(servers, buildAIServerSummary(node, offlineStore, store, snapshotTime))
 	}
 	return aiSnapshot{
 		GeneratedAt: snapshotTime.Format("2006-01-02 15:04:05"),
 		Servers:     servers,
 	}
+}
+
+func buildAIServerSummary(node NodeView, offlineStore *history.OfflineStore, store *Store, snapshotTime time.Time) aiServerSummary {
+	stats := node.Stats
+
+	diskUsed := calculateMaxDiskUsage(stats.Disk)
+	name := resolveNodeDisplayNameForAI(node)
+	offlineSummary := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
+	hostName := resolveHostName(stats)
+	diskType := resolveDiskType(node, stats)
+	netSpeedMbps := resolveNetSpeed(node, stats)
+	testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
+	testTrends := buildAINetworkTrendSummaries(testsByKey, queryAINetworkHistory(store, stats.NodeID, snapshotTime))
+
+	return aiServerSummary{
+		ServerID:          node.ServerID,
+		DisplayName:       name,
+		Hostname:          hostName,
+		Status:            node.Status,
+		Group:             strings.TrimSpace(node.Group),
+		Tags:              append([]string{}, node.Tags...),
+		Groups:            append([]string{}, node.Groups...),
+		Region:            strings.TrimSpace(node.Region),
+		OS:                stats.OS,
+		Arch:              stats.Arch,
+		AgentVersion:      strings.TrimSpace(stats.AgentVersion),
+		CPUUsage:          stats.CPU.UsagePercent,
+		MemUsage:          stats.Memory.UsedPercent,
+		DiskUsed:          diskUsed,
+		DiskType:          diskType,
+		NetSpeedMbps:      netSpeedMbps,
+		NetRecvBytes:      stats.Network.BytesRecv,
+		NetSendBytes:      stats.Network.BytesSent,
+		RxBytesPerSec:     stats.Network.RxBytesPerSec,
+		TxBytesPerSec:     stats.Network.TxBytesPerSec,
+		ProcessCount:      stats.ProcessCount,
+		TCPConns:          stats.TCPConns,
+		UDPConns:          stats.UDPConns,
+		UptimeSec:         stats.UptimeSec,
+		LastSeen:          node.LastSeen,
+		FirstSeen:         node.FirstSeen,
+		ExpireAt:          node.ExpireAt,
+		RenewIntervalSec:  node.RenewIntervalSec,
+		AlertEnabled:      node.AlertEnabled,
+		OfflineSummary:    offlineSummary,
+		NetworkTests:      testSummaries,
+		NetworkTestTrends: testTrends,
+	}
+}
+
+func calculateMaxDiskUsage(disks []metrics.DiskPartition) float64 {
+	maxUsed := 0.0
+	for _, disk := range disks {
+		if disk.UsedPercent > maxUsed {
+			maxUsed = disk.UsedPercent
+		}
+	}
+	return maxUsed
+}
+
+func resolveHostName(stats metrics.NodeStats) string {
+	if hostName := strings.TrimSpace(stats.Hostname); hostName != "" {
+		return hostName
+	}
+	if nodeName := strings.TrimSpace(stats.NodeName); nodeName != "" {
+		return nodeName
+	}
+	return strings.TrimSpace(stats.NodeID)
+}
+
+func resolveDiskType(node NodeView, stats metrics.NodeStats) string {
+	if diskType := strings.TrimSpace(node.DiskType); diskType != "" {
+		return diskType
+	}
+	return strings.TrimSpace(stats.DiskType)
+}
+
+func resolveNetSpeed(node NodeView, stats metrics.NodeStats) float64 {
+	if netSpeedMbps := float64(node.NetSpeedMbps); netSpeedMbps > 0 {
+		return netSpeedMbps
+	}
+	return stats.NetSpeedMbps
 }
 
 func queryAINetworkHistory(store *Store, nodeID string, now time.Time) map[string]*TestHistoryEntry {
@@ -1191,7 +1255,7 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 	client := &http.Client{Timeout: 18 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("AI 请求失败: %w", err)
+		return "", fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	body, _ := readResponseBodyLimited(resp.Body)
@@ -1255,7 +1319,7 @@ func callGemini(ctx context.Context, config AIProviderConfig, systemPrompt, user
 	client := &http.Client{Timeout: 18 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("AI 请求失败: %w", err)
+		return "", fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	body, _ := readResponseBodyLimited(resp.Body)

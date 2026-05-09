@@ -26,6 +26,7 @@ go.work.sum
 /agent
 /server
 /cyber-monitor
+/dist/
 
 # env file
 .env
@@ -35,6 +36,9 @@ go.work.sum
 
 # Local tooling and generated frontend workspace artifacts
 .cache/
+.gocache/
+.gomodcache/
+.tmp/
 .serena/
 output/
 internal/server/web/admin/node_modules/

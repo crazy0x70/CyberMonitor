@@ -258,11 +258,7 @@ func runNetworkTestsWithCacheAt(
 	runner func(context.Context, []metrics.NetworkTestConfig) []metrics.NetworkTestResult,
 ) ([]metrics.NetworkTestResult, bool) {
 	if len(configs) == 0 {
-		if len(cache) == 0 {
-			return nil, false
-		}
-		clear(cache)
-		return []metrics.NetworkTestResult{}, true
+		return handleEmptyConfigs(cache)
 	}
 	if defaultInterval <= 0 {
 		defaultInterval = 5 * time.Second
@@ -274,8 +270,36 @@ func runNetworkTestsWithCacheAt(
 		runner = RunNetworkTests
 	}
 
-	changed := false
 	currentTime := now()
+	dueConfigs, dueKeys, validKeys := findDueTests(configs, cache, currentTime, defaultInterval)
+
+	changed := false
+	if len(dueConfigs) > 0 {
+		updateCacheWithResults(cache, dueKeys, runner(ctx, dueConfigs))
+		changed = true
+	}
+
+	if cleanupStaleCache(cache, validKeys) {
+		changed = true
+	}
+
+	return buildOrderedResults(configs, cache), changed
+}
+
+func handleEmptyConfigs(cache map[string]cachedTest) ([]metrics.NetworkTestResult, bool) {
+	if len(cache) == 0 {
+		return nil, false
+	}
+	clear(cache)
+	return []metrics.NetworkTestResult{}, true
+}
+
+func findDueTests(
+	configs []metrics.NetworkTestConfig,
+	cache map[string]cachedTest,
+	currentTime time.Time,
+	defaultInterval time.Duration,
+) ([]metrics.NetworkTestConfig, []string, map[string]struct{}) {
 	dueConfigs := make([]metrics.NetworkTestConfig, 0, len(configs))
 	dueKeys := make([]string, 0, len(configs))
 	validKeys := make(map[string]struct{}, len(configs))
@@ -287,41 +311,49 @@ func runNetworkTestsWithCacheAt(
 			continue
 		}
 		validKeys[key] = struct{}{}
+
+		if _, duplicated := queuedKeys[key]; duplicated {
+			continue
+		}
+
 		interval := defaultInterval
 		if cfg.IntervalSec > 0 {
 			interval = time.Duration(cfg.IntervalSec) * time.Second
 		}
-		if _, duplicated := queuedKeys[key]; duplicated {
-			continue
-		}
+
 		if cached, ok := cache[key]; !ok || currentTime.Sub(cached.lastRun) >= interval {
 			dueConfigs = append(dueConfigs, cfg)
 			dueKeys = append(dueKeys, key)
 			queuedKeys[key] = struct{}{}
 		}
 	}
+	return dueConfigs, dueKeys, validKeys
+}
 
-	if len(dueConfigs) > 0 {
-		results := runner(ctx, dueConfigs)
-		for i, result := range results {
-			if i >= len(dueKeys) {
-				break
-			}
-			cache[dueKeys[i]] = cachedTest{
-				lastRun: time.Unix(result.CheckedAt, 0),
-				result:  result,
-			}
+func updateCacheWithResults(cache map[string]cachedTest, keys []string, results []metrics.NetworkTestResult) {
+	for i, result := range results {
+		if i >= len(keys) {
+			break
 		}
-		changed = true
+		cache[keys[i]] = cachedTest{
+			lastRun: time.Unix(result.CheckedAt, 0),
+			result:  result,
+		}
 	}
+}
 
+func cleanupStaleCache(cache map[string]cachedTest, validKeys map[string]struct{}) bool {
+	changed := false
 	for key := range cache {
 		if _, ok := validKeys[key]; !ok {
 			delete(cache, key)
 			changed = true
 		}
 	}
+	return changed
+}
 
+func buildOrderedResults(configs []metrics.NetworkTestConfig, cache map[string]cachedTest) []metrics.NetworkTestResult {
 	ordered := make([]metrics.NetworkTestResult, 0, len(configs))
 	for _, cfg := range configs {
 		key := testKey(cfg)
@@ -332,7 +364,7 @@ func runNetworkTestsWithCacheAt(
 			ordered = append(ordered, cached.result)
 		}
 	}
-	return ordered, changed
+	return ordered
 }
 
 func testKey(cfg metrics.NetworkTestConfig) string {

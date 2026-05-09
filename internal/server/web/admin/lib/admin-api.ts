@@ -29,15 +29,23 @@ export class AdminApiError extends Error {
 }
 
 export function getStoredAdminToken() {
-  return window.sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
+  try {
+    return window.sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
 }
 
 export function setStoredAdminToken(token: string) {
-  if (token) {
-    window.sessionStorage.setItem(ADMIN_TOKEN_KEY, "session");
-    return;
+  try {
+    if (token) {
+      window.sessionStorage.setItem(ADMIN_TOKEN_KEY, "session");
+      return;
+    }
+    window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  } catch {
+    // session cookie remains the source of truth when sessionStorage is unavailable
   }
-  window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
 }
 
 async function parseErrorMessage(resp: Response, fallback: string) {

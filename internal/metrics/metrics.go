@@ -142,9 +142,11 @@ var defaultPublicIPv6Endpoints = []string{
 type publicIPLookupFunc func(context.Context, publicIPFamily) (string, error)
 
 type publicIPInfo struct {
-	IPv4      string
-	IPv6      string
-	checkedAt time.Time
+	IPv4       string
+	IPv6       string
+	checkedAt  time.Time
+	ipv4Failed bool
+	ipv6Failed bool
 }
 
 type Collector struct {
@@ -162,6 +164,11 @@ type Collector struct {
 	publicIPs               publicIPInfo
 	publicIPRefreshInterval time.Duration
 	publicIPLookup          publicIPLookupFunc
+
+	cachedCPUModel        string
+	cachedCoreCount       int
+	cachedArch            string
+	staticInfoInitialized bool
 }
 
 func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collector {
@@ -186,19 +193,28 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 func (c *Collector) Collect() (NodeStats, error) {
 	now := time.Now()
 
+	if !c.staticInfoInitialized {
+		cpuInfos, _ := cpu.Info()
+		if len(cpuInfos) > 0 {
+			c.cachedCPUModel = strings.TrimSpace(cpuInfos[0].ModelName)
+		}
+		coreCount, err := cpu.Counts(true)
+		if err == nil && coreCount > 0 {
+			c.cachedCoreCount = coreCount
+		}
+		c.cachedArch = detectArch()
+		if hostInfo, _ := host.Info(); hostInfo != nil {
+			if normalized := normalizeArch(hostInfo.KernelArch); normalized != "" {
+				c.cachedArch = normalized
+			}
+		}
+		c.staticInfoInitialized = true
+	}
+
 	cpuPercents, _ := cpu.Percent(0, false)
 	usage := 0.0
 	if len(cpuPercents) > 0 {
 		usage = cpuPercents[0]
-	}
-	cpuInfos, _ := cpu.Info()
-	cpuModel := ""
-	if len(cpuInfos) > 0 {
-		cpuModel = strings.TrimSpace(cpuInfos[0].ModelName)
-	}
-	coreCount, err := cpu.Counts(true)
-	if err != nil || coreCount < 0 {
-		coreCount = 0
 	}
 
 	loadAvg, _ := load.Avg()
@@ -206,7 +222,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 	partitions, _ := disk.Partitions(false)
 
 	diskUsage := c.collectDiskUsage(partitions)
-	diskType := ""
+	diskType := detectDiskType(partitions, c.hostRoot)
 
 	diskCounters, _ := disk.IOCounters()
 	var diskRead, diskWrite uint64
@@ -229,15 +245,12 @@ func (c *Collector) Collect() (NodeStats, error) {
 	hostname := ""
 	uptime := uint64(0)
 	processCount := 0
-	arch := detectArch()
+	arch := c.cachedArch
 	if hostInfo != nil {
 		osLabel = normalizeOSLabel(hostInfo.Platform, hostInfo.PlatformVersion)
 		hostname = hostInfo.Hostname
 		uptime = hostInfo.Uptime
 		processCount = int(hostInfo.Procs)
-		if normalized := normalizeArch(hostInfo.KernelArch); normalized != "" {
-			arch = normalized
-		}
 	}
 	if hostOS := readHostOSRelease(c.hostRoot); hostOS != "" {
 		osLabel = hostOS
@@ -254,7 +267,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 	netSpeedMbps := collectNetSpeedMbps(netFilter)
 	publicIPs := c.collectPublicIPsAt(now)
 	loadStat := valueOrZero(loadAvg)
-	memoryStat := valueOrZeroMem(memStat)
+	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
 		NodeID:       c.nodeID,
 		NodeName:     c.nodeName,
@@ -271,8 +284,8 @@ func (c *Collector) Collect() (NodeStats, error) {
 			Load1:        loadStat.Load1,
 			Load5:        loadStat.Load5,
 			Load15:       loadStat.Load15,
-			Model:        cpuModel,
-			Cores:        coreCount,
+			Model:        c.cachedCPUModel,
+			Cores:        c.cachedCoreCount,
 		},
 		Memory: MemInfo{
 			Total:       memoryStat.Total,
@@ -360,28 +373,44 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 	type lookupResult struct {
 		family publicIPFamily
 		ip     string
+		failed bool
 	}
-	results := make(chan lookupResult, 2)
-	for _, family := range []publicIPFamily{publicIPv4Family, publicIPv6Family} {
+
+	familiesToCheck := []publicIPFamily{publicIPv4Family, publicIPv6Family}
+
+	if len(familiesToCheck) == 0 {
+		return c.publicIPs
+	}
+
+	results := make(chan lookupResult, len(familiesToCheck))
+	for _, family := range familiesToCheck {
 		go func(family publicIPFamily) {
 			normalized, err := c.lookupPublicIPAt(ctx, family)
 			if err != nil || normalized == "" {
-				results <- lookupResult{family: family}
+				results <- lookupResult{family: family, failed: true}
 				return
 			}
 			results <- lookupResult{family: family, ip: normalized}
 		}(family)
 	}
-	for range 2 {
+
+	for range len(familiesToCheck) {
 		result := <-results
-		if result.ip == "" {
-			continue
-		}
 		switch result.family {
 		case publicIPv4Family:
-			next.IPv4 = result.ip
+			if result.ip != "" {
+				next.IPv4 = result.ip
+				next.ipv4Failed = false
+			} else if result.failed {
+				next.ipv4Failed = c.publicIPs.IPv4 == ""
+			}
 		case publicIPv6Family:
-			next.IPv6 = result.ip
+			if result.ip != "" {
+				next.IPv6 = result.ip
+				next.ipv6Failed = false
+			} else if result.failed {
+				next.ipv6Failed = c.publicIPs.IPv6 == ""
+			}
 		}
 	}
 	c.publicIPs = next
@@ -543,18 +572,12 @@ func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {
 	return memStat
 }
 
-func valueOrZero(stat *load.AvgStat) *load.AvgStat {
-	if stat == nil {
-		return &load.AvgStat{}
+func valueOrZero[T any](val *T) *T {
+	if val == nil {
+		var zero T
+		return &zero
 	}
-	return stat
-}
-
-func valueOrZeroMem(stat *mem.VirtualMemoryStat) *mem.VirtualMemoryStat {
-	if stat == nil {
-		return &mem.VirtualMemoryStat{}
-	}
-	return stat
+	return val
 }
 
 func diffUint64(current, prev uint64) uint64 {

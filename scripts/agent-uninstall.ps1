@@ -37,7 +37,21 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 }
 
 if (Test-Path $installDir) {
-  Remove-Item -Path $installDir -Recurse -Force
+  $agentFiles = @(
+    "cyber-monitor-agent.exe",
+    ".cybermonitor-agent-token",
+    ".cybermonitor-node-id"
+  )
+  foreach ($fileName in $agentFiles) {
+    $filePath = Join-Path $installDir $fileName
+    if (Test-Path -LiteralPath $filePath) {
+      Remove-Item -LiteralPath $filePath -Force
+    }
+  }
+  $remaining = Get-ChildItem -LiteralPath $installDir -Force -ErrorAction SilentlyContinue
+  if (-not $remaining) {
+    Remove-Item -LiteralPath $installDir -Force
+  }
 }
 
 Write-Host "Service removed: $serviceName"

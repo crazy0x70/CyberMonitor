@@ -236,18 +236,19 @@ read_server_data_dir() {
 cleanup_server_config() {
   local data_dir="$1"
   rm -f "${CONF_DIR}/server.conf"
-  if [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
+  if [[ -n "${data_dir}" && "${data_dir}" != "/" && "${data_dir}" == "${INSTALL_DIR}/"* ]]; then
     rm -rf "${data_dir}"
+  elif [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
+    echo "未自动删除自定义数据目录: ${data_dir}"
   fi
-  if [[ -n "${INSTALL_DIR}" && "${INSTALL_DIR}" != "/" ]]; then
-    rm -rf "${INSTALL_DIR}"
-  fi
+  rmdir "${INSTALL_DIR}" 2>/dev/null || true
   rmdir "${CONF_DIR}" 2>/dev/null || true
 }
 
 cleanup_agent_config() {
   rm -f "${CONF_DIR}/agent.conf"
   rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
+  rm -f "${INSTALL_DIR}/.cybermonitor-node-id"
   rmdir "${CONF_DIR}" 2>/dev/null || true
   rmdir "${INSTALL_DIR}" 2>/dev/null || true
 }

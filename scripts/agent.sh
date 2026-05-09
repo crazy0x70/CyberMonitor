@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./install-common.sh
 source "${SCRIPT_DIR}/install-common.sh"
 
+require_value() {
+  local option="$1"
+  local value="${2:-}"
+  if [[ -z "${value}" || "${value}" == --* ]]; then
+    die "${option} 需要参数"
+  fi
+  printf '%s\n' "${value}"
+}
+
 usage() {
   cat <<'EOF'
 用法：
@@ -94,19 +103,19 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --server-url)
-        server_url="$2"
+        server_url="$(require_value "$1" "${2:-}")"
         shift 2
         ;;
       --agent-token)
-        token="$2"
+        token="$(require_value "$1" "${2:-}")"
         shift 2
         ;;
       --node-id)
-        node_id="$2"
+        node_id="$(require_value "$1" "${2:-}")"
         shift 2
         ;;
       --net-iface)
-        net_iface="$2"
+        net_iface="$(require_value "$1" "${2:-}")"
         shift 2
         ;;
       --disable-update)
@@ -114,7 +123,7 @@ main() {
         shift
         ;;
       --version)
-        version="$2"
+        version="$(require_value "$1" "${2:-}")"
         shift 2
         ;;
       -h|--help)

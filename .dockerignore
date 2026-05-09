@@ -1,6 +1,9 @@
 .git
 .gitignore
 .cache
+.gocache
+.gomodcache
+.tmp
 .serena
 output
 dist

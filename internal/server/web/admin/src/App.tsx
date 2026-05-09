@@ -149,7 +149,12 @@ function resolveInitialTheme(): ThemeMode {
   if (typeof window === "undefined") {
     return "light";
   }
-  const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+  let storedTheme = "";
+  try {
+    storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY) || "";
+  } catch {
+    storedTheme = "";
+  }
   if (storedTheme === "light" || storedTheme === "dark") {
     return storedTheme;
   }
@@ -294,7 +299,11 @@ export default function App() {
     root.classList.toggle("dark", isDark);
     root.setAttribute("data-theme", theme);
     root.style.colorScheme = theme;
-    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // storage may be disabled by browser policy
+    }
   }, [isDark, theme]);
 
   useEffect(() => {

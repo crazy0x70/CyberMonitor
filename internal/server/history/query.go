@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"cyber_monitor/internal/metrics"
 )
@@ -15,7 +16,9 @@ const (
 	networkLossMetric         = "cm_network_test_packet_loss"
 	networkAvailabilityMetric = "cm_network_test_availability"
 
-	networkRetentionDays = 366
+	networkRetentionDays    = 366
+	networkRetention        = networkRetentionDays * 24 * time.Hour
+	networkOutOfOrderWindow = 24 * time.Hour
 )
 
 type NetworkHistoryEntry struct {

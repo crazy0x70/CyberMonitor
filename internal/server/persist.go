@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mathrand "math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 
 const (
 	adminTokenLength       = 12
+	tokenAlphabet          = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	defaultSiteTitle       = "CyberMonitor"
 	defaultHomeTitle       = "CyberMonitor"
 	defaultHomeSub         = "主机监控"
@@ -29,6 +29,7 @@ const (
 	testHistoryVersion     = 1
 	testHistoryFileName    = "test_history.json"
 	configExportVersion    = 1
+	maxTestCatalogItems    = 512
 )
 
 type Settings struct {
@@ -385,7 +386,7 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 			seenSelections[item.ID] = struct{}{}
 			selections = append(selections, TestSelection{
 				TestID:      item.ID,
-				IntervalSec: normalizeSelectionInterval(item, test.IntervalSec),
+				IntervalSec: test.IntervalSec,
 			})
 		}
 		if len(selections) > 0 {
@@ -483,18 +484,54 @@ func legacyTestCatalogKey(name, testType, host string, port int) string {
 }
 
 func writeJSONFileAtomic(path string, payload any) error {
-	if err := ensureDataDir(filepath.Dir(path)); err != nil {
+	dir := filepath.Dir(path)
+	if err := ensureDataDir(dir); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	data = append(data, '\n')
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	committed = true
+	syncParentDir(dir)
+	return nil
+}
+
+func syncParentDir(dir string) {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer handle.Close()
+	_ = handle.Sync()
 }
 
 func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
@@ -610,54 +647,51 @@ func buildAdminPassword(input string) (string, string) {
 }
 
 func mergeSettings(existing, fallback Settings) Settings {
-	if existing.AdminPath == "" {
-		existing.AdminPath = fallback.AdminPath
+	mergeString := func(dst *string, src string) {
+		if *dst == "" {
+			*dst = src
+		}
 	}
-	if existing.AdminUser == "" {
-		existing.AdminUser = fallback.AdminUser
+	mergeInt64 := func(dst *int64, src int64) {
+		if *dst <= 0 {
+			*dst = src
+		}
 	}
-	if existing.AdminPass == "" {
-		existing.AdminPass = fallback.AdminPass
+	mergeInt := func(dst *int, src int) {
+		if *dst == 0 {
+			*dst = src
+		}
 	}
-	if existing.TokenSalt == "" {
-		existing.TokenSalt = fallback.TokenSalt
-	}
+
+	mergeString(&existing.AdminPath, fallback.AdminPath)
+	mergeString(&existing.AdminUser, fallback.AdminUser)
+	mergeString(&existing.AdminPass, fallback.AdminPass)
+	mergeString(&existing.TokenSalt, fallback.TokenSalt)
+
 	if existing.AgentToken == "" && existing.AuthToken != "" {
 		existing.AgentToken = existing.AuthToken
 		if fallback.AuthToken != "" && fallback.AuthToken != existing.AuthToken {
 			existing.AuthToken = fallback.AuthToken
 		}
 	}
-	if existing.AuthToken == "" {
-		existing.AuthToken = fallback.AuthToken
-	}
-	if existing.AgentToken == "" {
-		existing.AgentToken = fallback.AgentToken
-	}
-	if existing.AgentEndpoint == "" {
-		existing.AgentEndpoint = fallback.AgentEndpoint
-	}
-	if existing.SiteTitle == "" {
-		existing.SiteTitle = fallback.SiteTitle
-	}
-	if existing.HomeTitle == "" {
-		existing.HomeTitle = fallback.HomeTitle
-	}
-	if existing.HomeSubtitle == "" {
-		existing.HomeSubtitle = fallback.HomeSubtitle
-	}
-	if existing.SiteIcon == "" {
-		existing.SiteIcon = fallback.SiteIcon
-	}
-	if existing.AlertOfflineSec <= 0 {
-		existing.AlertOfflineSec = fallback.AlertOfflineSec
-	}
+	mergeString(&existing.AuthToken, fallback.AuthToken)
+	mergeString(&existing.AgentToken, fallback.AgentToken)
+	mergeString(&existing.AgentEndpoint, fallback.AgentEndpoint)
+	mergeString(&existing.SiteTitle, fallback.SiteTitle)
+	mergeString(&existing.HomeTitle, fallback.HomeTitle)
+	mergeString(&existing.HomeSubtitle, fallback.HomeSubtitle)
+	mergeString(&existing.SiteIcon, fallback.SiteIcon)
+	mergeString(&existing.AlertTelegramToken, fallback.AlertTelegramToken)
+
+	mergeInt64(&existing.AlertOfflineSec, fallback.AlertOfflineSec)
+	mergeInt64(&existing.LoginFailWindowSec, fallback.LoginFailWindowSec)
+	mergeInt64(&existing.LoginLockSec, fallback.LoginLockSec)
+	mergeInt(&existing.LoginFailLimit, fallback.LoginFailLimit)
+
 	if existing.AlertNodes == nil {
 		existing.AlertNodes = fallback.AlertNodes
 	}
-	if existing.AlertTelegramToken == "" {
-		existing.AlertTelegramToken = fallback.AlertTelegramToken
-	}
+
 	if len(existing.AlertTelegramUserIDs) == 0 && existing.AlertTelegramUserID > 0 {
 		existing.AlertTelegramUserIDs = []int64{existing.AlertTelegramUserID}
 	}
@@ -669,19 +703,13 @@ func mergeSettings(existing, fallback Settings) Settings {
 		existing.AlertTelegramToken = ""
 		existing.AlertTelegramUserIDs = []int64{}
 	}
-	if existing.LoginFailLimit == 0 {
-		existing.LoginFailLimit = fallback.LoginFailLimit
-	}
-	if existing.LoginFailWindowSec <= 0 {
-		existing.LoginFailWindowSec = fallback.LoginFailWindowSec
-	}
-	if existing.LoginLockSec <= 0 {
-		existing.LoginLockSec = fallback.LoginLockSec
-	}
+
 	if !existing.AlertAll && existing.AlertWebhook == "" && len(existing.AlertNodes) == 0 {
 		existing.AlertAll = fallback.AlertAll
 	}
+
 	existing.AISettings = mergeAISettings(existing.AISettings, fallback.AISettings)
+
 	if existing.Groups == nil {
 		existing.Groups = fallback.Groups
 	}
@@ -689,9 +717,11 @@ func mergeSettings(existing, fallback Settings) Settings {
 		existing.GroupTree = buildGroupTree(existing.Groups)
 	}
 	existing.Groups = flattenGroupTree(existing.GroupTree)
+
 	if existing.TestCatalog == nil {
 		existing.TestCatalog = fallback.TestCatalog
 	}
+
 	return existing
 }
 
@@ -721,22 +751,27 @@ func normalizeAdminPath(path string) (string, error) {
 }
 
 func randomToken(length int) string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	if length <= 0 {
 		return ""
 	}
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
-		for i := range bytes {
-			bytes[i] = alphabet[r.Intn(len(alphabet))]
+	limit := byte(256 - 256%len(tokenAlphabet))
+	out := make([]byte, 0, length)
+	buf := make([]byte, length)
+	for len(out) < length {
+		if _, err := rand.Read(buf); err != nil {
+			panic(fmt.Sprintf("crypto random failed: %v", err))
 		}
-		return string(bytes)
+		for _, b := range buf {
+			if b >= limit {
+				continue
+			}
+			out = append(out, tokenAlphabet[int(b)%len(tokenAlphabet)])
+			if len(out) == length {
+				break
+			}
+		}
 	}
-	for i, b := range bytes {
-		bytes[i] = alphabet[int(b)%len(alphabet)]
-	}
-	return string(bytes)
+	return string(out)
 }
 
 func normalizeUniqueStrings(values []string, skip func(string) bool) []string {
@@ -1057,6 +1092,9 @@ func buildGroupTree(groups []string) []GroupNode {
 }
 
 func normalizeTestCatalog(items []TestCatalogItem) ([]TestCatalogItem, error) {
+	if len(items) > maxTestCatalogItems {
+		return nil, fmt.Errorf("测试节点数量不能超过 %d 个", maxTestCatalogItems)
+	}
 	seen := make(map[string]struct{})
 	normalized := make([]TestCatalogItem, 0, len(items))
 	for _, item := range items {

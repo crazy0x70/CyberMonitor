@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/metrics"
 )
 
@@ -107,6 +108,7 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	if token != "" {
 		req.Header.Set("X-AGENT-TOKEN", token)
 	}
+	req.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
 
 	var payload RemoteConfig
 	if err := performAgentJSONRequest(client, req, "config", "config response has trailing data", &payload); err != nil {

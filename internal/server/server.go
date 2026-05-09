@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,20 +38,27 @@ import (
 )
 
 const (
-	maxLogSize               = 10 * 1024 * 1024
-	maxLogBackupCount        = 3
-	maxTestHistoryPoints     = 5000
-	testHistoryHotSeconds    = 60 * 60
-	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
-	maxJSONBodySize          = 4 * 1024 * 1024
-	wsSendQueueSize          = 8
-	wsWriteWait              = 10 * time.Second
-	wsPongWait               = 60 * time.Second
-	wsPingPeriod             = (wsPongWait * 9) / 10
-	agentUpdateLeaseUpdating = 10 * time.Minute
-	agentUpdateLeaseRestart  = 5 * time.Minute
-	publicVariantBalanced    = "balanced"
-	adminSessionCookieName   = "cm_admin_session"
+	maxLogSize                      = 10 * 1024 * 1024
+	maxLogBackupCount               = 3
+	maxTestHistoryPoints            = 5000
+	testHistoryHotSeconds           = 60 * 60
+	testHistoryMaxAgeSeconds        = 60 * 60 * 24 * 365
+	maxJSONBodySize                 = 4 * 1024 * 1024
+	wsSendQueueSize                 = 8
+	wsWriteWait                     = 10 * time.Second
+	wsPongWait                      = 60 * time.Second
+	wsPingPeriod                    = (wsPongWait * 9) / 10
+	agentUpdateLeaseUpdating        = 10 * time.Minute
+	agentUpdateLeaseRestart         = 5 * time.Minute
+	agentIngestWindow               = time.Second
+	agentRegisterWindow             = time.Minute
+	defaultAgentIngestLimit         = 2
+	defaultAgentRegisterLimit       = 1
+	defaultAgentRegisterGlobalLimit = 30
+	maxNetworkTestsPerNode          = 128
+	publicVariantConservative       = "conservative"
+	publicVariantBalanced           = "balanced"
+	adminSessionCookieName          = "cm_admin_session"
 )
 
 type sizeLimitedWriter struct {
@@ -186,21 +195,25 @@ type Config struct {
 }
 
 type Store struct {
-	mu              sync.RWMutex
-	persistMu       sync.Mutex
-	nodes           map[string]NodeState
-	profiles        map[string]*NodeProfile
-	settings        Settings
-	buildVersion    string
-	buildCommit     string
-	dataPath        string
-	lastPersist     time.Time
-	persistInterval time.Duration
-	alerted         map[string]alertState
-	offlineSessions map[string]OfflineSessionState
-	testHistory     map[string]map[string]*TestHistoryEntry
-	historyManager  *history.Manager
-	loginAttempts   map[string]*loginAttempt
+	mu                sync.RWMutex
+	persistMu         sync.Mutex
+	nodes             map[string]NodeState
+	profiles          map[string]*NodeProfile
+	settings          Settings
+	buildVersion      string
+	buildCommit       string
+	dataPath          string
+	historyPath       string
+	lastPersist       time.Time
+	persistInterval   time.Duration
+	alerted           map[string]alertState
+	offlineSessions   map[string]OfflineSessionState
+	testHistory       map[string]map[string]*TestHistoryEntry
+	historyManager    *history.Manager
+	loginAttempts     map[string]*loginAttempt
+	configRefresh     map[string]struct{}
+	agentIngestRate   map[string]agentRateWindow
+	agentRegisterRate map[string]agentRateWindow
 }
 
 type NodeState struct {
@@ -210,28 +223,29 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID                 string                  `json:"server_id,omitempty"`
-	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
-	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
-	Alias                    string                  `json:"alias,omitempty"`
-	Group                    string                  `json:"group,omitempty"`
-	Tags                     []string                `json:"tags,omitempty"`
-	Groups                   []string                `json:"groups,omitempty"`
-	Region                   string                  `json:"region,omitempty"`
-	DiskType                 string                  `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                   `json:"expire_at,omitempty"`
-	AutoRenew                bool                    `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                   `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int                     `json:"test_interval_sec"`
-	TestSelections           []TestSelection         `json:"test_selections,omitempty"`
-	AgentUpdate              *AgentUpdateInstruction `json:"agent_update,omitempty"`
-	AgentUpdateState         string                  `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string                  `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string                  `json:"agent_update_message,omitempty"`
-	AgentUpdateLeaseUntil    int64                   `json:"agent_update_lease_until,omitempty"`
-	AgentUpdateReportedAt    int64                   `json:"agent_update_reported_at,omitempty"`
-	UpdatedAt                int64                   `json:"updated_at,omitempty"`
+	ServerID                 string                      `json:"server_id,omitempty"`
+	AgentAuthToken           string                      `json:"agent_auth_token,omitempty"`
+	AlertEnabled             *bool                       `json:"alert_enabled,omitempty"`
+	Alias                    string                      `json:"alias,omitempty"`
+	Group                    string                      `json:"group,omitempty"`
+	Tags                     []string                    `json:"tags,omitempty"`
+	Groups                   []string                    `json:"groups,omitempty"`
+	Region                   string                      `json:"region,omitempty"`
+	DiskType                 string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                       `json:"expire_at,omitempty"`
+	AutoRenew                bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                         `json:"test_interval_sec"`
+	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
+	AgentUpdate              *AgentUpdateInstruction     `json:"agent_update,omitempty"`
+	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
+	AgentUpdateLeaseUntil    int64                       `json:"agent_update_lease_until,omitempty"`
+	AgentUpdateReportedAt    int64                       `json:"agent_update_reported_at,omitempty"`
+	UpdatedAt                int64                       `json:"updated_at,omitempty"`
 }
 
 type AgentUpdateInstruction struct {
@@ -256,29 +270,30 @@ type AgentConfig struct {
 }
 
 type NodeView struct {
-	Stats                    metrics.NodeStats `json:"stats"`
-	LastSeen                 int64             `json:"last_seen"`
-	FirstSeen                int64             `json:"first_seen,omitempty"`
-	Status                   string            `json:"status"`
-	ServerID                 string            `json:"server_id,omitempty"`
-	AlertEnabled             bool              `json:"alert_enabled"`
-	Alias                    string            `json:"alias,omitempty"`
-	Group                    string            `json:"group,omitempty"`
-	Tags                     []string          `json:"tags,omitempty"`
-	Groups                   []string          `json:"groups,omitempty"`
-	Region                   string            `json:"region,omitempty"`
-	DiskType                 string            `json:"disk_type,omitempty"`
-	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64             `json:"expire_at,omitempty"`
-	AutoRenew                bool              `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64             `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int               `json:"test_interval_sec,omitempty"`
-	TestSelections           []TestSelection   `json:"test_selections,omitempty"`
-	AgentUpdateSupported     bool              `json:"agent_update_supported"`
-	AgentUpdateMode          string            `json:"agent_update_mode,omitempty"`
-	AgentUpdateState         string            `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string            `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string            `json:"agent_update_message,omitempty"`
+	Stats                    metrics.NodeStats           `json:"stats"`
+	LastSeen                 int64                       `json:"last_seen"`
+	FirstSeen                int64                       `json:"first_seen,omitempty"`
+	Status                   string                      `json:"status"`
+	ServerID                 string                      `json:"server_id,omitempty"`
+	AlertEnabled             bool                        `json:"alert_enabled"`
+	Alias                    string                      `json:"alias,omitempty"`
+	Group                    string                      `json:"group,omitempty"`
+	Tags                     []string                    `json:"tags,omitempty"`
+	Groups                   []string                    `json:"groups,omitempty"`
+	Region                   string                      `json:"region,omitempty"`
+	DiskType                 string                      `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                       `json:"expire_at,omitempty"`
+	AutoRenew                bool                        `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                         `json:"test_interval_sec,omitempty"`
+	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
+	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
+	AgentUpdateSupported     bool                        `json:"agent_update_supported"`
+	AgentUpdateMode          string                      `json:"agent_update_mode,omitempty"`
+	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
 }
 
 type PublicSettings struct {
@@ -335,6 +350,11 @@ type loginAttempt struct {
 	firstAt     time.Time
 	lastAt      time.Time
 	lockedUntil time.Time
+}
+
+type agentRateWindow struct {
+	count int
+	until time.Time
 }
 
 func (c *hubClient) writeMessage(messageType int, payload []byte) error {
@@ -461,18 +481,22 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	store := &Store{
-		nodes:           nodes,
-		profiles:        profiles,
-		settings:        settings,
-		buildVersion:    version,
-		buildCommit:     commit,
-		dataPath:        dataPath,
-		persistInterval: defaultPersistInterval,
-		alerted:         make(map[string]alertState),
-		offlineSessions: offlineSessions,
-		testHistory:     testHistory,
-		historyManager:  historyManager,
-		loginAttempts:   make(map[string]*loginAttempt),
+		nodes:             nodes,
+		profiles:          profiles,
+		settings:          settings,
+		buildVersion:      version,
+		buildCommit:       commit,
+		dataPath:          dataPath,
+		historyPath:       historyPath,
+		persistInterval:   defaultPersistInterval,
+		alerted:           make(map[string]alertState),
+		offlineSessions:   offlineSessions,
+		testHistory:       testHistory,
+		historyManager:    historyManager,
+		loginAttempts:     make(map[string]*loginAttempt),
+		configRefresh:     make(map[string]struct{}),
+		agentIngestRate:   make(map[string]agentRateWindow),
+		agentRegisterRate: make(map[string]agentRateWindow),
 	}
 	if migration, err := history.MigrateLegacyJSONIfNeeded(historyPath, historyManager.NetworkStore(), time.Now()); err != nil {
 		log.Printf("%v", wrapDataPathError("迁移探测历史失败", historyPath, err))
@@ -553,9 +577,9 @@ func Run(ctx context.Context, cfg Config) error {
 			writeLoginRateLimit(w, retryAfter)
 			return
 		}
-		loginView := store.SettingsView()
-		if turnstileConfigured(loginView.TurnstileSiteKey, loginView.TurnstileSecretKey) {
-			if err := verifyTurnstileToken(r.Context(), loginView.TurnstileSecretKey, req.TurnstileToken, clientIPFromRemoteAddr(r.RemoteAddr)); err != nil {
+		turnstileSettings := store.Credentials()
+		if turnstileConfigured(turnstileSettings.TurnstileSiteKey, turnstileSettings.TurnstileSecretKey) {
+			if err := verifyTurnstileToken(r.Context(), turnstileSettings.TurnstileSecretKey, req.TurnstileToken, clientIPFromRemoteAddr(r.RemoteAddr)); err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 				return
 			}
@@ -596,7 +620,8 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		view := store.SettingsView()
-		enabled := turnstileConfigured(view.TurnstileSiteKey, view.TurnstileSecretKey)
+		settings := store.Credentials()
+		enabled := turnstileConfigured(settings.TurnstileSiteKey, settings.TurnstileSecretKey)
 		payload := map[string]interface{}{
 			"turnstile_enabled": enabled,
 		}
@@ -719,7 +744,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":         "ok",
 			"refresh_config": refreshConfig,
 		})
@@ -758,42 +783,40 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			store.mu.RLock()
 			node, exists := store.nodes[nodeID]
-			profile := store.profiles[nodeID]
 			store.mu.RUnlock()
 			if !exists {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
 				return
 			}
-			updateStats := withEffectiveAgentVersion(node.Stats, profile)
 
 			if r.Method == http.MethodGet {
-				if !resolveAgentUpdateSupported(updateStats) {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(updateStats)))
+				if !resolveAgentUpdateSupported(node.Stats) {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(node.Stats)))
 					return
 				}
-				if strings.TrimSpace(updateStats.AgentVersion) == "" {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
+				if strings.TrimSpace(node.Stats.AgentVersion) == "" {
+					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
 					return
 				}
-				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(updateStats.AgentVersion))
+				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
 				releaseInfo, err := client.CheckLatest(r.Context())
 				if err != nil {
 					writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 					return
 				}
-				writeJSON(w, http.StatusOK, buildAgentUpdateView(updateStats, releaseInfo, ""))
+				writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, releaseInfo, ""))
 				return
 			}
 
-			if !resolveAgentUpdateSupported(updateStats) {
-				message := resolveAgentUpdateUnsupportedReason(updateStats)
+			if !resolveAgentUpdateSupported(node.Stats) {
+				message := resolveAgentUpdateUnsupportedReason(node.Stats)
 				if strings.TrimSpace(message) == "" {
 					message = "当前节点平台暂不支持后台自更新"
 				}
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 				return
 			}
-			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(updateStats.AgentVersion))
+			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
 			releaseInfo, err := client.CheckLatest(r.Context())
 			if err != nil {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
@@ -810,8 +833,8 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前节点平台对应的 Agent 安装包"})
 				return
 			}
-			if strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS，已阻止下发必失败的 Agent 更新任务"})
+			if !isChecksumOptionalForAgentUpdate(node.Stats) && strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS 校验文件"})
 				return
 			}
 			store.QueueAgentUpdate(nodeID, AgentUpdateInstruction{
@@ -935,6 +958,10 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前平台对应的服务端安装包"})
 				return
 			}
+			if !updater.CanDockerManagedUpdate() && strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS 校验文件"})
+				return
+			}
 			err = systemUpdater.Start(releaseInfo, func() error {
 				if updater.CanDockerManagedUpdate() {
 					dockerUpdater, err := updater.NewDockerManagedUpdater()
@@ -949,6 +976,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := systemUpdater.client.ApplyAsset(ctx, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
 					return err
 				}
+				time.Sleep(700 * time.Millisecond)
 				return updater.RestartSelf()
 			})
 			if err != nil {
@@ -1150,6 +1178,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
+		store.MarkAgentConfigRefreshed(nodeID)
 		writeJSON(w, http.StatusOK, config)
 	})
 
@@ -1203,6 +1232,18 @@ func Run(ctx context.Context, cfg Config) error {
 		wsAuthMixed
 	)
 
+	resolvePublicVariant := func(r *http.Request) string {
+		if r == nil {
+			return publicVariantBalanced
+		}
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("variant"))) {
+		case publicVariantBalanced:
+			return publicVariantBalanced
+		default:
+			return publicVariantBalanced
+		}
+	}
+
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			audience := "public"
@@ -1229,7 +1270,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			upgrader := websocket.Upgrader{
 				CheckOrigin: func(request *http.Request) bool {
-					if audience == "admin" {
+					if audience == "admin" || strings.TrimSpace(request.Header.Get("Origin")) != "" {
 						return isSameOrigin(request)
 					}
 					return true
@@ -1240,13 +1281,13 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			}
 			configureWSConn(conn)
-			client := hub.Add(conn, publicVariantBalanced)
+			client := hub.Add(conn, resolvePublicVariant(r))
 
 			// 首次连接立即推送快照
 			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
 					hub.Remove(conn)
 					return
 				}
@@ -1308,20 +1349,20 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
 			return
 		}
-		html := string(data)
-		html = strings.Replace(html, "<title>CyberMonitor 管理后台</title>", "<title>"+adminDocumentTitle(store.SiteTitle())+"</title>", 1)
+		htmlText := string(data)
+		htmlText = strings.Replace(htmlText, "<title>CyberMonitor 管理后台</title>", "<title>"+html.EscapeString(adminDocumentTitle(store.SiteTitle()))+"</title>", 1)
 		bootPayload, err := buildAdminBootPayload(store)
 		if err == nil {
 			bootMeta := `<meta name="cm-admin-boot" content="` + bootPayload + `" />`
-			if strings.Contains(html, "</head>") {
-				html = strings.Replace(html, "</head>", bootMeta+"</head>", 1)
+			if strings.Contains(htmlText, "</head>") {
+				htmlText = strings.Replace(htmlText, "</head>", bootMeta+"</head>", 1)
 			} else {
-				html = bootMeta + html
+				htmlText = bootMeta + htmlText
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(html))
+		_, _ = w.Write([]byte(htmlText))
 	}
 
 	serveAdminDistAt := func(w http.ResponseWriter, r *http.Request, prefix string) {
@@ -1370,7 +1411,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
-			case "/":
+			case "/", "/dashboard":
 				writePublicIndexHTML(w, r)
 				return
 			default:
@@ -1423,16 +1464,22 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			case <-ticker.C:
 				now := time.Now()
-				if hub.HasVariant(publicVariantBalanced) {
+				hasConservative := hub.HasVariant(publicVariantConservative)
+				hasBalanced := hub.HasVariant(publicVariantBalanced)
+				if hasConservative || hasBalanced {
 					snapshot := storeSnapshot(store, false)
-					lastBalancedDigest = broadcastBalancedPublicSnapshot(
-						hub,
-						snapshot,
-						lastBalancedDigest,
-						func(snapshot Snapshot) ([]byte, error) {
-							return json.Marshal(snapshot)
-						},
-					)
+					if payload, err := json.Marshal(snapshot); err == nil {
+						if hasConservative {
+							hub.BroadcastVariant(payload, publicVariantConservative)
+						}
+						if hasBalanced {
+							digest := digestPublicSnapshot(snapshot)
+							if digest != lastBalancedDigest {
+								hub.BroadcastVariant(payload, publicVariantBalanced)
+								lastBalancedDigest = digest
+							}
+						}
+					}
 				}
 				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
@@ -1459,7 +1506,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	log.Printf("管理后台路径: %s", store.AdminPath())
+	log.Printf("管理后台路径已初始化")
 	if splitMode {
 		log.Printf("展示页监听: %s", cfg.PublicAddr)
 		log.Printf("管理后台监听: %s", cfg.Addr)
@@ -1467,13 +1514,13 @@ func Run(ctx context.Context, cfg Config) error {
 	if !loaded {
 		log.Printf("初始管理员账号: %s", settings.AdminUser)
 		if settings.AdminPassPlain != "" {
-			log.Printf("初始管理员密码: %s", settings.AdminPassPlain)
+			log.Printf("初始管理员密码已生成，请从持久化配置或重置命令获取")
 		} else {
 			log.Printf("初始管理员密码: 已设置")
 		}
 	}
 	if tokenGenerated {
-		log.Printf("初始 Agent Token: %s", cfg.AgentToken)
+		log.Printf("初始 Agent Token 已生成")
 	}
 	if splitMode {
 		adminErr := make(chan error, 1)
@@ -1560,11 +1607,9 @@ func generateBootstrapToken() string {
 
 func (s *Store) Update(stats metrics.NodeStats) bool {
 	var persist bool
-	var data PersistedData
 	var recoveryCandidate offlineRecoveryCandidate
 	var hasRecoveryCandidate bool
 	var updateReconciled bool
-	networkTestsChanged := stats.NetworkTestsChanged
 	s.mu.Lock()
 
 	now := time.Now()
@@ -1576,10 +1621,7 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 	storedStats := stats
 	if !shouldReplaceNodeStats(prev.Stats, stats) {
 		storedStats = prev.Stats
-	} else if !networkTestsChanged {
-		storedStats.NetworkTests = prev.Stats.NetworkTests
 	}
-	storedStats.NetworkTestsChanged = false
 	s.nodes[stats.NodeID] = NodeState{
 		Stats:     storedStats,
 		LastSeen:  now,
@@ -1640,24 +1682,19 @@ func (s *Store) Update(stats metrics.NodeStats) bool {
 		persist = true
 	}
 
-	if networkTestsChanged {
-		s.updateTestHistoryLocked(stats, now)
-	}
+	s.updateTestHistoryLocked(stats, now)
 	if s.shouldPersistLocked(now) {
 		persist = true
-	}
-	if persist {
-		data = s.snapshotPersistedLocked()
 	}
 	s.mu.Unlock()
 
 	if persist {
-		s.persist(data)
+		s.persist()
 	}
 	if hasRecoveryCandidate {
 		s.completeOfflineRecovery(recoveryCandidate)
 	}
-	if s.historyManager != nil && networkTestsChanged && len(stats.NetworkTests) > 0 {
+	if s.historyManager != nil {
 		if err := s.historyManager.AppendNetworkBatch(stats.NodeID, stats.NetworkTests, now); err != nil {
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
@@ -1738,7 +1775,25 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 }
 
 func buildTestHistoryKey(test metrics.NetworkTestResult) string {
-	return history.BuildNetworkTestKey(test)
+	kind := strings.ToLower(strings.TrimSpace(test.Type))
+	if kind == "" {
+		kind = "icmp"
+	}
+	host := strings.ToLower(strings.TrimSpace(test.Host))
+	name := strings.ToLower(strings.TrimSpace(test.Name))
+	if host == "" && name == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(kind) + len(host) + len(name) + 16)
+	builder.WriteString(kind)
+	builder.WriteByte('|')
+	builder.WriteString(host)
+	builder.WriteByte('|')
+	builder.WriteString(strconv.Itoa(test.Port))
+	builder.WriteByte('|')
+	builder.WriteString(name)
+	return builder.String()
 }
 
 func normalizeHistoryEntry(entry *TestHistoryEntry) {
@@ -1915,7 +1970,6 @@ type offlineRecoveryCandidate struct {
 
 func (s *Store) ReconcileOfflineTracker(now time.Time) {
 	var (
-		persistData        PersistedData
 		needsPersist       bool
 		recoveryCandidates []offlineRecoveryCandidate
 	)
@@ -1966,13 +2020,10 @@ func (s *Store) ReconcileOfflineTracker(now time.Time) {
 		needsPersist = true
 	}
 
-	if needsPersist {
-		persistData = s.snapshotPersistedLocked()
-	}
 	s.mu.Unlock()
 
 	if needsPersist {
-		s.persist(persistData)
+		s.persist()
 	}
 	for _, candidate := range recoveryCandidates {
 		s.completeOfflineRecovery(candidate)
@@ -2008,20 +2059,18 @@ func (s *Store) completeOfflineRecovery(candidate offlineRecoveryCandidate) {
 	}
 
 	var (
-		persistData   PersistedData
 		shouldPersist bool
 	)
 	s.mu.Lock()
 	session, ok := s.offlineSessions[candidate.NodeID]
 	if ok && session.StartedAt == candidate.StartedAt {
 		delete(s.offlineSessions, candidate.NodeID)
-		persistData = s.snapshotPersistedLocked()
 		shouldPersist = true
 	}
 	s.mu.Unlock()
 
 	if shouldPersist {
-		s.persist(persistData)
+		s.persist()
 	}
 }
 
@@ -2291,6 +2340,15 @@ func cloneNodeStates(values map[string]NodeState) map[string]NodeState {
 	return cloned
 }
 
+func cloneNetworkTestConfigs(values []metrics.NetworkTestConfig) []metrics.NetworkTestConfig {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]metrics.NetworkTestConfig, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
 func cloneTestSelections(values []TestSelection) []TestSelection {
 	if len(values) == 0 {
 		return nil
@@ -2447,24 +2505,8 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	}
 }
 
-func resolveEffectiveAgentVersion(stats metrics.NodeStats, profile *NodeProfile) string {
-	currentVersion := strings.TrimSpace(stats.AgentVersion)
-	if profile == nil {
-		return currentVersion
-	}
-	if strings.TrimSpace(profile.AgentUpdateState) != "succeeded" {
-		return currentVersion
-	}
-	targetVersion := strings.TrimSpace(profile.AgentUpdateTargetVersion)
-	if targetVersion == "" {
-		return currentVersion
-	}
-	return targetVersion
-}
-
-func withEffectiveAgentVersion(stats metrics.NodeStats, profile *NodeProfile) metrics.NodeStats {
-	stats.AgentVersion = resolveEffectiveAgentVersion(stats, profile)
-	return stats
+func isChecksumOptionalForAgentUpdate(stats metrics.NodeStats) bool {
+	return resolveAgentUpdateMode(stats) == "docker-managed"
 }
 
 func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
@@ -2581,63 +2623,15 @@ func digestPublicSnapshot(snapshot Snapshot) string {
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
-func broadcastBalancedPublicSnapshot(
-	hub *Hub,
-	snapshot Snapshot,
-	lastDigest string,
-	marshalSnapshot func(Snapshot) ([]byte, error),
-) string {
-	if hub == nil || marshalSnapshot == nil || !hub.HasVariant(publicVariantBalanced) {
-		return lastDigest
-	}
-
-	digest := digestPublicSnapshot(snapshot)
-	if digest == lastDigest {
-		return lastDigest
-	}
-
-	payload, err := marshalSnapshot(snapshot)
-	if err != nil {
-		return lastDigest
-	}
-	hub.BroadcastVariant(payload, publicVariantBalanced)
-	return digest
-}
-
 func convertNetworkHistoryToTestHistory(
 	source map[string]*history.NetworkHistoryEntry,
-	maxPoints int,
 ) map[string]*TestHistoryEntry {
 	result := make(map[string]*TestHistoryEntry, len(source))
 	for key, entry := range source {
-		projected := projectNetworkHistoryEntry(entry, maxPoints)
-		if projected != nil {
-			result[key] = projected
+		if entry == nil {
+			continue
 		}
-	}
-	return result
-}
-
-func projectNetworkHistoryEntry(
-	entry *history.NetworkHistoryEntry,
-	maxPoints int,
-) *TestHistoryEntry {
-	if entry == nil {
-		return nil
-	}
-	total := len(entry.Times)
-	if total == 0 {
-		return &TestHistoryEntry{
-			Latency:        []*float64{},
-			Loss:           []*float64{},
-			Times:          []int64{},
-			LastAt:         entry.LastAt,
-			MinIntervalSec: entry.MinIntervalSec,
-			AvgIntervalSec: entry.AvgIntervalSec,
-		}
-	}
-	if maxPoints <= 0 || total <= maxPoints {
-		return &TestHistoryEntry{
+		result[key] = &TestHistoryEntry{
 			Latency:        slices.Clone(entry.Latency),
 			Loss:           slices.Clone(entry.Loss),
 			Times:          slices.Clone(entry.Times),
@@ -2646,201 +2640,13 @@ func projectNetworkHistoryEntry(
 			AvgIntervalSec: entry.AvgIntervalSec,
 		}
 	}
-
-	indices := sampleHistoryIndices(total, maxPoints)
-	times := make([]int64, 0, len(indices))
-	latency := make([]*float64, 0, len(indices))
-	loss := make([]*float64, 0, len(indices))
-	for _, index := range indices {
-		times = append(times, entry.Times[index])
-		latency = append(latency, entry.Latency[index])
-		loss = append(loss, entry.Loss[index])
-	}
-	minIntervalSec, avgIntervalSec := history.HistoryIntervalStats(times)
-	return &TestHistoryEntry{
-		Latency:        latency,
-		Loss:           loss,
-		Times:          times,
-		LastAt:         times[len(times)-1],
-		MinIntervalSec: minIntervalSec,
-		AvgIntervalSec: avgIntervalSec,
-	}
-}
-
-func sampleHistoryIndices(total, maxPoints int) []int {
-	if total <= 0 {
-		return nil
-	}
-	if maxPoints <= 1 || total <= maxPoints {
-		indices := make([]int, 0, total)
-		for index := 0; index < total; index++ {
-			indices = append(indices, index)
-		}
-		return indices
-	}
-
-	step := float64(total-1) / float64(maxPoints-1)
-	indices := make([]int, 0, maxPoints)
-	lastIndex := -1
-	for point := 0; point < maxPoints; point++ {
-		index := int(math.Round(float64(point) * step))
-		if index <= lastIndex {
-			index = lastIndex + 1
-		}
-		remainingSlots := maxPoints - point - 1
-		maxIndex := total - 1 - remainingSlots
-		if index > maxIndex {
-			index = maxIndex
-		}
-		if index >= total {
-			index = total - 1
-		}
-		indices = append(indices, index)
-		lastIndex = index
-	}
-	return indices
-}
-
-func publicHistoryPointBudget(from, to time.Time) int {
-	duration := to.Sub(from)
-	switch {
-	case duration <= time.Hour:
-		return 360
-	case duration <= 24*time.Hour:
-		return 720
-	case duration <= 7*24*time.Hour:
-		return 840
-	case duration <= 30*24*time.Hour:
-		return 960
-	default:
-		return 1440
-	}
+	return result
 }
 
 func (s *Store) snapshotTestHistory() map[string]map[string]*TestHistoryEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneTestHistory(s.testHistory)
-}
-
-func (s *Store) queryPublicNodeHistoryFromMemory(
-	nodeID string,
-	from, to time.Time,
-	maxPoints int,
-) map[string]*TestHistoryEntry {
-	if s == nil {
-		return nil
-	}
-
-	fromSec := from.Unix()
-	toSec := to.Unix()
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	nodeHistory := s.testHistory[nodeID]
-	if len(nodeHistory) == 0 {
-		return nil
-	}
-
-	result := make(map[string]*TestHistoryEntry, len(nodeHistory))
-	for key, entry := range nodeHistory {
-		projected := projectTestHistoryEntryRange(entry, fromSec, toSec, maxPoints)
-		if projected != nil {
-			result[key] = projected
-		}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
-
-func projectTestHistoryEntryRange(
-	entry *TestHistoryEntry,
-	fromSec, toSec int64,
-	maxPoints int,
-) *TestHistoryEntry {
-	if entry == nil || len(entry.Times) == 0 {
-		return nil
-	}
-
-	start := 0
-	if fromSec > 0 {
-		start = sort.Search(len(entry.Times), func(i int) bool {
-			return entry.Times[i] >= fromSec
-		})
-	}
-	end := len(entry.Times)
-	if toSec > 0 {
-		end = sort.Search(len(entry.Times), func(i int) bool {
-			return entry.Times[i] > toSec
-		})
-	}
-	if start >= end {
-		return nil
-	}
-
-	total := end - start
-	indices := sampleHistoryIndices(total, maxPoints)
-	times := make([]int64, 0, len(indices))
-	latency := make([]*float64, 0, len(indices))
-	loss := make([]*float64, 0, len(indices))
-	for _, index := range indices {
-		sourceIndex := start + index
-		times = append(times, entry.Times[sourceIndex])
-		latency = append(latency, cloneHistorySampleAt(entry.Latency, sourceIndex))
-		loss = append(loss, cloneHistorySampleAt(entry.Loss, sourceIndex))
-	}
-	if len(times) == 0 {
-		return nil
-	}
-	minIntervalSec, avgIntervalSec := history.HistoryIntervalStats(times)
-	return &TestHistoryEntry{
-		Latency:        latency,
-		Loss:           loss,
-		Times:          times,
-		LastAt:         times[len(times)-1],
-		MinIntervalSec: minIntervalSec,
-		AvgIntervalSec: avgIntervalSec,
-	}
-}
-
-func cloneHistorySampleAt(samples []*float64, index int) *float64 {
-	if index < 0 || index >= len(samples) {
-		return nil
-	}
-	return normalizeFloatPointer(samples[index])
-}
-
-func mergePublicNodeHistory(
-	primary map[string]*TestHistoryEntry,
-	fallback map[string]*TestHistoryEntry,
-) map[string]*TestHistoryEntry {
-	if len(primary) == 0 {
-		if len(fallback) == 0 {
-			return map[string]*TestHistoryEntry{}
-		}
-		return fallback
-	}
-	if len(fallback) == 0 {
-		return primary
-	}
-
-	merged := make(map[string]*TestHistoryEntry, len(primary)+len(fallback))
-	for key, entry := range primary {
-		merged[key] = entry
-	}
-	for key, entry := range fallback {
-		if entry == nil {
-			continue
-		}
-		current := merged[key]
-		if current == nil || len(current.Times) < len(entry.Times) {
-			merged[key] = entry
-		}
-	}
-	return merged
 }
 
 func (s *Store) HasNode(nodeID string) bool {
@@ -2859,26 +2665,14 @@ func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[s
 	if nodeID == "" {
 		return map[string]*TestHistoryEntry{}, nil
 	}
-	maxPoints := publicHistoryPointBudget(from, to)
-	fallback := s.queryPublicNodeHistoryFromMemory(nodeID, from, to, maxPoints)
 	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
-		if len(fallback) == 0 {
-			return map[string]*TestHistoryEntry{}, nil
-		}
-		return fallback, nil
+		return map[string]*TestHistoryEntry{}, nil
 	}
 	entries, err := s.historyManager.NetworkStore().QueryPublicRange(nodeID, from, to)
 	if err != nil {
-		if len(fallback) > 0 {
-			log.Printf("查询 public history TSDB 失败，回退内存历史：%v", err)
-			return fallback, nil
-		}
 		return nil, err
 	}
-	return mergePublicNodeHistory(
-		convertNetworkHistoryToTestHistory(entries, maxPoints),
-		fallback,
-	), nil
+	return convertNetworkHistoryToTestHistory(entries), nil
 }
 
 func cloneTestHistory(
@@ -2915,7 +2709,6 @@ func cloneTestHistory(
 
 func (s *Store) Snapshot() []NodeView {
 	var persist bool
-	var data PersistedData
 	s.mu.Lock()
 
 	views := make([]NodeView, 0, len(s.nodes))
@@ -2925,7 +2718,39 @@ func (s *Store) Snapshot() []NodeView {
 		if s.applyAutoRenewLocked(profile, now) {
 			persist = true
 		}
-		views = append(views, buildNodeView(node, profile, now))
+		status := "online"
+		if now.Sub(node.LastSeen) > 5*time.Second {
+			status = "offline"
+		}
+		group, tags := resolveProfileGroupTags(profile, node.Stats)
+		groups := normalizeGroupSelections(profile.Groups)
+		updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
+		views = append(views, NodeView{
+			Stats:                    node.Stats,
+			LastSeen:                 node.LastSeen.Unix(),
+			FirstSeen:                node.FirstSeen.Unix(),
+			Status:                   status,
+			ServerID:                 profile.ServerID,
+			AlertEnabled:             isAlertEnabled(profile),
+			Alias:                    profile.Alias,
+			Group:                    group,
+			Tags:                     tags,
+			Groups:                   groups,
+			Region:                   profile.Region,
+			DiskType:                 profile.DiskType,
+			NetSpeedMbps:             profile.NetSpeedMbps,
+			ExpireAt:                 profile.ExpireAt,
+			AutoRenew:                profile.AutoRenew,
+			RenewIntervalSec:         profile.RenewIntervalSec,
+			TestIntervalSec:          profile.TestIntervalSec,
+			Tests:                    profile.Tests,
+			TestSelections:           profile.TestSelections,
+			AgentUpdateSupported:     updateSupported,
+			AgentUpdateMode:          updateMode,
+			AgentUpdateState:         updateState,
+			AgentUpdateTargetVersion: updateTargetVersion,
+			AgentUpdateMessage:       updateMessage,
+		})
 	}
 	sort.Slice(views, func(i, j int) bool {
 		leftGroup := views[i].Group
@@ -2935,13 +2760,10 @@ func (s *Store) Snapshot() []NodeView {
 		}
 		return leftGroup < rightGroup
 	})
-	if persist {
-		data = s.snapshotPersistedLocked()
-	}
 	s.mu.Unlock()
 
 	if persist {
-		s.persist(data)
+		s.persist()
 	}
 	return views
 }
@@ -2960,57 +2782,48 @@ func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 	}
 
 	profile := s.profiles[nodeID]
+	if profile == nil {
+		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
+	}
+
+	status := "online"
+	if time.Since(node.LastSeen) > 5*time.Second {
+		status = "offline"
+	}
+	group, tags := resolveProfileGroupTags(profile, node.Stats)
+	groups := normalizeGroupSelections(profile.Groups)
+	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
 	return NodeDelta{
 		Type:        "node_delta",
 		GeneratedAt: time.Now().Unix(),
-		Node:        buildNodeView(node, profile, time.Now()),
+		Node: NodeView{
+			Stats:                    node.Stats,
+			LastSeen:                 node.LastSeen.Unix(),
+			FirstSeen:                node.FirstSeen.Unix(),
+			Status:                   status,
+			ServerID:                 profile.ServerID,
+			AlertEnabled:             isAlertEnabled(profile),
+			Alias:                    profile.Alias,
+			Group:                    group,
+			Tags:                     tags,
+			Groups:                   groups,
+			Region:                   profile.Region,
+			DiskType:                 profile.DiskType,
+			NetSpeedMbps:             profile.NetSpeedMbps,
+			ExpireAt:                 profile.ExpireAt,
+			AutoRenew:                profile.AutoRenew,
+			RenewIntervalSec:         profile.RenewIntervalSec,
+			TestIntervalSec:          profile.TestIntervalSec,
+			Tests:                    profile.Tests,
+			TestSelections:           profile.TestSelections,
+			AgentUpdateSupported:     updateSupported,
+			AgentUpdateMode:          updateMode,
+			AgentUpdateState:         updateState,
+			AgentUpdateTargetVersion: updateTargetVersion,
+			AgentUpdateMessage:       updateMessage,
+		},
 	}, true
-}
-
-func buildNodeView(node NodeState, profile *NodeProfile, now time.Time) NodeView {
-	resolved := NodeProfile{TestIntervalSec: defaultTestIntervalSec}
-	if profile != nil {
-		resolved = *profile
-		if resolved.TestIntervalSec <= 0 {
-			resolved.TestIntervalSec = defaultTestIntervalSec
-		}
-	}
-	viewStats := withEffectiveAgentVersion(node.Stats, &resolved)
-	group, tags := resolveProfileGroupTags(&resolved, viewStats)
-	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(&resolved, viewStats)
-	return NodeView{
-		Stats:                    viewStats,
-		LastSeen:                 node.LastSeen.Unix(),
-		FirstSeen:                node.FirstSeen.Unix(),
-		Status:                   resolveNodeStatus(node.LastSeen, now),
-		ServerID:                 resolved.ServerID,
-		AlertEnabled:             isAlertEnabled(&resolved),
-		Alias:                    resolved.Alias,
-		Group:                    group,
-		Tags:                     tags,
-		Groups:                   normalizeGroupSelections(resolved.Groups),
-		Region:                   resolved.Region,
-		DiskType:                 resolved.DiskType,
-		NetSpeedMbps:             resolved.NetSpeedMbps,
-		ExpireAt:                 resolved.ExpireAt,
-		AutoRenew:                resolved.AutoRenew,
-		RenewIntervalSec:         resolved.RenewIntervalSec,
-		TestIntervalSec:          resolved.TestIntervalSec,
-		TestSelections:           resolved.TestSelections,
-		AgentUpdateSupported:     updateSupported,
-		AgentUpdateMode:          updateMode,
-		AgentUpdateState:         updateState,
-		AgentUpdateTargetVersion: updateTargetVersion,
-		AgentUpdateMessage:       updateMessage,
-	}
-}
-
-func resolveNodeStatus(lastSeen time.Time, now time.Time) string {
-	if now.Sub(lastSeen) > 5*time.Second {
-		return "offline"
-	}
-	return "online"
 }
 
 func resolveProfileGroupTags(profile *NodeProfile, stats metrics.NodeStats) (string, []string) {
@@ -3065,7 +2878,8 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 func (h *Hub) Broadcast(payload []byte) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
-		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+		copied := bytes.Clone(payload)
+		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3077,7 +2891,8 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 		if client == nil || client.variant != variant {
 			continue
 		}
-		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+		copied := bytes.Clone(payload)
+		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3221,7 +3036,7 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		if r.TLS != nil {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://challenges.cloudflare.com; frame-src 'self' https://challenges.cloudflare.com; connect-src 'self' ws: wss: https://challenges.cloudflare.com")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' ws: wss: https://challenges.cloudflare.com")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
@@ -3234,19 +3049,20 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 }
 
 type NodeProfileUpdate struct {
-	Alias            *string          `json:"alias"`
-	Group            *string          `json:"group"`
-	Tags             *[]string        `json:"tags"`
-	Groups           *[]string        `json:"groups"`
-	Region           *string          `json:"region"`
-	DiskType         *string          `json:"disk_type"`
-	NetSpeedMbps     *int             `json:"net_speed_mbps"`
-	ExpireAt         *int64           `json:"expire_at"`
-	AutoRenew        *bool            `json:"auto_renew"`
-	RenewIntervalSec *int64           `json:"renew_interval_sec"`
-	TestIntervalSec  *int             `json:"test_interval_sec"`
-	TestSelections   *[]TestSelection `json:"test_selections"`
-	AlertEnabled     *bool            `json:"alert_enabled"`
+	Alias            *string                      `json:"alias"`
+	Group            *string                      `json:"group"`
+	Tags             *[]string                    `json:"tags"`
+	Groups           *[]string                    `json:"groups"`
+	Region           *string                      `json:"region"`
+	DiskType         *string                      `json:"disk_type"`
+	NetSpeedMbps     *int                         `json:"net_speed_mbps"`
+	ExpireAt         *int64                       `json:"expire_at"`
+	AutoRenew        *bool                        `json:"auto_renew"`
+	RenewIntervalSec *int64                       `json:"renew_interval_sec"`
+	TestIntervalSec  *int                         `json:"test_interval_sec"`
+	Tests            *[]metrics.NetworkTestConfig `json:"tests"`
+	TestSelections   *[]TestSelection             `json:"test_selections"`
+	AlertEnabled     *bool                        `json:"alert_enabled"`
 }
 
 func (s *Store) AdminPath() string {
@@ -3403,6 +3219,47 @@ func (s *Store) pruneLoginAttemptsLocked(now time.Time, window, lock time.Durati
 	}
 }
 
+func (s *Store) allowAgentRate(key string, window time.Duration, limit int, now time.Time, useIngestMap bool) bool {
+	key = strings.TrimSpace(key)
+	if key == "" || window <= 0 || limit <= 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rates := s.agentRegisterRate
+	if useIngestMap {
+		rates = s.agentIngestRate
+	}
+	if rates == nil {
+		rates = make(map[string]agentRateWindow)
+		if useIngestMap {
+			s.agentIngestRate = rates
+		} else {
+			s.agentRegisterRate = rates
+		}
+	}
+	for rateKey, windowState := range rates {
+		if !windowState.until.IsZero() && !now.Before(windowState.until) {
+			delete(rates, rateKey)
+		}
+	}
+	state := rates[key]
+	if state.until.IsZero() || !now.Before(state.until) {
+		rates[key] = agentRateWindow{count: 1, until: now.Add(window)}
+		return true
+	}
+	if state.count >= limit {
+		return false
+	}
+	state.count++
+	rates[key] = state
+	return true
+}
+
 func (s *Store) upgradeAdminPasswordHash(password, stored string) {
 	hash, err := hashPassword(password)
 	if err != nil {
@@ -3414,9 +3271,8 @@ func (s *Store) upgradeAdminPasswordHash(password, stored string) {
 		return
 	}
 	s.settings.AdminPass = hash
-	data := s.snapshotPersistedLocked()
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 }
 
 func (s *Store) PublicSettings() PublicSettings {
@@ -3441,7 +3297,7 @@ func (s *Store) SettingsView() SettingsView {
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
 		TurnstileSiteKey:     strings.TrimSpace(s.settings.TurnstileSiteKey),
-		TurnstileSecretKey:   strings.TrimSpace(s.settings.TurnstileSecretKey),
+		TurnstileSecretKey:   "",
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
@@ -3572,7 +3428,6 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 		AdminPath:            stringPointer(adminPath),
 		AdminUser:            stringPointer(adminUser),
 		TurnstileSiteKey:     stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
-		TurnstileSecretKey:   stringPointer(strings.TrimSpace(view.TurnstileSecretKey)),
 		AgentEndpoint:        stringPointer(agentEndpoint),
 		SiteTitle:            stringPointer(siteTitle),
 		SiteIcon:             stringPointer(siteIcon),
@@ -3593,6 +3448,9 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	}
 	if agentToken != "" {
 		update.AgentToken = stringPointer(agentToken)
+	}
+	if secret := strings.TrimSpace(view.TurnstileSecretKey); secret != "" {
+		update.TurnstileSecretKey = stringPointer(secret)
 	}
 	if len(groupTree) > 0 {
 		update.GroupTree = &groupTree
@@ -3619,7 +3477,6 @@ func (s *Store) SiteTitle() string {
 }
 
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
-	var data PersistedData
 	var view SettingsView
 	s.mu.Lock()
 	if update.AdminPath != nil {
@@ -3680,6 +3537,9 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.TurnstileSiteKey != nil {
 		s.settings.TurnstileSiteKey = strings.TrimSpace(*update.TurnstileSiteKey)
+		if s.settings.TurnstileSiteKey == "" {
+			s.settings.TurnstileSecretKey = ""
+		}
 	}
 	if update.TurnstileSecretKey != nil {
 		s.settings.TurnstileSecretKey = strings.TrimSpace(*update.TurnstileSecretKey)
@@ -3810,7 +3670,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
-		if update.GroupTree == nil {
+		if len(s.settings.GroupTree) == 0 {
 			s.settings.GroupTree = buildGroupTree(s.settings.Groups)
 		}
 	}
@@ -3826,7 +3686,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.TestCatalog = catalog
 	}
-	data = s.snapshotPersistedLocked()
 	loginFailLimit := s.settings.LoginFailLimit
 	if loginFailLimit < 0 {
 		loginFailLimit = 0
@@ -3835,7 +3694,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AdminPath:            s.settings.AdminPath,
 		AdminUser:            s.settings.AdminUser,
 		TurnstileSiteKey:     strings.TrimSpace(s.settings.TurnstileSiteKey),
-		TurnstileSecretKey:   strings.TrimSpace(s.settings.TurnstileSecretKey),
+		TurnstileSecretKey:   "",
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
@@ -3861,7 +3720,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	s.mu.Unlock()
 
-	s.persist(data)
+	s.persist()
 	return view, nil
 }
 
@@ -3870,7 +3729,6 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, bool, er
 		return SettingsView{}, false, errors.New("导入文件版本无效")
 	}
 
-	current := s.SettingsView()
 	s.mu.RLock()
 	staged := &Store{
 		nodes:    cloneNodeStates(s.nodes),
@@ -3879,7 +3737,13 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, bool, er
 	}
 	s.mu.RUnlock()
 
-	if _, err := staged.UpdateSettings(settingsViewToUpdate(payload.Settings)); err != nil {
+	update := settingsViewToUpdate(payload.Settings)
+	update.AdminUser = nil
+	update.AdminPass = nil
+	if secret := strings.TrimSpace(payload.Settings.TurnstileSecretKey); secret != "" {
+		update.TurnstileSecretKey = stringPointer(secret)
+	}
+	if _, err := staged.UpdateSettings(update); err != nil {
 		return SettingsView{}, false, err
 	}
 	staged.mu.Lock()
@@ -3889,20 +3753,16 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, bool, er
 		return SettingsView{}, false, err
 	}
 
-	var data PersistedData
 	s.mu.Lock()
 	s.settings = staged.settings
 	s.profiles = normalizedProfiles
-	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 
-	reauthRequired := current.AdminUser != payload.Settings.AdminUser
-	return s.SettingsView(), reauthRequired, nil
+	return s.SettingsView(), false, nil
 }
 
 func (s *Store) ReplaceProfiles(profiles map[string]*NodeProfile) error {
-	var data PersistedData
 	s.mu.Lock()
 	normalized, err := s.normalizeProfilesForImportLocked(profiles)
 	if err != nil {
@@ -3910,9 +3770,8 @@ func (s *Store) ReplaceProfiles(profiles map[string]*NodeProfile) error {
 		return err
 	}
 	s.profiles = normalized
-	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	return nil
 }
 
@@ -3959,6 +3818,7 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if profile.TestIntervalSec <= 0 {
 			profile.TestIntervalSec = defaultTestIntervalSec
 		}
+		profile.Tests = cloneNetworkTestConfigs(profile.Tests)
 		profile.TestSelections = s.normalizeSelectionsLocked(cloneTestSelections(profile.TestSelections))
 		if profile.AlertEnabled == nil {
 			profile.AlertEnabled = boolPointer(true)
@@ -4007,20 +3867,18 @@ func (s *Store) ensureProfileLocked(nodeID string) *NodeProfile {
 }
 
 func (s *Store) ensureAgentAuthToken(nodeID string) string {
-	var data PersistedData
 	changed := false
 	s.mu.Lock()
 	profile := s.ensureProfileLocked(strings.TrimSpace(nodeID))
 	if strings.TrimSpace(profile.AgentAuthToken) == "" || s.isAgentAuthTokenDuplicateLocked(nodeID, profile.AgentAuthToken) {
 		profile.AgentAuthToken = s.generateAgentAuthTokenLocked()
 		profile.UpdatedAt = time.Now().Unix()
-		data = s.snapshotPersistedLocked()
 		changed = true
 	}
 	token := strings.TrimSpace(profile.AgentAuthToken)
 	s.mu.Unlock()
 	if changed {
-		s.persist(data)
+		s.persist()
 	}
 	return token
 }
@@ -4051,17 +3909,6 @@ func isBootstrapAgentToken(expected, token string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
-}
-
-func (s *Store) validateOrProvisionAgentAuthToken(nodeID, token, bootstrapToken string) bool {
-	if s.validateAgentAuthToken(nodeID, token) {
-		return true
-	}
-	if !isBootstrapAgentToken(bootstrapToken, token) {
-		return false
-	}
-	s.ensureAgentAuthToken(nodeID)
-	return true
 }
 
 func (s *Store) generateAgentAuthTokenLocked() string {
@@ -4167,21 +4014,9 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 			profile.AlertEnabled = boolPointer(true)
 		}
 		id := strings.TrimSpace(profile.ServerID)
-		if id == "" {
+		if id == "" || containsKey(used, id) {
 			id = randomToken(10)
-			for {
-				if _, exists := used[id]; !exists {
-					break
-				}
-				id = randomToken(10)
-			}
-			profile.ServerID = id
-		} else if _, exists := used[id]; exists {
-			id = randomToken(10)
-			for {
-				if _, duplicate := used[id]; !duplicate {
-					break
-				}
+			for containsKey(used, id) {
 				id = randomToken(10)
 			}
 			profile.ServerID = id
@@ -4190,25 +4025,34 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 	}
 }
 
+func containsKey(seen map[string]struct{}, key string) bool {
+	_, ok := seen[key]
+	return ok
+}
+
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfile {
-	var data PersistedData
 	s.mu.Lock()
 
 	profile := s.ensureProfileLocked(nodeID)
+	configChanged := false
 	if update.Alias != nil {
 		profile.Alias = strings.TrimSpace(*update.Alias)
+		configChanged = true
 	}
 	if update.Group != nil {
 		profile.Group = strings.TrimSpace(*update.Group)
+		configChanged = true
 	}
 	if update.Tags != nil {
 		profile.Tags = normalizeGroups(*update.Tags)
+		configChanged = true
 	}
 	if update.Groups != nil {
 		profile.Groups = normalizeGroupSelections(*update.Groups)
 		group, tags := primaryGroupTagsFromSelections(profile.Groups)
 		profile.Group = group
 		profile.Tags = tags
+		configChanged = true
 	}
 	if update.Groups == nil && (update.Group != nil || update.Tags != nil) {
 		profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
@@ -4259,18 +4103,26 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) NodeProfi
 	}
 	if update.TestIntervalSec != nil && *update.TestIntervalSec > 0 {
 		profile.TestIntervalSec = *update.TestIntervalSec
+		configChanged = true
+	}
+	if update.Tests != nil {
+		profile.Tests = *update.Tests
+		configChanged = true
 	}
 	if update.TestSelections != nil {
 		profile.TestSelections = s.normalizeSelectionsLocked(*update.TestSelections)
+		configChanged = true
 	}
 	if update.AlertEnabled != nil {
 		value := *update.AlertEnabled
 		profile.AlertEnabled = &value
 	}
+	if configChanged {
+		s.markAgentConfigRefreshLocked(nodeID)
+	}
 	profile.UpdatedAt = time.Now().Unix()
-	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	return *profile
 }
 
@@ -4279,7 +4131,6 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 	if serverID == "" {
 		return "", "", false
 	}
-	var data PersistedData
 	var nodeID string
 	var display string
 	s.mu.Lock()
@@ -4302,19 +4153,17 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 		} else {
 			display = resolveAlertDisplay(profile, metrics.NodeStats{}, nodeID)
 		}
-		data = s.snapshotPersistedLocked()
 		break
 	}
 	s.mu.Unlock()
 	if nodeID == "" {
 		return "", "", false
 	}
-	s.persist(data)
+	s.persist()
 	return nodeID, display, true
 }
 
 func (s *Store) DeleteNode(nodeID string) bool {
-	var data PersistedData
 	s.mu.Lock()
 	_, exists := s.nodes[nodeID]
 	delete(s.nodes, nodeID)
@@ -4324,10 +4173,9 @@ func (s *Store) DeleteNode(nodeID string) bool {
 	if s.testHistory != nil {
 		delete(s.testHistory, nodeID)
 	}
-	data = s.snapshotPersistedLocked()
 	historyManager := s.historyManager
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	if historyManager != nil {
 		if err := historyManager.DeleteNode(nodeID); err != nil {
 			log.Printf("删除节点 TSDB 历史失败 node=%s: %v", nodeID, err)
@@ -4337,17 +4185,15 @@ func (s *Store) DeleteNode(nodeID string) bool {
 }
 
 func (s *Store) ClearNodes() {
-	var data PersistedData
 	s.mu.Lock()
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
 	s.alerted = make(map[string]alertState)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.testHistory = make(map[string]map[string]*TestHistoryEntry)
-	data = s.snapshotPersistedLocked()
 	historyManager := s.historyManager
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	if historyManager != nil {
 		if err := historyManager.ClearNodes(); err != nil {
 			log.Printf("清空节点 TSDB 历史失败: %v", err)
@@ -4362,7 +4208,6 @@ type AgentUpdateReport struct {
 }
 
 func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstruction) NodeProfile {
-	var data PersistedData
 	s.mu.Lock()
 	profile := s.ensureProfileLocked(nodeID)
 	instruction.Version = strings.TrimSpace(instruction.Version)
@@ -4376,23 +4221,15 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	profile.AgentUpdateLeaseUntil = 0
 	profile.AgentUpdateReportedAt = instruction.RequestedAt
 	profile.UpdatedAt = instruction.RequestedAt
-	data = s.snapshotPersistedLocked()
+	s.markAgentConfigRefreshLocked(nodeID)
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	return *profile
 }
 
-func (s *Store) HasPendingAgentUpdate(nodeID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return shouldDispatchAgentUpdate(s.profiles[strings.TrimSpace(nodeID)], time.Now())
-}
-
 func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) NodeProfile {
-	var data PersistedData
 	s.mu.Lock()
 	profile := s.ensureProfileLocked(nodeID)
-	node, hasNode := s.nodes[nodeID]
 	reportedAt := time.Now().Unix()
 	state := strings.TrimSpace(report.State)
 	if state == "" {
@@ -4401,10 +4238,6 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 	profile.AgentUpdateState = state
 	if version := strings.TrimSpace(report.Version); version != "" {
 		profile.AgentUpdateTargetVersion = version
-		if hasNode && strings.EqualFold(state, "succeeded") {
-			node.Stats.AgentVersion = version
-			s.nodes[nodeID] = node
-		}
 	}
 	profile.AgentUpdateMessage = strings.TrimSpace(report.Message)
 	profile.AgentUpdateReportedAt = reportedAt
@@ -4418,10 +4251,41 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 		profile.AgentUpdateLeaseUntil = 0
 	}
 	profile.UpdatedAt = reportedAt
-	data = s.snapshotPersistedLocked()
 	s.mu.Unlock()
-	s.persist(data)
+	s.persist()
 	return *profile
+}
+
+func (s *Store) HasPendingAgentConfigRefresh(nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.configRefresh[nodeID]
+	return ok
+}
+
+func (s *Store) MarkAgentConfigRefreshed(nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.configRefresh, nodeID)
+	s.mu.Unlock()
+}
+
+func (s *Store) markAgentConfigRefreshLocked(nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	if s.configRefresh == nil {
+		s.configRefresh = make(map[string]struct{})
+	}
+	s.configRefresh[nodeID] = struct{}{}
 }
 
 func (s *Store) AgentConfig(nodeID string) AgentConfig {
@@ -4470,12 +4334,15 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 	}
 }
 
-func (s *Store) persist(data PersistedData) {
+func (s *Store) persist() {
 	if s.dataPath == "" {
 		return
 	}
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
+	s.mu.RLock()
+	data := s.snapshotPersistedLocked()
+	s.mu.RUnlock()
 	if err := savePersistedData(s.dataPath, data); err != nil {
 		log.Printf("%v", wrapDataPathError("持久化失败", s.dataPath, err))
 		return
@@ -4509,49 +4376,17 @@ func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {
 	return true
 }
 
-func testCatalogByID(items []TestCatalogItem) map[string]TestCatalogItem {
-	catalog := make(map[string]TestCatalogItem, len(items))
-	for _, item := range items {
-		id := strings.TrimSpace(item.ID)
-		if id == "" {
-			continue
-		}
-		catalog[id] = item
-	}
-	return catalog
-}
-
-func normalizeSelectionInterval(item TestCatalogItem, interval int) int {
-	if interval < 0 {
-		interval = 0
-	}
-	if strings.EqualFold(item.Type, "icmp") {
-		return 0
-	}
-	return interval
-}
-
-func resolveSelectionInterval(item TestCatalogItem, requested, fallback int) int {
-	if strings.EqualFold(item.Type, "icmp") {
-		return 0
-	}
-	if requested > 0 {
-		return requested
-	}
-	if item.IntervalSec > 0 {
-		return item.IntervalSec
-	}
-	if fallback > 0 {
-		return fallback
-	}
-	return defaultTestIntervalSec
-}
-
 func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
 	if len(profile.TestSelections) == 0 {
-		return nil
+		if len(profile.Tests) > maxNetworkTestsPerNode {
+			return profile.Tests[:maxNetworkTestsPerNode]
+		}
+		return profile.Tests
 	}
-	catalog := testCatalogByID(s.settings.TestCatalog)
+	catalog := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
+	for _, item := range s.settings.TestCatalog {
+		catalog[item.ID] = item
+	}
 	results := make([]metrics.NetworkTestConfig, 0, len(profile.TestSelections))
 	for _, sel := range profile.TestSelections {
 		if sel.TestID == "" {
@@ -4561,13 +4396,28 @@ func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestCo
 		if !ok {
 			continue
 		}
+		interval := 0
+		if strings.ToLower(item.Type) == "tcp" {
+			if sel.IntervalSec > 0 {
+				interval = sel.IntervalSec
+			} else if item.IntervalSec > 0 {
+				interval = item.IntervalSec
+			} else if profile.TestIntervalSec > 0 {
+				interval = profile.TestIntervalSec
+			} else {
+				interval = defaultTestIntervalSec
+			}
+		}
 		results = append(results, metrics.NetworkTestConfig{
 			Name:        item.Name,
 			Type:        item.Type,
 			Host:        item.Host,
 			Port:        item.Port,
-			IntervalSec: resolveSelectionInterval(item, sel.IntervalSec, profile.TestIntervalSec),
+			IntervalSec: interval,
 		})
+		if len(results) >= maxNetworkTestsPerNode {
+			break
+		}
 	}
 	return results
 }
@@ -4576,7 +4426,13 @@ func (s *Store) normalizeSelectionsLocked(selections []TestSelection) []TestSele
 	if len(selections) == 0 {
 		return nil
 	}
-	valid := testCatalogByID(s.settings.TestCatalog)
+	valid := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
+	for _, item := range s.settings.TestCatalog {
+		if item.ID == "" {
+			continue
+		}
+		valid[item.ID] = item
+	}
 	seen := make(map[string]struct{})
 	result := make([]TestSelection, 0, len(selections))
 	for _, sel := range selections {
@@ -4592,10 +4448,20 @@ func (s *Store) normalizeSelectionsLocked(selections []TestSelection) []TestSele
 			continue
 		}
 		seen[id] = struct{}{}
+		interval := sel.IntervalSec
+		if interval < 0 {
+			interval = 0
+		}
+		if strings.ToLower(item.Type) == "icmp" {
+			interval = 0
+		}
 		result = append(result, TestSelection{
 			TestID:      id,
-			IntervalSec: normalizeSelectionInterval(item, sel.IntervalSec),
+			IntervalSec: interval,
 		})
+		if len(result) >= maxNetworkTestsPerNode {
+			break
+		}
 	}
 	return result
 }
@@ -4731,17 +4597,44 @@ func validateWebhookURL(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return errors.New("webhook 不能为空")
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return errors.New("webhook 无效")
-	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return errors.New("webhook 协议无效")
-	}
-	if parsed.Host == "" {
+	if err := validateHTTPCallbackURL(raw); err != nil {
+		if errors.Is(err, errCallbackURLScheme) {
+			return errors.New("webhook 协议无效")
+		}
 		return errors.New("webhook 无效")
 	}
 	return nil
+}
+
+var errCallbackURLScheme = errors.New("callback url scheme invalid")
+
+func validateHTTPCallbackURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" {
+		return errors.New("callback url invalid")
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return errCallbackURLScheme
+	}
+	host := strings.Trim(strings.ToLower(parsed.Hostname()), "[]")
+	if host == "" {
+		return errors.New("callback host invalid")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return errors.New("callback private host rejected")
+	}
+	if ip := net.ParseIP(host); ip != nil && isPrivateCallbackIP(ip) {
+		return errors.New("callback private ip rejected")
+	}
+	return nil
+}
+
+func isPrivateCallbackIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified()
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

@@ -177,13 +177,15 @@ export default function BasicSettings({
       agent_token: agentToken.trim(),
       agent_endpoint: agentEndpoint.trim(),
       turnstile_site_key: turnstileSiteKey.trim(),
-      turnstile_secret_key: turnstileSecretKey.trim(),
       site_title: siteTitle.trim(),
       site_icon: siteIcon.trim(),
       home_title: homeTitle.trim(),
       home_subtitle: homeSubtitle.trim(),
     };
 
+    if (turnstileSecretKey.trim()) {
+      payload.turnstile_secret_key = turnstileSecretKey.trim();
+    }
     if (adminPath.trim()) payload.admin_path = adminPath.trim();
     if (adminUser.trim() && adminUser.trim() !== settings?.admin_user) payload.admin_user = adminUser.trim();
     if (adminPass.trim()) payload.admin_pass = adminPass.trim();

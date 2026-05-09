@@ -228,6 +228,7 @@ export default function AIProvider({
     const nextCommand = resolveProviderSelection(providerOptions, commandProvider);
     if (nextCommand !== commandProvider) {
       setCommandProvider(nextCommand);
+      setIsDirty(true);
     }
   }, [commandProvider, providerOptions]);
 
@@ -303,7 +304,14 @@ export default function AIProvider({
   };
 
   const removeCompatible = (id: string) => {
-    setProviderDrafts((current) => current.filter((item) => item.id !== id), true);
+    const removingSelectedProvider = commandProvider === `openai_compatible:${id}`;
+    setProviderDrafts((current) => {
+      const next = current.filter((item) => item.id !== id);
+      if (removingSelectedProvider) {
+        setCommandProvider(resolveProviderSelection(next.map((item) => ({ value: toProviderValue(item) })), ""));
+      }
+      return next;
+    }, true);
   };
 
   const handleTest = async (item: ProviderDraft) => {

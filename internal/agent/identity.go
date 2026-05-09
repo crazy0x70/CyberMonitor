@@ -256,10 +256,52 @@ func writeTrimmedFile(filePath, value string) error {
 	if trimmedValue == "" {
 		return fmt.Errorf("file value required")
 	}
-	if err := os.MkdirAll(filepath.Dir(trimmedPath), 0o755); err != nil {
+	dir := filepath.Dir(trimmedPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(trimmedPath, []byte(trimmedValue+"\n"), 0o600)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(trimmedPath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.WriteString(trimmedValue + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, trimmedPath); err != nil {
+		return err
+	}
+	committed = true
+	syncStateParentDir(dir)
+	return nil
+}
+
+func syncStateParentDir(dir string) {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer handle.Close()
+	_ = handle.Sync()
 }
 
 func generateRandomNodeUUID() (string, error) {

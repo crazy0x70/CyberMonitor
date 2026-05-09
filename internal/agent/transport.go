@@ -99,10 +99,11 @@ type grpcControlPlane struct {
 	opts        grpcTransportOptions
 	dialContext func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
 
-	mu      sync.Mutex
-	conn    *grpc.ClientConn
-	client  agentrpc.AgentServiceClient
-	dialing chan struct{}
+	mu       sync.Mutex
+	conn     *grpc.ClientConn
+	client   agentrpc.AgentServiceClient
+	dialOnce sync.Once
+	dialErr  error
 }
 
 func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane {
@@ -392,6 +393,8 @@ func (g *grpcControlPlane) Close() error {
 	err := g.conn.Close()
 	g.conn = nil
 	g.client = nil
+	g.dialErr = nil
+	g.dialOnce = sync.Once{}
 	return err
 }
 
@@ -433,28 +436,10 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 }
 
 func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServiceClient, error) {
-	for {
-		g.mu.Lock()
-		if g.client != nil {
-			client := g.client
-			g.mu.Unlock()
-			return client, nil
-		}
-		if wait := g.dialing; wait != nil {
-			g.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		wait := make(chan struct{})
-		g.dialing = wait
-		dialContext := g.dialContext
-		g.mu.Unlock()
-
+	g.dialOnce.Do(func() {
 		dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
+		defer cancel()
+
 		opts := []grpc.DialOption{
 			grpc.WithDefaultCallOptions(grpc.ForceCodec(agentrpc.GobCodec{})),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -479,32 +464,31 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 		} else {
 			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		}
-		conn, err := dialContext(dialCtx, g.target, opts...)
-		cancel()
 
-		var closeConn *grpc.ClientConn
-		g.mu.Lock()
-		if err == nil {
-			if g.conn == nil {
-				g.conn = conn
-				g.client = agentrpc.NewAgentServiceClient(conn)
-			} else {
-				closeConn = conn
-			}
-		}
-		g.dialing = nil
-		close(wait)
-		client := g.client
-		g.mu.Unlock()
-
-		if closeConn != nil {
-			_ = closeConn.Close()
-		}
+		conn, err := g.dialContext(dialCtx, g.target, opts...)
 		if err != nil {
-			return nil, err
+			g.dialErr = err
+			return
 		}
-		return client, nil
+
+		g.mu.Lock()
+		g.conn = conn
+		g.client = agentrpc.NewAgentServiceClient(conn)
+		g.mu.Unlock()
+	})
+
+	if g.dialErr != nil {
+		return nil, g.dialErr
 	}
+
+	g.mu.Lock()
+	client := g.client
+	g.mu.Unlock()
+
+	if client == nil {
+		return nil, status.Error(codes.Unavailable, "grpc client not initialized")
+	}
+	return client, nil
 }
 
 func fromRPCUpdateInstruction(update *agentrpc.UpdateInstruction) *RemoteUpdateInstruction {
