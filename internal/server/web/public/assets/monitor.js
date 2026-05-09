@@ -235,7 +235,7 @@ function connectWSForTarget(target) {
     ws = new WebSocket(target.socketURL);
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
-    dropSourceSnapshot(target.key);
+    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
     scheduleReconnect(target);
     return;
   }
@@ -256,7 +256,7 @@ function connectWSForTarget(target) {
     if (state.wsConnections.get(target.key) === ws) {
       state.wsConnections.delete(target.key);
     }
-    dropSourceSnapshot(target.key);
+    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
     scheduleReconnect(target);
   };
 
@@ -469,7 +469,6 @@ function handleTargetSocketSilence(target, socket) {
     }
     state.wsConnections.delete(target.key);
     state.wsLastMessageAt.delete(target.key);
-    dropSourceSnapshot(target.key);
     try {
       socket.close();
     } catch (error) {
