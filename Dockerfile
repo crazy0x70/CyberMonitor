@@ -1,4 +1,5 @@
 ARG GO_IMAGE_VERSION=1.26.2
+ARG NODE_IMAGE_VERSION=24
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
@@ -33,7 +34,7 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 RUN set -eu; \
     test -f internal/server/web/dist/admin/index.html || { \
-      echo "Missing admin assets: use scripts/docker-build-local.sh for local Docker builds." >&2; \
+      echo "Missing admin assets: run npm --prefix internal/server/web/admin run build:admin before local Docker builds." >&2; \
       exit 1; \
     }
 RUN set -eux; \

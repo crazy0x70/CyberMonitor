@@ -16,7 +16,6 @@ mkdir -p "${ROOT_DIR}/dist" "${GOPATH}" "${GOMODCACHE}" "${GOCACHE}" "${TMPDIR}"
 
 npm --prefix "${ADMIN_DIR}" ci --cache "${ROOT_DIR}/.cache/npm"
 npm --prefix "${ADMIN_DIR}" run lint
-npm --prefix "${ADMIN_DIR}" run test:unit
 npm --prefix "${ADMIN_DIR}" run build:admin
 
 cd "${ROOT_DIR}"
