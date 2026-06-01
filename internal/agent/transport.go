@@ -31,7 +31,7 @@ const (
 	defaultGRPCCallTimeout     = 5 * time.Second
 	// 首次 gRPC 建连在真实 Docker / 跨主机场景下可能需要明显超过 250ms 才能进入 Ready。
 	// 这里保留快速失败，但避免把正常的慢建连过早误判成不可用。
-	defaultGRPCReadyTimeout = 1 * time.Second
+	defaultGRPCReadyTimeout = 5 * time.Second
 )
 
 type grpcTransportOptions struct {
