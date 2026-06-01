@@ -8,6 +8,7 @@ services:
     environment:
       # Agent 统一接入地址。运行时会优先尝试 gRPC，不可用时自动回退到 HTTP。
       # 默认单端口部署时通常是 25012；如果服务端配置了 CM_PUBLIC_LISTEN=25013，则这里也必须改成 25013。
+      # HTTPS 未显式写端口时，Agent 的 gRPC 连接会使用 443；HTTP 未显式写端口时会使用 80。
       CM_SERVER_URL: "${CM_SERVER_URL:?set CM_SERVER_URL, for example http://192.0.2.10:25012}"
       CM_AGENT_TOKEN: "${CM_AGENT_TOKEN:?set CM_AGENT_TOKEN}"
       # 可选：显式指定固定节点 ID。未指定时，Agent 会优先复用 ~/.cybermonitor-node-id；
@@ -15,6 +16,7 @@ services:
       # CM_NODE_ID: "existing-node-01"
       CM_NODE_ID_FILE: "/state/.cybermonitor-node-id"
       CM_AGENT_TOKEN_FILE: "/state/.cybermonitor-agent-token"
+      CM_INTERVAL: "5s"
       # 默认拒绝服务端下发的远程更新任务；需要 Docker socket 更新能力时再改为 "0"。
       CM_DISABLE_UPDATE: "1"
       # 访问 Docker socket 需要显式 opt-in；挂载 docker.sock 并确认风险后再改为 "1"。
@@ -31,4 +33,7 @@ services:
       # CM_DISABLE_UPDATE: "0"
       # CM_ENABLE_DOCKER_UPDATE: "1"
       # - /var/run/docker.sock:/var/run/docker.sock
+    # 如果当前节点到 CDN IPv6 路由异常，可临时固定到可用 IPv4：
+    # extra_hosts:
+    #   - "monitor.example.com:203.0.113.10"
     restart: unless-stopped

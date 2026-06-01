@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,16 +30,12 @@ const (
 	defaultGRPCFallbackBackoff = 30 * time.Second
 	defaultGRPCDialTimeout     = 4 * time.Second
 	defaultGRPCCallTimeout     = 5 * time.Second
-	// 首次 gRPC 建连在真实 Docker / 跨主机场景下可能需要明显超过 250ms 才能进入 Ready。
-	// 这里保留快速失败，但避免把正常的慢建连过早误判成不可用。
-	defaultGRPCReadyTimeout = 5 * time.Second
 )
 
 type grpcTransportOptions struct {
 	fallbackBackoff time.Duration
 	dialTimeout     time.Duration
 	callTimeout     time.Duration
-	readyTimeout    time.Duration
 }
 
 func defaultGRPCTransportOptions() grpcTransportOptions {
@@ -46,7 +43,6 @@ func defaultGRPCTransportOptions() grpcTransportOptions {
 		fallbackBackoff: defaultGRPCFallbackBackoff,
 		dialTimeout:     defaultGRPCDialTimeout,
 		callTimeout:     defaultGRPCCallTimeout,
-		readyTimeout:    defaultGRPCReadyTimeout,
 	}
 }
 
@@ -60,9 +56,6 @@ func (o grpcTransportOptions) normalized() grpcTransportOptions {
 	}
 	if o.callTimeout <= 0 {
 		o.callTimeout = defaults.callTimeout
-	}
-	if o.readyTimeout <= 0 {
-		o.readyTimeout = defaults.readyTimeout
 	}
 	return o
 }
@@ -155,6 +148,14 @@ func parseGRPCTarget(serverURL string) (string, bool, error) {
 	if target == "" {
 		return "", false, fmt.Errorf("grpc target missing host")
 	}
+	if parsed.Port() == "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "https":
+			target = net.JoinHostPort(parsed.Hostname(), "443")
+		case "http":
+			target = net.JoinHostPort(parsed.Hostname(), "80")
+		}
+	}
 	return target, strings.EqualFold(parsed.Scheme, "https"), nil
 }
 
@@ -238,10 +239,13 @@ func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	t.grpcBackoffUntil = time.Now().Add(t.opts.fallbackBackoff)
 	t.lastMode = "http"
 	t.mu.Unlock()
-	log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: %v", t.opts.fallbackBackoff, err)
 	if t.grpc != nil {
+		target, state := t.grpc.connectionStatus()
+		log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: target=%s state=%s err=%v", t.opts.fallbackBackoff, target, state, err)
 		_ = t.grpc.Close()
+		return
 	}
+	log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: %v", t.opts.fallbackBackoff, err)
 }
 
 func callWithFallback[T any](
@@ -398,6 +402,20 @@ func (g *grpcControlPlane) Close() error {
 	return err
 }
 
+func (g *grpcControlPlane) connectionStatus() (string, string) {
+	if g == nil {
+		return "", "disabled"
+	}
+	g.mu.Lock()
+	conn := g.conn
+	target := g.target
+	g.mu.Unlock()
+	if conn == nil {
+		return target, "not_initialized"
+	}
+	return target, conn.GetState().String()
+}
+
 func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServiceClient, context.Context, context.CancelFunc, error) {
 	client, err := g.clientConn(ctx)
 	if err != nil {
@@ -410,26 +428,12 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport not ready")
 	}
 	state := conn.GetState()
-	if state == connectivity.Idle {
-		conn.Connect()
-		state = conn.GetState()
-	}
-	switch state {
-	case connectivity.Connecting, connectivity.TransientFailure:
-		waitCtx, cancel := context.WithTimeout(ctx, g.opts.readyTimeout)
-		defer cancel()
-		for state == connectivity.Connecting || state == connectivity.TransientFailure || state == connectivity.Idle {
-			if !conn.WaitForStateChange(waitCtx, state) {
-				return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport connecting")
-			}
-			state = conn.GetState()
-		}
-	case connectivity.Shutdown:
+	if state == connectivity.Shutdown {
 		_ = g.Close()
 		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport shutdown")
 	}
-	if state != connectivity.Ready {
-		return nil, nil, nil, status.Error(codes.Unavailable, "grpc transport not ready")
+	if state == connectivity.Idle {
+		conn.Connect()
 	}
 	callCtx, cancel := context.WithTimeout(ctx, g.opts.callTimeout)
 	return client, callCtx, cancel, nil
@@ -441,7 +445,10 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 		defer cancel()
 
 		opts := []grpc.DialOption{
-			grpc.WithDefaultCallOptions(grpc.ForceCodec(agentrpc.GobCodec{})),
+			grpc.WithDefaultCallOptions(
+				grpc.ForceCodec(agentrpc.GobCodec{}),
+				grpc.WaitForReady(true),
+			),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:                20 * time.Second,
 				Timeout:             10 * time.Second,

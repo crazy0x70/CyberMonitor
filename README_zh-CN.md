@@ -40,6 +40,7 @@ docker run -d \
 ### 3. Docker 部署探针 (Agent)
 
 ```bash
+mkdir -p ./agent-state
 docker run -d \
   --name cyber-monitor-agent \
   --network host \
@@ -47,26 +48,33 @@ docker run -d \
   --cap-add NET_RAW \
   -e CM_SERVER_URL="http://<主控IP>:25012" \
   -e CM_AGENT_TOKEN="<你的Token>" \
-  -e CM_NODE_ID="my-node-id" \
+  -e CM_NODE_ID_FILE="/state/.cybermonitor-node-id" \
+  -e CM_AGENT_TOKEN_FILE="/state/.cybermonitor-agent-token" \
+  -e CM_INTERVAL="5s" \
+  -e CM_DISABLE_UPDATE="1" \
+  -v "$(pwd)/agent-state:/state" \
   -v /:/host:ro \
   -v /proc:/host/proc:ro \
   -v /sys:/host/sys:ro \
   -v /etc:/host/etc:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   ghcr.io/crazy0x70/cyber-monitor-agent:latest
 ```
 
 **配置说明**：`CM_SERVER_URL` 是探针的统一接入地址。Agent 启动后会优先尝试建立 `gRPC` 控制链路；若环境（如反向代理或 CDN）仅支持 `HTTP/1.1`，Agent 会自动回退至 `HTTP` 模式。若需长期保持 `gRPC` 模式，请确保 Agent 直连 Server 或使用支持 `HTTP/2` / `h2c` 的代理。此外，若服务端启用了 `CM_PUBLIC_LISTEN` 分离接口，请务必填写该公网端口。
 
-若需在宿主机持久化节点身份，可挂载本地目录：
+Docker 部署应持久化 `/state`。`CM_NODE_ID_FILE` 保存节点身份，`CM_AGENT_TOKEN_FILE` 保存注册后的专属凭据。不要在多台服务器上复用同一个 `CM_NODE_ID`。
 
-```bash
--v ./agent-home:/home/cm
+HTTPS 地址未显式写端口时，Agent 的 gRPC 连接会使用 `443`；HTTP 地址会使用 `80`。反向代理 gRPC 时不要改写为 `/grpc/`，应转发真实服务前缀：
+
+```nginx
+location /cyber_monitor.agentrpc.AgentService/ {
+    grpc_pass grpc://127.0.0.1:25013;
+}
 ```
 
-此操作将容器内的 `~/.cybermonitor-node-id` 映射至宿主机，防止容器重建导致 ID 变化。
+如果节点到 CDN 的 IPv6 路由异常，HTTP/gRPC 都可能超时。此时应优先修复宿主机 IPv6；临时方案是在 `docker run` 中添加 `--add-host <域名>:<可用IPv4>`，让该节点固定走 IPv4。
 
-若需禁止后台远程更新，请添加配置 `-e CM_DISABLE_UPDATE=1`，该节点将继续上报数据，但会在管理后台被标记为已禁用更新。
+上面的默认命令已禁用后台远程更新。若确实需要后台一键更新 Docker Agent，请同时设置 `CM_DISABLE_UPDATE=0`、`CM_ENABLE_DOCKER_UPDATE=1`，并挂载 `/var/run/docker.sock`。
 
 ### 4. 安装探针 (Agent)
 

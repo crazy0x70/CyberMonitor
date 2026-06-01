@@ -7,11 +7,11 @@ import (
 )
 
 const (
-	ServiceName            = "cyber_monitor.agentrpc.AgentService"
-	MethodRegister         = "/" + ServiceName + "/Register"
-	MethodGetConfig        = "/" + ServiceName + "/GetConfig"
-	MethodReportStats      = "/" + ServiceName + "/ReportStats"
-	MethodReportUpdate     = "/" + ServiceName + "/ReportUpdate"
+	ServiceName        = "cyber_monitor.agentrpc.AgentService"
+	MethodRegister     = "/" + ServiceName + "/Register"
+	MethodGetConfig    = "/" + ServiceName + "/GetConfig"
+	MethodReportStats  = "/" + ServiceName + "/ReportStats"
+	MethodReportUpdate = "/" + ServiceName + "/ReportUpdate"
 )
 
 type AgentServiceServer interface {
@@ -75,19 +75,19 @@ func RegisterAgentServiceServer(server grpc.ServiceRegistrar, srv AgentServiceSe
 		Methods: []grpc.MethodDesc{
 			{
 				MethodName: "Register",
-				Handler:    unaryHandler[RegisterRequest, RegisterResponse](srv.Register),
+				Handler:    unaryHandler[RegisterRequest, RegisterResponse](MethodRegister, srv.Register),
 			},
 			{
 				MethodName: "GetConfig",
-				Handler:    unaryHandler[ConfigRequest, ConfigResponse](srv.GetConfig),
+				Handler:    unaryHandler[ConfigRequest, ConfigResponse](MethodGetConfig, srv.GetConfig),
 			},
 			{
 				MethodName: "ReportStats",
-				Handler:    unaryHandler[ReportStatsRequest, ReportStatsResponse](srv.ReportStats),
+				Handler:    unaryHandler[ReportStatsRequest, ReportStatsResponse](MethodReportStats, srv.ReportStats),
 			},
 			{
 				MethodName: "ReportUpdate",
-				Handler:    unaryHandler[ReportUpdateRequest, ReportUpdateResponse](srv.ReportUpdate),
+				Handler:    unaryHandler[ReportUpdateRequest, ReportUpdateResponse](MethodReportUpdate, srv.ReportUpdate),
 			},
 		},
 		Streams:  []grpc.StreamDesc{},
@@ -95,7 +95,7 @@ func RegisterAgentServiceServer(server grpc.ServiceRegistrar, srv AgentServiceSe
 	}, srv)
 }
 
-func unaryHandler[Req any, Resp any](handler func(context.Context, *Req) (*Resp, error)) grpc.MethodHandler {
+func unaryHandler[Req any, Resp any](method string, handler func(context.Context, *Req) (*Resp, error)) grpc.MethodHandler {
 	return func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 		in := new(Req)
 		if err := dec(in); err != nil {
@@ -106,7 +106,7 @@ func unaryHandler[Req any, Resp any](handler func(context.Context, *Req) (*Resp,
 		}
 		info := &grpc.UnaryServerInfo{
 			Server:     srv,
-			FullMethod: "",
+			FullMethod: method,
 		}
 		wrapped := func(nextCtx context.Context, req any) (any, error) {
 			return handler(nextCtx, req.(*Req))

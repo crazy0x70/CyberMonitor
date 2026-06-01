@@ -42,6 +42,7 @@ docker run -d \
 ### 3. Deploying the Agent via Docker
 
 ```bash
+mkdir -p ./agent-state
 docker run -d \
   --name cyber-monitor-agent \
   --network host \
@@ -49,33 +50,34 @@ docker run -d \
   --cap-add NET_RAW \
   -e CM_SERVER_URL="http://<server-ip>:25012" \
   -e CM_AGENT_TOKEN="<your-token>" \
-  -e CM_NODE_ID="my-node-id" \
+  -e CM_NODE_ID_FILE="/state/.cybermonitor-node-id" \
+  -e CM_AGENT_TOKEN_FILE="/state/.cybermonitor-agent-token" \
+  -e CM_INTERVAL="5s" \
+  -e CM_DISABLE_UPDATE="1" \
+  -v "$(pwd)/agent-state:/state" \
   -v /:/host:ro \
   -v /proc:/host/proc:ro \
   -v /sys:/host/sys:ro \
   -v /etc:/host/etc:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   ghcr.io/crazy0x70/cyber-monitor-agent:latest
 ```
 
 Configuration notes:
 The `CM_SERVER_URL` serves as the unified entry point for the Agent. Upon startup, the Agent attempts to establish a gRPC control link. If your environment, such as a reverse proxy or CDN, only supports HTTP/1.1, the Agent will automatically fall back to HTTP. For persistent gRPC connectivity, ensure the Agent has a direct connection to the Server or use a proxy supporting HTTP/2 or h2c. If the server is configured to use a separate public port via `CM_PUBLIC_LISTEN`, please use that port instead of the management port.
 
-To persist the node identity on the host, mount a local directory:
+Docker deployments should persist `/state`. `CM_NODE_ID_FILE` stores the node identity, and `CM_AGENT_TOKEN_FILE` stores the dedicated token returned after registration. Do not reuse the same `CM_NODE_ID` across multiple servers.
 
-```bash
--v ./agent-home:/home/cm
+When an HTTPS URL omits the port, the Agent uses `443` for gRPC. When an HTTP URL omits the port, it uses `80`. If you proxy gRPC, do not rewrite it to `/grpc/`; forward the real service prefix:
+
+```nginx
+location /cyber_monitor.agentrpc.AgentService/ {
+    grpc_pass grpc://127.0.0.1:25013;
+}
 ```
 
-This ensures the container's `~/.cybermonitor-node-id` is mapped to your host, allowing identification reuse upon container recreation.
+If a node has broken IPv6 routing to a CDN, both HTTP and gRPC can time out. Prefer fixing host IPv6 routing. As a temporary workaround, add `--add-host <domain>:<working-ipv4>` to `docker run` so that node uses IPv4 for the Agent endpoint.
 
-To disable remote updates initiated by the management panel, add:
-
-```bash
--e CM_DISABLE_UPDATE=1
-```
-
-The node will continue to report monitoring data but will be flagged as update-disabled in the dashboard.
+The default command above disables remote updates initiated by the management panel. To enable one-click updates for Docker Agent deployments, set both `CM_DISABLE_UPDATE=0` and `CM_ENABLE_DOCKER_UPDATE=1`, then mount `/var/run/docker.sock`.
 
 ### 4. Installing the Agent
 
