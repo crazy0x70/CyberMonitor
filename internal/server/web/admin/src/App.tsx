@@ -30,6 +30,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import {
   AdminApiError,
+  addAdminUnauthorizedListener,
   connectAdminSocket,
   deleteNodeProfile,
   exportConfig,
@@ -67,7 +68,7 @@ import type {
   SettingsView,
   SystemUpdateInfo,
 } from "@/lib/admin-types";
-import { formatVersionLabel, getErrorMessage } from "@/lib/admin-format";
+import { formatVersionLabel, getErrorMessage, upsertNodeView } from "@/lib/admin-format";
 import {
   adminDialogCancelClass,
   adminDialogContentClass,
@@ -286,8 +287,9 @@ export default function App() {
   const [hasUnsavedPageChanges, setHasUnsavedPageChanges] = useState(false);
   const [pendingPageNavigation, setPendingPageNavigation] = useState<Page | null>(null);
   const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<{ close: () => void } | null>(null);
   const systemUpdatePollRef = useRef<number | null>(null);
+  const loadAllRequestRef = useRef(0);
   const isDark = theme === "dark";
   const siteIcon = (settings?.site_icon || publicSettings?.site_icon || "").trim();
   const siteTitle = resolveBrandTitle(settings, publicSettings);
@@ -395,6 +397,7 @@ export default function App() {
   }
 
   function handleLogout(nextLoginState?: Partial<LoginState>) {
+    loadAllRequestRef.current += 1;
     socketRef.current?.close();
     socketRef.current = null;
     setStoredAdminToken("");
@@ -405,6 +408,7 @@ export default function App() {
     setHasUnsavedPageChanges(false);
     setPendingPageNavigation(null);
     setUnsavedDialogOpen(false);
+    setLoading(false);
     setLoginState(
       createLoginState(
         nextLoginState?.errorType || "none",
@@ -414,25 +418,36 @@ export default function App() {
     );
   }
 
-  async function loadAll(nextToken = token) {
-    if (!nextToken) {
+  async function loadAll() {
+    if (!token) {
+      loadAllRequestRef.current += 1;
       setSettings(null);
       setNodes([]);
+      setLoading(false);
       return;
     }
 
+    const requestID = loadAllRequestRef.current + 1;
+    loadAllRequestRef.current = requestID;
+    const isCurrentLoad = () => loadAllRequestRef.current === requestID;
     setLoading(true);
-    const nodesPromise = fetchNodes(nextToken)
+    const nodesPromise = fetchNodes()
       .then((data) => ({ data }))
       .catch((error) => ({ error }));
     try {
-      const settingsData = await fetchSettings(nextToken);
+      const settingsData = await fetchSettings();
+      if (!isCurrentLoad()) {
+        return;
+      }
       setSettings(settingsData);
       setPublicSettings((current) => mergePublicSettings(settingsData, current));
       setStoredAdminToken("session");
       setToken("session");
       setLoading(false);
       const nodesResult = await nodesPromise;
+      if (!isCurrentLoad()) {
+        return;
+      }
       if ("error" in nodesResult) {
         const { error } = nodesResult;
         if (error instanceof AdminApiError && error.status === 401) {
@@ -447,6 +462,9 @@ export default function App() {
       }
       setNodes(nodesResult.data.nodes || []);
     } catch (error) {
+      if (!isCurrentLoad()) {
+        return;
+      }
       if (error instanceof AdminApiError && error.status === 401) {
         handleLogout({
           errorMessage: "当前登录态已失效，请重新登录。",
@@ -456,7 +474,9 @@ export default function App() {
       }
       throw error;
     } finally {
-      setLoading(false);
+      if (isCurrentLoad()) {
+        setLoading(false);
+      }
     }
   }
 
@@ -508,10 +528,19 @@ export default function App() {
     if (!token) {
       return;
     }
-    loadAll(token).catch((error) => {
+    loadAll().catch((error) => {
       toast.error(getErrorMessage(error, "初始化后台数据失败"));
     });
   }, [token]);
+
+  useEffect(() => {
+    return addAdminUnauthorizedListener(() => {
+      handleLogout({
+        errorMessage: "当前登录态已失效，请重新登录。",
+        errorType: "expired",
+      });
+    });
+  }, []);
 
   useEffect(() => {
     if (!token || currentPage !== "settings") {
@@ -595,19 +624,22 @@ export default function App() {
       socketRef.current = null;
       return;
     }
-    const socket = connectAdminSocket(token, (snapshot) => {
-      if (Array.isArray(snapshot.nodes)) {
-        setNodes(snapshot.nodes);
-      }
-    });
+    const socket = connectAdminSocket(
+      (snapshot) => {
+        if (Array.isArray(snapshot.nodes)) {
+          setNodes(snapshot.nodes);
+        }
+      },
+      (node) => {
+        setNodes((current) => upsertNodeView(current, node));
+      },
+    );
     socketRef.current = socket;
-    socket.addEventListener("close", () => {
+    return () => {
+      socket.close();
       if (socketRef.current === socket) {
         socketRef.current = null;
       }
-    });
-    return () => {
-      socket.close();
     };
   }, [token]);
 
@@ -652,12 +684,12 @@ export default function App() {
   async function updateSettings(page: Page, payload: Record<string, unknown>) {
     setSavingPage(page);
     try {
-      const data = await saveSettings(payload, token);
+      const data = await saveSettings(payload);
       setSettings(data);
       setPublicSettings((current) => mergePublicSettings(data, current));
       setStoredAdminToken("session");
       setToken("session");
-      const nextNodes = await fetchNodes("session");
+      const nextNodes = await fetchNodes();
       setNodes(nextNodes.nodes || []);
       return data;
     } catch (error) {
@@ -674,21 +706,21 @@ export default function App() {
   }
 
   async function handleExport() {
-    const data = await exportConfig(token);
+    const data = await exportConfig();
     triggerDownload(data.blob, parseDownloadFilename(data.disposition));
   }
 
   async function handleImport(payload: Record<string, unknown>): Promise<ConfigImportResponse> {
     setSavingPage("settings");
     try {
-      const data = await importConfig(payload, token);
+      const data = await importConfig(payload);
       if (data.settings) {
         setSettings(data.settings);
         setPublicSettings((current) => mergePublicSettings(data.settings || null, current));
       }
       setStoredAdminToken("session");
       setToken("session");
-      const snapshot = await fetchNodes("session");
+      const snapshot = await fetchNodes();
       setNodes(snapshot.nodes || []);
       if (data.settings?.admin_path) {
         window.history.replaceState({}, "", data.settings.admin_path);
@@ -702,7 +734,7 @@ export default function App() {
   async function handleRefreshNodes() {
     setRefreshingNodes(true);
     try {
-      const snapshot = await fetchNodes(token);
+      const snapshot = await fetchNodes();
       setNodes(snapshot.nodes || []);
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
@@ -724,7 +756,7 @@ export default function App() {
     }
     setRefreshingSystemUpdate(true);
     try {
-      const data = await fetchSystemUpdateInfo(token);
+      const data = await fetchSystemUpdateInfo();
       setSystemUpdateInfo(data);
       if (data.current_version) {
         setSettings((current) => (current ? { ...current, version: data.current_version } : current));
@@ -755,7 +787,7 @@ export default function App() {
     }
     setStartingSystemUpdate(true);
     try {
-      const data = await triggerSystemUpdate(token);
+      const data = await triggerSystemUpdate();
       if (data.status === "up_to_date") {
         toast.success("当前服务端已经是最新正式版");
         await refreshSystemUpdate(true);
@@ -793,7 +825,7 @@ export default function App() {
 
   async function handleSaveNode(nodeID: string, payload: NodeProfilePayload) {
     try {
-      await saveNodeProfile(nodeID, payload, token);
+      await saveNodeProfile(nodeID, payload);
       await handleRefreshNodes();
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
@@ -806,9 +838,9 @@ export default function App() {
     }
   }
 
-  async function handleDeleteNode(nodeID: string) {
+  async function handleDeleteNode(nodeID: string): Promise<void> {
     try {
-      await deleteNodeProfile(nodeID, token);
+      await deleteNodeProfile(nodeID);
       await handleRefreshNodes();
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
@@ -912,11 +944,11 @@ export default function App() {
             <ServerManagementPage
               loading={refreshingNodes || loading}
               nodes={nodes}
-              onCheckAgentUpdate={(nodeID) => fetchAgentUpdateInfo(nodeID, token)}
+              onCheckAgentUpdate={(nodeID) => fetchAgentUpdateInfo(nodeID)}
               onDeleteNode={handleDeleteNode}
               onRefresh={handleRefreshNodes}
               onSaveNode={handleSaveNode}
-              onTriggerAgentUpdate={(nodeID) => triggerAgentUpdate(nodeID, token)}
+              onTriggerAgentUpdate={(nodeID) => triggerAgentUpdate(nodeID)}
               settings={settings}
             />
           </Suspense>
@@ -971,7 +1003,7 @@ export default function App() {
               onDirtyChange={setHasUnsavedPageChanges}
               onSave={(payload) => updateSettings("alerts", payload).then(() => undefined)}
               onTest={(payload: AlertTestPayload) =>
-                testAlertChannels(payload, token).then(() => undefined)
+                testAlertChannels(payload).then(() => undefined)
               }
               saving={savingPage === "alerts"}
               settings={settings}
@@ -983,12 +1015,12 @@ export default function App() {
           <Suspense fallback={<SectionLoader label="正在加载 AI 服务商…" />}>
             <AIProviderPage
               onFetchModels={(provider: string, config: AIProviderConfig) =>
-                fetchAIModels(provider, config, token).then((data) => data.models || [])
+                fetchAIModels(provider, config).then((data) => data.models || [])
               }
               onDirtyChange={setHasUnsavedPageChanges}
               onSave={(payload) => updateSettings("ai", payload).then(() => undefined)}
               onTestProvider={(provider: string, config: AIProviderConfig) =>
-                testAIProvider(provider, config, token).then(() => undefined)
+                testAIProvider(provider, config).then(() => undefined)
               }
               settings={settings}
             />

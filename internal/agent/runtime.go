@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/updater"
@@ -21,7 +23,13 @@ type agentRunner struct {
 	agentToken          string
 	lastUpdateState     string
 	lastUpdateVersion   string
+	lastUpdateSignature string
+	lastUpdateAppliedAt time.Time
 }
+
+const remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
+
+var remoteUpdateNow = time.Now
 
 func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.Collector) *agentRunner {
 	return &agentRunner{
@@ -72,11 +80,40 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 	if remote.Update == nil {
 		r.lastUpdateState = ""
 		r.lastUpdateVersion = ""
+		r.lastUpdateSignature = ""
+		r.lastUpdateAppliedAt = time.Time{}
+		return
+	}
+	signature := remoteUpdateInstructionSignature(remote.Update)
+	now := remoteUpdateNow()
+	if r.shouldSuppressRemoteUpdate(signature, now) {
 		return
 	}
 	if err := maybeApplyRemoteUpdate(ctx, r.reportRemoteUpdate, r.cfg, remote.Update); err != nil {
 		log.Printf("执行远程更新失败: %v", err)
+		return
 	}
+	r.lastUpdateSignature = signature
+	r.lastUpdateAppliedAt = now
+}
+
+func (r *agentRunner) shouldSuppressRemoteUpdate(signature string, now time.Time) bool {
+	if signature == "" || signature != r.lastUpdateSignature || r.lastUpdateAppliedAt.IsZero() {
+		return false
+	}
+	return now.Before(r.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow))
+}
+
+func remoteUpdateInstructionSignature(update *RemoteUpdateInstruction) string {
+	if update == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(update.Version),
+		strings.TrimSpace(update.DownloadURL),
+		strings.TrimSpace(update.ChecksumURL),
+		fmt.Sprint(update.RequestedAt),
+	}, "\x00")
 }
 
 func (r *agentRunner) reportRemoteUpdate(ctx context.Context, state, version, message string) error {

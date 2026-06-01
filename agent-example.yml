@@ -1,28 +1,34 @@
-version: "3.9"
-
 services:
   cyber-monitor-agent:
-    image: ghcr.io/crazy0x70/cyber-monitor-agent:latest
+    # 仅用于 Linux Docker host；Windows 使用 scripts/agent.ps1，普通 Linux systemd 使用 scripts/agent.sh。
+    # 示例：CM_VERSION=v0.6.0 CM_SERVER_URL=http://192.0.2.10:25012 CM_AGENT_TOKEN=... docker compose -f agent-example.yml up -d
+    image: ghcr.io/crazy0x70/cyber-monitor-agent:${CM_VERSION:?set CM_VERSION}
     container_name: cyber-monitor-agent
     network_mode: "host"
-    cap_add:
-      # 兜底：某些环境可能不支持镜像内 setcap，此时需要显式开启 NET_RAW 才能执行 ping。
-      - NET_RAW
     environment:
       # Agent 统一接入地址。运行时会优先尝试 gRPC，不可用时自动回退到 HTTP。
       # 默认单端口部署时通常是 25012；如果服务端配置了 CM_PUBLIC_LISTEN=25013，则这里也必须改成 25013。
-      CM_SERVER_URL: "http://${YOUR_SERVER_IP}:25012"
-      CM_AGENT_TOKEN: "${YOUR_AGENT_TOKEN}"
+      CM_SERVER_URL: "${CM_SERVER_URL:?set CM_SERVER_URL, for example http://192.0.2.10:25012}"
+      CM_AGENT_TOKEN: "${CM_AGENT_TOKEN:?set CM_AGENT_TOKEN}"
       # 可选：显式指定固定节点 ID。未指定时，Agent 会优先复用 ~/.cybermonitor-node-id；
       # 如果是 Docker 且没有可复用节点文件，则会退回到宿主机指纹稳定 UUID。
       # CM_NODE_ID: "existing-node-01"
-      # 可选：设置为 "1" 后，拒绝服务端下发的远程更新任务。
-      CM_DISABLE_UPDATE: "0"
+      CM_NODE_ID_FILE: "/state/.cybermonitor-node-id"
+      CM_AGENT_TOKEN_FILE: "/state/.cybermonitor-agent-token"
+      # 默认拒绝服务端下发的远程更新任务；需要 Docker socket 更新能力时再改为 "0"。
+      CM_DISABLE_UPDATE: "1"
+      # 访问 Docker socket 需要显式 opt-in；挂载 docker.sock 并确认风险后再改为 "1"。
+      CM_ENABLE_DOCKER_UPDATE: "0"
     volumes:
-      # 可选：如需显式持久化默认节点身份文件，可挂载 Agent 运行用户 home（默认 /home/cm）。
-      # - ./agent-home:/home/cm
+      # 持久化默认节点身份与专属 Agent Token，避免容器重建后重复注册。
+      - ./agent-state:/state
       - /:/host:ro
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /etc:/host/etc:ro
+      # 如遇到 ping 权限异常，优先检查镜像内 /bin/ping capability；确认需要后再显式添加 NET_RAW。
+      # 后台远程更新需要访问 Docker socket；启用前确认风险，并同时设置：
+      # CM_DISABLE_UPDATE: "0"
+      # CM_ENABLE_DOCKER_UPDATE: "1"
+      # - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

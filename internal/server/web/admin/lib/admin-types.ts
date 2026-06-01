@@ -83,7 +83,10 @@ export interface SettingsView {
 
 export interface ConfigImportResponse {
   settings?: SettingsView;
-  reauth_required?: boolean;
+}
+
+export interface NodeDeleteResponse {
+  status: string;
 }
 
 export interface NetworkTestResult {
@@ -241,6 +244,12 @@ export interface Snapshot {
   groups?: string[];
   settings?: PublicSettings;
   test_history?: Record<string, unknown>;
+}
+
+export interface NodeDelta {
+  type: "node_delta";
+  generated_at: number;
+  node: NodeView;
 }
 
 export interface NodeProfilePayload {

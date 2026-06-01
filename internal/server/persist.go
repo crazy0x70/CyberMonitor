@@ -10,10 +10,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/server/history"
 )
 
 const (
@@ -31,6 +33,8 @@ const (
 	configExportVersion    = 1
 	maxTestCatalogItems    = 512
 )
+
+var secureRandomReader io.Reader = rand.Reader
 
 type Settings struct {
 	AdminPath            string            `json:"admin_path"`
@@ -123,10 +127,12 @@ type SettingsUpdate struct {
 }
 
 type PersistedData struct {
-	Settings        Settings                       `json:"settings"`
-	Profiles        map[string]*NodeProfile        `json:"profiles"`
-	Nodes           map[string]NodeState           `json:"nodes,omitempty"`
-	OfflineSessions map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+	Settings              Settings                       `json:"settings"`
+	Profiles              map[string]*NodeProfile        `json:"profiles"`
+	Nodes                 map[string]NodeState           `json:"nodes,omitempty"`
+	OfflineSessions       map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+	PendingHistoryClear   bool                           `json:"pending_history_clear,omitempty"`
+	PendingHistoryDeletes []string                       `json:"pending_history_deletes,omitempty"`
 }
 
 type legacyPersistedProfile struct {
@@ -175,16 +181,27 @@ func ResetAdminPassword(dataDir string) (ResetResult, error) {
 		return ResetResult{}, err
 	}
 	if !loaded {
-		payload.Settings = initSettings(Config{JWTSecret: ""})
+		settings, err := initSettings(Config{JWTSecret: ""})
+		if err != nil {
+			return ResetResult{}, err
+		}
+		payload.Settings = settings
 		payload = applyPersistedDataDefaults(payload)
 	}
-	newPass := randomToken(adminTokenLength)
+	newPass, err := randomToken(adminTokenLength)
+	if err != nil {
+		return ResetResult{}, err
+	}
 	newHash, err := hashPassword(newPass)
 	if err != nil {
 		return ResetResult{}, err
 	}
 	payload.Settings.AdminPass = newHash
-	payload.Settings.TokenSalt = randomToken(adminTokenLength)
+	tokenSalt, err := randomToken(adminTokenLength)
+	if err != nil {
+		return ResetResult{}, err
+	}
+	payload.Settings.TokenSalt = tokenSalt
 	if err := savePersistedData(dataPath, payload); err != nil {
 		return ResetResult{}, err
 	}
@@ -260,7 +277,32 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if err := migrateLegacyProfileTests(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	return applyPersistedDataDefaults(payload), true, nil
+	if err := migrateLegacyAISettings(data, &payload); err != nil {
+		return PersistedData{}, false, err
+	}
+	payload = applyPersistedDataDefaults(payload)
+	nodes, err := normalizePersistedNodeStates(payload.Nodes)
+	if err != nil {
+		return PersistedData{}, false, err
+	}
+	offlineSessions, err := normalizePersistedOfflineSessions(payload.OfflineSessions)
+	if err != nil {
+		return PersistedData{}, false, err
+	}
+	payload.Nodes = nodes
+	payload.OfflineSessions = offlineSessions
+	profiles, err := normalizePersistedProfiles(payload.Settings, payload.Nodes, payload.Profiles)
+	if err != nil {
+		return PersistedData{}, false, err
+	}
+	payload.Profiles = profiles
+	pendingClear, pendingDeletes, err := normalizePersistedHistoryCleanup(payload.PendingHistoryClear, payload.PendingHistoryDeletes)
+	if err != nil {
+		return PersistedData{}, false, err
+	}
+	payload.PendingHistoryClear = pendingClear
+	payload.PendingHistoryDeletes = pendingDeletes
+	return payload, true, nil
 }
 
 func savePersistedData(path string, payload PersistedData) error {
@@ -308,6 +350,14 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 		payload.Nodes = make(map[string]map[string]*TestHistoryEntry)
 	}
 	needsRewrite := trailing
+	nodes, nodeIDsChanged, err := normalizeTestHistoryNodes(payload.Nodes)
+	if err != nil {
+		return TestHistoryData{}, false, false, err
+	}
+	payload.Nodes = nodes
+	if nodeIDsChanged {
+		needsRewrite = true
+	}
 	if payload.Version != testHistoryVersion {
 		payload.Version = testHistoryVersion
 		needsRewrite = true
@@ -329,6 +379,31 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 	return payload, true, needsRewrite, nil
 }
 
+func normalizeTestHistoryNodes(nodes map[string]map[string]*TestHistoryEntry) (map[string]map[string]*TestHistoryEntry, bool, error) {
+	if len(nodes) == 0 {
+		return map[string]map[string]*TestHistoryEntry{}, false, nil
+	}
+	normalized := make(map[string]map[string]*TestHistoryEntry, len(nodes))
+	changed := false
+	for rawNodeID, tests := range nodes {
+		nodeID, err := history.NormalizeNodeID(rawNodeID)
+		if err != nil {
+			return nil, false, fmt.Errorf("test_history 节点 ID invalid node id: %w", err)
+		}
+		if nodeID == "" {
+			return nil, false, errors.New("test_history 节点 ID 不能为空")
+		}
+		if _, exists := normalized[nodeID]; exists {
+			return nil, false, fmt.Errorf("test_history 节点 ID 重复: %s", nodeID)
+		}
+		if nodeID != rawNodeID {
+			changed = true
+		}
+		normalized[nodeID] = tests
+	}
+	return normalized, changed, nil
+}
+
 func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	if payload.Profiles == nil {
 		payload.Profiles = make(map[string]*NodeProfile)
@@ -340,6 +415,76 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 		payload.OfflineSessions = make(map[string]OfflineSessionState)
 	}
 	return payload
+}
+
+func normalizePersistedNodeStates(nodes map[string]NodeState) (map[string]NodeState, error) {
+	if len(nodes) == 0 {
+		return map[string]NodeState{}, nil
+	}
+	normalized := make(map[string]NodeState, len(nodes))
+	for rawNodeID, node := range nodes {
+		nodeID, err := history.NormalizeNodeID(rawNodeID)
+		if err != nil {
+			return nil, fmt.Errorf("nodes 节点 ID invalid node id: %w", err)
+		}
+		if nodeID == "" {
+			return nil, errors.New("nodes 节点 ID 不能为空")
+		}
+		if _, exists := normalized[nodeID]; exists {
+			return nil, fmt.Errorf("nodes 节点 ID 重复: %s", nodeID)
+		}
+		node.Stats.NodeID = nodeID
+		normalized[nodeID] = node
+	}
+	return normalized, nil
+}
+
+func normalizePersistedOfflineSessions(sessions map[string]OfflineSessionState) (map[string]OfflineSessionState, error) {
+	if len(sessions) == 0 {
+		return map[string]OfflineSessionState{}, nil
+	}
+	normalized := make(map[string]OfflineSessionState, len(sessions))
+	for rawNodeID, session := range sessions {
+		nodeID, err := history.NormalizeNodeID(rawNodeID)
+		if err != nil {
+			return nil, fmt.Errorf("offline_sessions 节点 ID invalid node id: %w", err)
+		}
+		if nodeID == "" {
+			return nil, errors.New("offline_sessions 节点 ID 不能为空")
+		}
+		if _, exists := normalized[nodeID]; exists {
+			return nil, fmt.Errorf("offline_sessions 节点 ID 重复: %s", nodeID)
+		}
+		normalized[nodeID] = session
+	}
+	return normalized, nil
+}
+
+func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []string, error) {
+	if clear {
+		return true, nil, nil
+	}
+	if len(deletes) == 0 {
+		return false, nil, nil
+	}
+	seen := make(map[string]struct{}, len(deletes))
+	normalized := make([]string, 0, len(deletes))
+	for _, rawNodeID := range deletes {
+		nodeID, err := history.NormalizeNodeID(rawNodeID)
+		if err != nil {
+			return false, nil, fmt.Errorf("pending_history_deletes 节点 ID invalid node id: %w", err)
+		}
+		if nodeID == "" {
+			return false, nil, errors.New("pending_history_deletes 节点 ID 不能为空")
+		}
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		normalized = append(normalized, nodeID)
+	}
+	sort.Strings(normalized)
+	return false, normalized, nil
 }
 
 func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
@@ -365,8 +510,15 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 			continue
 		}
 		profile := payload.Profiles[nodeID]
-		if profile == nil || len(profile.TestSelections) > 0 {
+		if profile == nil {
 			continue
+		}
+		if len(profile.TestSelections) > 0 {
+			profile.TestSelections = normalizeTestSelections(payload.Settings.TestCatalog, profile.TestSelections)
+			if len(profile.TestSelections) > 0 {
+				profile.Tests = nil
+				continue
+			}
 		}
 		selections := make([]TestSelection, 0, len(tests))
 		seenSelections := make(map[string]struct{}, len(tests))
@@ -376,7 +528,11 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 				continue
 			}
 			if item.ID == "" {
-				item.ID = randomToken(10)
+				id, err := randomToken(10)
+				if err != nil {
+					return err
+				}
+				item.ID = id
 				payload.Settings.TestCatalog = append(payload.Settings.TestCatalog, item)
 				catalogIndex[legacyTestCatalogKey(item.Name, item.Type, item.Host, item.Port)] = item
 			}
@@ -391,9 +547,78 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 		}
 		if len(selections) > 0 {
 			profile.TestSelections = selections
+			profile.Tests = nil
 		}
 	}
 	return nil
+}
+
+func migrateLegacyAISettings(data []byte, payload *PersistedData) error {
+	if payload == nil {
+		return nil
+	}
+
+	var raw struct {
+		Settings struct {
+			AISettings json.RawMessage `json:"ai_settings"`
+		} `json:"settings"`
+	}
+	if err := strictUnmarshalJSON(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Settings.AISettings) == 0 {
+		return nil
+	}
+
+	var legacy struct {
+		DefaultProvider  string           `json:"default_provider"`
+		OpenAICompatible AIProviderConfig `json:"openai_compatible"`
+	}
+	if err := strictUnmarshalJSON(raw.Settings.AISettings, &legacy); err != nil {
+		return err
+	}
+
+	compatID := "legacy-openai-compatible"
+	if legacyAIProviderConfigPresent(legacy.OpenAICompatible) && !aiCompatibleIDExists(payload.Settings.AISettings.OpenAICompatibles, compatID) {
+		payload.Settings.AISettings.OpenAICompatibles = append(payload.Settings.AISettings.OpenAICompatibles, AIProviderProfile{
+			ID:               compatID,
+			Name:             "OpenAI 兼容",
+			AIProviderConfig: legacy.OpenAICompatible,
+		})
+	}
+
+	if strings.TrimSpace(payload.Settings.AISettings.CommandProvider) != "" {
+		return nil
+	}
+	provider := normalizeAIProviderName(legacy.DefaultProvider)
+	if provider == "" {
+		return nil
+	}
+	if provider == aiProviderOpenAICompatible && legacyAIProviderConfigPresent(legacy.OpenAICompatible) {
+		payload.Settings.AISettings.CommandProvider = aiProviderOpenAICompatible + ":" + compatID
+		return nil
+	}
+	payload.Settings.AISettings.CommandProvider = provider
+	return nil
+}
+
+func legacyAIProviderConfigPresent(cfg AIProviderConfig) bool {
+	return strings.TrimSpace(cfg.APIKey) != "" ||
+		strings.TrimSpace(cfg.BaseURL) != "" ||
+		strings.TrimSpace(cfg.Model) != ""
+}
+
+func aiCompatibleIDExists(items []AIProviderProfile, id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.ID) == id {
+			return true
+		}
+	}
+	return false
 }
 
 func readLegacyProfileTests(data []byte) (map[string][]metrics.NetworkTestConfig, error) {
@@ -543,28 +768,50 @@ func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 		if profile == nil {
 			continue
 		}
-		copyProfile := *profile
-		copyProfile.Tags = cloneStringSlice(profile.Tags)
-		copyProfile.Groups = cloneStringSlice(profile.Groups)
-		copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
-		copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
-		if profile.AlertEnabled != nil {
-			value := *profile.AlertEnabled
-			copyProfile.AlertEnabled = &value
-		}
+		copyProfile := cloneNodeProfileValue(profile)
 		cloned[id] = &copyProfile
 	}
 	return cloned
+}
+
+func cloneNodeProfileValue(profile *NodeProfile) NodeProfile {
+	if profile == nil {
+		return NodeProfile{}
+	}
+	copyProfile := *profile
+	copyProfile.Tags = cloneStringSlice(profile.Tags)
+	copyProfile.Groups = cloneStringSlice(profile.Groups)
+	copyProfile.Tests = cloneNetworkTestConfigs(profile.Tests)
+	copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
+	copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
+	if profile.AlertEnabled != nil {
+		value := *profile.AlertEnabled
+		copyProfile.AlertEnabled = &value
+	}
+	return copyProfile
 }
 
 func cloneProfilesForExport(profiles map[string]*NodeProfile) map[string]*NodeProfile {
 	cloned := cloneProfiles(profiles)
 	for _, profile := range cloned {
 		if profile != nil {
-			profile.AgentAuthToken = ""
+			redactProfileRuntimeForTransfer(profile)
 		}
 	}
 	return cloned
+}
+
+func redactProfileRuntimeForTransfer(profile *NodeProfile) {
+	if profile == nil {
+		return
+	}
+	profile.AgentAuthToken = ""
+	profile.AgentUpdate = nil
+	profile.AgentUpdateState = ""
+	profile.AgentUpdateTargetVersion = ""
+	profile.AgentUpdateMessage = ""
+	profile.AgentUpdateLeaseUntil = 0
+	profile.AgentUpdateReportedAt = 0
 }
 
 func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]OfflineSessionState {
@@ -578,30 +825,49 @@ func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]Of
 	return cloned
 }
 
-func initSettings(cfg Config) Settings {
+func initSettings(cfg Config) (Settings, error) {
 	path := strings.TrimSpace(cfg.AdminPath)
 	if path == "" {
-		path = "/" + randomToken(adminTokenLength)
+		token, err := randomToken(adminTokenLength)
+		if err != nil {
+			return Settings{}, err
+		}
+		path = "/" + token
 	} else {
 		if normalized, err := normalizeAdminPath(path); err == nil {
 			path = normalized
 		} else {
-			path = "/" + randomToken(adminTokenLength)
+			token, err := randomToken(adminTokenLength)
+			if err != nil {
+				return Settings{}, err
+			}
+			path = "/" + token
 		}
 	}
 
 	user := strings.TrimSpace(cfg.AdminUser)
 	if user == "" {
-		user = randomToken(adminTokenLength)
+		token, err := randomToken(adminTokenLength)
+		if err != nil {
+			return Settings{}, err
+		}
+		user = token
 	}
-	passHash, passPlain := buildAdminPassword(cfg.AdminPass)
+	passHash, passPlain, err := buildAdminPassword(cfg.AdminPass)
+	if err != nil {
+		return Settings{}, err
+	}
+	tokenSalt, err := randomToken(adminTokenLength)
+	if err != nil {
+		return Settings{}, err
+	}
 
 	return Settings{
 		AdminPath:            path,
 		AdminUser:            user,
 		AdminPass:            passHash,
 		AdminPassPlain:       passPlain,
-		TokenSalt:            randomToken(adminTokenLength),
+		TokenSalt:            tokenSalt,
 		AuthToken:            cfg.JWTSecret,
 		AgentToken:           cfg.AgentToken,
 		AgentEndpoint:        "",
@@ -623,30 +889,34 @@ func initSettings(cfg Config) Settings {
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
 		TestCatalog:          []TestCatalogItem{},
-	}
+	}, nil
 }
 
-func buildAdminPassword(input string) (string, string) {
+func buildAdminPassword(input string) (string, string, error) {
 	pass := strings.TrimSpace(input)
 	generated := false
 	if pass == "" {
-		pass = randomToken(adminTokenLength)
+		token, err := randomToken(adminTokenLength)
+		if err != nil {
+			return "", "", err
+		}
+		pass = token
 		generated = true
 	}
 	hash, err := hashPassword(pass)
 	if err != nil {
 		if generated {
-			return pass, pass
+			return pass, pass, nil
 		}
-		return pass, ""
+		return pass, "", nil
 	}
 	if generated {
-		return hash, pass
+		return hash, pass, nil
 	}
-	return hash, ""
+	return hash, "", nil
 }
 
-func mergeSettings(existing, fallback Settings) Settings {
+func mergeSettings(existing, fallback Settings) (Settings, error) {
 	mergeString := func(dst *string, src string) {
 		if *dst == "" {
 			*dst = src
@@ -708,7 +978,11 @@ func mergeSettings(existing, fallback Settings) Settings {
 		existing.AlertAll = fallback.AlertAll
 	}
 
-	existing.AISettings = mergeAISettings(existing.AISettings, fallback.AISettings)
+	aiSettings, err := mergeAISettings(existing.AISettings, fallback.AISettings)
+	if err != nil {
+		return Settings{}, err
+	}
+	existing.AISettings = aiSettings
 
 	if existing.Groups == nil {
 		existing.Groups = fallback.Groups
@@ -722,7 +996,7 @@ func mergeSettings(existing, fallback Settings) Settings {
 		existing.TestCatalog = fallback.TestCatalog
 	}
 
-	return existing
+	return existing, nil
 }
 
 func normalizeAdminPath(path string) (string, error) {
@@ -743,23 +1017,23 @@ func normalizeAdminPath(path string) (string, error) {
 		return "", errors.New("admin path invalid")
 	}
 	for _, prefix := range []string{"/api", "/assets", "/ws"} {
-		if strings.HasPrefix(trimmed, prefix) {
+		if trimmed == prefix || strings.HasPrefix(trimmed, prefix+"/") {
 			return "", fmt.Errorf("admin path conflicts with %s", prefix)
 		}
 	}
 	return trimmed, nil
 }
 
-func randomToken(length int) string {
+func randomToken(length int) (string, error) {
 	if length <= 0 {
-		return ""
+		return "", nil
 	}
 	limit := byte(256 - 256%len(tokenAlphabet))
 	out := make([]byte, 0, length)
 	buf := make([]byte, length)
 	for len(out) < length {
-		if _, err := rand.Read(buf); err != nil {
-			panic(fmt.Sprintf("crypto random failed: %v", err))
+		if _, err := io.ReadFull(secureRandomReader, buf); err != nil {
+			return "", fmt.Errorf("crypto random failed: %w", err)
 		}
 		for _, b := range buf {
 			if b >= limit {
@@ -771,7 +1045,7 @@ func randomToken(length int) string {
 			}
 		}
 	}
-	return string(out)
+	return string(out), nil
 }
 
 func normalizeUniqueStrings(values []string, skip func(string) bool) []string {
@@ -1141,13 +1415,21 @@ func normalizeTestCatalog(items []TestCatalogItem) ([]TestCatalogItem, error) {
 		}
 		id := strings.TrimSpace(item.ID)
 		if id == "" {
-			id = randomToken(10)
+			generatedID, err := randomToken(10)
+			if err != nil {
+				return nil, err
+			}
+			id = generatedID
 		}
 		for {
 			if _, ok := seen[id]; !ok {
 				break
 			}
-			id = randomToken(10)
+			generatedID, err := randomToken(10)
+			if err != nil {
+				return nil, err
+			}
+			id = generatedID
 		}
 		seen[id] = struct{}{}
 		normalized = append(normalized, TestCatalogItem{

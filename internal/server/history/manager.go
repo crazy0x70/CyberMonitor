@@ -63,10 +63,37 @@ func (m *Manager) AppendNetworkBatch(nodeID string, tests []metrics.NetworkTestR
 }
 
 func (m *Manager) DeleteNode(nodeID string) error {
+	nodeID, err := NormalizeNodeID(nodeID)
+	if err != nil || nodeID == "" {
+		return err
+	}
 	return m.joinStoreOps(
 		func(store *NetworkStore) error { return store.DeleteNode(nodeID) },
 		func(store *OfflineStore) error { return store.DeleteNode(nodeID) },
 	)
+}
+
+func (m *Manager) HasNodeHistory(nodeID string) (bool, error) {
+	var err error
+	nodeID, err = NormalizeNodeID(nodeID)
+	if err != nil || nodeID == "" {
+		return false, err
+	}
+	if ok, err := hasStoreHistory(m.networkStore(), nodeID); ok || err != nil {
+		return ok, err
+	}
+	return hasStoreHistory(m.offlineStore(), nodeID)
+}
+
+type historyExistenceStore interface {
+	HasNodeHistory(string) (bool, error)
+}
+
+func hasStoreHistory(store historyExistenceStore, nodeID string) (bool, error) {
+	if store == nil {
+		return false, nil
+	}
+	return store.HasNodeHistory(nodeID)
 }
 
 func (m *Manager) ClearNodes() error {

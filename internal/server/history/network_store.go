@@ -130,6 +130,26 @@ func (s *NetworkStore) QueryPublicRange(nodeID string, from, to time.Time) (map[
 	return s.queryRange(nodeID, from, to, false)
 }
 
+func (s *NetworkStore) HasNodeHistory(nodeID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errNilNetworkStore
+	}
+	var err error
+	nodeID, err = NormalizeNodeID(nodeID)
+	if err != nil || nodeID == "" {
+		return false, err
+	}
+	nameMatcher, err := newMetricNameMatcher(networkMetricNames(true))
+	if err != nil {
+		return false, err
+	}
+	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
+	if err != nil {
+		return false, err
+	}
+	return hasMatchingSeries(s.db, nameMatcher, nodeMatcher)
+}
+
 func (s *NetworkStore) queryRange(
 	nodeID string,
 	from, to time.Time,
@@ -195,7 +215,11 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	if s == nil || s.db == nil {
 		return errNilNetworkStore
 	}
-	nodeID = normalizeNodeID(nodeID)
+	var err error
+	nodeID, err = NormalizeNodeID(nodeID)
+	if err != nil {
+		return err
+	}
 	if nodeID == "" {
 		return nil
 	}

@@ -1127,6 +1127,32 @@ html[data-theme="dark"] .theme-toggle:hover {
   letter-spacing: 0;
 }
 
+.network-empty-state {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 6px;
+  padding: 28px 24px;
+  border-radius: 12px;
+  border: 1px dashed rgba(239, 68, 68, 0.28);
+  background: rgba(248, 113, 113, 0.08);
+  text-align: center;
+  color: var(--muted);
+}
+
+.network-empty-state strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.network-empty-state span {
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
 @keyframes network-loading-pulse {
   0%,
   100% {

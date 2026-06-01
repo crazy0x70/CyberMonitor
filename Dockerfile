@@ -1,22 +1,5 @@
 ARG GO_IMAGE_VERSION=1.26.2
 
-FROM --platform=$BUILDPLATFORM node:24-alpine AS admin-build
-
-WORKDIR /src
-COPY internal/server/web ./internal/server/web
-RUN test -f internal/server/web/admin/package.json && \
-    test -f internal/server/web/admin/package-lock.json && \
-    test -f internal/server/web/admin/src/App.tsx && \
-    test -f internal/server/web/admin/lib/admin-ui.ts && \
-    test -f internal/server/web/public/index.html && \
-    test -f internal/server/web/public/assets/styles.css && \
-    test -f internal/server/web/public/assets/theme.js && \
-    test -f internal/server/web/public/assets/monitor.js
-RUN --mount=type=cache,target=/root/.npm \
-    npm --prefix internal/server/web/admin ci && \
-    npm --prefix internal/server/web/admin run lint && \
-    npm --prefix internal/server/web/admin run build:admin
-
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
 ARG GO_IMAGE_VERSION
@@ -48,7 +31,11 @@ ARG BUILD_TIME=unknown
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
-COPY --from=admin-build /src/internal/server/web/dist/admin ./internal/server/web/dist/admin
+RUN set -eu; \
+    test -f internal/server/web/dist/admin/index.html || { \
+      echo "Missing admin assets: use scripts/docker-build-local.sh for local Docker builds." >&2; \
+      exit 1; \
+    }
 RUN set -eux; \
   export GOOS=${TARGETOS}; \
   export GOARCH=${TARGETARCH}; \

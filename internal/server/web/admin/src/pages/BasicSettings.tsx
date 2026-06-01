@@ -238,9 +238,6 @@ export default function BasicSettings({
       if (response.settings?.admin_path) {
         messages.push(`后台路径已更新为 ${response.settings.admin_path}`);
       }
-      if (response.reauth_required) {
-        messages.push("管理员登录态已自动刷新");
-      }
       toast.success(messages.join("；"));
       resetDirtyState();
     } catch (error) {
@@ -713,11 +710,11 @@ export default function BasicSettings({
                     type="button"
                   >
                     <Upload className="mr-2 h-4 w-4" />
-                    导入配置（覆盖）
+                    导入配置
                   </AlertDialogTrigger>
                   <AlertDialogContent className={compactConfirmContentClass}>
                     <AlertDialogHeader className={compactConfirmHeaderClass}>
-                      <AlertDialogTitle>确认导入并覆盖当前配置？</AlertDialogTitle>
+                      <AlertDialogTitle>确认导入配置？当前环境凭证与 Agent 运行时任务会保留。</AlertDialogTitle>
                     </AlertDialogHeader>
                     <AlertDialogFooter className={compactConfirmFooterClass}>
                       <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
@@ -726,7 +723,7 @@ export default function BasicSettings({
                         onClick={() => fileInputRef.current?.click()}
                         disabled={isImporting}
                       >
-                        {isImporting ? "导入中…" : "确认覆盖"}
+                        {isImporting ? "导入中…" : "确认导入"}
                       </AlertDialogAction>
                     </AlertDialogFooter>
                   </AlertDialogContent>

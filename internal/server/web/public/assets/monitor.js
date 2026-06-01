@@ -70,8 +70,11 @@ const state = {
   settingsGroups: [],
   testHistory: new Map(),
   testHistoryFetched: new Map(),
+  testHistoryFailures: new Map(),
   testHistoryInflight: new Map(),
   testHistoryControllers: new Map(),
+  testHistoryGeneration: new Map(),
+  testHistoryRetryTimers: new Map(),
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
@@ -91,11 +94,12 @@ const state = {
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
-const HISTORY_CACHE_VERSION = 3;
+const HISTORY_CACHE_VERSION = 4;
 const HISTORY_CACHE_MAX_POINTS = 5000;
 const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
 const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 366;
 const HISTORY_CACHE_SAVE_DELAY = 1500;
+const HISTORY_FAILURE_RETRY_DELAY_MS = 30000;
 const WS_RECONNECT_BASE_DELAY = 500;
 const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
@@ -1117,8 +1121,12 @@ function normalizeHistorySourceKey(sourceKey) {
   return raw || "default";
 }
 
+function historyKeyPart(value) {
+  return encodeURIComponent(String(value || "").trim());
+}
+
 function historyNodeCacheKey(nodeId, sourceKey) {
-  return `${normalizeHistorySourceKey(sourceKey)}::${String(nodeId || "").trim()}`;
+  return `${historyKeyPart(normalizeHistorySourceKey(sourceKey))}::${historyKeyPart(nodeId)}`;
 }
 
 function resolveHistoryNodeId(nodeId) {
@@ -1135,6 +1143,23 @@ function resolveHistoryNodeCacheKey(nodeId, sourceKey = resolveNodeSourceKey(nod
 
 function historyRequestKey(nodeId, sourceKey, rangeKey) {
   return `${historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
+}
+
+function historyRequestKeyPrefix(cacheKey) {
+  return `${cacheKey}::`;
+}
+
+function historyRequestBelongsToCache(requestKey, cacheKey) {
+  return String(requestKey).startsWith(historyRequestKeyPrefix(cacheKey));
+}
+
+function historyRequestCacheKey(requestKey) {
+  const raw = String(requestKey || "");
+  const separator = raw.lastIndexOf("::");
+  if (separator <= 0 || separator === raw.length - 2) {
+    return "";
+  }
+  return raw.slice(0, separator);
 }
 
 function ensureNodeHistoryRangesByKey(cacheKey) {
@@ -1207,17 +1232,41 @@ function hasAnyHistoryForNode(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) 
 }
 
 function trimHistoryRequestState(nodeId, sourceKey) {
-  const prefix = `${historyNodeCacheKey(nodeId, sourceKey)}::`;
-  for (const key of state.testHistoryFetched.keys()) {
-    if (String(key).startsWith(prefix)) {
-      state.testHistoryFetched.delete(key);
+  const cacheKey = historyNodeCacheKey(nodeId, sourceKey);
+  trimHistoryRequestStateByKey(cacheKey);
+}
+
+function trimHistoryRequestStateByKey(cacheKey) {
+  bumpHistoryGeneration(cacheKey);
+  const controllerEntry = state.testHistoryControllers.get(cacheKey);
+  if (controllerEntry) {
+    controllerEntry.controller.abort();
+    state.testHistoryControllers.delete(cacheKey);
+  }
+  clearHistoryRequestStateForCache(state.testHistoryFetched, cacheKey);
+  clearHistoryRequestStateForCache(state.testHistoryInflight, cacheKey);
+  clearHistoryRequestStateForCache(state.testHistoryFailures, cacheKey);
+  for (const key of state.testHistoryRetryTimers.keys()) {
+    if (historyRequestBelongsToCache(key, cacheKey)) {
+      clearNodeHistoryRetryTimer(key);
     }
   }
-  for (const key of state.testHistoryInflight.keys()) {
-    if (String(key).startsWith(prefix)) {
-      state.testHistoryInflight.delete(key);
+}
+
+function clearHistoryRequestStateForCache(source, cacheKey) {
+  for (const key of source.keys()) {
+    if (historyRequestBelongsToCache(key, cacheKey)) {
+      source.delete(key);
     }
   }
+}
+
+function historyGeneration(cacheKey) {
+  return Number(state.testHistoryGeneration.get(cacheKey) || 0);
+}
+
+function bumpHistoryGeneration(cacheKey) {
+  state.testHistoryGeneration.set(cacheKey, historyGeneration(cacheKey) + 1);
 }
 
 function isHistoryRangeFetched(
@@ -1234,6 +1283,49 @@ function isNodeHistoryInflight(nodeId, rangeKey, sourceKey = resolveNodeSourceKe
   return state.testHistoryInflight.has(
     historyRequestKey(nodeId, sourceKey, rangeKey)
   );
+}
+
+function clearNodeHistoryRetryTimer(requestKey) {
+  const timer = state.testHistoryRetryTimers.get(requestKey);
+  if (!timer) {
+    return;
+  }
+  clearTimeout(timer);
+  state.testHistoryRetryTimers.delete(requestKey);
+}
+
+function clearNodeHistoryFailure(requestKey) {
+  state.testHistoryFailures.delete(requestKey);
+  clearNodeHistoryRetryTimer(requestKey);
+}
+
+function scheduleNodeHistoryFailureRetry(nodeId, rangeKey, sourceKey, failedAt) {
+  const requestKey = historyRequestKey(nodeId, sourceKey, rangeKey);
+  if (state.testHistoryRetryTimers.has(requestKey)) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    state.testHistoryRetryTimers.delete(requestKey);
+    if (Number(state.testHistoryFailures.get(requestKey) || 0) !== failedAt) {
+      return;
+    }
+    state.testHistoryFailures.delete(requestKey);
+    forceRefreshOpenNodeHistoryViews(nodeId);
+  }, HISTORY_FAILURE_RETRY_DELAY_MS);
+  state.testHistoryRetryTimers.set(requestKey, timer);
+}
+
+function isNodeHistoryFailed(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+  const requestKey = historyRequestKey(nodeId, sourceKey, rangeKey);
+  const failedAt = Number(state.testHistoryFailures.get(requestKey) || 0);
+  if (!failedAt) {
+    return false;
+  }
+  if (Date.now() - failedAt >= HISTORY_FAILURE_RETRY_DELAY_MS) {
+    clearNodeHistoryFailure(requestKey);
+    return false;
+  }
+  return true;
 }
 
 function trimTestHistoryEntry(entry) {
@@ -1312,6 +1404,30 @@ function trimTestHistoryEntry(entry) {
   return entry;
 }
 
+function collectHistoryRequestCacheKeys() {
+  const keys = new Set(state.testHistory.keys());
+  for (const cacheKey of state.testHistoryControllers.keys()) {
+    keys.add(cacheKey);
+  }
+  for (const source of [
+    state.testHistoryFetched,
+    state.testHistoryInflight,
+    state.testHistoryFailures,
+    state.testHistoryRetryTimers,
+  ]) {
+    for (const requestKey of source.keys()) {
+      const cacheKey = historyRequestCacheKey(requestKey);
+      if (cacheKey) {
+        keys.add(cacheKey);
+      }
+    }
+  }
+  for (const cacheKey of state.testHistoryGeneration.keys()) {
+    keys.add(cacheKey);
+  }
+  return keys;
+}
+
 function cleanupDetachedHistory(nodes) {
   if (!Array.isArray(nodes)) return;
   const activeHistoryKeys = new Set();
@@ -1324,15 +1440,11 @@ function cleanupDetachedHistory(nodes) {
     }
   });
   let changed = false;
-  for (const cacheKey of state.testHistory.keys()) {
+  for (const cacheKey of collectHistoryRequestCacheKeys()) {
     if (!activeHistoryKeys.has(cacheKey)) {
       state.testHistory.delete(cacheKey);
-      const separator = String(cacheKey).indexOf("::");
-      if (separator > -1) {
-        const sourceKey = cacheKey.slice(0, separator);
-        const nodeId = cacheKey.slice(separator + 2);
-        trimHistoryRequestState(nodeId, sourceKey);
-      }
+      trimHistoryRequestStateByKey(cacheKey);
+      state.testHistoryGeneration.delete(cacheKey);
       changed = true;
     }
   }
@@ -1544,11 +1656,15 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     return null;
   }
   const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);
+  const requestGeneration = historyGeneration(cacheKey);
   if (state.testHistoryFetched.has(requestKey)) {
     return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
   }
   if (state.testHistoryInflight.has(requestKey)) {
     return state.testHistoryInflight.get(requestKey);
+  }
+  if (isNodeHistoryFailed(nodeId, normalizedRange, sourceKey)) {
+    return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
   }
 
   const target = resolveHistoryTargetBySourceKey(sourceKey);
@@ -1565,6 +1681,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
   const controller = new AbortController();
   state.testHistoryControllers.set(cacheKey, { requestKey, controller });
 
+  let requestFailed = false;
   const request = fetch(
     `${apiBase}/api/v1/public/nodes/${encodeURIComponent(
       rawNodeId
@@ -1584,13 +1701,18 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
       const resolvedRange = normalizeHistoryRangeKey(
         payload?.range_key || normalizedRange
       );
-      if (resolveNodeSourceKey(nodeId) !== sourceKey) {
+      if (
+        resolveNodeSourceKey(nodeId) !== sourceKey ||
+        historyGeneration(cacheKey) !== requestGeneration
+      ) {
         return null;
       }
       if (payload?.tests && typeof payload.tests === "object") {
         replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);
         scheduleHistoryCacheSave();
       }
+      clearNodeHistoryFailure(requestKey);
+      clearNodeHistoryFailure(historyRequestKey(nodeId, sourceKey, resolvedRange));
       state.testHistoryFetched.set(
         historyRequestKey(nodeId, sourceKey, resolvedRange),
         true
@@ -1602,6 +1724,15 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
       if (error?.name === "AbortError") {
         return null;
       }
+      requestFailed = true;
+      const failedAt = Date.now();
+      state.testHistoryFailures.set(requestKey, failedAt);
+      scheduleNodeHistoryFailureRetry(
+        nodeId,
+        normalizedRange,
+        sourceKey,
+        failedAt
+      );
       console.warn("加载节点历史失败", nodeId, normalizedRange, error);
       return null;
     })
@@ -1610,6 +1741,9 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
       const activeController = state.testHistoryControllers.get(cacheKey);
       if (activeController && activeController.requestKey === requestKey) {
         state.testHistoryControllers.delete(cacheKey);
+      }
+      if (requestFailed) {
+        forceRefreshOpenNodeHistoryViews(nodeId);
       }
     });
 
@@ -2540,6 +2674,19 @@ function renderNetworkLoadingState(fields) {
   if (fields.testRange) {
     fields.testRange.innerHTML = "";
   }
+  resetNetworkChartInteractions(fields);
+  fields.testChart.innerHTML = `
+    <div class="network-loading-state">
+      <span></span>
+      <span></span>
+      <span></span>
+      <strong>正在加载网络连通性数据</strong>
+    </div>
+  `;
+  fields.testCards.innerHTML = "";
+}
+
+function resetNetworkChartInteractions(fields) {
   if (fields.testSmooth) {
     fields.testSmooth.disabled = true;
     fields.testSmooth.classList.remove("active");
@@ -2551,14 +2698,21 @@ function renderNetworkLoadingState(fields) {
   if (fields.testCrosshair) {
     fields.testCrosshair.classList.remove("visible");
   }
+}
+
+function renderNetworkHistoryErrorChart(fields) {
+  resetNetworkChartInteractions(fields);
   fields.testChart.innerHTML = `
-    <div class="network-loading-state">
-      <span></span>
-      <span></span>
-      <span></span>
-      <strong>正在加载网络连通性数据</strong>
+    <div class="network-empty-state" role="status" aria-live="polite" aria-label="网络连通性历史加载失败，等待下一次刷新后重试">
+      <strong>网络连通性历史加载失败</strong>
+      <span>等待下一次刷新后重试</span>
     </div>
   `;
+}
+
+function renderNetworkHistoryErrorState(fields, nodeId, activeRange) {
+  renderRangeTabs(fields, nodeId, activeRange);
+  renderNetworkHistoryErrorChart(fields);
   fields.testCards.innerHTML = "";
 }
 
@@ -2578,10 +2732,23 @@ function updateNetworkTests(fields, node, tests, nodeId) {
   }
 
   setNetworkSectionVisibility(fields, true);
-  if (!tests.length && !hasAnyHistoryForNode(nodeId)) {
-    const activeRange = normalizeHistoryRangeKey(
-      state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
-    );
+  const activeRange = normalizeHistoryRangeKey(
+    state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
+  );
+  const activeRangeHistory = getNodeHistoryRange(nodeId, activeRange);
+  const hasActiveRangeHistory = activeRangeHistory.size > 0;
+  const activeRangeFailed = isNodeHistoryFailed(nodeId, activeRange);
+  const hasHistory = hasActiveRangeHistory || hasAnyHistoryForNode(nodeId);
+  if (activeRangeFailed) {
+    if (!tests.length && !hasActiveRangeHistory) {
+      renderNetworkHistoryErrorState(fields, nodeId, activeRange);
+      return;
+    }
+    renderNetworkSection(fields, nodeId);
+    renderNetworkHistoryErrorChart(fields);
+    return;
+  }
+  if (!tests.length && !hasHistory) {
     void fetchNodeHistory(nodeId, activeRange);
     if (isNodeHistoryInflight(nodeId, activeRange)) {
       renderNetworkLoadingState(fields);
@@ -2599,7 +2766,9 @@ function resolveNetworkRenderContext(
   rangeKey = state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
 ) {
   const activeRange = normalizeHistoryRangeKey(rangeKey);
-  const renderHistoryMap = getFallbackHistoryMap(nodeId, activeRange);
+  const renderHistoryMap = isNodeHistoryFailed(nodeId, activeRange)
+    ? getNodeHistoryRange(nodeId, activeRange)
+    : getFallbackHistoryMap(nodeId, activeRange);
   let latestHistoryAt = 0;
   renderHistoryMap.forEach((history) => {
     const historyLastAt = resolveHistoryLastAt(history);
@@ -2635,7 +2804,9 @@ function renderNetworkSection(fields, nodeId) {
   if (!state.testRange.has(nodeId)) {
     state.testRange.set(nodeId, DEFAULT_TEST_RANGE_KEY);
   }
-  void fetchNodeHistory(nodeId, activeRange);
+  if (!isNodeHistoryFailed(nodeId, activeRange)) {
+    void fetchNodeHistory(nodeId, activeRange);
+  }
 
   const baseTests = fields._tests || [];
   const tests =

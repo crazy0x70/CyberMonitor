@@ -25,21 +25,24 @@ EOF
 
 write_server_conf() {
   mkdir -p "${CONF_DIR}"
-  cat > "${CONF_DIR}/server.conf" <<EOF
-CM_LISTEN=${1}
-CM_DATA_DIR=${2}
-EOF
+  {
+    write_systemd_env "CM_LISTEN" "$1" || return 1
+    write_systemd_env "CM_DATA_DIR" "$2" || return 1
+  } > "${CONF_DIR}/server.conf"
 }
 
 write_agent_conf() {
+  local server_url="$1"
+  local net_iface="$2"
+  local disable_update="$3"
   mkdir -p "${CONF_DIR}"
-  cat > "${CONF_DIR}/agent.conf" <<EOF
-CM_SERVER_URL=${1}
-CM_NODE_ID=${2}
-CM_AGENT_TOKEN_FILE=${INSTALL_DIR}/.cybermonitor-agent-token
-CM_NET_IFACE=${3}
-CM_DISABLE_UPDATE=${4}
-EOF
+  {
+    write_systemd_env "CM_SERVER_URL" "${server_url}" || return 1
+    write_systemd_env "CM_NODE_ID_FILE" "${INSTALL_DIR}/.cybermonitor-node-id" || return 1
+    write_systemd_env "CM_AGENT_TOKEN_FILE" "${INSTALL_DIR}/.cybermonitor-agent-token" || return 1
+    write_systemd_env "CM_NET_IFACE" "${net_iface}" || return 1
+    write_systemd_env "CM_DISABLE_UPDATE" "${disable_update}" || return 1
+  } > "${CONF_DIR}/agent.conf"
 }
 
 write_service_file() {
@@ -66,8 +69,9 @@ EOF
 
 enable_service() {
   local service="$1"
-  systemctl daemon-reload
-  systemctl enable --now "${service}"
+  systemctl daemon-reload &&
+    systemctl enable "${service}" &&
+    systemctl restart "${service}"
 }
 
 read_admin_settings() {
@@ -127,16 +131,7 @@ resolve_host_port() {
     port="25012"
   fi
   if [[ -z "${host}" || "${host}" == "0.0.0.0" || "${host}" == "::" || "${host}" == "[::]" ]]; then
-    local public_ip=""
-    public_ip="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-    if is_valid_ipv4 "${public_ip}"; then
-      host="${public_ip}"
-    else
-      host="$(hostname -I 2>/dev/null | awk '{print $1}')"
-      if [[ -z "${host}" ]]; then
-        host="127.0.0.1"
-      fi
-    fi
+    host="127.0.0.1"
   fi
   echo "${host} ${port}"
 }
@@ -164,19 +159,47 @@ install_server() {
   local listen="$1"
   local data_dir="$2"
   local version="$3"
+  local data_dir_created=""
+  validate_systemd_unit_paths || die "systemd unit 路径包含非法值"
   local arch
   arch="$(detect_arch)"
   version="$(resolve_version "${version}")"
+  if [[ ! -e "${data_dir}" ]]; then
+    data_dir_created="1"
+  fi
   mkdir -p "${data_dir}"
 
-  local bin
-  bin="$(download_binary "server" "${version}" "${arch}")"
-  write_server_conf "${listen}" "${data_dir}"
-
   local service="cyber-monitor-server"
-  local service_file="/etc/systemd/system/${service}.service"
-  write_service_file "${service_file}" "CyberMonitor Server" "${CONF_DIR}/server.conf" "${bin}"
-  enable_service "${service}"
+  local service_file="${SYSTEMD_SERVICE_DIR}/${service}.service"
+  local conf_backup=""
+  local service_backup=""
+  local service_existed=""
+  local service_enabled=""
+  local service_active=""
+  capture_service_state "${service}" service_existed service_enabled service_active
+  if ! backup_file_if_exists "${CONF_DIR}/server.conf" conf_backup ||
+    ! backup_file_if_exists "${service_file}" service_backup; then
+    cleanup_file_backup "${conf_backup}"
+    cleanup_file_backup "${service_backup}"
+    cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+    die "安装 ${service} 失败，无法创建回滚备份"
+  fi
+
+  local bin
+  if ! download_binary "server" "${version}" "${arch}" bin ||
+    ! write_server_conf "${listen}" "${data_dir}" ||
+    ! write_service_file "${service_file}" "CyberMonitor Server" "${CONF_DIR}/server.conf" "${bin}" ||
+    ! enable_service "${service}"; then
+    if ! rollback_install_failure "server" "${service}" "" "" "${CONF_DIR}/server.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
+      cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+      die "启动 ${service} 失败；回滚后服务仍未运行"
+    fi
+    cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+    die "安装 ${service} 失败，已执行回滚流程"
+  fi
+  cleanup_file_backup "${conf_backup}"
+  cleanup_file_backup "${service_backup}"
+  cleanup_binary_backup
   echo "已安装并启动 ${service}"
   print_admin_info "${listen}" "${data_dir}"
 }
@@ -190,23 +213,60 @@ install_agent() {
   local version="$6"
   [[ -z "${server_url}" ]] && die "被控需要填写 Server 地址"
   [[ -z "${bootstrap_token}" ]] && die "被控需要填写 Token"
+  validate_systemd_unit_paths || die "systemd unit 路径包含非法值"
 
   local arch
   arch="$(detect_arch)"
   version="$(resolve_version "${version}")"
-  [[ -n "${node_id}" ]] || node_id="$(generate_node_id)"
-  local node_token
-  node_token="$(register_agent "${server_url}" "${bootstrap_token}" "${node_id}")"
-
-  local bin
-  bin="$(download_binary "agent" "${version}" "${arch}")"
-  write_agent_token_file "${node_token}"
-  write_agent_conf "${server_url}" "${node_id}" "${net_iface}" "${disable_update}"
+  node_id="$(resolve_node_id "${node_id}")"
+  validate_agent_local_config "${server_url}" "${node_id}" "${net_iface}" "${disable_update}" || die "本地 Agent 配置包含非法值"
 
   local service="cyber-monitor-agent"
-  local service_file="/etc/systemd/system/${service}.service"
-  write_service_file "${service_file}" "CyberMonitor Agent" "${CONF_DIR}/agent.conf" "${bin}"
-  enable_service "${service}"
+  local service_file="${SYSTEMD_SERVICE_DIR}/${service}.service"
+  local token_file="${INSTALL_DIR}/.cybermonitor-agent-token"
+  local node_id_file="${INSTALL_DIR}/.cybermonitor-node-id"
+  local token_backup=""
+  local node_id_backup=""
+  local conf_backup=""
+  local service_backup=""
+  local service_existed=""
+  local service_enabled=""
+  local service_active=""
+  capture_service_state "${service}" service_existed service_enabled service_active
+  if ! backup_file_if_exists "${token_file}" token_backup ||
+    ! backup_file_if_exists "${node_id_file}" node_id_backup ||
+    ! backup_file_if_exists "${CONF_DIR}/agent.conf" conf_backup ||
+    ! backup_file_if_exists "${service_file}" service_backup; then
+    cleanup_file_backup "${token_backup}"
+    cleanup_file_backup "${node_id_backup}"
+    cleanup_file_backup "${conf_backup}"
+    cleanup_file_backup "${service_backup}"
+    die "安装 ${service} 失败，无法创建回滚备份"
+  fi
+
+  local bin
+  local node_token=""
+  local node_registered="0"
+  if ! download_binary "agent" "${version}" "${arch}" bin ||
+    ! { node_token="$(register_agent "${server_url}" "${bootstrap_token}" "${node_id}")" && node_registered="1"; } ||
+    ! write_agent_token_file "${node_token}" ||
+    ! write_node_id_file "${node_id}" ||
+    ! write_agent_conf "${server_url}" "${net_iface}" "${disable_update}" ||
+    ! write_service_file "${service_file}" "CyberMonitor Agent" "${CONF_DIR}/agent.conf" "${bin}" ||
+    ! enable_service "${service}"; then
+    if [[ "${node_registered}" != "1" || -n "${node_id_backup}" ]]; then
+      restore_file_backup "${node_id_file}" "${node_id_backup}" || true
+    fi
+    if ! rollback_install_failure "agent" "${service}" "${token_file}" "${token_backup}" "${CONF_DIR}/agent.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
+      die "启动 ${service} 失败；回滚后服务仍未运行"
+    fi
+    die "安装 ${service} 失败，已执行回滚流程"
+  fi
+  cleanup_file_backup "${token_backup}"
+  cleanup_file_backup "${node_id_backup}"
+  cleanup_file_backup "${conf_backup}"
+  cleanup_file_backup "${service_backup}"
+  cleanup_binary_backup
   echo "已安装并启动 ${service}"
   echo "Node ID: ${node_id}"
 }
@@ -214,7 +274,9 @@ install_agent() {
 uninstall_service() {
   local type="$1"
   local service="cyber-monitor-${type}"
-  local service_file="/etc/systemd/system/${service}.service"
+  local service_file="${SYSTEMD_SERVICE_DIR}/${service}.service"
+  reject_unsafe_path "${service_file}" || die "拒绝清理包含不安全路径的服务文件"
+  reject_unsafe_path "${INSTALL_DIR}/cyber-monitor-${type}" || die "拒绝清理包含不安全路径的安装文件"
   systemctl disable --now "${service}" >/dev/null 2>&1 || true
   rm -f "${service_file}"
   rm -f "${INSTALL_DIR}/cyber-monitor-${type}"
@@ -226,6 +288,7 @@ read_server_data_dir() {
   local data_dir=""
   if [[ -f "${CONF_DIR}/server.conf" ]]; then
     data_dir="$(sed -n 's/^CM_DATA_DIR=//p' "${CONF_DIR}/server.conf" | head -n 1)"
+    data_dir="$(strip_systemd_env_quotes "${data_dir}")"
   fi
   if [[ -z "${data_dir}" ]]; then
     data_dir="/opt/CyberMonitor/data"
@@ -233,10 +296,29 @@ read_server_data_dir() {
   echo "${data_dir}"
 }
 
+cleanup_created_data_dir() {
+  local data_dir="$1"
+  local created="$2"
+  if [[ "${created}" != "1" || -z "${data_dir}" || "${data_dir}" == "/" ]]; then
+    return 0
+  fi
+  rmdir "${data_dir}" 2>/dev/null || echo "保留非空数据目录: ${data_dir}" >&2
+}
+
 cleanup_server_config() {
   local data_dir="$1"
+  local install_real=""
+  local data_real=""
+  reject_unsafe_path "${CONF_DIR}/server.conf" || die "拒绝清理包含不安全路径的主控配置"
+  reject_unsafe_path "${INSTALL_DIR}" || die "拒绝清理包含不安全路径的安装目录"
+  reject_unsafe_path "${CONF_DIR}" || die "拒绝清理包含不安全路径的配置目录"
+  if [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
+    reject_unsafe_path "${data_dir}" || die "拒绝清理包含不安全路径的数据目录"
+    install_real="$(realpath -m -- "${INSTALL_DIR}")"
+    data_real="$(realpath -m -- "${data_dir}")"
+  fi
   rm -f "${CONF_DIR}/server.conf"
-  if [[ -n "${data_dir}" && "${data_dir}" != "/" && "${data_dir}" == "${INSTALL_DIR}/"* ]]; then
+  if [[ -n "${data_real}" && "${data_real}" != "${install_real}" && "${data_real}" == "${install_real}/"* ]]; then
     rm -rf "${data_dir}"
   elif [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
     echo "未自动删除自定义数据目录: ${data_dir}"
@@ -246,6 +328,11 @@ cleanup_server_config() {
 }
 
 cleanup_agent_config() {
+  reject_unsafe_path "${CONF_DIR}/agent.conf" || die "拒绝清理包含不安全路径的 Agent 配置"
+  reject_unsafe_path "${INSTALL_DIR}/.cybermonitor-agent-token" || die "拒绝清理包含不安全路径的 Agent token"
+  reject_unsafe_path "${INSTALL_DIR}/.cybermonitor-node-id" || die "拒绝清理包含不安全路径的节点 ID"
+  reject_unsafe_path "${CONF_DIR}" || die "拒绝清理包含不安全路径的配置目录"
+  reject_unsafe_path "${INSTALL_DIR}" || die "拒绝清理包含不安全路径的安装目录"
   rm -f "${CONF_DIR}/agent.conf"
   rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
   rm -f "${INSTALL_DIR}/.cybermonitor-node-id"
@@ -285,7 +372,7 @@ run_install_menu() {
       2)
         read -r -p "Server 地址(统一接入地址，例如 http://1.2.3.4:25012；运行态会优先尝试 gRPC): " server_url
         read -r -p "Agent Token: " token
-        read -r -p "Node ID（可空，留空则随机生成）: " node_id
+        read -r -p "Node ID（可空，留空则复用本机已保存 ID 或自动生成）: " node_id
         read -r -p "指定网卡(可空): " net_iface
         read -r -p "是否禁用服务端远程更新? [y/N]: " disable_update_answer
         read -r -p "版本号(默认 latest): " version
@@ -337,4 +424,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

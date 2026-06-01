@@ -10,6 +10,7 @@ import (
 
 	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/server/history"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -37,11 +38,10 @@ func (e *agentAPIError) Error() string {
 type agentAPI struct {
 	store *Store
 	hub   *Hub
-	cfg   *Config
 }
 
-func newAgentAPI(store *Store, hub *Hub, cfg *Config) *agentAPI {
-	return &agentAPI{store: store, hub: hub, cfg: cfg}
+func newAgentAPI(store *Store, hub *Hub) *agentAPI {
+	return &agentAPI{store: store, hub: hub}
 }
 
 func badAgentRequest(message string) *agentAPIError {
@@ -56,8 +56,16 @@ func invalidBootstrapTokenError() *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusUnauthorized, message: "invalid bootstrap token"}
 }
 
+func agentServiceUnavailable(message string) *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusServiceUnavailable, message: message}
+}
+
 func normalizeAgentNodeID(nodeID string) (string, *agentAPIError) {
-	nodeID = strings.TrimSpace(nodeID)
+	var err error
+	nodeID, err = history.NormalizeNodeID(nodeID)
+	if err != nil {
+		return "", badAgentRequest("invalid node id")
+	}
 	if nodeID == "" {
 		return "", badAgentRequest("node_id required")
 	}
@@ -192,12 +200,7 @@ func (a *agentAPI) broadcastPublicDelta(nodeID string) {
 }
 
 func (a *agentAPI) broadcastSnapshot() {
-	if a.hub == nil {
-		return
-	}
-	if data, err := json.Marshal(storeSnapshot(a.store, false)); err == nil {
-		a.hub.Broadcast(data)
-	}
+	broadcastStoreSnapshot(a.hub, a.store, false)
 }
 
 func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) (bool, *agentAPIError) {
@@ -205,13 +208,24 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if apiErr != nil {
 		return false, apiErr
 	}
-	if apiErr := a.validateAgentToken(payload.NodeID, token); apiErr != nil {
+	updateReconciled, refreshConfig, apiErr := func() (bool, bool, *agentAPIError) {
+		unlock := a.store.lockAgentNodeRead(payload.NodeID)
+		defer unlock()
+		if apiErr := a.validateAgentToken(payload.NodeID, token); apiErr != nil {
+			return false, false, apiErr
+		}
+		if !a.store.allowAgentRate("ingest:"+payload.NodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), true) {
+			return false, false, agentRateLimitError()
+		}
+		updateReconciled, err := a.store.updateNodeStats(payload)
+		if err != nil {
+			return false, false, agentServiceUnavailable(err.Error())
+		}
+		return updateReconciled, a.store.HasPendingAgentConfigRefresh(payload.NodeID), nil
+	}()
+	if apiErr != nil {
 		return false, apiErr
 	}
-	if !a.store.allowAgentRate("ingest:"+payload.NodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), true) {
-		return false, agentRateLimitError()
-	}
-	updateReconciled := a.store.Update(payload)
 	a.broadcastPublicDelta(payload.NodeID)
 	if updateReconciled {
 		a.broadcastSnapshot()
@@ -219,7 +233,7 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if strings.TrimSpace(remoteAddr) == "" {
 		remoteAddr = "grpc"
 	}
-	return a.store.HasPendingAgentConfigRefresh(payload.NodeID), nil
+	return refreshConfig, nil
 }
 
 func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
@@ -227,10 +241,22 @@ func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
 	if apiErr != nil {
 		return AgentConfig{}, apiErr
 	}
-	if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+	config, leaseUpdated, apiErr := func() (AgentConfig, bool, *agentAPIError) {
+		unlock := a.store.lockAgentNodeRead(nodeID)
+		defer unlock()
+		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+			return AgentConfig{}, false, apiErr
+		}
+		config, leaseUpdated := a.store.DeliverAgentConfig(nodeID)
+		return config, leaseUpdated, nil
+	}()
+	if apiErr != nil {
 		return AgentConfig{}, apiErr
 	}
-	return a.store.AgentConfig(nodeID), nil
+	if leaseUpdated {
+		a.store.persist()
+	}
+	return config, nil
 }
 
 func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIError) {
@@ -238,16 +264,9 @@ func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIErr
 	if apiErr != nil {
 		return "", apiErr
 	}
-	if strings.TrimSpace(a.cfg.AgentToken) != "" && !isBootstrapAgentToken(a.cfg.AgentToken, bootstrapToken) {
-		return "", invalidBootstrapTokenError()
-	}
-	if !a.store.allowAgentRate("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, time.Now(), false) {
-		return "", agentRateLimitError()
-	}
-	if !a.store.allowAgentRate("register:"+nodeID, agentRegisterWindow, defaultAgentRegisterLimit, time.Now(), false) {
-		return "", agentRateLimitError()
-	}
-	return a.store.ensureAgentAuthToken(nodeID), nil
+	unlock := a.store.lockAgentNodeRead(nodeID)
+	defer unlock()
+	return a.store.registerAgentAuthToken(nodeID, bootstrapToken, time.Now())
 }
 
 func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) *agentAPIError {
@@ -255,10 +274,17 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 	if apiErr != nil {
 		return apiErr
 	}
-	if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+	if apiErr := func() *agentAPIError {
+		unlock := a.store.lockAgentNodeRead(nodeID)
+		defer unlock()
+		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
+			return apiErr
+		}
+		a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
+		return nil
+	}(); apiErr != nil {
 		return apiErr
 	}
-	a.store.ApplyAgentUpdateReport(nodeID, report)
 	a.broadcastSnapshot()
 	return nil
 }
@@ -315,7 +341,6 @@ func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequ
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
-	s.api.store.MarkAgentConfigRefreshed(req.NodeID)
 	return &agentrpc.ConfigResponse{
 		Alias:           config.Alias,
 		Group:           config.Group,
@@ -377,6 +402,8 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 		return status.Error(codes.NotFound, err.message)
 	case http.StatusTooManyRequests:
 		return status.Error(codes.ResourceExhausted, err.message)
+	case http.StatusServiceUnavailable:
+		return status.Error(codes.Unavailable, err.message)
 	default:
 		return status.Error(codes.Internal, err.message)
 	}

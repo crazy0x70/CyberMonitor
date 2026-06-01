@@ -118,7 +118,7 @@ func DefaultUnsupportedUpdateMessage() string {
 		if CanDockerManagedUpdate() {
 			return ""
 		}
-		return "Docker 部署请挂载 /var/run/docker.sock 以启用后台一键更新；否则请拉取最新镜像并重建容器"
+		return "Docker 部署请设置 CM_ENABLE_DOCKER_UPDATE=1 并挂载 /var/run/docker.sock 以启用后台一键更新；否则请拉取最新镜像并重建容器"
 	}
 	return ""
 }

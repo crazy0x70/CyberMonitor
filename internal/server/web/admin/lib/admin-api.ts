@@ -7,6 +7,8 @@ import type {
   ConfigImportResponse,
   LoginConfigResponse,
   LoginResponse,
+  NodeDelta,
+  NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
   SettingsView,
@@ -15,6 +17,10 @@ import type {
 } from "@/lib/admin-types";
 
 export const ADMIN_TOKEN_KEY = "cm_admin_token";
+
+type AdminUnauthorizedListener = () => void;
+
+const adminUnauthorizedListeners = new Set<AdminUnauthorizedListener>();
 
 export class AdminApiError extends Error {
   status: number;
@@ -48,6 +54,19 @@ export function setStoredAdminToken(token: string) {
   }
 }
 
+export function addAdminUnauthorizedListener(listener: AdminUnauthorizedListener) {
+  adminUnauthorizedListeners.add(listener);
+  return () => {
+    adminUnauthorizedListeners.delete(listener);
+  };
+}
+
+function notifyAdminUnauthorized() {
+  for (const listener of Array.from(adminUnauthorizedListeners)) {
+    listener();
+  }
+}
+
 async function parseErrorMessage(resp: Response, fallback: string) {
   try {
     const payload = (await resp.json()) as ApiErrorPayload;
@@ -70,11 +89,12 @@ async function unwrapResponse<T>(resp: Response, fallback: string) {
   return (await resp.json()) as T;
 }
 
-async function apiFetch(path: string, init: RequestInit = {}, token = getStoredAdminToken()) {
+async function apiFetch(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers || {});
   const resp = await fetch(path, { ...init, headers, credentials: "same-origin" });
-  if (resp.status === 401 && token) {
+  if (resp.status === 401) {
     setStoredAdminToken("");
+    notifyAdminUnauthorized();
   }
   return resp;
 }
@@ -126,12 +146,12 @@ export async function loginAdmin(username: string, password: string, turnstileTo
   return data;
 }
 
-export async function fetchSettings(token = getStoredAdminToken()) {
-  const resp = await apiFetch("/api/v1/admin/settings", {}, token);
+export async function fetchSettings() {
+  const resp = await apiFetch("/api/v1/admin/settings");
   return unwrapResponse<SettingsView>(resp, "加载设置失败");
 }
 
-export async function saveSettings(payload: Record<string, unknown>, token = getStoredAdminToken()) {
+export async function saveSettings(payload: Record<string, unknown>) {
   const resp = await apiFetch(
     "/api/v1/admin/settings",
     {
@@ -139,13 +159,12 @@ export async function saveSettings(payload: Record<string, unknown>, token = get
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
-    token,
   );
   return unwrapResponse<SettingsView>(resp, "保存设置失败");
 }
 
-export async function exportConfig(token = getStoredAdminToken()) {
-  const resp = await apiFetch("/api/v1/admin/config/export", {}, token);
+export async function exportConfig() {
+  const resp = await apiFetch("/api/v1/admin/config/export");
   if (!resp.ok) {
     const message = await parseErrorMessage(resp, "导出配置失败");
     throw new AdminApiError(message, resp.status);
@@ -156,7 +175,7 @@ export async function exportConfig(token = getStoredAdminToken()) {
   };
 }
 
-export async function importConfig(payload: Record<string, unknown>, token = getStoredAdminToken()) {
+export async function importConfig(payload: Record<string, unknown>) {
   const resp = await apiFetch(
     "/api/v1/admin/config/import",
     {
@@ -164,7 +183,6 @@ export async function importConfig(payload: Record<string, unknown>, token = get
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
-    token,
   );
   return unwrapResponse<ConfigImportResponse>(resp, "导入配置失败");
 }
@@ -181,12 +199,12 @@ export async function logoutAdmin() {
   setStoredAdminToken("");
 }
 
-export async function fetchNodes(token = getStoredAdminToken()) {
-  const resp = await apiFetch("/api/v1/admin/nodes?history=0", {}, token);
+export async function fetchNodes() {
+  const resp = await apiFetch("/api/v1/admin/nodes?history=0");
   return unwrapResponse<Snapshot>(resp, "加载节点失败");
 }
 
-export async function saveNodeProfile(nodeID: string, payload: NodeProfilePayload, token = getStoredAdminToken()) {
+export async function saveNodeProfile(nodeID: string, payload: NodeProfilePayload) {
   const resp = await apiFetch(
     `/api/v1/admin/nodes/${encodeURIComponent(nodeID)}`,
     {
@@ -194,53 +212,47 @@ export async function saveNodeProfile(nodeID: string, payload: NodeProfilePayloa
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
-    token,
   );
   return unwrapResponse<NodeView>(resp, "保存节点失败");
 }
 
-export async function deleteNodeProfile(nodeID: string, token = getStoredAdminToken()) {
+export async function deleteNodeProfile(nodeID: string) {
   const resp = await apiFetch(
     `/api/v1/admin/nodes/${encodeURIComponent(nodeID)}`,
     { method: "DELETE" },
-    token,
   );
-  await unwrapResponse<{ status: string }>(resp, "删除节点失败");
+  return unwrapResponse<NodeDeleteResponse>(resp, "删除节点失败");
 }
 
-export async function fetchSystemUpdateInfo(token = getStoredAdminToken()) {
-  const resp = await apiFetch("/api/v1/admin/system/update", {}, token);
+export async function fetchSystemUpdateInfo() {
+  const resp = await apiFetch("/api/v1/admin/system/update");
   return unwrapResponse<SystemUpdateInfo>(resp, "获取服务端更新状态失败");
 }
 
-export async function triggerSystemUpdate(token = getStoredAdminToken()) {
+export async function triggerSystemUpdate() {
   const resp = await apiFetch(
     "/api/v1/admin/system/update",
     { method: "POST" },
-    token,
   );
   return unwrapResponse<{ status: string; target_version?: string }>(resp, "触发服务端更新失败");
 }
 
-export async function triggerAgentUpdate(nodeID: string, token = getStoredAdminToken()) {
+export async function triggerAgentUpdate(nodeID: string) {
   const resp = await apiFetch(
     `/api/v1/admin/nodes/${encodeURIComponent(nodeID)}/agent/update`,
     { method: "POST" },
-    token,
   );
   return unwrapResponse<{ status: string; target_version?: string }>(resp, "下发 Agent 更新失败");
 }
 
-export async function fetchAgentUpdateInfo(nodeID: string, token = getStoredAdminToken()) {
+export async function fetchAgentUpdateInfo(nodeID: string) {
   const resp = await apiFetch(
     `/api/v1/admin/nodes/${encodeURIComponent(nodeID)}/agent/update`,
-    {},
-    token,
   );
   return unwrapResponse<AgentUpdateInfo>(resp, "获取 Agent 更新状态失败");
 }
 
-export async function testAlertChannels(payload: AlertTestPayload, token = getStoredAdminToken()) {
+export async function testAlertChannels(payload: AlertTestPayload) {
   const resp = await apiFetch(
     "/api/v1/admin/alerts/test",
     {
@@ -248,12 +260,11 @@ export async function testAlertChannels(payload: AlertTestPayload, token = getSt
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
-    token,
   );
   return unwrapResponse<{ status: string }>(resp, "测试告警失败");
 }
 
-export async function testAIProvider(provider: string, config: AIProviderConfig, token = getStoredAdminToken()) {
+export async function testAIProvider(provider: string, config: AIProviderConfig) {
   const resp = await apiFetch(
     "/api/v1/admin/ai/test",
     {
@@ -261,12 +272,11 @@ export async function testAIProvider(provider: string, config: AIProviderConfig,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, config }),
     },
-    token,
   );
   return unwrapResponse<{ status: string }>(resp, "测试 Provider 失败");
 }
 
-export async function fetchAIModels(provider: string, config: AIProviderConfig, token = getStoredAdminToken()) {
+export async function fetchAIModels(provider: string, config: AIProviderConfig) {
   const resp = await apiFetch(
     "/api/v1/admin/ai/models",
     {
@@ -274,25 +284,123 @@ export async function fetchAIModels(provider: string, config: AIProviderConfig, 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, config }),
     },
-    token,
   );
   return unwrapResponse<{ models: string[] }>(resp, "获取模型列表失败");
 }
 
-export function connectAdminSocket(token: string, onSnapshot: (snapshot: Snapshot) => void) {
-  void token;
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = `${protocol}://${window.location.host}/ws`;
-  const socket = new WebSocket(url);
-  socket.addEventListener("message", (event) => {
+export interface AdminSocketConnection {
+  close: () => void;
+}
+
+interface AdminSocketOptions {
+  reconnectDelayMs?: number;
+  reconnectMaxDelayMs?: number;
+}
+
+export function connectAdminSocket(
+  onSnapshot: (snapshot: Snapshot) => void,
+  onNodeDelta?: (node: NodeView) => void,
+  options: AdminSocketOptions = {},
+): AdminSocketConnection {
+  const reconnectDelayMs = Math.max(0, Number(options.reconnectDelayMs ?? 1000));
+  const reconnectMaxDelayMs = Math.max(
+    reconnectDelayMs,
+    Number(options.reconnectMaxDelayMs ?? 8000),
+  );
+  let nextReconnectDelayMs = reconnectDelayMs;
+  let socket: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+
+  const handleMessage = (event: MessageEvent) => {
     try {
-      const payload = JSON.parse(event.data) as Snapshot;
-      if (Array.isArray(payload.nodes)) {
+      const payload = JSON.parse(event.data) as Snapshot | NodeDelta;
+      if (isSnapshotPayload(payload)) {
         onSnapshot(payload);
+      } else if (isNodeDeltaPayload(payload)) {
+        onNodeDelta?.(payload.node);
       }
     } catch {
       // ignore invalid frames
     }
-  });
-  return socket;
+  };
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const connect = () => {
+    if (closed) {
+      return;
+    }
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+    socket.addEventListener("open", () => {
+      nextReconnectDelayMs = reconnectDelayMs;
+    });
+    socket.addEventListener("message", handleMessage);
+    socket.addEventListener("close", () => {
+      socket = null;
+      if (!closed && !reconnectTimer) {
+        const delay = nextReconnectDelayMs;
+        nextReconnectDelayMs = reconnectDelayMs === 0
+          ? 0
+          : Math.min(reconnectMaxDelayMs, Math.max(reconnectDelayMs, nextReconnectDelayMs * 2));
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      }
+    });
+  };
+
+  connect();
+
+  return {
+    close() {
+      closed = true;
+      clearReconnectTimer();
+      const activeSocket = socket;
+      socket = null;
+      activeSocket?.close();
+    },
+  };
+}
+
+function isSnapshotPayload(payload: unknown): payload is Snapshot {
+  return Boolean(payload && typeof payload === "object" && Array.isArray((payload as Snapshot).nodes));
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function hasStableNodeID(stats: Record<string, unknown>) {
+  return typeof stats.node_id === "string" && stats.node_id.trim() !== "" ||
+    typeof stats.node_name === "string" && stats.node_name.trim() !== "";
+}
+
+function isNodeViewPayload(payload: unknown): payload is NodeView {
+  if (!isObjectRecord(payload)) {
+    return false;
+  }
+  if (!isObjectRecord(payload.stats)) {
+    return false;
+  }
+  return (
+    hasStableNodeID(payload.stats) &&
+    isObjectRecord(payload.stats.cpu) &&
+    isObjectRecord(payload.stats.memory)
+  );
+}
+
+function isNodeDeltaPayload(payload: unknown): payload is NodeDelta {
+  if (!isObjectRecord(payload)) {
+    return false;
+  }
+  const delta = payload as Partial<NodeDelta>;
+  return delta.type === "node_delta" && isNodeViewPayload(delta.node);
 }

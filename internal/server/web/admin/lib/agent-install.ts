@@ -7,11 +7,12 @@ export function buildAgentInstallCommand(endpoint: string, token: string) {
   const safeEndpoint = escapeShell(normalizedEndpoint);
   const safeToken = escapeShell(normalizedToken);
   return [
+    `set -e`,
     `tmp="$(mktemp -d)"`,
+    `trap 'rm -rf "$tmp"' EXIT`,
     `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"`,
     `curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"`,
     `sudo bash "$tmp/agent.sh" --server-url ${safeEndpoint} --agent-token ${safeToken}`,
-    `rm -rf "$tmp"`,
   ].join("\n");
 }
 
@@ -24,8 +25,13 @@ export function buildAgentWindowsInstallCommand(endpoint: string, token: string)
   const safeEndpoint = escapePwsh(normalizedEndpoint);
   const safeToken = escapePwsh(normalizedToken);
   return [
-    `$script = Join-Path $env:TEMP 'agent.ps1'`,
-    `Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script`,
-    `& $script -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'`,
+    `$ErrorActionPreference = 'Stop'`,
+    `$script = Join-Path $env:TEMP ("cybermonitor-agent-" + [guid]::NewGuid().ToString() + ".ps1")`,
+    `try {`,
+    `  Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script -ErrorAction Stop`,
+    `  & $script -ServerUrl '${safeEndpoint}' -AgentToken '${safeToken}'`,
+    `} finally {`,
+    `  Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue`,
+    `}`,
   ].join("\n");
 }

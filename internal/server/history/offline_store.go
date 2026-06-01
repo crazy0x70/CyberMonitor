@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -44,7 +45,8 @@ type OfflineInsights struct {
 }
 
 type OfflineStore struct {
-	db *tsdb.DB
+	db       *tsdb.DB
+	appendMu sync.Mutex
 }
 
 func OpenOfflineStore(dir string) (*OfflineStore, error) {
@@ -82,6 +84,9 @@ func (s *OfflineStore) AppendEvent(nodeID string, recoveredAt time.Time, duratio
 	if nodeID == "" || duration <= 0 {
 		return nil
 	}
+
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
 
 	appender := s.db.Appender(context.Background())
 	committed := false
@@ -167,6 +172,26 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 		insights.RecentSessions = recent.NewestFirst()
 	}
 	return insights, nil
+}
+
+func (s *OfflineStore) HasNodeHistory(nodeID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errNilOfflineStore
+	}
+	var err error
+	nodeID, err = NormalizeNodeID(nodeID)
+	if err != nil || nodeID == "" {
+		return false, err
+	}
+	nameMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, offlineDurationMetric)
+	if err != nil {
+		return false, err
+	}
+	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
+	if err != nil {
+		return false, err
+	}
+	return hasMatchingSeries(s.db, nameMatcher, nodeMatcher)
 }
 
 func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit func(OfflineSession) bool) error {
@@ -394,10 +419,17 @@ func (s *OfflineStore) DeleteNode(nodeID string) error {
 	if s == nil || s.db == nil {
 		return errNilOfflineStore
 	}
-	nodeID = strings.TrimSpace(nodeID)
+	var err error
+	nodeID, err = NormalizeNodeID(nodeID)
+	if err != nil {
+		return err
+	}
 	if nodeID == "" {
 		return nil
 	}
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
 	matcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
 	if err != nil {
 		return err
@@ -409,6 +441,9 @@ func (s *OfflineStore) Clear() error {
 	if s == nil || s.db == nil {
 		return errNilOfflineStore
 	}
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
 	matcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, offlineDurationMetric)
 	if err != nil {
 		return err

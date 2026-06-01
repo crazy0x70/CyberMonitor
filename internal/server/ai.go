@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -78,50 +79,6 @@ type AISettings struct {
 	OpenAICompatibles []AIProviderProfile `json:"openai_compatibles,omitempty"`
 }
 
-type aiSettingsWire struct {
-	DefaultProvider   string              `json:"default_provider,omitempty"`
-	CommandProvider   string              `json:"command_provider,omitempty"`
-	Prompt            string              `json:"prompt,omitempty"`
-	OpenAI            AIProviderConfig    `json:"openai,omitempty"`
-	Gemini            AIProviderConfig    `json:"gemini,omitempty"`
-	Volcengine        AIProviderConfig    `json:"volcengine,omitempty"`
-	OpenAICompatible  AIProviderConfig    `json:"openai_compatible,omitempty"`
-	OpenAICompatibles []AIProviderProfile `json:"openai_compatibles,omitempty"`
-}
-
-func (s *AISettings) UnmarshalJSON(data []byte) error {
-	var raw aiSettingsWire
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	commandProvider := raw.CommandProvider
-	if strings.TrimSpace(commandProvider) == "" {
-		commandProvider = raw.DefaultProvider
-	}
-	compatibles := raw.OpenAICompatibles
-	if len(compatibles) == 0 && hasAIProviderConfig(raw.OpenAICompatible) {
-		compatibles = []AIProviderProfile{
-			{
-				ID:               "compat-legacy",
-				Name:             "OpenAI 兼容",
-				AIProviderConfig: raw.OpenAICompatible,
-			},
-		}
-		if normalizeAIProviderName(commandProvider) == aiProviderOpenAICompatible {
-			commandProvider = aiProviderOpenAICompatible + ":compat-legacy"
-		}
-	}
-	*s = AISettings{
-		CommandProvider:   commandProvider,
-		Prompt:            raw.Prompt,
-		OpenAI:            raw.OpenAI,
-		Gemini:            raw.Gemini,
-		Volcengine:        raw.Volcengine,
-		OpenAICompatibles: compatibles,
-	}
-	return nil
-}
-
 type AIProviderProfile struct {
 	ID   string `json:"id,omitempty"`
 	Name string `json:"name,omitempty"`
@@ -172,6 +129,7 @@ type aiServerSummary struct {
 	OfflineSummary    *aiOfflineSummary      `json:"offline_summary,omitempty"`
 	NetworkTests      []aiNetworkTestSummary `json:"network_tests,omitempty"`
 	NetworkTestTrends []aiNetworkTrend       `json:"network_test_trends,omitempty"`
+	Diagnostics       []string               `json:"diagnostics,omitempty"`
 }
 
 type aiOfflineSummary struct {
@@ -282,9 +240,16 @@ func defaultAISettings() AISettings {
 	}
 }
 
-func mergeAISettings(existing, fallback AISettings) AISettings {
-	existing = normalizeAISettings(existing)
-	fallback = normalizeAISettings(fallback)
+func mergeAISettings(existing, fallback AISettings) (AISettings, error) {
+	var err error
+	existing, err = normalizeAISettings(existing)
+	if err != nil {
+		return AISettings{}, err
+	}
+	fallback, err = normalizeAISettings(fallback)
+	if err != nil {
+		return AISettings{}, err
+	}
 	if existing.CommandProvider == "" {
 		existing.CommandProvider = fallback.CommandProvider
 	}
@@ -297,8 +262,11 @@ func mergeAISettings(existing, fallback AISettings) AISettings {
 	if len(existing.OpenAICompatibles) == 0 {
 		existing.OpenAICompatibles = fallback.OpenAICompatibles
 	}
-	existing.OpenAICompatibles = normalizeAICompatibles(existing.OpenAICompatibles)
-	return existing
+	existing.OpenAICompatibles, err = normalizeAICompatibles(existing.OpenAICompatibles)
+	if err != nil {
+		return AISettings{}, err
+	}
+	return existing, nil
 }
 
 func mergeAIProviderConfig(existing, fallback AIProviderConfig) AIProviderConfig {
@@ -314,7 +282,7 @@ func mergeAIProviderConfig(existing, fallback AIProviderConfig) AIProviderConfig
 	return normalizeAIProviderConfig(existing)
 }
 
-func normalizeAISettings(settings AISettings) AISettings {
+func normalizeAISettings(settings AISettings) (AISettings, error) {
 	commandProvider := normalizeAIProviderSelector(settings.CommandProvider)
 	if commandProvider == "" {
 		commandProvider = aiProviderOpenAI
@@ -324,8 +292,12 @@ func normalizeAISettings(settings AISettings) AISettings {
 	settings.OpenAI = normalizeAIProviderConfig(settings.OpenAI)
 	settings.Gemini = normalizeAIProviderConfig(settings.Gemini)
 	settings.Volcengine = normalizeAIProviderConfig(settings.Volcengine)
-	settings.OpenAICompatibles = normalizeAICompatibles(settings.OpenAICompatibles)
-	return settings
+	compatibles, err := normalizeAICompatibles(settings.OpenAICompatibles)
+	if err != nil {
+		return AISettings{}, err
+	}
+	settings.OpenAICompatibles = compatibles
+	return settings, nil
 }
 
 func normalizeAIProviderName(value string) string {
@@ -358,7 +330,7 @@ func normalizeAIProviderSelector(value string) string {
 	return normalizeAIProviderName(trimmed)
 }
 
-func normalizeAICompatibles(items []AIProviderProfile) []AIProviderProfile {
+func normalizeAICompatibles(items []AIProviderProfile) ([]AIProviderProfile, error) {
 	seen := make(map[string]struct{})
 	normalized := make([]AIProviderProfile, 0, len(items))
 	for _, item := range items {
@@ -368,16 +340,17 @@ func normalizeAICompatibles(items []AIProviderProfile) []AIProviderProfile {
 		if item.Name == "" && item.APIKey == "" && item.BaseURL == "" && item.Model == "" {
 			continue
 		}
-		if item.ID == "" {
-			item.ID = randomToken(8)
-		}
-		if _, ok := seen[item.ID]; ok {
-			item.ID = randomToken(8)
+		for item.ID == "" || containsKey(seen, item.ID) {
+			id, err := randomToken(8)
+			if err != nil {
+				return nil, err
+			}
+			item.ID = id
 		}
 		seen[item.ID] = struct{}{}
 		normalized = append(normalized, item)
 	}
-	return normalized
+	return normalized, nil
 }
 
 func normalizeAIProviderConfig(cfg AIProviderConfig) AIProviderConfig {
@@ -385,12 +358,6 @@ func normalizeAIProviderConfig(cfg AIProviderConfig) AIProviderConfig {
 	cfg.BaseURL = strings.TrimSpace(cfg.BaseURL)
 	cfg.Model = strings.TrimSpace(cfg.Model)
 	return cfg
-}
-
-func hasAIProviderConfig(cfg AIProviderConfig) bool {
-	return strings.TrimSpace(cfg.APIKey) != "" ||
-		strings.TrimSpace(cfg.BaseURL) != "" ||
-		strings.TrimSpace(cfg.Model) != ""
 }
 
 func validateAIBaseURL(raw string) error {
@@ -634,14 +601,17 @@ func validateResolvedAISelection(selection aiProviderSelection) error {
 	return nil
 }
 
-func (s *Store) AISettings() AISettings {
+func (s *Store) AISettings() (AISettings, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return normalizeAISettings(s.settings.AISettings)
 }
 
 func runAIQuery(ctx context.Context, store *Store, question string) (string, error) {
-	settings := store.AISettings()
+	settings, err := store.AISettings()
+	if err != nil {
+		return "", err
+	}
 	provider := settings.CommandProvider
 	selection, err := resolveAIProviderConfigBySelector(settings, provider)
 	if err != nil {
@@ -812,12 +782,20 @@ func buildAIServerSummary(node NodeView, offlineStore *history.OfflineStore, sto
 
 	diskUsed := calculateMaxDiskUsage(stats.Disk)
 	name := resolveNodeDisplayNameForAI(node)
-	offlineSummary := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
+	offlineSummary, offlineHistoryUnavailable := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
 	hostName := resolveHostName(stats)
 	diskType := resolveDiskType(node, stats)
 	netSpeedMbps := resolveNetSpeed(node, stats)
 	testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
-	testTrends := buildAINetworkTrendSummaries(testsByKey, queryAINetworkHistory(store, stats.NodeID, snapshotTime))
+	networkHistory, networkHistoryUnavailable := queryAINetworkHistory(store, stats.NodeID, snapshotTime)
+	testTrends := buildAINetworkTrendSummaries(testsByKey, networkHistory)
+	diagnostics := make([]string, 0, 2)
+	if networkHistoryUnavailable {
+		diagnostics = append(diagnostics, "network_history_unavailable")
+	}
+	if offlineHistoryUnavailable {
+		diagnostics = append(diagnostics, "offline_history_unavailable")
+	}
 
 	return aiServerSummary{
 		ServerID:          node.ServerID,
@@ -852,6 +830,7 @@ func buildAIServerSummary(node NodeView, offlineStore *history.OfflineStore, sto
 		OfflineSummary:    offlineSummary,
 		NetworkTests:      testSummaries,
 		NetworkTestTrends: testTrends,
+		Diagnostics:       diagnostics,
 	}
 }
 
@@ -889,13 +868,13 @@ func resolveNetSpeed(node NodeView, stats metrics.NodeStats) float64 {
 	return stats.NetSpeedMbps
 }
 
-func queryAINetworkHistory(store *Store, nodeID string, now time.Time) map[string]*TestHistoryEntry {
+func queryAINetworkHistory(store *Store, nodeID string, now time.Time) (map[string]*TestHistoryEntry, bool) {
 	if store == nil {
-		return nil
+		return nil, false
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return nil
+		return nil, false
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -904,10 +883,14 @@ func queryAINetworkHistory(store *Store, nodeID string, now time.Time) map[strin
 	}
 	from := now.Add(-24 * time.Hour)
 	entries, err := store.QueryPublicNodeHistory(nodeID, from, now)
-	if err != nil || len(entries) == 0 {
-		return nil
+	if err != nil {
+		log.Printf("AI 网络历史查询失败 node=%s: %v", nodeID, err)
+		return nil, true
 	}
-	return entries
+	if len(entries) == 0 {
+		return nil, false
+	}
+	return entries, false
 }
 
 func resolveAIOfflineStore(store *Store) *history.OfflineStore {
@@ -923,13 +906,13 @@ func resolveAIOfflineStore(store *Store) *history.OfflineStore {
 	return historyManager.OfflineStore()
 }
 
-func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, now time.Time) *aiOfflineSummary {
+func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, now time.Time) (*aiOfflineSummary, bool) {
 	if offlineStore == nil {
-		return nil
+		return nil, false
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return nil
+		return nil, false
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -938,7 +921,8 @@ func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, no
 	}
 	insights, err := offlineStore.QueryInsights(nodeID, now, aiOfflineRecentSessionLimit)
 	if err != nil {
-		return nil
+		log.Printf("AI 离线历史查询失败 node=%s: %v", nodeID, err)
+		return nil, true
 	}
 
 	summary := &aiOfflineSummary{
@@ -960,7 +944,7 @@ func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, no
 			}
 		}
 	}
-	return summary
+	return summary, false
 }
 
 func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetworkTestSummary, map[string]metrics.NetworkTestResult) {

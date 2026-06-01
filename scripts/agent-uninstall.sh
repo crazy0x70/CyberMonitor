@@ -31,6 +31,52 @@ require_root() {
   fi
 }
 
+function reject_unsafe_path() {
+  local path="$1"
+  local allow_leaf="${2:-}"
+  local current=""
+  local part
+  local remaining
+  if [[ -z "${path}" ]]; then
+    return 0
+  fi
+  case "/${path}/" in
+    *"/../"*)
+      echo "refuses unsafe path traversal: ${path}" >&2
+      return 1
+      ;;
+  esac
+  case "${path}" in
+    /*) ;;
+    *) path="$(pwd)/${path}" ;;
+  esac
+  remaining="${path#/}"
+  while [[ -n "${remaining}" ]]; do
+    part="${remaining%%/*}"
+    if [[ "${part}" == "${remaining}" ]]; then
+      remaining=""
+    else
+      remaining="${remaining#*/}"
+    fi
+    [[ -n "${part}" ]] || continue
+    if [[ -z "${current}" ]]; then
+      current="/${part}"
+    else
+      current="${current}/${part}"
+    fi
+    if [[ -L "${current}" ]]; then
+      if [[ "${allow_leaf}" == "allow-leaf" && -z "${remaining}" ]]; then
+        return 0
+      fi
+      echo "refuses symbolic link path: ${current}" >&2
+      return 1
+    fi
+    if [[ ! -e "${current}" ]]; then
+      return 0
+    fi
+  done
+}
+
 detect_os() {
   case "$(uname -s)" in
     Linux) echo "linux" ;;
@@ -51,11 +97,18 @@ should_cleanup_script() {
 
 cleanup_script() {
   if should_cleanup_script && [[ -f "${SCRIPT_PATH}" ]]; then
+    reject_unsafe_path "${SCRIPT_PATH}" || return 1
     rm -f "${SCRIPT_PATH}"
   fi
 }
 
 cleanup_common_files() {
+  reject_unsafe_path "${INSTALL_DIR}/cyber-monitor-agent" || die "拒绝清理包含不安全路径的 Agent 二进制"
+  reject_unsafe_path "${INSTALL_DIR}/.cybermonitor-agent-token" || die "拒绝清理包含不安全路径的 Agent token"
+  reject_unsafe_path "${INSTALL_DIR}/.cybermonitor-node-id" || die "拒绝清理包含不安全路径的节点 ID"
+  reject_unsafe_path "${CONF_DIR}/agent.conf" || die "拒绝清理包含不安全路径的 Agent 配置"
+  reject_unsafe_path "${CONF_DIR}" || die "拒绝清理包含不安全路径的配置目录"
+  reject_unsafe_path "${INSTALL_DIR}" || die "拒绝清理包含不安全路径的安装目录"
   rm -f "${INSTALL_DIR}/cyber-monitor-agent"
   rm -f "${INSTALL_DIR}/.cybermonitor-agent-token"
   rm -f "${INSTALL_DIR}/.cybermonitor-node-id"
@@ -66,6 +119,7 @@ cleanup_common_files() {
 
 linux_uninstall() {
   local service_file="${SYSTEMD_SERVICE_DIR}/${SERVICE_NAME}.service"
+  reject_unsafe_path "${service_file}" || die "拒绝清理包含不安全路径的 systemd service"
 
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -95,6 +149,7 @@ macos_uninstall() {
   while IFS= read -r plist_path; do
     [[ -n "${plist_path}" ]] || continue
     if [[ -f "${plist_path}" ]]; then
+      reject_unsafe_path "${plist_path}" || die "拒绝清理包含不安全路径的 launchd plist"
       if command -v launchctl >/dev/null 2>&1; then
         launchctl bootout system "${plist_path}" >/dev/null 2>&1 || \
           launchctl unload -w "${plist_path}" >/dev/null 2>&1 || true
@@ -125,6 +180,7 @@ main() {
   esac
 }
 
-trap cleanup_script EXIT
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  trap 'cleanup_script || true' EXIT
+  main "$@"
+fi

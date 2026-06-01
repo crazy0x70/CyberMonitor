@@ -24,6 +24,7 @@ import (
 
 const (
 	dockerSocketEnvKey             = "CM_DOCKER_SOCKET"
+	dockerUpdateOptInEnvKey        = "CM_ENABLE_DOCKER_UPDATE"
 	containerIDEnvKey              = "CM_CONTAINER_ID"
 	containerVersionEnvKey         = "CM_VERSION"
 	containerCommitEnvKey          = "CM_COMMIT"
@@ -122,7 +123,10 @@ func ResolveDockerTargetImage(currentImage, targetVersion string) string {
 	if targetVersion == "" {
 		return repo
 	}
-	return repo + ":" + strings.TrimPrefix(targetVersion, "v")
+	if !strings.HasPrefix(targetVersion, "v") {
+		targetVersion = "v" + targetVersion
+	}
+	return repo + ":" + targetVersion
 }
 
 func resolveDockerSocketPath() string {
@@ -137,6 +141,9 @@ func resolveCurrentContainerID() (string, error) {
 }
 
 func probeDockerManagedUpdate() (dockerManagedProbe, error) {
+	if err := requireDockerManagedUpdateOptIn(); err != nil {
+		return dockerManagedProbe{}, err
+	}
 	dockerManagedProbeCache.mu.Lock()
 	defer dockerManagedProbeCache.mu.Unlock()
 	now := time.Now()
@@ -153,6 +160,9 @@ func probeDockerManagedUpdate() (dockerManagedProbe, error) {
 func probeDockerManagedUpdateUncached() (dockerManagedProbe, error) {
 	if DetectDeployMode() != DeployModeDocker {
 		return dockerManagedProbe{}, fmt.Errorf("当前部署模式不是 Docker")
+	}
+	if err := requireDockerManagedUpdateOptIn(); err != nil {
+		return dockerManagedProbe{}, err
 	}
 	socketPath := resolveDockerSocketPath()
 	if err := ensureDockerSocketAccessible(socketPath); err != nil {
@@ -182,6 +192,13 @@ func ensureDockerSocketAccessible(socketPath string) error {
 	}
 	_ = conn.Close()
 	return nil
+}
+
+func requireDockerManagedUpdateOptIn() error {
+	if strings.TrimSpace(os.Getenv(dockerUpdateOptInEnvKey)) == "1" {
+		return nil
+	}
+	return fmt.Errorf("Docker 更新未显式启用，请设置 %s=1 并挂载 docker.sock", dockerUpdateOptInEnvKey)
 }
 
 func resolveCurrentContainerIDWithSources(
@@ -252,7 +269,7 @@ func NewDockerManagedUpdaterContext(ctx context.Context) (*DockerManagedUpdater,
 	}
 	probe, err := probeDockerManagedUpdate()
 	if err != nil {
-		return nil, fmt.Errorf("Docker 一键更新需要挂载可访问的 docker.sock")
+		return nil, fmt.Errorf("Docker 一键更新不可用: %w", err)
 	}
 	cli, err := newDockerClient(probe.socketPath)
 	if err != nil {
@@ -293,13 +310,27 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 	if targetImage == "" {
 		return fmt.Errorf("缺少目标镜像")
 	}
-	helperName := fmt.Sprintf("cm-update-helper-%s-%d", sanitizeContainerName(u.containerName), time.Now().Unix())
+	helperName, config, hostConfig := u.buildDockerUpdateHelperSpec(targetImage, currentNodeID, time.Now())
+	resp, err := u.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, helperName)
+	if err != nil {
+		return fmt.Errorf("创建 Docker 更新 helper 失败: %w", err)
+	}
+	if err := u.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("启动 Docker 更新 helper 失败: %w", err)
+	}
+	return nil
+}
+
+func (u *DockerManagedUpdater) buildDockerUpdateHelperSpec(targetImage string, currentNodeID string, now time.Time) (string, *container.Config, *container.HostConfig) {
+	helperName := fmt.Sprintf("cm-update-helper-%s-%d", sanitizeContainerName(u.containerName), now.Unix())
 	config := &container.Config{
 		Image:      u.helperImage,
 		Entrypoint: append([]string{}, u.helperEntrypoint...),
 		Cmd:        []string{dockerHelperCommand},
 		User:       "0",
 		Env: []string{
+			dockerUpdateOptInEnvKey + "=1",
+			fmt.Sprintf("%s=%s", dockerSocketEnvKey, dockerHelperMountTarget),
 			fmt.Sprintf("%s=%s", dockerHelperTargetContainerEnv, u.containerID),
 			fmt.Sprintf("%s=%s", dockerHelperTargetImageEnv, targetImage),
 			fmt.Sprintf("%s=%s", dockerHelperNodeIDEnv, currentNodeID),
@@ -315,14 +346,7 @@ func (u *DockerManagedUpdater) LaunchSelfContainerUpdate(ctx context.Context, ta
 		},
 		RestartPolicy: container.RestartPolicy{Name: "no"},
 	}
-	resp, err := u.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, helperName)
-	if err != nil {
-		return fmt.Errorf("创建 Docker 更新 helper 失败: %w", err)
-	}
-	if err := u.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("启动 Docker 更新 helper 失败: %w", err)
-	}
-	return nil
+	return helperName, config, hostConfig
 }
 
 func RunDockerRecreateHelper(ctx context.Context) (err error) {

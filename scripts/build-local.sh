@@ -7,13 +7,16 @@ BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 VERSION="${VERSION:-0.0.0-local}"
 COMMIT="${COMMIT:-$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || echo local)}"
 
+export GOPATH="${GOPATH:-${ROOT_DIR}/.cache/go}"
 export GOMODCACHE="${GOMODCACHE:-${ROOT_DIR}/.cache/go-mod}"
 export GOCACHE="${GOCACHE:-${ROOT_DIR}/.cache/go-build}"
+export TMPDIR="${TMPDIR:-${ROOT_DIR}/.tmp}"
 
-mkdir -p "${ROOT_DIR}/dist" "${GOMODCACHE}" "${GOCACHE}"
+mkdir -p "${ROOT_DIR}/dist" "${GOPATH}" "${GOMODCACHE}" "${GOCACHE}" "${TMPDIR}"
 
 npm --prefix "${ADMIN_DIR}" ci --cache "${ROOT_DIR}/.cache/npm"
 npm --prefix "${ADMIN_DIR}" run lint
+npm --prefix "${ADMIN_DIR}" run test:unit
 npm --prefix "${ADMIN_DIR}" run build:admin
 
 cd "${ROOT_DIR}"

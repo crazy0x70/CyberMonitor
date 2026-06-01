@@ -9,7 +9,12 @@
     "build:admin": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf ../dist/admin",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "npm run test:unit",
+    "test:admin": "node --test --import tsx lib/admin-api.test.ts lib/admin-format.test.ts lib/agent-install.test.ts",
+    "test:public": "node --check ../public/assets/monitor.js && node --test ../public-tests/*.test.mjs",
+    "test:installers": "node --test --import tsx lib/install-scripts.test.ts lib/installer-dry-run.test.ts",
+    "test:unit": "npm run test:admin && npm run test:public && npm run test:installers"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.0",
