@@ -21,7 +21,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Edit2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import type { TestCatalogItem } from "@/lib/admin-types";
+import type { SettingsView, TestCatalogItem } from "@/lib/admin-types";
 import { getErrorMessage } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
@@ -87,7 +87,7 @@ export interface ProbeSettingsProps {
   testCatalog: TestCatalogItem[];
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
-  onSave: (catalog: TestCatalogItem[]) => Promise<unknown>;
+  onSave: (catalog: TestCatalogItem[]) => Promise<SettingsView>;
 }
 
 function resolveProbeType(item?: Partial<TestCatalogItem>): ProbeType {
@@ -275,15 +275,38 @@ export default function ProbeSettings({
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null);
   const [formState, setFormState] = useState<ProbeFormState>(() => toFormState());
   const [formError, setFormError] = useState<{ field: ProbeField; message: string } | null>(null);
+  const draftSignature = useMemo(() => serializeCatalog(drafts), [drafts]);
+  const isBusy = isSaving || saving;
 
   useEffect(() => {
+    if (isBusy) {
+      return;
+    }
+    const currentDraftMatchesIncoming = draftSignature === normalizedCatalogSignature;
+    if (isDirty && currentDraftMatchesIncoming) {
+      setSourceSignature(normalizedCatalogSignature);
+      setIsDirty(false);
+      return;
+    }
     if (normalizedCatalogSignature === sourceSignature) {
+      return;
+    }
+    if (isDirty) {
+      setSourceSignature(normalizedCatalogSignature);
+      toast.warning("服务端探测配置已更新，当前未保存修改已保留。");
       return;
     }
     setDrafts(normalizedCatalog);
     setSourceSignature(normalizedCatalogSignature);
     setIsDirty(false);
-  }, [normalizedCatalog, normalizedCatalogSignature, sourceSignature]);
+  }, [
+    draftSignature,
+    isBusy,
+    isDirty,
+    normalizedCatalog,
+    normalizedCatalogSignature,
+    sourceSignature,
+  ]);
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -296,6 +319,9 @@ export default function ProbeSettings({
   }, [onDirtyChange]);
 
   const openDialog = (item?: TestCatalogItem, index: number | null = null) => {
+    if (isBusy) {
+      return;
+    }
     setEditingIndex(index);
     setFormState(toFormState(item));
     setFormError(null);
@@ -319,6 +345,9 @@ export default function ProbeSettings({
     field: TField,
     value: ProbeFormState[TField],
   ) => {
+    if (isBusy) {
+      return;
+    }
     setFormState((current) => ({ ...current, [field]: value }) as ProbeFormState);
     setFormError((current) => (current?.field === field ? null : current));
   };
@@ -335,6 +364,9 @@ export default function ProbeSettings({
   };
 
   const handleDialogSave = () => {
+    if (isBusy) {
+      return;
+    }
     const result = validateProbeForm(formState);
     if (!("item" in result)) {
       setFormError({ field: result.field, message: result.error });
@@ -354,18 +386,27 @@ export default function ProbeSettings({
   };
 
   const handleDelete = (index: number) => {
+    if (isBusy) {
+      return;
+    }
     setDrafts((current) => current.filter((_, currentIndex) => currentIndex !== index));
     setIsDirty(true);
     toast.success("探测节点已移除");
   };
 
   const handleSave = async () => {
+    if (isBusy) {
+      return;
+    }
     const payload = normalizeCatalog(drafts);
 
     setIsSaving(true);
     try {
-      await onSave(payload);
-      setSourceSignature(serializeCatalog(payload));
+      const savedSettings = await onSave(payload);
+      const canonicalCatalog = normalizeCatalog(savedSettings.test_catalog || payload);
+      const canonicalSignature = serializeCatalog(canonicalCatalog);
+      setDrafts(canonicalCatalog);
+      setSourceSignature(canonicalSignature);
       setIsDirty(false);
       toast.success("探测节点配置已保存");
     } catch (error) {
@@ -375,7 +416,7 @@ export default function ProbeSettings({
     }
   };
 
-  const submitting = isSaving || saving;
+  const submitting = isBusy;
 
   return (
     <div className={adminPageShellClass}>
@@ -391,6 +432,7 @@ export default function ProbeSettings({
             variant="outline"
             className={`${adminActionButtonClass} h-11 min-w-[140px] px-5 font-bold`}
             onClick={openCreateDialog}
+            disabled={isBusy}
           >
             <Plus className="mr-2 h-4 w-4" />
             新增探测节点
@@ -448,6 +490,7 @@ export default function ProbeSettings({
                     size="icon"
                     className={cn(adminActionButtonClass, "h-9 w-9 px-0")}
                     aria-label={`编辑探测节点 ${item.name || formatProbeTarget(item)}`}
+                    disabled={isBusy}
                     onClick={() => openEditDialog(item, index)}
                   >
                     <Edit2 className="h-4 w-4" />
@@ -457,6 +500,7 @@ export default function ProbeSettings({
                     size="icon"
                     className={adminDangerIconButtonClass}
                     aria-label={`删除探测节点 ${item.name || formatProbeTarget(item)}`}
+                    disabled={isBusy}
                     onClick={() => setPendingDeleteIndex(index)}
                   >
                     <Trash2 className="h-4 w-4" />
@@ -512,6 +556,7 @@ export default function ProbeSettings({
                   aria-invalid={formError?.field === "name"}
                   aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
                   value={formState.name}
+                  disabled={isBusy}
                   onChange={(event) => updateFormField("name", event.target.value)}
                   placeholder="例如：主站 TCP 443…"
                 />
@@ -537,14 +582,18 @@ export default function ProbeSettings({
                             ? `${adminPrimaryButtonClass} h-11 w-full min-w-0 px-4`
                             : `${adminActionButtonClass} h-11 w-full min-w-0 px-4`
                         }
-                        onClick={() =>
+                        onClick={() => {
+                          if (isBusy) {
+                            return;
+                          }
                           setFormState((current) => ({
                             ...current,
                             type,
                             port: type === "tcp" ? current.port : "",
                             intervalSec: type === "tcp" ? current.intervalSec : "",
-                          }))
-                        }
+                          }));
+                        }}
+                        disabled={isBusy}
                       >
                         {type.toUpperCase()}
                       </Button>
@@ -565,6 +614,7 @@ export default function ProbeSettings({
                 aria-invalid={formError?.field === "host"}
                 aria-describedby={formError?.field === "host" ? "probe-host-error" : undefined}
                 value={formState.host}
+                disabled={isBusy}
                 onChange={(event) => updateFormField("host", event.target.value)}
                 placeholder="例如：1.1.1.1 / example.com…"
               />
@@ -591,6 +641,7 @@ export default function ProbeSettings({
                     aria-invalid={formError?.field === "port"}
                     aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
                     value={formState.port}
+                    disabled={isBusy}
                     onChange={(event) => updateFormField("port", event.target.value)}
                     placeholder="例如：443…"
                   />
@@ -615,11 +666,12 @@ export default function ProbeSettings({
                     aria-invalid={formError?.field === "intervalSec"}
                     aria-describedby={formError?.field === "intervalSec" ? "probe-interval-error" : undefined}
                     value={formState.intervalSec}
+                    disabled={isBusy}
                     onChange={(event) => updateFormField("intervalSec", event.target.value)}
                     placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    留空或填写 `0` 时，将沿用默认间隔 {DEFAULT_TCP_INTERVAL} 秒。
+                    {`留空或填写 0 时，将沿用默认间隔 ${DEFAULT_TCP_INTERVAL} 秒。`}
                   </p>
                   {formError?.field === "intervalSec" ? (
                     <p id="probe-interval-error" className="text-xs font-medium text-rose-500" aria-live="polite">
@@ -636,12 +688,14 @@ export default function ProbeSettings({
               variant="outline"
               className={`${adminOutlineButtonClass} h-12 px-8 font-bold`}
               onClick={closeDialog}
+              disabled={isBusy}
             >
               取消
             </Button>
             <Button
               className={`${adminPrimaryButtonClass} h-12 px-8 font-bold`}
               onClick={handleDialogSave}
+              disabled={isBusy}
             >
               {editingIndex === null ? "新增探测节点" : "保存探测节点"}
             </Button>
@@ -665,6 +719,7 @@ export default function ProbeSettings({
             <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
             <AlertDialogAction
               className={adminPrimaryButtonClass}
+              disabled={isBusy}
               onClick={() => {
                 if (pendingDeleteIndex !== null) {
                   handleDelete(pendingDeleteIndex);

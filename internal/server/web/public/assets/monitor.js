@@ -14,6 +14,141 @@ const siteIcon = document.getElementById("site-icon");
 const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 const footerYear = document.getElementById("footer-year");
+const PUBLIC_LOCALE_STORAGE_KEY = "cm_public_locale";
+let publicLocale = "zh-CN";
+let currentPublicSettings = {};
+const PUBLIC_I18N = {
+  "zh-CN": {
+    skipLink: "跳转到主要内容",
+    brandSubtitle: "主机监控",
+    themeAuto: "跟随系统",
+    themeLight: "浅色主题",
+    themeDark: "深色主题",
+    statTotal: "服务器总数",
+    statOnline: "在线服务器",
+    statOffline: "离线服务器",
+    statNetwork: "网络信息",
+    groupTabsLabel: "节点分组导航",
+    emptyWaitingTitle: "等待节点接入",
+    emptyWaitingBody: "请启动 Agent 并指向当前管理端地址。",
+    emptyGroupTitle: "当前分组暂无节点",
+    emptyGroupBody: "请选择其他分组或返回全部查看。",
+    poweredBy: "Powered by",
+    all: "全部",
+    traffic: "流量",
+    bandwidth: "带宽",
+    unconfigured: "未配置",
+    memory: "内存",
+    disk: "硬盘",
+    network: "网络",
+    status: "状态",
+    uptime: "运行时间",
+    remaining: "剩余时间",
+    arch: "系统架构",
+    region: "地区",
+    os: "系统信息",
+    gpu: "GPU",
+    load: "负载",
+    uploadTotal: "累计上传",
+    downloadTotal: "累计下载",
+    firstReport: "首次上报",
+    lastReport: "末次上报",
+    process: "进程",
+    connection: "连接",
+    smooth: "平滑",
+    smoothToggle: "切换平滑",
+    online: "在线",
+    offline: "离线",
+    processCount: "当前进程数",
+    runningPrefix: "已运行",
+    updatedPrefix: "更新",
+    networkLoading: "正在加载网络连通性数据",
+    historyErrorLabel: "网络连通性历史加载失败，等待下一次刷新后重试",
+    historyErrorTitle: "网络连通性历史加载失败",
+    historyErrorBody: "等待下一次刷新后重试",
+    current: "当前",
+    loss: "丢包",
+    lossRate: "丢包率",
+    cores: "核",
+    unknown: "未知",
+    unnamed: "未命名",
+    unset: "未设置",
+    renewing: "续费中",
+    expired: "已到期",
+    days: "天",
+    hours: "小时",
+    minutes: "分钟",
+    remainingPrefix: "剩余",
+    unnamedNode: "未命名节点",
+    totalSuffix: "total",
+    recentTransport: (label, time) => `最近 ${label}：${time}`,
+  },
+  "en-US": {
+    skipLink: "Skip to main content",
+    brandSubtitle: "Host monitoring",
+    themeAuto: "Follow system",
+    themeLight: "Light theme",
+    themeDark: "Dark theme",
+    statTotal: "Total servers",
+    statOnline: "Online servers",
+    statOffline: "Offline servers",
+    statNetwork: "Network",
+    groupTabsLabel: "Node group navigation",
+    emptyWaitingTitle: "Waiting for nodes",
+    emptyWaitingBody: "Start the Agent and point it to this control server.",
+    emptyGroupTitle: "No nodes in this group",
+    emptyGroupBody: "Choose another group or return to All.",
+    poweredBy: "Powered by",
+    all: "All",
+    traffic: "Traffic",
+    bandwidth: "Bandwidth",
+    unconfigured: "Unconfigured",
+    memory: "Memory",
+    disk: "Disk",
+    network: "Network",
+    status: "Status",
+    uptime: "Uptime",
+    remaining: "Remaining",
+    arch: "Architecture",
+    region: "Region",
+    os: "System",
+    gpu: "GPU",
+    load: "Load",
+    uploadTotal: "Total upload",
+    downloadTotal: "Total download",
+    firstReport: "First report",
+    lastReport: "Last report",
+    process: "Processes",
+    connection: "Connections",
+    smooth: "Smooth",
+    smoothToggle: "Toggle smoothing",
+    online: "Online",
+    offline: "Offline",
+    processCount: "Current process count",
+    runningPrefix: "Running",
+    updatedPrefix: "Updated",
+    networkLoading: "Loading network connectivity data",
+    historyErrorLabel: "Network connectivity history failed to load. Waiting for the next refresh.",
+    historyErrorTitle: "Network connectivity history failed to load",
+    historyErrorBody: "Waiting for the next refresh",
+    current: "Current",
+    loss: "Loss",
+    lossRate: "Packet loss",
+    cores: "cores",
+    unknown: "Unknown",
+    unnamed: "Unnamed",
+    unset: "Unset",
+    renewing: "Renewing",
+    expired: "Expired",
+    days: "d",
+    hours: "h",
+    minutes: "m",
+    remainingPrefix: "Remaining",
+    unnamedNode: "Unnamed node",
+    totalSuffix: "total",
+    recentTransport: (label, time) => `Recent ${label}: ${time}`,
+  },
+};
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
   minute: "2-digit",
@@ -37,7 +172,7 @@ const fallbackRegionNames = {
   US: "United States",
 };
 
-const CONFIG_PATH = "/config.json";
+const CONFIG_PATH = "./config.json";
 const DEFAULT_GROUP = "全部";
 const DEFAULT_STATUS_FILTER = "all";
 const DEFAULT_TEST_RANGE_KEY = "1h";
@@ -106,6 +241,91 @@ const WS_WATCHDOG_MS = 15000;
 const PUBLIC_SNAPSHOT_FALLBACK_INTERVAL_MS = 3000;
 const PUBLIC_NODE_STALE_GRACE_SECONDS = 12;
 const LATENCY_SMOOTH_ALPHA = 0.2;
+
+function normalizePublicLocale(value) {
+  return String(value || "").trim().toLowerCase().replace("_", "-") === "en-us"
+    ? "en-US"
+    : "zh-CN";
+}
+
+function loadPublicLocalePreference(fallbackLocale) {
+  const storage = safeLocalStorage();
+  if (!storage) return normalizePublicLocale(fallbackLocale);
+  const stored = storage.getItem(PUBLIC_LOCALE_STORAGE_KEY);
+  return stored ? normalizePublicLocale(stored) : normalizePublicLocale(fallbackLocale);
+}
+
+function savePublicLocalePreference(locale) {
+  const storage = safeLocalStorage();
+  if (!storage) return;
+  storage.setItem(PUBLIC_LOCALE_STORAGE_KEY, normalizePublicLocale(locale));
+}
+
+function t(key, ...args) {
+  const value = PUBLIC_I18N[publicLocale]?.[key] ?? PUBLIC_I18N["zh-CN"][key] ?? key;
+  return typeof value === "function" ? value(...args) : value;
+}
+
+function applyStaticTranslations() {
+  document.documentElement.lang = publicLocale;
+  document.querySelectorAll("[data-i18n]").forEach((node) => {
+    const key = node.getAttribute("data-i18n");
+    if (key) {
+      node.textContent = t(key);
+    }
+  });
+  document.querySelectorAll("[data-i18n-attr]").forEach((node) => {
+    const pairs = (node.getAttribute("data-i18n-attr") || "").split(",");
+    pairs.forEach((pair) => {
+      const [attr, key] = pair.split(":").map((item) => item.trim());
+      if (attr && key) {
+        node.setAttribute(attr, t(key));
+      }
+    });
+  });
+  window.dispatchEvent(new CustomEvent("cm:localechange", { detail: { locale: publicLocale } }));
+}
+
+function resetRenderedLocaleState() {
+  state.nodes.forEach((card) => card.remove());
+  state.nodes.clear();
+  state.tagSections.clear();
+  state.renderMode = "";
+  state.groupTabSignature = "";
+}
+
+function setPublicLocale(locale, options = {}) {
+  const nextLocale = normalizePublicLocale(locale);
+  if (options.persist) {
+    savePublicLocalePreference(nextLocale);
+  }
+  const localeChanged = nextLocale !== publicLocale || document.documentElement.lang !== nextLocale;
+  publicLocale = nextLocale;
+  if (localeChanged) {
+    applyStaticTranslations();
+    applyPublicIdentitySettings(currentPublicSettings);
+    resetRenderedLocaleState();
+    scheduleRender();
+  }
+  return publicLocale;
+}
+
+window.CyberMonitorPublic = Object.assign(window.CyberMonitorPublic || {}, {
+  getLocale: () => publicLocale,
+  setLocale: (locale) => setPublicLocale(locale, { persist: true }),
+});
+
+function applySiteBackground(image) {
+  const value = normalizePublicImageURL(image);
+  if (!value) {
+    document.documentElement.removeAttribute("data-site-background");
+    document.documentElement.style.removeProperty("--site-background-image");
+    return;
+  }
+  const resolved = new URL(value, window.location.href).toString();
+  document.documentElement.setAttribute("data-site-background", "custom");
+  document.documentElement.style.setProperty("--site-background-image", `url(${JSON.stringify(resolved)})`);
+}
 
 function safeLocalStorage() {
   try {
@@ -295,16 +515,23 @@ function connectWSForTarget(target) {
   };
 }
 
+function buildFallbackTarget(currentLocation = document.baseURI || location.href) {
+  const currentURL = new URL(currentLocation);
+  const fallbackBase = new URL("./", currentURL);
+  const socketURL = new URL("ws", fallbackBase);
+  socketURL.protocol = currentURL.protocol === "https:" ? "wss:" : "ws:";
+  return {
+    key: "default",
+    socketURL: socketURL.toString(),
+    apiBase: fallbackBase.toString().replace(/\/+$/, ""),
+  };
+}
+
 function resolveTargets() {
   if (Array.isArray(remoteConfig.targets) && remoteConfig.targets.length > 0) {
     return remoteConfig.targets;
   }
-  const protocol = location.protocol === "https:" ? "wss" : "ws";
-  return [{
-    key: "default",
-    socketURL: `${protocol}://${location.host}/ws`,
-    apiBase: location.origin,
-  }];
+  return [buildFallbackTarget()];
 }
 
 function normalizeAPIBase(value) {
@@ -874,7 +1101,7 @@ function updateTransportState(type, generatedAt) {
   const live = document.querySelector('[data-field="demo-variant-live"]');
   if (!live) return;
   const label = state.lastTransportType === "delta" ? "delta" : "snapshot";
-  live.textContent = `最近 ${label}：${formatTime(state.lastTransportAt)}`;
+  live.textContent = t("recentTransport", label, formatTime(state.lastTransportAt));
 }
 
 function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
@@ -967,11 +1194,11 @@ function updateEmptyState(visibleCount, totalCount) {
   }
   empty.style.display = "block";
   if (totalCount > 0 && state.selectedGroup !== DEFAULT_GROUP) {
-    empty.querySelector("h2").textContent = "当前分组暂无节点";
-    empty.querySelector("p").textContent = "请选择其他分组或返回全部查看。";
+    empty.querySelector("h2").textContent = t("emptyGroupTitle");
+    empty.querySelector("p").textContent = t("emptyGroupBody");
   } else {
-    empty.querySelector("h2").textContent = "等待节点接入";
-    empty.querySelector("p").textContent = "请启动 Agent 并指向当前管理端地址。";
+    empty.querySelector("h2").textContent = t("emptyWaitingTitle");
+    empty.querySelector("p").textContent = t("emptyWaitingBody");
   }
 }
 
@@ -983,15 +1210,32 @@ const RANGE_OPTIONS = [
   { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 366 },
 ];
 
-function applyPublicSettings(settings) {
-  if (!settings) return;
-  const title = (settings.site_title || "").trim();
-  const icon = (settings.site_icon || "").trim();
-  const homeTitle = (settings.home_title || "").trim();
-  const homeSubtitle = (settings.home_subtitle || "").trim();
+function normalizePublicImageURL(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.startsWith("//") || raw.includes("\\") || /[\u0000-\u001F\u007F]/.test(raw)) {
+    return "";
+  }
+  try {
+    const parsed = new URL(raw, window.location.href);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? raw : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizePublicIconURL(value) {
+  return normalizePublicImageURL(value);
+}
+
+function applyPublicIdentitySettings(settings) {
+  const activeSettings = settings || {};
+  const title = (activeSettings.site_title || "").trim();
+  const icon = normalizePublicIconURL(activeSettings.site_icon);
+  const homeTitle = (activeSettings.home_title || "").trim();
+  const homeSubtitle = (activeSettings.home_subtitle || "").trim();
   const resolvedTitle = title || "CyberMonitor";
   const resolvedHomeTitle = homeTitle || resolvedTitle;
-  const resolvedSubtitle = homeSubtitle || "主机监控";
+  const resolvedSubtitle = homeSubtitle || t("brandSubtitle");
 
   if (resolvedTitle) {
     document.title = resolvedTitle;
@@ -1012,8 +1256,16 @@ function applyPublicSettings(settings) {
       siteIcon.setAttribute("href", DEFAULT_SITE_ICON);
     }
   }
-
   updateFooter();
+}
+
+function applyPublicSettings(settings) {
+  if (!settings) return;
+  currentPublicSettings = settings || {};
+  const backgroundImage = normalizePublicImageURL(settings.site_background_image);
+  setPublicLocale(loadPublicLocalePreference(settings.locale), { persist: false });
+  applyPublicIdentitySettings(currentPublicSettings);
+  applySiteBackground(backgroundImage);
 }
 
 function loadTestHistoryCache() {
@@ -1919,7 +2171,7 @@ function extractGroupSelections(node) {
 
 function parseGroupSelection(value) {
   const raw = String(value || "").trim();
-  if (!raw || raw === "全部") return null;
+  if (!raw || raw === DEFAULT_GROUP) return null;
   let group = raw;
   let tag = "";
   if (raw.includes(":")) {
@@ -2011,7 +2263,7 @@ function filterNodesByStatus(nodes, status) {
 }
 
 function formatGroupLabel(groupPath) {
-  if (!groupPath || groupPath === "全部") return "全部";
+  if (!groupPath || groupPath === DEFAULT_GROUP) return t("all");
   const parts = String(groupPath).split("/").filter(Boolean);
   return parts[parts.length - 1] || groupPath;
 }
@@ -2021,7 +2273,7 @@ function normalizeTagList(tags) {
   const list = [];
   (tags || []).forEach((tag) => {
     const value = String(tag || "").trim();
-    if (!value || value === "全部") {
+    if (!value || value === DEFAULT_GROUP) {
       return;
     }
     if (seen.has(value)) return;
@@ -2054,10 +2306,10 @@ function updateStats(nodes) {
   statTotal.textContent = String(total);
   statOnline.textContent = String(online);
   statOffline.textContent = String(offline);
-  statNetUsage.textContent = `流量 ↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(
+  statNetUsage.textContent = `${t("traffic")} ↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(
     totalDown
   )}`;
-  statNetRate.textContent = `带宽 ↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
+  statNetRate.textContent = `${t("bandwidth")} ↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
     totalDownRate
   )}`;
 }
@@ -2183,7 +2435,7 @@ function groupNodesByTag(nodes, group) {
   const groups = new Map();
   nodes.forEach((node) => {
     const matches = getGroupSelections(node, group);
-    let primary = "未配置";
+    let primary = t("unconfigured");
     for (const match of matches) {
       if (match.tag) {
         primary = match.tag;
@@ -2198,8 +2450,8 @@ function groupNodesByTag(nodes, group) {
   const sorted = Array.from(groups.entries())
     .map(([tag, list]) => ({ tag, nodes: list }))
     .sort((a, b) => {
-      if (a.tag === "未配置") return 1;
-      if (b.tag === "未配置") return -1;
+      if (a.tag === t("unconfigured")) return 1;
+      if (b.tag === t("unconfigured")) return -1;
       return a.tag.localeCompare(b.tag, "zh-Hans-CN");
     });
   return sorted;
@@ -2234,7 +2486,7 @@ function createCard() {
         </div>
         <div class="summary-metric">
           <div class="summary-inline">
-            <span class="summary-label">内存</span>
+            <span class="summary-label">${t("memory")}</span>
             <span class="summary-text" data-field="mem-meta">--</span>
             <span class="summary-value" data-field="mem-summary">--</span>
           </div>
@@ -2246,7 +2498,7 @@ function createCard() {
         </div>
         <div class="summary-metric">
           <div class="summary-inline">
-            <span class="summary-label">硬盘</span>
+            <span class="summary-label">${t("disk")}</span>
             <span class="summary-text" data-field="disk-meta">--</span>
             <span class="summary-value" data-field="disk-summary">--</span>
           </div>
@@ -2258,7 +2510,7 @@ function createCard() {
         </div>
         <div class="summary-metric">
           <div class="summary-inline">
-            <span class="summary-label">网络</span>
+            <span class="summary-label">${t("network")}</span>
             <span class="summary-text" data-field="net-meta">--</span>
             <span class="summary-value" data-field="net-summary">--</span>
           </div>
@@ -2277,20 +2529,21 @@ function createCard() {
     <div class="node-details">
       <div class="detail-layout">
         <div class="detail-info">
-          <div class="info-row"><span>状态</span><strong data-field="detail-status">--</strong></div>
-          <div class="info-row"><span>运行时间</span><strong data-field="detail-uptime">--</strong></div>
-          <div class="info-row"><span>剩余时间</span><strong data-field="detail-remaining">--</strong></div>
-          <div class="info-row"><span>系统架构</span><strong data-field="detail-arch">--</strong></div>
-          <div class="info-row"><span>内存</span><strong data-field="detail-mem">--</strong></div>
-          <div class="info-row"><span>硬盘</span><strong data-field="detail-disk">--</strong></div>
-          <div class="info-row"><span>地区</span><strong data-field="detail-region">--</strong></div>
-          <div class="info-row"><span>系统信息</span><strong data-field="detail-os">--</strong></div>
+          <div class="info-row"><span>${t("status")}</span><strong data-field="detail-status">--</strong></div>
+          <div class="info-row"><span>${t("uptime")}</span><strong data-field="detail-uptime">--</strong></div>
+          <div class="info-row"><span>${t("remaining")}</span><strong data-field="detail-remaining">--</strong></div>
+          <div class="info-row"><span>${t("arch")}</span><strong data-field="detail-arch">--</strong></div>
+          <div class="info-row"><span>${t("memory")}</span><strong data-field="detail-mem">--</strong></div>
+          <div class="info-row"><span>${t("disk")}</span><strong data-field="detail-disk">--</strong></div>
+          <div class="info-row"><span>${t("region")}</span><strong data-field="detail-region">--</strong></div>
+          <div class="info-row"><span>${t("os")}</span><strong data-field="detail-os">--</strong></div>
           <div class="info-row"><span>CPU</span><strong data-field="detail-cpu">--</strong></div>
-          <div class="info-row"><span>负载</span><strong data-field="detail-load">--</strong></div>
-          <div class="info-row"><span>累计上传</span><strong data-field="detail-upload">--</strong></div>
-          <div class="info-row"><span>累计下载</span><strong data-field="detail-download">--</strong></div>
-          <div class="info-row"><span>首次上报</span><strong data-field="detail-first">--</strong></div>
-          <div class="info-row"><span>末次上报</span><strong data-field="detail-last">--</strong></div>
+          <div class="info-row"><span>${t("gpu")}</span><strong data-field="detail-gpu">--</strong></div>
+          <div class="info-row"><span>${t("load")}</span><strong data-field="detail-load">--</strong></div>
+          <div class="info-row"><span>${t("uploadTotal")}</span><strong data-field="detail-upload">--</strong></div>
+          <div class="info-row"><span>${t("downloadTotal")}</span><strong data-field="detail-download">--</strong></div>
+          <div class="info-row"><span>${t("firstReport")}</span><strong data-field="detail-first">--</strong></div>
+          <div class="info-row"><span>${t("lastReport")}</span><strong data-field="detail-last">--</strong></div>
         </div>
         <div class="detail-charts">
           <div class="detail-grid">
@@ -2305,7 +2558,7 @@ function createCard() {
             </div>
             <div class="metric">
               <div class="metric-head">
-                <span>进程</span>
+                <span>${t("process")}</span>
                 <span data-field="proc-value">--</span>
               </div>
               <div class="metric-sub" data-field="proc-detail">--</div>
@@ -2313,7 +2566,7 @@ function createCard() {
             </div>
             <div class="metric">
               <div class="metric-head">
-                <span>内存</span>
+                <span>${t("memory")}</span>
                 <span data-field="mem-value">--</span>
               </div>
               <div class="meter"><span class="fill mem" data-field="mem-bar"></span></div>
@@ -2322,7 +2575,7 @@ function createCard() {
             </div>
             <div class="metric">
               <div class="metric-head">
-                <span>磁盘</span>
+                <span>${t("disk")}</span>
                 <span data-field="disk-value">--</span>
               </div>
               <div class="meter"><span class="fill disk" data-field="disk-bar"></span></div>
@@ -2331,7 +2584,7 @@ function createCard() {
             </div>
             <div class="metric">
               <div class="metric-head">
-                <span>网络</span>
+                <span>${t("network")}</span>
                 <span data-field="net-total">--</span>
               </div>
               <div class="metric-sub" data-field="net-detail">--</div>
@@ -2339,7 +2592,7 @@ function createCard() {
             </div>
             <div class="metric">
               <div class="metric-head">
-                <span>连接</span>
+                <span>${t("connection")}</span>
                 <span data-field="conn-value">--</span>
               </div>
               <div class="metric-sub" data-field="conn-detail">--</div>
@@ -2353,12 +2606,12 @@ function createCard() {
           <div class="network-chart-toolbar">
             <div class="network-controls">
               <div class="smooth-control">
-                <span class="smooth-control-label">平滑</span>
+                <span class="smooth-control-label">${t("smooth")}</span>
                 <button
                   type="button"
                   class="smooth-toggle"
                   data-field="test-smooth"
-                  aria-label="切换平滑"
+                  aria-label="${t("smoothToggle")}"
                 >
                   <span class="smooth-toggle-track">
                     <span class="smooth-toggle-thumb"></span>
@@ -2434,6 +2687,7 @@ function createCard() {
     detailArch: card.querySelector('[data-field="detail-arch"]'),
     detailOS: card.querySelector('[data-field="detail-os"]'),
     detailCPU: card.querySelector('[data-field="detail-cpu"]'),
+    detailGPU: card.querySelector('[data-field="detail-gpu"]'),
     detailLoad: card.querySelector('[data-field="detail-load"]'),
     detailMem: card.querySelector('[data-field="detail-mem"]'),
     detailDisk: card.querySelector('[data-field="detail-disk"]'),
@@ -2481,8 +2735,9 @@ function updateCard(card, node, nodeId) {
 
   fields.meta.textContent = `${stats.os || "--"} · ${stats.arch || "--"}`;
 
-  const status = resolveNodeStatus(node) === "offline" ? "离线" : "在线";
-  fields.statusDot.classList.toggle("offline", status === "离线");
+  const statusValue = resolveNodeStatus(node);
+  const status = statusValue === "offline" ? t("offline") : t("online");
+  fields.statusDot.classList.toggle("offline", statusValue === "offline");
 
   const cpuPercent = clamp(cpu.usage_percent || 0);
   fields.cpuSummary.textContent = `${cpuPercent.toFixed(0)}%`;
@@ -2495,7 +2750,7 @@ function updateCard(card, node, nodeId) {
 
   const processCount = stats.process_count || 0;
   fields.procValue.textContent = `${processCount}`;
-  fields.procDetail.textContent = "当前进程数";
+  fields.procDetail.textContent = t("processCount");
 
   const memPercent = clamp(mem.used_percent || 0);
   fields.memSummary.textContent = `${memPercent.toFixed(0)}%`;
@@ -2559,9 +2814,9 @@ function updateCard(card, node, nodeId) {
     tcp: stats.tcp_conns || 0,
     udp: stats.udp_conns || 0,
   });
-  fields.uptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
-  fields.lastSeen.textContent = `更新 ${formatTime(node.last_seen || 0)}`;
-  fields.summaryUptime.textContent = `已运行 ${formatUptime(stats.uptime_sec || 0)}`;
+  fields.uptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
+  fields.lastSeen.textContent = `${t("updatedPrefix")} ${formatTime(node.last_seen || 0)}`;
+  fields.summaryUptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
   fields.summaryTests.textContent = formatRemainingSummary(
     node.expire_at || 0,
     node.auto_renew,
@@ -2573,6 +2828,7 @@ function updateCard(card, node, nodeId) {
   fields.detailArch.textContent = stats.arch || "--";
   fields.detailOS.textContent = stats.os || "--";
   fields.detailCPU.textContent = formatCPUModel(cpu);
+  fields.detailGPU.textContent = formatGPUDetails(stats.gpu);
   fields.detailLoad.textContent = formatLoad(cpu);
   fields.detailMem.textContent = `${formatBytes(mem.used)} / ${formatBytes(
     mem.total
@@ -2680,7 +2936,7 @@ function renderNetworkLoadingState(fields) {
       <span></span>
       <span></span>
       <span></span>
-      <strong>正在加载网络连通性数据</strong>
+      <strong>${t("networkLoading")}</strong>
     </div>
   `;
   fields.testCards.innerHTML = "";
@@ -2703,9 +2959,9 @@ function resetNetworkChartInteractions(fields) {
 function renderNetworkHistoryErrorChart(fields) {
   resetNetworkChartInteractions(fields);
   fields.testChart.innerHTML = `
-    <div class="network-empty-state" role="status" aria-live="polite" aria-label="网络连通性历史加载失败，等待下一次刷新后重试">
-      <strong>网络连通性历史加载失败</strong>
-      <span>等待下一次刷新后重试</span>
+    <div class="network-empty-state" role="status" aria-live="polite" aria-label="${t("historyErrorLabel")}">
+      <strong>${t("historyErrorTitle")}</strong>
+      <span>${t("historyErrorBody")}</span>
     </div>
   `;
 }
@@ -3177,7 +3433,7 @@ function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
 }
 
 function buildSummaryExtra(stats, tests) {
-  const parts = [`已运行 ${formatUptime(stats.uptime_sec || 0)}`];
+  const parts = [`${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`];
   const summary = summarizeTests(tests, 2);
   if (summary) {
     parts.push(summary);
@@ -3594,7 +3850,7 @@ function buildLatencyTooltipRows(meta, labels, hoverIndex) {
       const value = series[hoverIndex];
       if (value === null || value === undefined) return null;
       const color = meta.colors[idx] || "#4f7cff";
-      const name = labels[idx] || "未命名";
+      const name = labels[idx] || t("unnamed");
       return { color, name, value: formatLatencyStat(value) };
     })
     .filter(Boolean)
@@ -3855,7 +4111,7 @@ function formatLatencyStat(value) {
   return formatLatency(value);
 }
 
-function formatLossValue(loss, label = "丢包") {
+function formatLossValue(loss, label = t("loss")) {
   if (loss === null || loss === undefined || !Number.isFinite(loss)) {
     return `${label} --`;
   }
@@ -3904,10 +4160,10 @@ function summarizeTestSnapshot(test, rangeHistory, fallbackHistory) {
   return {
     latency:
       latestLatency === null
-        ? "当前 --"
-        : `当前 ${formatLatencyStat(latestLatency)}`,
+        ? `${t("current")} --`
+        : `${t("current")} ${formatLatencyStat(latestLatency)}`,
     latencyTone: latencyToneClass(latestLatency),
-    loss: formatLossValue(displayLoss, "丢包率"),
+    loss: formatLossValue(displayLoss, t("lossRate")),
   };
 }
 
@@ -3917,8 +4173,28 @@ function formatCPUModel(cpu) {
   const cores = cpu.cores || 0;
   const parts = [];
   if (model) parts.push(model);
-  if (cores) parts.push(`${cores} 核`);
+  if (cores) parts.push(`${cores} ${t("cores")}`);
   return parts.length ? parts.join(" · ") : "--";
+}
+
+function formatGPUDetails(gpus) {
+  const items = Array.isArray(gpus) ? gpus : [];
+  if (items.length === 0) {
+    return "--";
+  }
+  return items
+    .map((gpu) => {
+      const name = (gpu.name || gpu.vendor || `GPU ${Number(gpu.index || 0) + 1}`).trim();
+      const usage = Number.isFinite(gpu.utilization_percent)
+        ? `${clamp(gpu.utilization_percent).toFixed(0)}%`
+        : "--";
+      const memory =
+        Number.isFinite(gpu.memory_used) && Number.isFinite(gpu.memory_total) && gpu.memory_total > 0
+          ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
+          : "";
+      return [name, usage, memory].filter(Boolean).join(" · ");
+    })
+    .join(" / ");
 }
 
 function stripCPUFrequency(raw) {
@@ -3933,13 +4209,13 @@ function stripCPUFrequency(raw) {
 
 function formatDiskType(node, stats) {
   const raw = (node?.disk_type || stats?.disk_type || "").trim();
-  return raw || "未知";
+  return raw || t("unknown");
 }
 
 function formatDiskMeta(node, stats, total) {
   const typeLabel = formatDiskType(node, stats);
   if (Number.isFinite(total) && total > 0) {
-    return `${typeLabel} · ${formatBytes(total)} total`;
+    return `${typeLabel} · ${formatBytes(total)} ${t("totalSuffix")}`;
   }
   return typeLabel;
 }
@@ -3956,7 +4232,7 @@ function calcNetPercent(net, speedMbps) {
 function formatTestName(test) {
   const name = (test.name || "").trim();
   if (name) return name;
-  return "未命名";
+  return t("unnamed");
 }
 
 function formatLatencyValue(test) {
@@ -4027,7 +4303,7 @@ function formatRegion(code) {
 
 function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
   if (!expireAt) {
-    return "未设置";
+    return t("unset");
   }
   const now = Math.floor(Date.now() / 1000);
   const diff = expireAt - now;
@@ -4037,14 +4313,19 @@ function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
       const remain = renewIntervalSec - (elapsed % renewIntervalSec);
       return formatDuration(remain);
     }
-    return autoRenew ? "续费中" : "已到期";
+    return autoRenew ? t("renewing") : t("expired");
   }
   const days = Math.floor(diff / 86400);
   const hours = Math.floor((diff % 86400) / 3600);
   const minutes = Math.floor((diff % 3600) / 60);
-  if (days > 0) return `${days}天 ${hours}小时`;
-  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
-  return `${minutes}分钟`;
+  if (publicLocale === "en-US") {
+    if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
+    if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
+    return `${minutes}${t("minutes")}`;
+  }
+  if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
+  if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
+  return `${minutes}${t("minutes")}`;
 }
 
 function formatRemainingSummary(expireAt, autoRenew, renewIntervalSec) {
@@ -4052,13 +4333,13 @@ function formatRemainingSummary(expireAt, autoRenew, renewIntervalSec) {
     return "--";
   }
   const value = formatRemaining(expireAt, autoRenew, renewIntervalSec);
-  if (value === "未设置") {
+  if (value === t("unset")) {
     return "--";
   }
-  if (value === "已到期" || value === "续费中") {
+  if (value === t("expired") || value === t("renewing")) {
     return value;
   }
-  return `剩余 ${value}`;
+  return `${t("remainingPrefix")} ${value}`;
 }
 
 function formatDuration(seconds) {
@@ -4066,9 +4347,14 @@ function formatDuration(seconds) {
   const days = Math.floor(safe / 86400);
   const hours = Math.floor((safe % 86400) / 3600);
   const minutes = Math.floor((safe % 3600) / 60);
-  if (days > 0) return `${days}天 ${hours}小时`;
-  if (hours > 0) return `${hours}小时 ${minutes}分钟`;
-  return `${minutes}分钟`;
+  if (publicLocale === "en-US") {
+    if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
+    if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
+    return `${minutes}${t("minutes")}`;
+  }
+  if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
+  if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
+  return `${minutes}${t("minutes")}`;
 }
 
 function resolveDisplayName(node, stats) {
@@ -4083,7 +4369,7 @@ function resolveDisplayName(node, stats) {
   if (nodeID && nodeID !== hostname) {
     return nodeID;
   }
-  return "未命名节点";
+  return t("unnamedNode");
 }
 
 function clamp(value) {

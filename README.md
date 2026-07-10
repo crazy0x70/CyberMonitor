@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.26.2-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/Go-1.26.5-blue" alt="Go Version">
     <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
   </p>
 </div>
@@ -33,11 +33,12 @@ docker run -d \
   -p 25012:25012 \
   -e CM_DATA_DIR=/data \
   -v "$(pwd)/data:/data" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   --name cyber-monitor-server \
   --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
+
+The default Server command does not mount the Docker socket. To enable one-click updates for Docker Server deployments from the management panel, set `CM_ENABLE_DOCKER_UPDATE=1` and mount `/var/run/docker.sock`; otherwise, pull the latest image and recreate the container manually.
 
 ### 3. Deploying the Agent via Docker
 

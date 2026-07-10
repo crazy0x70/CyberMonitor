@@ -27,8 +27,10 @@ import (
 	"sync"
 	"time"
 
+	"cyber_monitor/internal/agentrpc"
 	"cyber_monitor/internal/cmdutil"
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/netguard"
 	"cyber_monitor/internal/server/history"
 	"cyber_monitor/internal/updater"
 
@@ -44,6 +46,7 @@ const (
 	testHistoryHotSeconds           = 60 * 60
 	testHistoryMaxAgeSeconds        = 60 * 60 * 24 * 365
 	maxJSONBodySize                 = 4 * 1024 * 1024
+	maxHTTPHeaderBytes              = 1 << 20
 	wsSendQueueSize                 = 8
 	wsWriteWait                     = 10 * time.Second
 	wsPongWait                      = 60 * time.Second
@@ -51,6 +54,11 @@ const (
 	agentUpdateLeaseDelivery        = 2 * time.Minute
 	agentUpdateLeaseUpdating        = 10 * time.Minute
 	agentUpdateLeaseRestart         = 5 * time.Minute
+	agentUpdateStatePending         = "pending"
+	agentUpdateStateUpdating        = "updating"
+	agentUpdateStateRestarting      = "restarting"
+	agentUpdateStateSucceeded       = "succeeded"
+	agentUpdateStateFailed          = "failed"
 	agentIngestWindow               = time.Second
 	agentRegisterWindow             = time.Minute
 	defaultAgentIngestLimit         = 2
@@ -58,8 +66,11 @@ const (
 	defaultAgentRegisterGlobalLimit = 30
 	maxNetworkTestsPerNode          = 128
 	nodeStaleGraceSeconds           = 12
-	publicVariantConservative       = "conservative"
+	nodeStatusOnline                = "online"
+	nodeStatusOffline               = "offline"
+	nodeStatusWaitingRegistration   = "waiting_registration"
 	publicVariantBalanced           = "balanced"
+	adminVariant                    = "admin"
 	adminSessionCookieName          = "cm_admin_session"
 )
 
@@ -147,19 +158,24 @@ func rotateLogFile(path string, backups int) error {
 }
 
 func setupLogger(dataDir string) {
+	runtimeAdminLogs.Reset()
 	serverOutput := io.Writer(os.Stdout)
 	reportOutput := io.Writer(os.Stdout)
+	serverCapture := adminLogCaptureWriter{source: "server"}
+	reportCapture := adminLogCaptureWriter{source: "report"}
 	if dataDir == "" {
-		log.SetOutput(serverOutput)
-		reportLogger.SetOutput(reportOutput)
+		log.SetOutput(io.MultiWriter(serverOutput, serverCapture))
+		reportLogger.SetOutput(io.MultiWriter(reportOutput, reportCapture))
 		return
 	}
 	serverPath := filepath.Join(dataDir, "server.log")
 	reportPath := filepath.Join(dataDir, "report.log")
+	runtimeAdminLogs.SeedFile(serverPath, "server")
+	runtimeAdminLogs.SeedFile(reportPath, "report")
 	serverWriter := &sizeLimitedWriter{path: serverPath, maxSize: maxLogSize}
 	reportWriter := &sizeLimitedWriter{path: reportPath, maxSize: maxLogSize}
-	serverOutput = io.MultiWriter(os.Stdout, serverWriter)
-	reportOutput = reportWriter
+	serverOutput = io.MultiWriter(os.Stdout, serverWriter, serverCapture)
+	reportOutput = io.MultiWriter(reportWriter, reportCapture)
 	log.SetOutput(serverOutput)
 	reportLogger.SetOutput(reportOutput)
 }
@@ -183,17 +199,22 @@ const (
 //go:embed web/public/* web/public/assets/* web/dist/admin/* web/dist/admin/assets/*
 var webFS embed.FS
 
+var newAgentUpdateID = func() (string, error) {
+	return randomToken(16)
+}
+
 type Config struct {
-	Addr       string
-	PublicAddr string
-	AdminUser  string
-	AdminPass  string
-	AdminPath  string
-	JWTSecret  string
-	AgentToken string
-	DataDir    string
-	Version    string
-	Commit     string
+	Addr                string
+	PublicAddr          string
+	AdminUser           string
+	AdminPass           string
+	AdminPath           string
+	JWTSecret           string
+	AgentToken          string
+	DataDir             string
+	Version             string
+	Commit              string
+	TrustedProxyHeaders bool
 }
 
 type Store struct {
@@ -235,32 +256,32 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID                 string                      `json:"server_id,omitempty"`
-	AgentAuthToken           string                      `json:"agent_auth_token,omitempty"`
-	AlertEnabled             *bool                       `json:"alert_enabled,omitempty"`
-	Alias                    string                      `json:"alias,omitempty"`
-	Group                    string                      `json:"group,omitempty"`
-	Tags                     []string                    `json:"tags,omitempty"`
-	Groups                   []string                    `json:"groups,omitempty"`
-	Region                   string                      `json:"region,omitempty"`
-	DiskType                 string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                       `json:"expire_at,omitempty"`
-	AutoRenew                bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int                         `json:"test_interval_sec"`
-	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
-	AgentUpdate              *AgentUpdateInstruction     `json:"agent_update,omitempty"`
-	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
-	AgentUpdateLeaseUntil    int64                       `json:"agent_update_lease_until,omitempty"`
-	AgentUpdateReportedAt    int64                       `json:"agent_update_reported_at,omitempty"`
-	UpdatedAt                int64                       `json:"updated_at,omitempty"`
+	ServerID                 string                  `json:"server_id,omitempty"`
+	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
+	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
+	Alias                    string                  `json:"alias,omitempty"`
+	Group                    string                  `json:"group,omitempty"`
+	Tags                     []string                `json:"tags,omitempty"`
+	Groups                   []string                `json:"groups,omitempty"`
+	Region                   string                  `json:"region,omitempty"`
+	DiskType                 string                  `json:"disk_type,omitempty"`
+	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64                   `json:"expire_at,omitempty"`
+	AutoRenew                bool                    `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64                   `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int                     `json:"test_interval_sec"`
+	TestSelections           []TestSelection         `json:"test_selections,omitempty"`
+	AgentUpdate              *AgentUpdateInstruction `json:"agent_update,omitempty"`
+	AgentUpdateState         string                  `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string                  `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string                  `json:"agent_update_message,omitempty"`
+	AgentUpdateLeaseUntil    int64                   `json:"agent_update_lease_until,omitempty"`
+	AgentUpdateReportedAt    int64                   `json:"agent_update_reported_at,omitempty"`
+	UpdatedAt                int64                   `json:"updated_at,omitempty"`
 }
 
 type AgentUpdateInstruction struct {
+	ID          string `json:"id"`
 	Version     string `json:"version"`
 	DownloadURL string `json:"download_url"`
 	ChecksumURL string `json:"checksum_url,omitempty"`
@@ -282,37 +303,38 @@ type AgentConfig struct {
 }
 
 type NodeView struct {
-	Stats                    metrics.NodeStats           `json:"stats"`
-	LastSeen                 int64                       `json:"last_seen"`
-	FirstSeen                int64                       `json:"first_seen,omitempty"`
-	Status                   string                      `json:"status"`
-	ServerID                 string                      `json:"server_id,omitempty"`
-	AlertEnabled             bool                        `json:"alert_enabled"`
-	Alias                    string                      `json:"alias,omitempty"`
-	Group                    string                      `json:"group,omitempty"`
-	Tags                     []string                    `json:"tags,omitempty"`
-	Groups                   []string                    `json:"groups,omitempty"`
-	Region                   string                      `json:"region,omitempty"`
-	DiskType                 string                      `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                         `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                       `json:"expire_at,omitempty"`
-	AutoRenew                bool                        `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                       `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int                         `json:"test_interval_sec,omitempty"`
-	Tests                    []metrics.NetworkTestConfig `json:"tests,omitempty"`
-	TestSelections           []TestSelection             `json:"test_selections,omitempty"`
-	AgentUpdateSupported     bool                        `json:"agent_update_supported"`
-	AgentUpdateMode          string                      `json:"agent_update_mode,omitempty"`
-	AgentUpdateState         string                      `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string                      `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string                      `json:"agent_update_message,omitempty"`
+	Stats                    metrics.NodeStats `json:"stats"`
+	LastSeen                 int64             `json:"last_seen"`
+	FirstSeen                int64             `json:"first_seen,omitempty"`
+	Status                   string            `json:"status"`
+	ServerID                 string            `json:"server_id,omitempty"`
+	AlertEnabled             bool              `json:"alert_enabled"`
+	Alias                    string            `json:"alias,omitempty"`
+	Group                    string            `json:"group,omitempty"`
+	Tags                     []string          `json:"tags,omitempty"`
+	Groups                   []string          `json:"groups,omitempty"`
+	Region                   string            `json:"region,omitempty"`
+	DiskType                 string            `json:"disk_type,omitempty"`
+	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
+	ExpireAt                 int64             `json:"expire_at,omitempty"`
+	AutoRenew                bool              `json:"auto_renew,omitempty"`
+	RenewIntervalSec         int64             `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec          int               `json:"test_interval_sec,omitempty"`
+	TestSelections           []TestSelection   `json:"test_selections,omitempty"`
+	AgentUpdateSupported     bool              `json:"agent_update_supported"`
+	AgentUpdateMode          string            `json:"agent_update_mode,omitempty"`
+	AgentUpdateState         string            `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string            `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string            `json:"agent_update_message,omitempty"`
 }
 
 type PublicSettings struct {
-	SiteTitle    string `json:"site_title,omitempty"`
-	SiteIcon     string `json:"site_icon,omitempty"`
-	HomeTitle    string `json:"home_title,omitempty"`
-	HomeSubtitle string `json:"home_subtitle,omitempty"`
+	SiteTitle           string `json:"site_title,omitempty"`
+	SiteIcon            string `json:"site_icon,omitempty"`
+	SiteBackgroundImage string `json:"site_background_image,omitempty"`
+	HomeTitle           string `json:"home_title,omitempty"`
+	HomeSubtitle        string `json:"home_subtitle,omitempty"`
+	Locale              string `json:"locale,omitempty"`
 }
 
 type Snapshot struct {
@@ -349,12 +371,13 @@ type hubMessage struct {
 }
 
 type hubClient struct {
-	conn    *websocket.Conn
-	variant string
-	mu      sync.Mutex
-	send    chan hubMessage
-	done    chan struct{}
-	once    sync.Once
+	conn           *websocket.Conn
+	variant        string
+	adminTokenSalt string
+	mu             sync.Mutex
+	send           chan hubMessage
+	done           chan struct{}
+	once           sync.Once
 }
 
 type loginAttempt struct {
@@ -526,6 +549,7 @@ func Run(ctx context.Context, cfg Config) error {
 	agentAPI := newAgentAPI(store, hub)
 	systemUpdater := newSystemUpdateManager(version)
 	splitMode := strings.TrimSpace(cfg.PublicAddr) != "" && cfg.PublicAddr != cfg.Addr
+	trustedProxyHeaders := cfg.TrustedProxyHeaders
 
 	webRoot, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -555,6 +579,10 @@ func Run(ctx context.Context, cfg Config) error {
 		req.Username = strings.TrimSpace(req.Username)
 		now := time.Now()
 		creds := store.Credentials()
+		if !normalizeAdminAuthSettings(creds.AdminAuth).PasswordLoginEnabled {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password login disabled"})
+			return
+		}
 		attemptKey := loginAttemptKey(req.Username, r.RemoteAddr)
 		if allowed, retryAfter := store.allowLoginAttempt(attemptKey, now); !allowed {
 			writeLoginRateLimit(w, retryAfter)
@@ -576,24 +604,35 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		store.clearLoginAttempts(attemptKey)
-		token, exp, err := generateToken(cfg.JWTSecret, req.Username, creds.TokenSalt)
+		exp, err := issueAdminSession(w, r, cfg.JWTSecret, store, trustedProxyHeaders)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token error"})
 			return
 		}
-		setAdminSessionCookie(w, r, token, exp)
 		log.Printf("管理员登录: %s (%s)", req.Username, r.RemoteAddr)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"expires_at": exp,
 		})
 	})
 
+	adminMux.HandleFunc("/api/v1/login/oauth/start", handleAdminOAuthStart(store, cfg.JWTSecret, trustedProxyHeaders))
+	adminMux.HandleFunc("/api/v1/login/oauth/callback", handleAdminOAuthCallback(store, cfg.JWTSecret, trustedProxyHeaders))
+
 	adminMux.HandleFunc("/api/v1/logout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		clearAdminSessionCookie(w, r)
+		if extractToken(r) != "" && isSameOrigin(r) {
+			if err := validateAdminJWT(store, cfg.JWTSecret, r); err == nil {
+				if err := store.RotateAdminTokenSalt(); err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session revoke failed"})
+					return
+				}
+				hub.CloseAdminClients()
+			}
+		}
+		clearAdminSessionCookie(w, r, trustedProxyHeaders)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
@@ -607,6 +646,9 @@ func Run(ctx context.Context, cfg Config) error {
 		enabled := turnstileConfigured(settings.TurnstileSiteKey, settings.TurnstileSecretKey)
 		payload := map[string]interface{}{
 			"turnstile_enabled": enabled,
+		}
+		for key, value := range buildAdminLoginConfig(store) {
+			payload[key] = value
 		}
 		if enabled {
 			payload["turnstile_site_key"] = strings.TrimSpace(view.TurnstileSiteKey)
@@ -632,14 +674,14 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
-		apiBase, socketURL := buildDefaultPublicConfig(r)
+		apiBase, socketURL := buildDefaultPublicConfig(r, trustedProxyHeaders)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"socket": socketURL,
 			"apiURL": apiBase,
 		})
 	})
 
-	publicMux.HandleFunc("/api/v1/public/snapshot", func(w http.ResponseWriter, r *http.Request) {
+	publicSnapshotHandler := func(w http.ResponseWriter, r *http.Request) {
 		if handlePublicCORSPreflight(w, r) {
 			return
 		}
@@ -651,7 +693,11 @@ func Run(ctx context.Context, cfg Config) error {
 		w.Header().Set("Cache-Control", "no-store")
 		snapshot := storeSnapshot(store, false)
 		writeJSON(w, http.StatusOK, snapshot)
-	})
+	}
+	publicMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
+	if splitMode {
+		adminMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
+	}
 
 	publicMux.HandleFunc("/api/v1/public/nodes/", func(w http.ResponseWriter, r *http.Request) {
 		if handlePublicCORSPreflight(w, r) {
@@ -706,8 +752,12 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	})
 
-	adminMux.HandleFunc("/api/v1/nodes", requireJWT(cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		snapshot := storeSnapshot(store, true)
+	adminMux.HandleFunc("/api/v1/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		snapshot := adminStoreSnapshot(store, true)
 		writeJSON(w, http.StatusOK, snapshot)
 	}))
 
@@ -733,18 +783,14 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	})
 
+	agentUpdateAdminHandler := adminAgentUpdateHandler(store, hub, defaultAgentReleaseChecker)
 	adminMux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			snapshot := storeSnapshot(store, parseBoolQuery(r, "history"))
+			snapshot := adminStoreSnapshot(store, parseBoolQuery(r, "history"))
 			writeJSON(w, http.StatusOK, snapshot)
 		case http.MethodDelete:
-			if err := store.ClearNodes(); err != nil {
-				writeClearNodesHistoryError(w, r, err)
-				return
-			}
-			broadcastStoreSnapshot(hub, store, false)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+			handleAdminClearNodesRequest(w, r, store, hub)
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
@@ -753,94 +799,7 @@ func Run(ctx context.Context, cfg Config) error {
 	adminMux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
 		if strings.HasSuffix(path, "/agent/update") {
-			if r.Method != http.MethodGet && r.Method != http.MethodPost {
-				writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-				return
-			}
-			rawNodeID := strings.TrimSuffix(path, "/agent/update")
-			nodeID, err := url.PathUnescape(rawNodeID)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-				return
-			}
-			nodeID, err = history.NormalizeNodeID(nodeID)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-				return
-			}
-			if nodeID == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
-				return
-			}
-			store.mu.RLock()
-			node, exists := store.nodes[nodeID]
-			store.mu.RUnlock()
-			if !exists {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-				return
-			}
-
-			if r.Method == http.MethodGet {
-				if !resolveAgentUpdateSupported(node.Stats) {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(node.Stats)))
-					return
-				}
-				if strings.TrimSpace(node.Stats.AgentVersion) == "" {
-					writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
-					return
-				}
-				client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
-				releaseInfo, err := client.CheckLatest(r.Context())
-				if err != nil {
-					writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-					return
-				}
-				writeJSON(w, http.StatusOK, buildAgentUpdateView(node.Stats, releaseInfo, ""))
-				return
-			}
-
-			if !resolveAgentUpdateSupported(node.Stats) {
-				message := resolveAgentUpdateUnsupportedReason(node.Stats)
-				if strings.TrimSpace(message) == "" {
-					message = "当前节点平台暂不支持后台自更新"
-				}
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
-				return
-			}
-			client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(node.Stats.AgentVersion))
-			releaseInfo, err := client.CheckLatest(r.Context())
-			if err != nil {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-				return
-			}
-			if !releaseInfo.HasUpdate && updater.CompareVersions(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) >= 0 {
-				writeJSON(w, http.StatusOK, map[string]string{
-					"status":         "up_to_date",
-					"target_version": releaseInfo.LatestVersion,
-				})
-				return
-			}
-			if strings.TrimSpace(releaseInfo.DownloadURL) == "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前节点平台对应的 Agent 安装包"})
-				return
-			}
-			if !isChecksumOptionalForAgentUpdate(node.Stats) && strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS 校验文件"})
-				return
-			}
-			if _, ok := store.QueueAgentUpdate(nodeID, AgentUpdateInstruction{
-				Version:     releaseInfo.LatestVersion,
-				DownloadURL: releaseInfo.DownloadURL,
-				ChecksumURL: releaseInfo.ChecksumURL,
-			}); !ok {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-				return
-			}
-			broadcastStoreSnapshot(hub, store, false)
-			writeJSON(w, http.StatusAccepted, map[string]string{
-				"status":         "queued",
-				"target_version": releaseInfo.LatestVersion,
-			})
+			agentUpdateAdminHandler(w, r)
 			return
 		}
 		nodeID, err := url.PathUnescape(path)
@@ -859,33 +818,9 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		switch r.Method {
 		case http.MethodPut, http.MethodPatch:
-			var update NodeProfileUpdate
-			if err := decodeJSON(w, r, &update); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-				return
-			}
-			profile, ok := store.UpdateProfile(nodeID, update)
-			if !ok {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-				return
-			}
-			writeJSON(w, http.StatusOK, profile)
+			handleAdminUpdateNodeProfileRequest(w, r, store, hub, nodeID)
 		case http.MethodDelete:
-			deleted, err := store.DeleteNode(nodeID)
-			if err != nil {
-				if errors.Is(err, history.ErrInvalidNodeID) {
-					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-					return
-				}
-				writeNodeDeleteHistoryError(w, r, err)
-				return
-			}
-			if !deleted {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-				return
-			}
-			broadcastStoreSnapshot(hub, store, false)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			handleAdminDeleteNodeRequest(w, r, store, hub, nodeID)
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
@@ -899,6 +834,8 @@ func Run(ctx context.Context, cfg Config) error {
 		authenticated := validateAdminJWT(store, cfg.JWTSecret, r) == nil
 		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": authenticated})
 	})
+
+	adminMux.HandleFunc("/api/v1/admin/logs", requireAdminJWT(store, cfg.JWTSecret, handleAdminLogsRequest))
 
 	adminMux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -922,7 +859,7 @@ func Run(ctx context.Context, cfg Config) error {
 			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
-			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store); err != nil {
+			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
 				return
 			}
@@ -946,45 +883,66 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
 				return
 			}
+			reservation, err := systemUpdater.ReserveStart()
+			if err != nil {
+				if errors.Is(err, errSystemUpdateInProgress) {
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
+					return
+				}
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
 			releaseInfo, err := systemUpdater.CheckLatest(r.Context())
 			if err != nil {
+				reservation.Cancel()
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 				return
 			}
-			if !releaseInfo.HasUpdate && updater.CompareVersions(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) >= 0 {
+			if err := validateReleaseTargetVersion(releaseInfo); err != nil {
+				reservation.Cancel()
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
+				reservation.Cancel()
 				writeJSON(w, http.StatusOK, map[string]string{
 					"status":         "up_to_date",
 					"target_version": releaseInfo.LatestVersion,
 				})
 				return
 			}
-			if strings.TrimSpace(releaseInfo.DownloadURL) == "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "未找到当前平台对应的服务端安装包"})
+			dockerManaged := updater.CanDockerManagedUpdate()
+			if message := systemUpdateReleaseAssetError(releaseInfo, dockerManaged); message != "" {
+				reservation.Cancel()
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": message})
 				return
 			}
-			if !updater.CanDockerManagedUpdate() && strings.TrimSpace(releaseInfo.ChecksumURL) == "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Release 缺少 SHA256SUMS 校验文件"})
-				return
-			}
-			err = systemUpdater.Start(releaseInfo, func() error {
-				if updater.CanDockerManagedUpdate() {
-					dockerUpdater, err := updater.NewDockerManagedUpdater()
+			err = reservation.Start(releaseInfo, dockerManaged, func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cancel()
+				if dockerManaged {
+					dockerUpdater, err := updater.NewDockerManagedUpdaterContext(ctx)
 					if err != nil {
 						return err
 					}
-					targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
-					return dockerUpdater.LaunchSelfContainerUpdate(context.Background(), targetImage, "")
+					targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
+					if err != nil {
+						return fmt.Errorf("解析 Docker 目标镜像失败: %w", err)
+					}
+					return dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage, "")
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				defer cancel()
-				if err := systemUpdater.client.ApplyAsset(ctx, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
+				if err := systemUpdater.client.ApplyReleaseAsset(ctx, releaseInfo.LatestVersion, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
 					return err
 				}
 				time.Sleep(700 * time.Millisecond)
 				return updater.RestartSelf()
 			})
 			if err != nil {
-				writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
+				if errors.Is(err, errSystemUpdateInProgress) {
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
+					return
+				}
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
 			writeJSON(w, http.StatusAccepted, map[string]string{
@@ -1035,7 +993,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
 			view.AgentEndpoint = cfg.PublicAddr
 		}
-		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store); err != nil {
+		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session refresh failed"})
 			return
 		}
@@ -1105,8 +1063,8 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		var req struct {
-			Provider string           `json:"provider"`
-			Config   AIProviderConfig `json:"config"`
+			Provider string            `json:"provider"`
+			Config   *AIProviderConfig `json:"config"`
 		}
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1141,8 +1099,8 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 		var req struct {
-			Provider string           `json:"provider"`
-			Config   AIProviderConfig `json:"config"`
+			Provider string            `json:"provider"`
+			Config   *AIProviderConfig `json:"config"`
 		}
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1191,31 +1149,7 @@ func Run(ctx context.Context, cfg Config) error {
 		})
 	})
 
-	publicMux.HandleFunc("/api/v1/agent/update/report", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req struct {
-			NodeID  string `json:"node_id"`
-			State   string `json:"state"`
-			Version string `json:"version,omitempty"`
-			Message string `json:"message,omitempty"`
-		}
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		if err := agentAPI.reportUpdate(req.NodeID, r.Header.Get("X-AGENT-TOKEN"), AgentUpdateReport{
-			State:   req.State,
-			Version: req.Version,
-			Message: req.Message,
-		}); err != nil {
-			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	publicMux.HandleFunc("/api/v1/agent/update/report", agentUpdateReportHTTPHandler(agentAPI))
 
 	type wsAuthMode int
 	const (
@@ -1224,21 +1158,10 @@ func Run(ctx context.Context, cfg Config) error {
 		wsAuthMixed
 	)
 
-	resolvePublicVariant := func(r *http.Request) string {
-		if r == nil {
-			return publicVariantBalanced
-		}
-		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("variant"))) {
-		case publicVariantBalanced:
-			return publicVariantBalanced
-		default:
-			return publicVariantBalanced
-		}
-	}
-
 	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			audience := "public"
+			adminTokenSalt := ""
 			switch mode {
 			case wsAuthRequired:
 				if extractToken(r) == "" {
@@ -1249,16 +1172,27 @@ func Run(ctx context.Context, cfg Config) error {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
-				if err := validateJWTFromRequest(cfg.JWTSecret, r); err != nil {
+				if err := validateAdminJWT(store, cfg.JWTSecret, r); err != nil {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 					return
 				}
 				audience = "admin"
+				adminTokenSalt = store.Credentials().TokenSalt
 			case wsAuthPublic:
 			case wsAuthMixed:
-				if validateAdminJWT(store, cfg.JWTSecret, r) == nil {
-					audience = "admin"
+				if extractToken(r) == "" {
+					break
 				}
+				if !isSameOrigin(r) {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+				if err := validateAdminJWT(store, cfg.JWTSecret, r); err != nil {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+				audience = "admin"
+				adminTokenSalt = store.Credentials().TokenSalt
 			}
 			upgrader := websocket.Upgrader{
 				CheckOrigin: func(request *http.Request) bool {
@@ -1273,10 +1207,15 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			}
 			configureWSConn(conn)
-			client := hub.Add(conn, resolvePublicVariant(r))
+			variant := publicVariantBalanced
+			snapshot := storeSnapshot(store, false)
+			if audience == "admin" {
+				variant = adminVariant
+				snapshot = adminStoreSnapshot(store, false)
+			}
+			client := hub.Add(conn, variant, adminTokenSalt)
 
 			// 首次连接立即推送快照
-			snapshot := storeSnapshot(store, false)
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
 				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
@@ -1330,12 +1269,21 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
 			return
 		}
+		htmlText := string(data)
+		if prefix := forwardedPrefix(r, trustedProxyHeaders); prefix != "" {
+			baseTag := `<base href="` + html.EscapeString(prefix+"/") + `" />`
+			if strings.Contains(htmlText, "<head>") {
+				htmlText = strings.Replace(htmlText, "<head>", "<head>"+baseTag, 1)
+			} else {
+				htmlText = baseTag + htmlText
+			}
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+		_, _ = w.Write([]byte(htmlText))
 	}
 
-	writeAdminAppHTML := func(w http.ResponseWriter) {
+	writeAdminAppHTML := func(w http.ResponseWriter, r *http.Request) {
 		data, err := webFS.ReadFile("web/dist/admin/index.html")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
@@ -1343,7 +1291,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		htmlText := string(data)
 		htmlText = strings.Replace(htmlText, "<title>CyberMonitor 管理后台</title>", "<title>"+html.EscapeString(adminDocumentTitle(store.SiteTitle()))+"</title>", 1)
-		bootPayload, err := buildAdminBootPayload(store)
+		bootPayload, err := buildAdminBootPayload(store, r, trustedProxyHeaders)
 		if err == nil {
 			bootMeta := `<meta name="cm-admin-boot" content="` + bootPayload + `" />`
 			if strings.Contains(htmlText, "</head>") {
@@ -1378,10 +1326,10 @@ func Run(ctx context.Context, cfg Config) error {
 
 		switch r.URL.Path {
 		case adminPath:
-			http.Redirect(w, r, adminPrefix, http.StatusFound)
+			http.Redirect(w, r, forwardedPrefixedPath(r, adminPrefix, trustedProxyHeaders), http.StatusFound)
 			return true
 		case adminPrefix:
-			writeAdminAppHTML(w)
+			writeAdminAppHTML(w, r)
 			return true
 		}
 
@@ -1424,26 +1372,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	grpcServer := newAgentRPCServer(agentAPI)
-	publicHandler := wrapPublicHandler(publicMux, grpcServer)
-	publicServer := &http.Server{
-		Addr:              cfg.PublicAddr,
-		Handler:           withSecurityHeaders(publicHandler),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	publicHandler := stripForwardedPrefixPath(wrapPublicHandler(publicMux, grpcServer), trustedProxyHeaders)
+	publicServer := newHTTPServer(cfg.PublicAddr, withSecurityHeaders(publicHandler))
 
 	adminServer := &http.Server{}
 	if splitMode {
-		adminServer = &http.Server{
-			Addr:              cfg.Addr,
-			Handler:           withSecurityHeaders(adminMux),
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       10 * time.Second,
-			WriteTimeout:      10 * time.Second,
-			IdleTimeout:       60 * time.Second,
-		}
+		adminServer = newHTTPServer(cfg.Addr, withSecurityHeaders(stripForwardedPrefixPath(adminMux, trustedProxyHeaders)))
 	}
 
 	go func() {
@@ -1456,20 +1390,14 @@ func Run(ctx context.Context, cfg Config) error {
 				return
 			case <-ticker.C:
 				now := time.Now()
-				hasConservative := hub.HasVariant(publicVariantConservative)
 				hasBalanced := hub.HasVariant(publicVariantBalanced)
-				if hasConservative || hasBalanced {
+				if hasBalanced {
 					snapshot := storeSnapshot(store, false)
 					if payload, err := json.Marshal(snapshot); err == nil {
-						if hasConservative {
-							hub.BroadcastVariant(payload, publicVariantConservative)
-						}
-						if hasBalanced {
-							digest := digestPublicSnapshot(snapshot)
-							if digest != lastBalancedDigest {
-								hub.BroadcastVariant(payload, publicVariantBalanced)
-								lastBalancedDigest = digest
-							}
+						digest := digestPublicSnapshot(snapshot)
+						if digest != lastBalancedDigest {
+							hub.BroadcastVariant(payload, publicVariantBalanced)
+							lastBalancedDigest = digest
 						}
 					}
 				}
@@ -1515,20 +1443,39 @@ func Run(ctx context.Context, cfg Config) error {
 		log.Printf("初始 Agent Token 已生成")
 	}
 	if splitMode {
-		adminErr := make(chan error, 1)
-		go func() {
-			if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				adminErr <- err
-				return
-			}
-			adminErr <- nil
-		}()
-
-		if err := publicServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		adminListener, err := net.Listen("tcp", adminServer.Addr)
+		if err != nil {
 			return err
 		}
-		if err := <-adminErr; err != nil {
+		defer adminListener.Close()
+		publicListener, err := net.Listen("tcp", publicServer.Addr)
+		if err != nil {
 			return err
+		}
+		defer publicListener.Close()
+
+		serverErr := make(chan error, 2)
+		go func() {
+			if err := adminServer.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+				return
+			}
+			serverErr <- nil
+		}()
+		go func() {
+			if err := publicServer.Serve(publicListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+				return
+			}
+			serverErr <- nil
+		}()
+
+		for i := 0; i < 2; i++ {
+			if err := <-serverErr; err != nil {
+				_ = adminServer.Shutdown(context.Background())
+				_ = publicServer.Shutdown(context.Background())
+				return err
+			}
 		}
 		return nil
 	}
@@ -1536,6 +1483,18 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	return nil
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    maxHTTPHeaderBytes,
+	}
 }
 
 func applyDefaults(cfg *Config) error {
@@ -1630,19 +1589,23 @@ func (s *Store) Update(stats metrics.NodeStats) (bool, error) {
 	hadNodeOrProfile := s.hasNodeOrProfile(nodeID)
 
 	unlock := s.lockAgentNodeRead(stats.NodeID)
-	defer unlock()
 	if hadNodeOrProfile && !s.hasNodeOrProfile(nodeID) {
+		unlock()
 		return false, nil
 	}
 
-	return s.updateNodeStats(stats)
+	updateReconciled, recoveryCandidate, err := s.updateNodeStats(stats)
+	unlock()
+	if recoveryCandidate != nil {
+		s.completeOfflineRecovery(*recoveryCandidate)
+	}
+	return updateReconciled, err
 }
 
 // updateNodeStats requires the caller to hold lockAgentNodeRead(stats.NodeID).
-func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, error) {
+func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecoveryCandidate, error) {
 	var persist bool
-	var recoveryCandidate offlineRecoveryCandidate
-	var hasRecoveryCandidate bool
+	var recoveryCandidate *offlineRecoveryCandidate
 	var updateReconciled bool
 	now := time.Now()
 
@@ -1676,10 +1639,11 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, error) {
 		firstSeen = now
 	}
 	acceptStats := shouldReplaceNodeStats(prev.Stats, stats)
-	storedStats := cloneNodeStats(stats)
+	mergedStats := mergeNodeStatsStaticInfo(prev.Stats, stats)
+	storedStats := cloneNodeStats(mergedStats)
 	if !acceptStats {
 		storedStats = cloneNodeStats(prev.Stats)
-	} else if !stats.NetworkTestsChanged && len(stats.NetworkTests) == 0 && len(prev.Stats.NetworkTests) > 0 {
+	} else if !mergedStats.NetworkTestsChanged && len(mergedStats.NetworkTests) == 0 && len(prev.Stats.NetworkTests) > 0 {
 		storedStats.NetworkTests = cloneNetworkTestResults(prev.Stats.NetworkTests)
 	}
 	s.nodes[stats.NodeID] = NodeState{
@@ -1693,7 +1657,7 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, error) {
 	if err != nil {
 		rollbackNodeProfile()
 		s.mu.Unlock()
-		return false, err
+		return false, nil, err
 	}
 	if serverIDChanged {
 		persist = true
@@ -1739,17 +1703,16 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, error) {
 	profile.UpdatedAt = now.Unix()
 
 	if session, ok := s.offlineSessions[stats.NodeID]; ok && session.StartedAt > 0 {
-		recoveryCandidate = offlineRecoveryCandidate{
+		recoveryCandidate = &offlineRecoveryCandidate{
 			NodeID:      stats.NodeID,
 			StartedAt:   session.StartedAt,
 			RecoveredAt: now.UTC(),
 		}
-		hasRecoveryCandidate = true
 		persist = true
 	}
 
 	if acceptStats {
-		s.updateTestHistoryLocked(stats, now)
+		s.updateTestHistoryLocked(mergedStats, now)
 	}
 	if s.shouldPersistLocked(now) {
 		persist = true
@@ -1759,18 +1722,15 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, error) {
 	if persist {
 		s.persist()
 	}
-	if hasRecoveryCandidate {
-		s.completeOfflineRecoveryProtected(recoveryCandidate)
-	}
 	s.mu.RLock()
 	historyManager := s.historyManager
 	s.mu.RUnlock()
-	if acceptStats && historyManager != nil && len(stats.NetworkTests) > 0 {
-		if err := historyManager.AppendNetworkBatch(stats.NodeID, stats.NetworkTests, now); err != nil {
+	if acceptStats && historyManager != nil && len(storedStats.NetworkTests) > 0 && mergedStats.NetworkTestsChanged {
+		if err := historyManager.AppendNetworkBatch(mergedStats.NodeID, mergedStats.NetworkTests, now); err != nil {
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
 	}
-	return updateReconciled, nil
+	return updateReconciled, recoveryCandidate, nil
 }
 
 func (s *Store) hasNodeOrProfile(nodeID string) bool {
@@ -1795,6 +1755,64 @@ func shouldReplaceNodeStats(current, incoming metrics.NodeStats) bool {
 		return true
 	}
 	return incoming.Timestamp >= current.Timestamp
+}
+
+func mergeNodeStatsStaticInfo(current, incoming metrics.NodeStats) metrics.NodeStats {
+	if strings.TrimSpace(current.NodeID) == "" || incoming.StaticInfo {
+		return incoming
+	}
+	incoming.OS = current.OS
+	incoming.Arch = current.Arch
+	incoming.StaticInfo = current.StaticInfo
+	incoming.StaticUpdatedAt = current.StaticUpdatedAt
+	incoming.CPU.Model = current.CPU.Model
+	incoming.CPU.Cores = current.CPU.Cores
+	incoming.DiskType = current.DiskType
+	incoming.GPU = mergeGPUStaticInfo(current.GPU, incoming.GPU, incoming.GPUCollected)
+	return incoming
+}
+
+func mergeGPUStaticInfo(current, incoming []metrics.GPUInfo, collected bool) []metrics.GPUInfo {
+	if len(incoming) == 0 {
+		if collected {
+			return nil
+		}
+		return cloneGPUInfos(current)
+	}
+	byID := make(map[string]metrics.GPUInfo, len(current))
+	byIndex := make(map[int]metrics.GPUInfo, len(current))
+	for _, gpu := range current {
+		if id := strings.TrimSpace(gpu.ID); id != "" {
+			byID[id] = gpu
+		}
+		byIndex[gpu.Index] = gpu
+	}
+	merged := make([]metrics.GPUInfo, len(incoming))
+	for i, gpu := range incoming {
+		if prev, ok := byID[strings.TrimSpace(gpu.ID)]; ok {
+			gpu = mergeSingleGPUStaticInfo(prev, gpu)
+		} else if prev, ok := byIndex[gpu.Index]; ok {
+			gpu = mergeSingleGPUStaticInfo(prev, gpu)
+		}
+		merged[i] = gpu
+	}
+	return merged
+}
+
+func mergeSingleGPUStaticInfo(current, incoming metrics.GPUInfo) metrics.GPUInfo {
+	if incoming.ID == "" {
+		incoming.ID = current.ID
+	}
+	if incoming.Name == "" {
+		incoming.Name = current.Name
+	}
+	if incoming.Vendor == "" {
+		incoming.Vendor = current.Vendor
+	}
+	if incoming.DriverVersion == "" {
+		incoming.DriverVersion = current.DriverVersion
+	}
+	return incoming
 }
 
 func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) bool {
@@ -2311,7 +2329,7 @@ func sendFeishuText(webhook, text string) error {
 		return fmt.Errorf("告警请求创建失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 6 * time.Second}
+	client := newWebhookHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("告警发送失败: %w", err)
@@ -2447,6 +2465,15 @@ func cloneDiskPartitions(values []metrics.DiskPartition) []metrics.DiskPartition
 	return cloned
 }
 
+func cloneGPUInfos(values []metrics.GPUInfo) []metrics.GPUInfo {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]metrics.GPUInfo, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
 func cloneNetworkTestResults(values []metrics.NetworkTestResult) []metrics.NetworkTestResult {
 	if len(values) == 0 {
 		return nil
@@ -2464,6 +2491,7 @@ func cloneNetworkTestResults(values []metrics.NetworkTestResult) []metrics.Netwo
 
 func cloneNodeStats(stats metrics.NodeStats) metrics.NodeStats {
 	stats.Disk = cloneDiskPartitions(stats.Disk)
+	stats.GPU = cloneGPUInfos(stats.GPU)
 	stats.NetworkTests = cloneNetworkTestResults(stats.NetworkTests)
 	return stats
 }
@@ -2561,8 +2589,8 @@ func cloneAISettings(settings AISettings) AISettings {
 }
 
 func cloneSettings(settings Settings) Settings {
-	settings.AlertNodes = cloneStringSlice(settings.AlertNodes)
 	settings.AlertTelegramUserIDs = cloneInt64Slice(settings.AlertTelegramUserIDs)
+	settings.AdminAuth = cloneAdminAuthSettings(settings.AdminAuth)
 	settings.AISettings = cloneAISettings(settings.AISettings)
 	settings.Groups = cloneStringSlice(settings.Groups)
 	settings.GroupTree = cloneGroupNodes(settings.GroupTree)
@@ -2590,26 +2618,35 @@ func cloneAgentUpdateInstruction(value *AgentUpdateInstruction) *AgentUpdateInst
 
 func isAgentUpdateTerminalState(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "succeeded", "failed":
+	case agentUpdateStateSucceeded, agentUpdateStateFailed:
 		return true
 	default:
 		return false
 	}
 }
 
+func normalizeAgentUpdateReportState(state string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case agentUpdateStateUpdating:
+		return agentUpdateStateUpdating, true
+	case agentUpdateStateRestarting:
+		return agentUpdateStateRestarting, true
+	case agentUpdateStateSucceeded:
+		return agentUpdateStateSucceeded, true
+	case agentUpdateStateFailed:
+		return agentUpdateStateFailed, true
+	default:
+		return "", false
+	}
+}
+
 func agentUpdateLeaseForState(state string) time.Duration {
 	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "updating":
+	case agentUpdateStateUpdating:
 		return agentUpdateLeaseUpdating
-	case "restarting":
+	case agentUpdateStateRestarting:
 		return agentUpdateLeaseRestart
 	default:
-		if isAgentUpdateTerminalState(state) {
-			return 0
-		}
-		if strings.TrimSpace(state) != "" {
-			return agentUpdateLeaseUpdating
-		}
 		return 0
 	}
 }
@@ -2636,11 +2673,11 @@ func reconcileAgentUpdateWithStatsLocked(profile *NodeProfile, stats metrics.Nod
 	if currentVersion == "" || targetVersion == "" {
 		return false
 	}
-	if updater.CompareVersions(currentVersion, targetVersion) != 0 {
+	if !updater.VersionsEqual(currentVersion, targetVersion) {
 		return false
 	}
 	profile.AgentUpdate = nil
-	profile.AgentUpdateState = "succeeded"
+	profile.AgentUpdateState = agentUpdateStateSucceeded
 	profile.AgentUpdateTargetVersion = targetVersion
 	profile.AgentUpdateMessage = "节点已上报目标版本，服务端已自动完成更新任务收口"
 	profile.AgentUpdateLeaseUntil = 0
@@ -2674,6 +2711,12 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	if stats.AgentUpdateDisabled {
 		return "当前 Agent 已禁用远程更新"
 	}
+	if stats.AgentUpdateInsecure {
+		return "远程更新要求 Agent 使用 HTTPS 控制面"
+	}
+	if !stats.AgentRemoteUpdate {
+		return "当前 Agent 未上报远程更新能力"
+	}
 	switch resolveAgentUpdateMode(stats) {
 	case "windows":
 		return "当前节点平台暂不支持后台自更新"
@@ -2686,10 +2729,6 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	}
 }
 
-func isChecksumOptionalForAgentUpdate(stats metrics.NodeStats) bool {
-	return resolveAgentUpdateMode(stats) == "docker-managed"
-}
-
 func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool, string, string, string, string) {
 	if profile == nil {
 		supported := resolveAgentUpdateSupported(stats)
@@ -2700,10 +2739,10 @@ func resolveAgentUpdateView(profile *NodeProfile, stats metrics.NodeStats) (bool
 		return supported, resolveAgentUpdateMode(stats), "", "", message
 	}
 	supported := resolveAgentUpdateSupported(stats)
-	message := strings.TrimSpace(profile.AgentUpdateMessage)
-	if !supported && message == "" {
-		message = resolveAgentUpdateUnsupportedReason(stats)
+	if !supported {
+		return supported, resolveAgentUpdateMode(stats), strings.TrimSpace(profile.AgentUpdateState), strings.TrimSpace(profile.AgentUpdateTargetVersion), resolveAgentUpdateUnsupportedReason(stats)
 	}
+	message := strings.TrimSpace(profile.AgentUpdateMessage)
 	return supported, resolveAgentUpdateMode(stats), strings.TrimSpace(profile.AgentUpdateState), strings.TrimSpace(profile.AgentUpdateTargetVersion), message
 }
 
@@ -2773,7 +2812,14 @@ func parsePublicHistoryRange(raw string, now time.Time) (string, time.Time, time
 }
 
 func storeSnapshot(s *Store, withHistory bool) Snapshot {
-	nodes := s.Snapshot()
+	return buildStoreSnapshot(s, s.Snapshot(), withHistory)
+}
+
+func adminStoreSnapshot(s *Store, withHistory bool) Snapshot {
+	return buildStoreSnapshot(s, s.AdminSnapshot(), withHistory)
+}
+
+func buildStoreSnapshot(s *Store, nodes []NodeView, withHistory bool) Snapshot {
 	snapshot := Snapshot{
 		Type:        "snapshot",
 		GeneratedAt: time.Now().Unix(),
@@ -2796,7 +2842,16 @@ func broadcastStoreSnapshot(hub *Hub, store *Store, withHistory bool) {
 		log.Printf("序列化节点快照失败: %v", err)
 		return
 	}
-	hub.Broadcast(payload)
+	hub.BroadcastVariant(payload, publicVariantBalanced)
+	if !hub.HasVariant(adminVariant) {
+		return
+	}
+	payload, err = json.Marshal(adminStoreSnapshot(store, withHistory))
+	if err != nil {
+		log.Printf("序列化管理端节点快照失败: %v", err)
+		return
+	}
+	hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
 }
 
 func digestPublicSnapshot(snapshot Snapshot) string {
@@ -2901,46 +2956,43 @@ func cloneTestHistory(
 }
 
 func (s *Store) Snapshot() []NodeView {
+	return s.snapshot(false)
+}
+
+func (s *Store) AdminSnapshot() []NodeView {
+	return s.snapshot(true)
+}
+
+func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
 	var persist bool
 	s.mu.Lock()
 
 	views := make([]NodeView, 0, len(s.nodes))
 	now := time.Now()
+	seenNodes := make(map[string]struct{}, len(s.nodes))
 	for _, node := range s.nodes {
+		seenNodes[node.Stats.NodeID] = struct{}{}
 		profile := s.ensureProfileLocked(node.Stats.NodeID)
 		if s.applyAutoRenewLocked(profile, now) {
 			persist = true
 		}
-		status := resolveNodeStatus(now, node)
-		group, tags := resolveProfileGroupTags(profile, node.Stats)
-		groups := normalizeGroupSelections(profile.Groups)
-		updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
-		views = append(views, NodeView{
-			Stats:                    cloneNodeStats(node.Stats),
-			LastSeen:                 node.LastSeen.Unix(),
-			FirstSeen:                node.FirstSeen.Unix(),
-			Status:                   status,
-			ServerID:                 profile.ServerID,
-			AlertEnabled:             isAlertEnabled(profile),
-			Alias:                    profile.Alias,
-			Group:                    group,
-			Tags:                     cloneStringSlice(tags),
-			Groups:                   cloneStringSlice(groups),
-			Region:                   profile.Region,
-			DiskType:                 profile.DiskType,
-			NetSpeedMbps:             profile.NetSpeedMbps,
-			ExpireAt:                 profile.ExpireAt,
-			AutoRenew:                profile.AutoRenew,
-			RenewIntervalSec:         profile.RenewIntervalSec,
-			TestIntervalSec:          profile.TestIntervalSec,
-			Tests:                    cloneNetworkTestConfigs(profile.Tests),
-			TestSelections:           cloneTestSelections(profile.TestSelections),
-			AgentUpdateSupported:     updateSupported,
-			AgentUpdateMode:          updateMode,
-			AgentUpdateState:         updateState,
-			AgentUpdateTargetVersion: updateTargetVersion,
-			AgentUpdateMessage:       updateMessage,
-		})
+		view, ok := s.nodeViewLocked(node.Stats.NodeID, now)
+		if ok {
+			views = append(views, view)
+		}
+	}
+	if includeProfileOnly {
+		for nodeID, profile := range s.profiles {
+			if _, ok := seenNodes[nodeID]; ok {
+				continue
+			}
+			if s.applyAutoRenewLocked(profile, now) {
+				persist = true
+			}
+			if view, ok := profileOnlyNodeView(nodeID, profile); ok {
+				views = append(views, view)
+			}
+		}
 	}
 	sort.Slice(views, func(i, j int) bool {
 		leftGroup := views[i].Group
@@ -2963,63 +3015,114 @@ func resolveNodeStatus(now time.Time, node NodeState) string {
 		now = time.Now()
 	}
 	if now.Sub(node.LastSeen) > nodeStaleGraceSeconds*time.Second {
-		return "offline"
+		return nodeStatusOffline
 	}
-	return "online"
+	return nodeStatusOnline
+}
+
+func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || profile == nil {
+		return NodeView{}, false
+	}
+	alias := strings.TrimSpace(profile.Alias)
+	nodeName := alias
+	if nodeName == "" {
+		nodeName = nodeID
+	}
+	stats := metrics.NodeStats{
+		NodeID:    nodeID,
+		NodeName:  nodeName,
+		NodeAlias: alias,
+		Hostname:  nodeID,
+		Timestamp: profile.UpdatedAt,
+	}
+	group, tags := resolveProfileGroupTags(profile, stats)
+	stats.NodeGroup = group
+	groups := normalizeGroupSelections(profile.Groups)
+	return NodeView{
+		Stats:                    stats,
+		Status:                   nodeStatusWaitingRegistration,
+		ServerID:                 profile.ServerID,
+		AlertEnabled:             isAlertEnabled(profile),
+		Alias:                    alias,
+		Group:                    group,
+		Tags:                     cloneStringSlice(tags),
+		Groups:                   cloneStringSlice(groups),
+		Region:                   profile.Region,
+		DiskType:                 profile.DiskType,
+		NetSpeedMbps:             profile.NetSpeedMbps,
+		ExpireAt:                 profile.ExpireAt,
+		AutoRenew:                profile.AutoRenew,
+		RenewIntervalSec:         profile.RenewIntervalSec,
+		TestIntervalSec:          profile.TestIntervalSec,
+		TestSelections:           cloneTestSelections(profile.TestSelections),
+		AgentUpdateSupported:     false,
+		AgentUpdateState:         strings.TrimSpace(profile.AgentUpdateState),
+		AgentUpdateTargetVersion: strings.TrimSpace(profile.AgentUpdateTargetVersion),
+		AgentUpdateMessage:       strings.TrimSpace(profile.AgentUpdateMessage),
+	}, true
 }
 
 func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	now := time.Now()
+	node, ok := s.nodeViewLocked(nodeID, now)
+	if !ok {
+		return NodeDelta{}, false
+	}
+	return NodeDelta{
+		Type:        "node_delta",
+		GeneratedAt: now.Unix(),
+		Node:        node,
+	}, true
+}
+
+func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return NodeDelta{}, false
+		return NodeView{}, false
 	}
 	node, ok := s.nodes[nodeID]
 	if !ok {
-		return NodeDelta{}, false
+		return NodeView{}, false
 	}
 
 	profile := s.profiles[nodeID]
 	if profile == nil {
 		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
 	}
-
-	status := resolveNodeStatus(time.Now(), node)
+	status := resolveNodeStatus(now, node)
 	group, tags := resolveProfileGroupTags(profile, node.Stats)
 	groups := normalizeGroupSelections(profile.Groups)
 	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
-	return NodeDelta{
-		Type:        "node_delta",
-		GeneratedAt: time.Now().Unix(),
-		Node: NodeView{
-			Stats:                    cloneNodeStats(node.Stats),
-			LastSeen:                 node.LastSeen.Unix(),
-			FirstSeen:                node.FirstSeen.Unix(),
-			Status:                   status,
-			ServerID:                 profile.ServerID,
-			AlertEnabled:             isAlertEnabled(profile),
-			Alias:                    profile.Alias,
-			Group:                    group,
-			Tags:                     cloneStringSlice(tags),
-			Groups:                   cloneStringSlice(groups),
-			Region:                   profile.Region,
-			DiskType:                 profile.DiskType,
-			NetSpeedMbps:             profile.NetSpeedMbps,
-			ExpireAt:                 profile.ExpireAt,
-			AutoRenew:                profile.AutoRenew,
-			RenewIntervalSec:         profile.RenewIntervalSec,
-			TestIntervalSec:          profile.TestIntervalSec,
-			Tests:                    cloneNetworkTestConfigs(profile.Tests),
-			TestSelections:           cloneTestSelections(profile.TestSelections),
-			AgentUpdateSupported:     updateSupported,
-			AgentUpdateMode:          updateMode,
-			AgentUpdateState:         updateState,
-			AgentUpdateTargetVersion: updateTargetVersion,
-			AgentUpdateMessage:       updateMessage,
-		},
+	return NodeView{
+		Stats:                    cloneNodeStats(node.Stats),
+		LastSeen:                 node.LastSeen.Unix(),
+		FirstSeen:                node.FirstSeen.Unix(),
+		Status:                   status,
+		ServerID:                 profile.ServerID,
+		AlertEnabled:             isAlertEnabled(profile),
+		Alias:                    profile.Alias,
+		Group:                    group,
+		Tags:                     cloneStringSlice(tags),
+		Groups:                   cloneStringSlice(groups),
+		Region:                   profile.Region,
+		DiskType:                 profile.DiskType,
+		NetSpeedMbps:             profile.NetSpeedMbps,
+		ExpireAt:                 profile.ExpireAt,
+		AutoRenew:                profile.AutoRenew,
+		RenewIntervalSec:         profile.RenewIntervalSec,
+		TestIntervalSec:          profile.TestIntervalSec,
+		TestSelections:           cloneTestSelections(profile.TestSelections),
+		AgentUpdateSupported:     updateSupported,
+		AgentUpdateMode:          updateMode,
+		AgentUpdateState:         updateState,
+		AgentUpdateTargetVersion: updateTargetVersion,
+		AgentUpdateMessage:       updateMessage,
 	}, true
 }
 
@@ -3046,12 +3149,13 @@ func (s *Store) SettingsGroups() []string {
 	return groups
 }
 
-func (h *Hub) Add(conn *websocket.Conn, variant string) *hubClient {
+func (h *Hub) Add(conn *websocket.Conn, variant string, adminTokenSalt string) *hubClient {
 	client := &hubClient{
-		conn:    conn,
-		variant: variant,
-		send:    make(chan hubMessage, wsSendQueueSize),
-		done:    make(chan struct{}),
+		conn:           conn,
+		variant:        variant,
+		adminTokenSalt: strings.TrimSpace(adminTokenSalt),
+		send:           make(chan hubMessage, wsSendQueueSize),
+		done:           make(chan struct{}),
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -3072,6 +3176,14 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 	_ = conn.Close()
 }
 
+func (h *Hub) CloseAdminClients() {
+	for _, client := range h.snapshotClients() {
+		if client != nil && client.variant == adminVariant {
+			h.removeClient(client)
+		}
+	}
+}
+
 func (h *Hub) Broadcast(payload []byte) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
@@ -3086,6 +3198,24 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
 		if client == nil || client.variant != variant {
+			continue
+		}
+		copied := bytes.Clone(payload)
+		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+			h.removeClient(client)
+		}
+	}
+}
+
+func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
+	clients := h.snapshotClients()
+	currentSalt := strings.TrimSpace(tokenSalt)
+	for _, client := range clients {
+		if client == nil || client.variant != adminVariant {
+			continue
+		}
+		if client.adminTokenSalt != currentSalt {
+			h.removeClient(client)
 			continue
 		}
 		copied := bytes.Clone(payload)
@@ -3203,10 +3333,10 @@ func isSameOrigin(r *http.Request) bool {
 	return strings.EqualFold(parsed.Host, r.Host)
 }
 
-func buildDefaultPublicConfig(r *http.Request) (string, string) {
+func buildDefaultPublicConfig(r *http.Request, trustedProxyHeaders bool) (string, string) {
 	scheme := "http"
 	if r != nil {
-		if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); strings.EqualFold(proto, "https") {
+		if proto := trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Proto"); strings.EqualFold(proto, "https") {
 			scheme = "https"
 		} else if r.TLS != nil {
 			scheme = "https"
@@ -3223,9 +3353,127 @@ func buildDefaultPublicConfig(r *http.Request) (string, string) {
 	if scheme == "https" {
 		wsScheme = "wss"
 	}
-	apiBase := fmt.Sprintf("%s://%s", scheme, host)
-	socketURL := fmt.Sprintf("%s://%s/ws", wsScheme, host)
+	prefix := forwardedPrefix(r, trustedProxyHeaders)
+	apiBase := fmt.Sprintf("%s://%s%s", scheme, host, prefix)
+	socketURL := fmt.Sprintf("%s://%s%s/ws", wsScheme, host, prefix)
 	return apiBase, socketURL
+}
+
+func stripForwardedPrefixPath(next http.Handler, trustedProxyHeaders bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := forwardedPrefix(r, trustedProxyHeaders)
+		if prefix == "" || r == nil || r.URL == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		path := r.URL.Path
+		strippedPath := ""
+		switch {
+		case path == prefix:
+			strippedPath = "/"
+		case strings.HasPrefix(path, prefix+"/"):
+			strippedPath = strings.TrimPrefix(path, prefix)
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+		req := r.Clone(r.Context())
+		urlCopy := *r.URL
+		urlCopy.Path = strippedPath
+		urlCopy.RawPath = ""
+		req.URL = &urlCopy
+		next.ServeHTTP(w, req)
+	})
+}
+
+func forwardedPrefix(r *http.Request, trustedProxyHeaders bool) string {
+	if r == nil {
+		return ""
+	}
+	raw := trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Prefix")
+	if raw == "" {
+		return ""
+	}
+	if comma := strings.Index(raw, ","); comma >= 0 {
+		raw = strings.TrimSpace(raw[:comma])
+	}
+	if invalidForwardedPrefix(raw) {
+		return ""
+	}
+	decoded, ok := decodeForwardedPrefix(raw)
+	if !ok {
+		return ""
+	}
+	decoded = strings.TrimSpace(decoded)
+	if invalidForwardedPrefix(decoded) {
+		return ""
+	}
+	if !strings.HasPrefix(decoded, "/") {
+		decoded = "/" + decoded
+	}
+	parts := strings.Split(decoded, "/")
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if part == "." || part == ".." {
+			return ""
+		}
+		clean = append(clean, part)
+	}
+	if len(clean) == 0 {
+		return ""
+	}
+	return "/" + strings.Join(clean, "/")
+}
+
+func trustedForwardedHeader(r *http.Request, trustedProxyHeaders bool, name string) string {
+	if !trustedProxyHeaders || r == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.Header.Get(name))
+}
+
+func decodeForwardedPrefix(raw string) (string, bool) {
+	decoded := raw
+	for i := 0; i < 4; i++ {
+		next, err := url.PathUnescape(decoded)
+		if err != nil {
+			return "", false
+		}
+		if next == decoded {
+			return next, true
+		}
+		decoded = next
+		if invalidForwardedPrefix(decoded) {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func forwardedPrefixedPath(r *http.Request, path string, trustedProxyHeaders bool) string {
+	prefix := forwardedPrefix(r, trustedProxyHeaders)
+	if prefix == "" {
+		return path
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return prefix + path
+}
+
+func invalidForwardedPrefix(value string) bool {
+	if value == "" || value == "/" || strings.Contains(value, "://") || strings.Contains(value, ":") || strings.ContainsAny(value, "?#\\") {
+		return true
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func withSecurityHeaders(next http.Handler) http.Handler {
@@ -3246,20 +3494,19 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 }
 
 type NodeProfileUpdate struct {
-	Alias            *string                      `json:"alias"`
-	Group            *string                      `json:"group"`
-	Tags             *[]string                    `json:"tags"`
-	Groups           *[]string                    `json:"groups"`
-	Region           *string                      `json:"region"`
-	DiskType         *string                      `json:"disk_type"`
-	NetSpeedMbps     *int                         `json:"net_speed_mbps"`
-	ExpireAt         *int64                       `json:"expire_at"`
-	AutoRenew        *bool                        `json:"auto_renew"`
-	RenewIntervalSec *int64                       `json:"renew_interval_sec"`
-	TestIntervalSec  *int                         `json:"test_interval_sec"`
-	Tests            *[]metrics.NetworkTestConfig `json:"tests"`
-	TestSelections   *[]TestSelection             `json:"test_selections"`
-	AlertEnabled     *bool                        `json:"alert_enabled"`
+	Alias            *string          `json:"alias"`
+	Group            *string          `json:"group"`
+	Tags             *[]string        `json:"tags"`
+	Groups           *[]string        `json:"groups"`
+	Region           *string          `json:"region"`
+	DiskType         *string          `json:"disk_type"`
+	NetSpeedMbps     *int             `json:"net_speed_mbps"`
+	ExpireAt         *int64           `json:"expire_at"`
+	AutoRenew        *bool            `json:"auto_renew"`
+	RenewIntervalSec *int64           `json:"renew_interval_sec"`
+	TestIntervalSec  *int             `json:"test_interval_sec"`
+	TestSelections   *[]TestSelection `json:"test_selections"`
+	AlertEnabled     *bool            `json:"alert_enabled"`
 }
 
 func (s *Store) AdminPath() string {
@@ -3272,6 +3519,18 @@ func (s *Store) Credentials() Settings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.settings
+}
+
+func (s *Store) RotateAdminTokenSalt() error {
+	tokenSalt, err := randomToken(16)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.settings.TokenSalt = tokenSalt
+	s.mu.Unlock()
+	s.persist()
+	return nil
 }
 
 func (s *Store) VerifyAdminPassword(password string) bool {
@@ -3479,10 +3738,12 @@ func (s *Store) PublicSettings() PublicSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return PublicSettings{
-		SiteTitle:    s.settings.SiteTitle,
-		SiteIcon:     s.settings.SiteIcon,
-		HomeTitle:    s.settings.HomeTitle,
-		HomeSubtitle: s.settings.HomeSubtitle,
+		SiteTitle:           s.settings.SiteTitle,
+		SiteIcon:            safeSiteIconURL(s.settings.SiteIcon),
+		SiteBackgroundImage: safeSiteBackgroundImageURL(s.settings.SiteBackgroundImage),
+		HomeTitle:           s.settings.HomeTitle,
+		HomeSubtitle:        s.settings.HomeSubtitle,
+		Locale:              normalizeLocale(s.settings.Locale),
 	}
 }
 
@@ -3501,19 +3762,20 @@ func (s *Store) SettingsView() SettingsView {
 		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
-		SiteIcon:             s.settings.SiteIcon,
+		SiteIcon:             safeSiteIconURL(s.settings.SiteIcon),
+		SiteBackgroundImage:  safeSiteBackgroundImageURL(s.settings.SiteBackgroundImage),
 		HomeTitle:            s.settings.HomeTitle,
 		HomeSubtitle:         s.settings.HomeSubtitle,
+		Locale:               normalizeLocale(s.settings.Locale),
 		AlertWebhook:         s.settings.AlertWebhook,
 		AlertOfflineSec:      s.settings.AlertOfflineSec,
-		AlertAll:             s.settings.AlertAll,
-		AlertNodes:           cloneStringSlice(s.settings.AlertNodes),
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: cloneInt64Slice(s.settings.AlertTelegramUserIDs),
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		LoginFailLimit:       loginFailLimit,
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
+		AdminAuth:            redactAdminAuthSettings(normalizeAdminAuthSettings(s.settings.AdminAuth)),
 		AISettings:           cloneAISettings(s.settings.AISettings),
 		Version:              s.buildVersion,
 		Commit:               s.buildCommit,
@@ -3526,7 +3788,7 @@ func (s *Store) SettingsView() SettingsView {
 func (s *Store) ExportConfig() ConfigTransferData {
 	view := redactSettingsViewForExport(s.SettingsView())
 	s.mu.RLock()
-	profiles := cloneProfilesForExport(s.profiles)
+	profiles := configTransferProfilesFromNodeProfiles(s.profiles)
 	s.mu.RUnlock()
 	return ConfigTransferData{
 		Version:    configExportVersion,
@@ -3544,6 +3806,7 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 	view.AlertTelegramToken = ""
 	view.AlertTelegramUserIDs = nil
 	view.AlertTelegramUserID = 0
+	view.AdminAuth = redactAdminAuthSettings(view.AdminAuth)
 	view.AISettings = redactAISettingsForExport(view.AISettings)
 	view.Commit = ""
 	view.SessionToken = ""
@@ -3562,7 +3825,7 @@ func redactAISettingsForExport(settings AISettings) AISettings {
 	return settings
 }
 
-func refreshAdminSessionCookie(w http.ResponseWriter, r *http.Request, secret string, store *Store) error {
+func refreshAdminSessionCookie(w http.ResponseWriter, r *http.Request, secret string, store *Store, trustedProxyHeaders bool) error {
 	if w == nil || store == nil {
 		return nil
 	}
@@ -3574,11 +3837,11 @@ func refreshAdminSessionCookie(w http.ResponseWriter, r *http.Request, secret st
 	if err != nil {
 		return err
 	}
-	setAdminSessionCookie(w, r, token, exp)
+	setAdminSessionCookie(w, r, token, exp, trustedProxyHeaders)
 	return nil
 }
 
-func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string, exp int64) {
+func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string, exp int64, trustedProxyHeaders bool) {
 	if w == nil {
 		return
 	}
@@ -3592,13 +3855,13 @@ func setAdminSessionCookie(w http.ResponseWriter, r *http.Request, token string,
 	if exp > 0 {
 		cookie.Expires = time.Unix(exp, 0)
 	}
-	if requestIsSecure(r) {
+	if requestIsSecure(r, trustedProxyHeaders) {
 		cookie.Secure = true
 	}
 	http.SetCookie(w, cookie)
 }
 
-func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request) {
+func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request, trustedProxyHeaders bool) {
 	if w == nil {
 		return
 	}
@@ -3611,20 +3874,20 @@ func clearAdminSessionCookie(w http.ResponseWriter, r *http.Request) {
 		Expires:  time.Unix(0, 0),
 		SameSite: http.SameSiteLaxMode,
 	}
-	if requestIsSecure(r) {
+	if requestIsSecure(r, trustedProxyHeaders) {
 		cookie.Secure = true
 	}
 	http.SetCookie(w, cookie)
 }
 
-func requestIsSecure(r *http.Request) bool {
+func requestIsSecure(r *http.Request, trustedProxyHeaders bool) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	return strings.EqualFold(trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Proto"), "https")
 }
 
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
@@ -3634,17 +3897,18 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	agentEndpoint := strings.TrimSpace(view.AgentEndpoint)
 	siteTitle := strings.TrimSpace(view.SiteTitle)
 	siteIcon := strings.TrimSpace(view.SiteIcon)
+	siteBackgroundImage := strings.TrimSpace(view.SiteBackgroundImage)
 	homeTitle := strings.TrimSpace(view.HomeTitle)
 	homeSubtitle := strings.TrimSpace(view.HomeSubtitle)
+	locale := strings.TrimSpace(view.Locale)
 	alertWebhook := strings.TrimSpace(view.AlertWebhook)
 	alertTelegramToken := strings.TrimSpace(view.AlertTelegramToken)
-	alertNodes := cloneStringSlice(view.AlertNodes)
 	alertTelegramUserIDs := cloneInt64Slice(view.AlertTelegramUserIDs)
+	adminAuth := cloneAdminAuthSettings(view.AdminAuth)
 	aiSettings := cloneAISettings(view.AISettings)
 	groups := cloneStringSlice(view.Groups)
 	groupTree := cloneGroupNodes(view.GroupTree)
 	testCatalog := cloneTestCatalogItems(view.TestCatalog)
-	alertAll := view.AlertAll
 
 	update := SettingsUpdate{
 		AdminPath:            stringPointer(adminPath),
@@ -3653,19 +3917,21 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 		AgentEndpoint:        stringPointer(agentEndpoint),
 		SiteTitle:            stringPointer(siteTitle),
 		SiteIcon:             stringPointer(siteIcon),
+		SiteBackgroundImage:  stringPointer(siteBackgroundImage),
 		HomeTitle:            stringPointer(homeTitle),
 		HomeSubtitle:         stringPointer(homeSubtitle),
+		Locale:               stringPointer(locale),
 		AlertWebhook:         stringPointer(alertWebhook),
 		AlertOfflineSec:      int64Pointer(view.AlertOfflineSec),
-		AlertAll:             &alertAll,
-		AlertNodes:           &alertNodes,
 		AlertTelegramToken:   stringPointer(alertTelegramToken),
 		AlertTelegramUserIDs: &alertTelegramUserIDs,
 		LoginFailLimit:       intPointer(view.LoginFailLimit),
 		LoginFailWindowSec:   int64Pointer(view.LoginFailWindowSec),
 		LoginLockSec:         int64Pointer(view.LoginLockSec),
+		AdminAuth:            &adminAuth,
 		AISettings:           &aiSettings,
 		Groups:               &groups,
+		GroupTree:            &groupTree,
 		TestCatalog:          &testCatalog,
 	}
 	if agentToken != "" {
@@ -3673,9 +3939,6 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	}
 	if secret := strings.TrimSpace(view.TurnstileSecretKey); secret != "" {
 		update.TurnstileSecretKey = stringPointer(secret)
-	}
-	if len(groupTree) > 0 {
-		update.GroupTree = &groupTree
 	}
 	return update
 }
@@ -3763,7 +4026,11 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.settings.AgentToken = token
 	}
 	if update.AgentEndpoint != nil {
-		s.settings.AgentEndpoint = strings.TrimSpace(*update.AgentEndpoint)
+		value := strings.TrimSpace(*update.AgentEndpoint)
+		if err := validateAgentEndpoint(value); err != nil {
+			return fail(err)
+		}
+		s.settings.AgentEndpoint = value
 	}
 	if update.TurnstileSiteKey != nil {
 		siteKey := strings.TrimSpace(*update.TurnstileSiteKey)
@@ -3791,7 +4058,18 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 	}
 	if update.SiteIcon != nil {
-		s.settings.SiteIcon = strings.TrimSpace(*update.SiteIcon)
+		siteIcon, err := normalizeSiteIconURL(*update.SiteIcon)
+		if err != nil {
+			return fail(err)
+		}
+		s.settings.SiteIcon = siteIcon
+	}
+	if update.SiteBackgroundImage != nil {
+		siteBackgroundImage, err := normalizeSiteBackgroundImageURL(*update.SiteBackgroundImage)
+		if err != nil {
+			return fail(err)
+		}
+		s.settings.SiteBackgroundImage = siteBackgroundImage
 	}
 	if update.HomeTitle != nil {
 		s.settings.HomeTitle = strings.TrimSpace(*update.HomeTitle)
@@ -3804,6 +4082,9 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		if s.settings.HomeSubtitle == "" {
 			s.settings.HomeSubtitle = defaultHomeSub
 		}
+	}
+	if update.Locale != nil {
+		s.settings.Locale = normalizeLocale(*update.Locale)
 	}
 	if update.AlertWebhook != nil {
 		value := strings.TrimSpace(*update.AlertWebhook)
@@ -3820,12 +4101,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 			offlineSec = defaultAlertOfflineSec
 		}
 		s.settings.AlertOfflineSec = offlineSec
-	}
-	if update.AlertAll != nil {
-		s.settings.AlertAll = *update.AlertAll
-	}
-	if update.AlertNodes != nil {
-		s.settings.AlertNodes = normalizeAlertNodes(*update.AlertNodes)
 	}
 	if update.AlertTelegramToken != nil {
 		value := strings.TrimSpace(*update.AlertTelegramToken)
@@ -3890,6 +4165,21 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.LoginLockSec = lockSec
 	}
+	if update.AdminAuth != nil {
+		normalized := normalizeAdminAuthSettings(*update.AdminAuth)
+		normalized = preserveAdminAuthSecrets(normalized, s.settings.AdminAuth)
+		if err := validateAdminAuthSettings(normalized); err != nil {
+			return fail(err)
+		}
+		if !adminAuthSettingsEqual(normalizeAdminAuthSettings(s.settings.AdminAuth), normalized) {
+			s.settings.AdminAuth = normalized
+			tokenSalt, err := randomToken(adminTokenLength)
+			if err != nil {
+				return fail(err)
+			}
+			s.settings.TokenSalt = tokenSalt
+		}
+	}
 	if update.AISettings != nil {
 		normalized, err := normalizeAISettings(*update.AISettings)
 		if err != nil {
@@ -3933,18 +4223,19 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		AgentToken:           s.settings.AgentToken,
 		SiteTitle:            s.settings.SiteTitle,
 		SiteIcon:             s.settings.SiteIcon,
+		SiteBackgroundImage:  s.settings.SiteBackgroundImage,
 		HomeTitle:            s.settings.HomeTitle,
 		HomeSubtitle:         s.settings.HomeSubtitle,
+		Locale:               normalizeLocale(s.settings.Locale),
 		AlertWebhook:         s.settings.AlertWebhook,
 		AlertOfflineSec:      s.settings.AlertOfflineSec,
-		AlertAll:             s.settings.AlertAll,
-		AlertNodes:           cloneStringSlice(s.settings.AlertNodes),
 		AlertTelegramToken:   s.settings.AlertTelegramToken,
 		AlertTelegramUserIDs: cloneInt64Slice(s.settings.AlertTelegramUserIDs),
 		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
 		LoginFailLimit:       loginFailLimit,
 		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
 		LoginLockSec:         s.settings.LoginLockSec,
+		AdminAuth:            redactAdminAuthSettings(normalizeAdminAuthSettings(s.settings.AdminAuth)),
 		AISettings:           cloneAISettings(s.settings.AISettings),
 		Version:              s.buildVersion,
 		Commit:               s.buildCommit,
@@ -3990,7 +4281,7 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, error) {
 		return SettingsView{}, err
 	}
 	staged.mu.Lock()
-	normalizedProfiles, err := staged.normalizeProfilesForImportLocked(payload.Profiles)
+	normalizedProfiles, err := staged.normalizeProfilesForImportLocked(configTransferProfilesToNodeProfiles(payload.Profiles))
 	staged.mu.Unlock()
 	if err != nil {
 		return SettingsView{}, err
@@ -4040,6 +4331,10 @@ func preserveRedactedSensitiveSettings(update *SettingsUpdate, imported Settings
 		update.AlertTelegramToken = nil
 		update.AlertTelegramUserIDs = nil
 		update.AlertTelegramUserID = nil
+	}
+	if update.AdminAuth != nil {
+		merged := preserveAdminAuthSecrets(*update.AdminAuth, existing.AdminAuth)
+		update.AdminAuth = &merged
 	}
 	if update.AISettings != nil {
 		merged := mergeRedactedAISettings(*update.AISettings, existing.AISettings)
@@ -4153,11 +4448,7 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if profile.TestIntervalSec <= 0 {
 			profile.TestIntervalSec = defaultTestIntervalSec
 		}
-		profile.Tests = cloneNetworkTestConfigs(profile.Tests)
 		profile.TestSelections = s.normalizeSelectionsLocked(cloneTestSelections(profile.TestSelections))
-		if len(profile.TestSelections) > 0 {
-			profile.Tests = nil
-		}
 		if profile.AlertEnabled == nil {
 			profile.AlertEnabled = boolPointer(true)
 		} else {
@@ -4217,6 +4508,13 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	if expectedBootstrapToken != "" && !isBootstrapAgentToken(expectedBootstrapToken, bootstrapToken) {
 		s.mu.Unlock()
 		return "", invalidBootstrapTokenError()
+	}
+	if profile := s.profiles[nodeID]; profile != nil {
+		token := strings.TrimSpace(profile.AgentAuthToken)
+		if token != "" && !s.isAgentAuthTokenDuplicateLocked(nodeID, token) {
+			s.mu.Unlock()
+			return "", invalidBootstrapTokenError()
+		}
 	}
 	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
 		s.mu.Unlock()
@@ -4279,7 +4577,10 @@ func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
 	if expected == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(token)) != 1 {
+		return false
+	}
+	return !s.isAgentAuthTokenDuplicateLocked(nodeID, expected)
 }
 
 func isBootstrapAgentToken(expected, token string) bool {
@@ -4517,14 +4818,8 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		profile.TestIntervalSec = *update.TestIntervalSec
 		configChanged = true
 	}
-	if update.Tests != nil {
-		profile.Tests = cloneNetworkTestConfigs(*update.Tests)
-		profile.TestSelections = nil
-		configChanged = true
-	}
 	if update.TestSelections != nil {
 		profile.TestSelections = s.normalizeSelectionsLocked(*update.TestSelections)
-		profile.Tests = nil
 		configChanged = true
 	}
 	if update.AlertEnabled != nil {
@@ -4655,10 +4950,23 @@ func (s *Store) DeleteNode(nodeID string) (bool, error) {
 	s.mu.RLock()
 	_, nodeExists := s.nodes[nodeID]
 	_, profileExists := s.profiles[nodeID]
+	_, hadPendingDelete := s.pendingNodeDeletes[nodeID]
 	historyManager := s.historyManager
 	s.mu.RUnlock()
+	hasBusinessState := nodeExists || profileExists
+	shouldPersist := s.dataPath != ""
 	if !nodeExists && !profileExists {
 		if historyManager == nil {
+			if hadPendingDelete {
+				if shouldPersist {
+					s.rollbackNodeDeleteIntent(nodeID)
+				} else {
+					s.mu.Lock()
+					s.unmarkPendingNodeDeleteLocked(nodeID)
+					s.mu.Unlock()
+				}
+				return true, nil
+			}
 			return false, nil
 		}
 		hasHistory, err := historyManager.HasNodeHistory(nodeID)
@@ -4667,35 +4975,97 @@ func (s *Store) DeleteNode(nodeID string) (bool, error) {
 			return true, err
 		}
 		if !hasHistory {
+			if hadPendingDelete {
+				if shouldPersist {
+					s.rollbackNodeDeleteIntent(nodeID)
+				} else {
+					s.mu.Lock()
+					s.unmarkPendingNodeDeleteLocked(nodeID)
+					s.mu.Unlock()
+				}
+				return true, nil
+			}
 			return false, nil
 		}
 	}
 
-	shouldPersist := s.dataPath != ""
 	if shouldPersist {
 		if err := s.persistNodeDeleteIntent(nodeID); err != nil {
 			return true, err
 		}
 	}
 
+	var historyCleanupErr error
 	if historyManager != nil {
 		if err := historyManager.DeleteNode(nodeID); err != nil {
 			log.Printf("删除节点 TSDB 历史失败 node=%s: %v", nodeID, err)
-			if shouldPersist {
+			if shouldPersist && !hasBusinessState && !hadPendingDelete {
 				s.rollbackNodeDeleteIntent(nodeID)
 			}
-			return true, err
+			if !hasBusinessState {
+				return true, err
+			}
+			historyCleanupErr = err
 		}
 	}
 
 	s.mu.Lock()
 	s.deleteNodeMemoryLocked(nodeID)
-	s.unmarkPendingNodeDeleteLocked(nodeID)
+	if historyCleanupErr == nil {
+		s.unmarkPendingNodeDeleteLocked(nodeID)
+	}
 	s.mu.Unlock()
 	if shouldPersist {
 		s.persist()
 	}
+	if historyCleanupErr != nil {
+		return true, &nodeDeleteHistoryCleanupError{err: historyCleanupErr}
+	}
 	return true, nil
+}
+
+type nodeDeleteHistoryCleanupError struct {
+	err error
+}
+
+func (e *nodeDeleteHistoryCleanupError) Error() string {
+	return "删除节点成功，" + e.HistoryError()
+}
+
+func (e *nodeDeleteHistoryCleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *nodeDeleteHistoryCleanupError) HistoryError() string {
+	if e == nil || e.err == nil {
+		return "历史数据清理失败"
+	}
+	return fmt.Sprintf("历史数据清理失败: %v", e.err)
+}
+
+type clearNodesHistoryCleanupError struct {
+	err error
+}
+
+func (e *clearNodesHistoryCleanupError) Error() string {
+	return "清空节点成功，" + e.HistoryError()
+}
+
+func (e *clearNodesHistoryCleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *clearNodesHistoryCleanupError) HistoryError() string {
+	if e == nil || e.err == nil {
+		return "历史数据清理失败"
+	}
+	return fmt.Sprintf("历史数据清理失败: %v", e.err)
 }
 
 func (s *Store) ClearNodes() error {
@@ -4713,23 +5083,26 @@ func (s *Store) ClearNodes() error {
 		}
 	}
 
+	var historyCleanupErr error
 	if historyManager != nil {
 		if err := historyManager.ClearNodes(); err != nil {
 			log.Printf("清空节点 TSDB 历史失败: %v", err)
-			if shouldPersist {
-				s.rollbackClearNodesIntent()
-			}
-			return err
+			historyCleanupErr = err
 		}
 	}
 
 	s.mu.Lock()
 	s.clearNodesMemoryLocked()
-	s.pendingClearNodes = false
+	if historyCleanupErr == nil {
+		s.pendingClearNodes = false
+	}
 	s.pendingNodeDeletes = nil
 	s.mu.Unlock()
 	if shouldPersist {
 		s.persist()
+	}
+	if historyCleanupErr != nil {
+		return &clearNodesHistoryCleanupError{err: historyCleanupErr}
 	}
 	return nil
 }
@@ -4894,19 +5267,6 @@ func (s *Store) persistClearNodesIntent() error {
 	return nil
 }
 
-func (s *Store) rollbackClearNodesIntent() {
-	s.persistMu.Lock()
-	defer s.persistMu.Unlock()
-
-	s.mu.Lock()
-	s.pendingClearNodes = false
-	snapshot := s.snapshotPersistedLocked()
-	s.mu.Unlock()
-	if persistErr := s.writePersistedSnapshotLocked(snapshot); persistErr != nil {
-		log.Printf("%v", persistErr)
-	}
-}
-
 func (s *Store) markPendingNodeDeleteLocked(nodeID string) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
@@ -4951,14 +5311,23 @@ func (s *Store) clearNodesMemoryLocked() {
 
 type AgentUpdateReport struct {
 	State   string `json:"state"`
+	ID      string `json:"update_id,omitempty"`
 	Version string `json:"version,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
-func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstruction) (NodeProfile, bool) {
+type agentUpdateQueueStatus string
+
+const (
+	agentUpdateQueueNotFound agentUpdateQueueStatus = "not_found"
+	agentUpdateQueueActive   agentUpdateQueueStatus = "active"
+	agentUpdateQueueQueued   agentUpdateQueueStatus = "queued"
+)
+
+func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstruction) (NodeProfile, agentUpdateQueueStatus, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return NodeProfile{}, false
+		return NodeProfile{}, agentUpdateQueueNotFound, nil
 	}
 	unlock := s.lockAgentNodeRead(nodeID)
 	defer unlock()
@@ -4967,21 +5336,35 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	if _, nodeExists := s.nodes[nodeID]; !nodeExists {
 		if _, profileExists := s.profiles[nodeID]; !profileExists {
 			s.mu.Unlock()
-			return NodeProfile{}, false
+			return NodeProfile{}, agentUpdateQueueNotFound, nil
 		}
 	}
 
 	profile := s.ensureProfileLocked(nodeID)
+	if profile.AgentUpdate != nil && !isAgentUpdateTerminalState(profile.AgentUpdateState) {
+		result := cloneNodeProfileValue(profile)
+		s.mu.Unlock()
+		return result, agentUpdateQueueActive, nil
+	}
 	instruction.Version = strings.TrimSpace(instruction.Version)
 	instruction.DownloadURL = strings.TrimSpace(instruction.DownloadURL)
 	instruction.ChecksumURL = strings.TrimSpace(instruction.ChecksumURL)
+	instruction.ID = strings.TrimSpace(instruction.ID)
+	if instruction.ID == "" {
+		updateID, err := newAgentUpdateID()
+		if err != nil {
+			s.mu.Unlock()
+			return NodeProfile{}, "", fmt.Errorf("生成 Agent 更新任务 ID 失败: %w", err)
+		}
+		instruction.ID = updateID
+	}
 	instruction.RequestedAt = time.Now().Unix()
 	applyQueuedAgentUpdate(profile, instruction)
 	s.markAgentConfigRefreshLocked(nodeID)
 	result := cloneNodeProfileValue(profile)
 	s.mu.Unlock()
 	s.persist()
-	return result, true
+	return result, agentUpdateQueueQueued, nil
 }
 
 func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) NodeProfile {
@@ -4992,34 +5375,42 @@ func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) 
 	unlock := s.lockAgentNodeRead(nodeID)
 	defer unlock()
 
-	return s.applyAgentUpdateReportNodeLocked(nodeID, report)
+	profile, _ := s.applyAgentUpdateReportNodeLocked(nodeID, report)
+	return profile
 }
 
 // applyAgentUpdateReportNodeLocked requires the caller to hold lockAgentNodeRead(nodeID).
-func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) NodeProfile {
+func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) (NodeProfile, bool) {
 	s.mu.Lock()
 	if _, nodeExists := s.nodes[nodeID]; !nodeExists {
 		if _, profileExists := s.profiles[nodeID]; !profileExists {
 			s.mu.Unlock()
-			return NodeProfile{}
+			return NodeProfile{}, false
 		}
 	}
 	profile := s.ensureProfileLocked(nodeID)
 	reportedAt := time.Now().Unix()
-	state := strings.TrimSpace(report.State)
-	if state == "" {
-		state = "unknown"
+	state, validState := normalizeAgentUpdateReportState(report.State)
+	if !validState {
+		result := cloneNodeProfileValue(profile)
+		s.mu.Unlock()
+		return result, false
 	}
 	if !agentUpdateReportMatchesPendingInstruction(profile, report) {
 		result := cloneNodeProfileValue(profile)
 		s.mu.Unlock()
-		return result
+		return result, false
+	}
+	if !agentUpdateReportAllowedForCurrentState(profile.AgentUpdateState, state) {
+		result := cloneNodeProfileValue(profile)
+		s.mu.Unlock()
+		return result, false
 	}
 	applyAgentUpdateReport(profile, report, state, reportedAt)
 	result := cloneNodeProfileValue(profile)
 	s.mu.Unlock()
 	s.persist()
-	return result
+	return result, true
 }
 
 func applyQueuedAgentUpdate(profile *NodeProfile, instruction AgentUpdateInstruction) {
@@ -5027,7 +5418,7 @@ func applyQueuedAgentUpdate(profile *NodeProfile, instruction AgentUpdateInstruc
 		return
 	}
 	profile.AgentUpdate = cloneAgentUpdateInstruction(&instruction)
-	profile.AgentUpdateState = "pending"
+	profile.AgentUpdateState = agentUpdateStatePending
 	profile.AgentUpdateTargetVersion = instruction.Version
 	profile.AgentUpdateMessage = "已下发更新任务，等待 Agent 执行"
 	profile.AgentUpdateLeaseUntil = 0
@@ -5066,10 +5457,31 @@ func agentUpdateReportMatchesPendingInstruction(profile *NodeProfile, report Age
 		targetVersion = strings.TrimSpace(profile.AgentUpdate.Version)
 	}
 	reportVersion := strings.TrimSpace(report.Version)
-	if targetVersion == "" || reportVersion == "" {
+	reportID := strings.TrimSpace(report.ID)
+	if targetVersion == "" || reportVersion == "" || reportID == "" {
 		return false
 	}
-	return updater.CompareVersions(reportVersion, targetVersion) == 0
+	if reportID != strings.TrimSpace(profile.AgentUpdate.ID) {
+		return false
+	}
+	return updater.VersionsEqual(reportVersion, targetVersion)
+}
+
+func agentUpdateReportAllowedForCurrentState(current, next string) bool {
+	next = strings.ToLower(strings.TrimSpace(next))
+	if isAgentUpdateTerminalState(next) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(current)) {
+	case "", agentUpdateStatePending:
+		return next == agentUpdateStateUpdating
+	case agentUpdateStateUpdating:
+		return next == agentUpdateStateUpdating || next == agentUpdateStateRestarting
+	case agentUpdateStateRestarting:
+		return next == agentUpdateStateRestarting
+	default:
+		return false
+	}
 }
 
 func (s *Store) HasPendingAgentConfigRefresh(nodeID string) bool {
@@ -5097,13 +5509,13 @@ func (s *Store) markAgentConfigRefreshLocked(nodeID string) {
 func (s *Store) AgentConfig(nodeID string) AgentConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.buildAgentConfigLocked(nodeID)
+	return s.buildAgentConfigLocked(nodeID, false)
 }
 
-func (s *Store) DeliverAgentConfig(nodeID string) (AgentConfig, bool) {
+func (s *Store) DeliverAgentConfig(nodeID string, remoteUpdateCapable bool) (AgentConfig, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	config := s.buildAgentConfigLocked(nodeID)
+	config := s.buildAgentConfigLocked(nodeID, remoteUpdateCapable)
 	return config, s.markAgentConfigDeliveredLocked(nodeID, config)
 }
 
@@ -5119,11 +5531,11 @@ func (s *Store) markAgentConfigDeliveredLocked(nodeID string, config AgentConfig
 	return leaseUpdated
 }
 
-func (s *Store) buildAgentConfigLocked(nodeID string) AgentConfig {
-	return s.buildAgentConfigAtLocked(nodeID, time.Now())
+func (s *Store) buildAgentConfigLocked(nodeID string, remoteUpdateCapable bool) AgentConfig {
+	return s.buildAgentConfigAtLocked(nodeID, time.Now(), remoteUpdateCapable)
 }
 
-func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time) AgentConfig {
+func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time, remoteUpdateCapable bool) AgentConfig {
 	profile := s.profiles[nodeID]
 	if profile == nil {
 		return AgentConfig{
@@ -5140,7 +5552,8 @@ func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time) AgentConf
 		tests = []metrics.NetworkTestConfig{}
 	}
 	var update *AgentUpdateInstruction
-	if shouldDispatchAgentUpdate(profile, now) {
+	node, nodeExists := s.nodes[nodeID]
+	if remoteUpdateCapable && nodeExists && resolveAgentUpdateSupported(node.Stats) && shouldDispatchAgentUpdate(profile, now) {
 		update = cloneAgentUpdateInstruction(profile.AgentUpdate)
 	}
 	return AgentConfig{
@@ -5163,7 +5576,7 @@ func (s *Store) agentConfigProjectionsLocked(now time.Time) map[string]AgentConf
 		if nodeID == "" || profile == nil {
 			continue
 		}
-		configs[nodeID] = s.buildAgentConfigAtLocked(nodeID, now)
+		configs[nodeID] = s.buildAgentConfigAtLocked(nodeID, now, false)
 	}
 	return configs
 }
@@ -5174,7 +5587,7 @@ func (s *Store) reconcileAgentConfigRefreshLocked(previous map[string]AgentConfi
 			delete(s.configRefresh, nodeID)
 			continue
 		}
-		if !agentConfigsEqual(previousConfig, s.buildAgentConfigAtLocked(nodeID, now)) {
+		if !agentConfigsEqual(previousConfig, s.buildAgentConfigAtLocked(nodeID, now, false)) {
 			s.markAgentConfigRefreshLocked(nodeID)
 		}
 	}
@@ -5192,7 +5605,7 @@ func (s *Store) reconcileAgentConfigRefreshLocked(previous map[string]AgentConfi
 		if _, ok := previous[nodeID]; ok {
 			continue
 		}
-		if !agentConfigsEqual(defaultConfig, s.buildAgentConfigAtLocked(nodeID, now)) {
+		if !agentConfigsEqual(defaultConfig, s.buildAgentConfigAtLocked(nodeID, now, false)) {
 			s.markAgentConfigRefreshLocked(nodeID)
 		}
 	}
@@ -5311,10 +5724,7 @@ func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {
 
 func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
 	if len(profile.TestSelections) == 0 {
-		if len(profile.Tests) > maxNetworkTestsPerNode {
-			return profile.Tests[:maxNetworkTestsPerNode]
-		}
-		return profile.Tests
+		return nil
 	}
 	catalog := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
 	for _, item := range s.settings.TestCatalog {
@@ -5479,7 +5889,28 @@ func requireAdminJWT(store *Store, secret string, next http.HandlerFunc) http.Ha
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
+		if requestUsesCookieAdminAuth(r) && isStateChangingMethod(r.Method) && !isSameOrigin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin admin request rejected"})
+			return
+		}
 		next(w, r)
+	}
+}
+
+func requestUsesCookieAdminAuth(r *http.Request) bool {
+	if r == nil || extractExplicitToken(r) != "" {
+		return false
+	}
+	cookie, err := r.Cookie(adminSessionCookieName)
+	return err == nil && strings.TrimSpace(cookie.Value) != ""
+}
+
+func isStateChangingMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -5590,7 +6021,240 @@ func validateWebhookURL(raw string) error {
 	return nil
 }
 
+func validateAgentEndpoint(raw string) error {
+	if err := validateHTTPBaseURL(raw); err != nil {
+		if errors.Is(err, errHTTPBaseURLScheme) {
+			return errors.New("agent endpoint 需为 http 或 https")
+		}
+		return errors.New("agent endpoint 无效")
+	}
+	return nil
+}
+
+func normalizeSiteIconURL(raw string) (string, error) {
+	return normalizePublicImageURL(raw, "site_icon")
+}
+
+func normalizeSiteBackgroundImageURL(raw string) (string, error) {
+	return normalizePublicImageURL(raw, "site_background_image")
+}
+
+func normalizePublicImageURL(raw, field string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if strings.Contains(value, "\\") || strings.Contains(value, "\x00") || strings.ContainsAny(value, "\r\n\t") {
+		return "", fmt.Errorf("%s 无效", field)
+	}
+	if strings.HasPrefix(value, "//") {
+		return "", fmt.Errorf("%s 不能使用协议相对 URL", field)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("%s 无效", field)
+	}
+	if parsed.Scheme != "" {
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return "", fmt.Errorf("%s 需为 http/https 或相对路径", field)
+		}
+		if parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+			return "", fmt.Errorf("%s 无效", field)
+		}
+		if strings.Contains(parsed.Hostname(), "%") || isAmbiguousIPv4LiteralHost(parsed.Hostname()) {
+			return "", fmt.Errorf("%s 无效", field)
+		}
+		if siteIconPathHasTraversal(parsed.EscapedPath()) {
+			return "", fmt.Errorf("%s 不能包含路径穿越", field)
+		}
+		return value, nil
+	}
+	if parsed.Host != "" || parsed.User != nil || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s 无效", field)
+	}
+	if siteIconPathHasTraversal(parsed.EscapedPath()) {
+		return "", fmt.Errorf("%s 不能包含路径穿越", field)
+	}
+	return value, nil
+}
+
+func safeSiteIconURL(raw string) string {
+	value, err := normalizeSiteIconURL(raw)
+	if err != nil {
+		return ""
+	}
+	return value
+}
+
+func safeSiteBackgroundImageURL(raw string) string {
+	value, err := normalizeSiteBackgroundImageURL(raw)
+	if err != nil {
+		return ""
+	}
+	return value
+}
+
+func normalizeLocale(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "en", "en-us", "en_us":
+		return "en-US"
+	default:
+		return defaultLocale
+	}
+}
+
+func siteIconPathHasTraversal(pathValue string) bool {
+	pathValue = strings.TrimSpace(pathValue)
+	if pathValue == "" {
+		return false
+	}
+	for _, segment := range strings.Split(pathValue, "/") {
+		if segment == "" {
+			continue
+		}
+		decoded := segment
+		for i := 0; i < 3; i++ {
+			next, err := url.PathUnescape(decoded)
+			if err != nil || next == decoded {
+				break
+			}
+			decoded = next
+		}
+		if decoded == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func validateReleaseTargetVersion(info updater.ReleaseInfo) error {
+	targetVersion := strings.TrimSpace(info.LatestVersion)
+	if targetVersion == "" {
+		return errors.New("缺少更新目标版本")
+	}
+	if !updater.ValidReleaseVersion(targetVersion) {
+		return fmt.Errorf("更新目标版本无效: %s", targetVersion)
+	}
+	return nil
+}
+
+var errHTTPBaseURLScheme = errors.New("http base url scheme invalid")
+
+func validateHTTPBaseURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
+		return errors.New("http base url invalid")
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return errHTTPBaseURLScheme
+	}
+	if strings.Contains(parsed.Hostname(), "%") {
+		return errors.New("http base url invalid")
+	}
+	if isAmbiguousIPv4LiteralHost(parsed.Hostname()) {
+		return errors.New("http base url invalid")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("http base url invalid")
+	}
+	return nil
+}
+
 var errCallbackURLScheme = errors.New("callback url scheme invalid")
+
+type callbackResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+type callbackDialContext func(context.Context, string, string) (net.Conn, error)
+
+var (
+	defaultCallbackResolver callbackResolver = net.DefaultResolver
+	defaultCallbackDialer                    = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+)
+
+func newWebhookHTTPClient() *http.Client {
+	return newWebhookHTTPClientWithResolver(defaultCallbackResolver, defaultCallbackDialer)
+}
+
+func newWebhookHTTPClientWithResolver(resolver callbackResolver, dialContext callbackDialContext) *http.Client {
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	if dialContext == nil {
+		dialContext = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+	}
+	return &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           restrictedCallbackDialContext(resolver, dialContext),
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 6 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("webhook redirect limit exceeded")
+			}
+			return validateWebhookURL(req.URL.String())
+		},
+	}
+}
+
+func restrictedCallbackDialContext(resolver callbackResolver, dialContext callbackDialContext) callbackDialContext {
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" {
+			return nil, errors.New("callback address invalid")
+		}
+		ips, err := validateResolvedCallbackHost(ctx, resolver, host)
+		if err != nil {
+			return nil, err
+		}
+		var firstErr error
+		for _, ip := range ips {
+			target := net.JoinHostPort(ip.IP.String(), port)
+			conn, err := dialContext(ctx, network, target)
+			if err == nil {
+				return conn, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		return nil, errors.New("callback host has no resolved ip")
+	}
+}
+
+func validateResolvedCallbackHost(ctx context.Context, resolver callbackResolver, host string) ([]net.IPAddr, error) {
+	host = canonicalCallbackHost(host)
+	if host == "" || strings.Contains(host, "%") || isAmbiguousIPv4LiteralHost(host) {
+		return nil, errors.New("callback host invalid")
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("callback host resolve failed: %w", err)
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("callback host has no resolved ip")
+	}
+	for _, ip := range ips {
+		if ip.IP == nil {
+			return nil, errors.New("callback host resolved empty ip")
+		}
+		if isPrivateCallbackIP(ip.IP) {
+			return nil, errors.New("callback private ip rejected")
+		}
+	}
+	return ips, nil
+}
 
 func validateHTTPCallbackURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
@@ -5600,12 +6264,21 @@ func validateHTTPCallbackURL(raw string) error {
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
 		return errCallbackURLScheme
 	}
-	host := strings.Trim(strings.ToLower(parsed.Hostname()), "[]")
+	if parsed.User != nil {
+		return errors.New("callback url invalid")
+	}
+	host := canonicalCallbackHost(parsed.Hostname())
 	if host == "" {
 		return errors.New("callback host invalid")
 	}
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return errors.New("callback private host rejected")
+	}
+	if strings.Contains(host, "%") {
+		return errors.New("callback host invalid")
+	}
+	if isAmbiguousIPv4LiteralHost(host) {
+		return errors.New("callback host invalid")
 	}
 	if ip := net.ParseIP(host); ip != nil && isPrivateCallbackIP(ip) {
 		return errors.New("callback private ip rejected")
@@ -5613,18 +6286,203 @@ func validateHTTPCallbackURL(raw string) error {
 	return nil
 }
 
+func canonicalCallbackHost(raw string) string {
+	return strings.TrimRight(strings.Trim(strings.ToLower(raw), "[]"), ".")
+}
+
 func isPrivateCallbackIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified()
+	return !netguard.IsAllowedPublicIP(ip)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub, nodeID string) {
+	var update NodeProfileUpdate
+	if err := decodeJSON(w, r, &update); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if _, ok := store.UpdateProfile(nodeID, update); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+		return
+	}
+	broadcastStoreSnapshot(hub, store, false)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (updater.ReleaseInfo, error) {
+	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(stats.AgentVersion))
+	return client.CheckLatest(ctx)
+}
+
+func adminAgentUpdateHandler(store *Store, hub *Hub, checkRelease agentReleaseChecker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		rawNodeID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/"), "/agent/update")
+		nodeID, err := url.PathUnescape(rawNodeID)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+			return
+		}
+		nodeID, err = history.NormalizeNodeID(nodeID)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+			return
+		}
+		if nodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+			return
+		}
+		store.mu.RLock()
+		node, exists := store.nodes[nodeID]
+		store.mu.RUnlock()
+		if !exists {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			handleAdminGetAgentUpdate(w, r, node.Stats, checkRelease)
+			return
+		}
+		handleAdminPostAgentUpdate(w, r, store, hub, nodeID, node.Stats, checkRelease)
+	}
+}
+
+func handleAdminGetAgentUpdate(w http.ResponseWriter, r *http.Request, stats metrics.NodeStats, checkRelease agentReleaseChecker) {
+	if !resolveAgentUpdateSupported(stats) {
+		writeJSON(w, http.StatusOK, buildAgentUpdateView(stats, updater.ReleaseInfo{}, resolveAgentUpdateUnsupportedReason(stats)))
+		return
+	}
+	if strings.TrimSpace(stats.AgentVersion) == "" {
+		writeJSON(w, http.StatusOK, buildAgentUpdateView(stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
+		return
+	}
+	releaseInfo, err := checkRelease(r.Context(), stats)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, buildAgentUpdateView(stats, releaseInfo, ""))
+}
+
+func handleAdminPostAgentUpdate(
+	w http.ResponseWriter,
+	r *http.Request,
+	store *Store,
+	hub *Hub,
+	nodeID string,
+	stats metrics.NodeStats,
+	checkRelease agentReleaseChecker,
+) {
+	if !resolveAgentUpdateSupported(stats) {
+		message := resolveAgentUpdateUnsupportedReason(stats)
+		if strings.TrimSpace(message) == "" {
+			message = "当前节点平台暂不支持后台自更新"
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
+		return
+	}
+	if strings.TrimSpace(stats.AgentVersion) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前节点还没有上报 Agent 版本"})
+		return
+	}
+	releaseInfo, err := checkRelease(r.Context(), stats)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := validateReleaseTargetVersion(releaseInfo); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":         "up_to_date",
+			"target_version": releaseInfo.LatestVersion,
+		})
+		return
+	}
+	if message := agentUpdateReleaseAssetError(stats, releaseInfo); message != "" {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": message})
+		return
+	}
+	_, queueStatus, queueErr := store.QueueAgentUpdate(nodeID, AgentUpdateInstruction{
+		Version:     releaseInfo.LatestVersion,
+		DownloadURL: releaseInfo.DownloadURL,
+		ChecksumURL: releaseInfo.ChecksumURL,
+	})
+	if queueErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": queueErr.Error()})
+		return
+	}
+	if queueStatus == agentUpdateQueueNotFound {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+		return
+	}
+	if queueStatus == agentUpdateQueueQueued {
+		broadcastStoreSnapshot(hub, store, false)
+	}
+	status := "in_progress"
+	if queueStatus == agentUpdateQueueQueued {
+		status = "queued"
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":         status,
+		"target_version": releaseInfo.LatestVersion,
+	})
+}
+
+func handleAdminClearNodesRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub) {
+	if err := store.ClearNodes(); err != nil {
+		var partialHistoryErr *clearNodesHistoryCleanupError
+		if errors.As(err, &partialHistoryErr) {
+			broadcastStoreSnapshot(hub, store, false)
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status":        "cleared",
+				"history_error": partialHistoryErr.HistoryError(),
+			})
+			return
+		}
+		writeClearNodesHistoryError(w, r, err)
+		return
+	}
+	broadcastStoreSnapshot(hub, store, false)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+}
+
+func handleAdminDeleteNodeRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub, nodeID string) {
+	deleted, err := store.DeleteNode(nodeID)
+	if err != nil {
+		var partialHistoryErr *nodeDeleteHistoryCleanupError
+		if errors.As(err, &partialHistoryErr) {
+			broadcastStoreSnapshot(hub, store, false)
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status":        "deleted",
+				"history_error": partialHistoryErr.HistoryError(),
+			})
+			return
+		}
+		if errors.Is(err, history.ErrInvalidNodeID) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+			return
+		}
+		writeNodeDeleteHistoryError(w, r, err)
+		return
+	}
+	if !deleted {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+		return
+	}
+	broadcastStoreSnapshot(hub, store, false)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func agentConfigHTTPHandler(agentAPI *agentAPI) http.HandlerFunc {
@@ -5635,12 +6493,42 @@ func agentConfigHTTPHandler(agentAPI *agentAPI) http.HandlerFunc {
 		}
 		nodeID := r.URL.Query().Get("node_id")
 		token := r.Header.Get("X-AGENT-TOKEN")
-		config, err := agentAPI.config(nodeID, token)
+		config, err := agentAPI.config(nodeID, token, agentRemoteUpdateCapableHeader(r.Header.Get(agentrpc.AgentCapabilitiesHeader)))
 		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
 		}
 		writeJSON(w, http.StatusOK, config)
+	}
+}
+
+func agentUpdateReportHTTPHandler(agentAPI *agentAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req struct {
+			NodeID   string `json:"node_id"`
+			UpdateID string `json:"update_id"`
+			State    string `json:"state"`
+			Version  string `json:"version,omitempty"`
+			Message  string `json:"message,omitempty"`
+		}
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if err := agentAPI.reportUpdate(req.NodeID, r.Header.Get("X-AGENT-TOKEN"), AgentUpdateReport{
+			State:   req.State,
+			ID:      req.UpdateID,
+			Version: req.Version,
+			Message: req.Message,
+		}); err != nil {
+			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }
 
@@ -5680,27 +6568,33 @@ func handlePublicCORSPreflight(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func buildAdminBootPayload(store *Store) (string, error) {
+func buildAdminBootPayload(store *Store, r *http.Request, trustedProxyHeaders bool) (string, error) {
 	settings := store.PublicSettings()
 	adminSettings := struct {
-		SiteTitle    string `json:"site_title,omitempty"`
-		SiteIcon     string `json:"site_icon,omitempty"`
-		HomeTitle    string `json:"home_title,omitempty"`
-		HomeSubtitle string `json:"home_subtitle,omitempty"`
-		Version      string `json:"version,omitempty"`
-		Commit       string `json:"commit,omitempty"`
+		SiteTitle           string `json:"site_title,omitempty"`
+		SiteIcon            string `json:"site_icon,omitempty"`
+		SiteBackgroundImage string `json:"site_background_image,omitempty"`
+		HomeTitle           string `json:"home_title,omitempty"`
+		HomeSubtitle        string `json:"home_subtitle,omitempty"`
+		Locale              string `json:"locale,omitempty"`
+		Version             string `json:"version,omitempty"`
+		Commit              string `json:"commit,omitempty"`
 	}{
-		SiteTitle:    settings.SiteTitle,
-		SiteIcon:     settings.SiteIcon,
-		HomeTitle:    settings.HomeTitle,
-		HomeSubtitle: settings.HomeSubtitle,
-		Version:      store.buildVersion,
-		Commit:       store.buildCommit,
+		SiteTitle:           settings.SiteTitle,
+		SiteIcon:            settings.SiteIcon,
+		SiteBackgroundImage: settings.SiteBackgroundImage,
+		HomeTitle:           settings.HomeTitle,
+		HomeSubtitle:        settings.HomeSubtitle,
+		Locale:              settings.Locale,
+		Version:             store.buildVersion,
+		Commit:              store.buildCommit,
 	}
 	payload := struct {
 		Settings interface{} `json:"settings"`
+		BasePath string      `json:"base_path,omitempty"`
 	}{
 		Settings: adminSettings,
+		BasePath: forwardedPrefix(r, trustedProxyHeaders),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

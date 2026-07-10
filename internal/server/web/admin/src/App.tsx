@@ -14,10 +14,13 @@ import {
   Bot,
   FolderTree,
   LayoutDashboard,
+  Languages,
   Loader2,
   LogOut,
   Menu,
+  Monitor,
   Moon,
+  ScrollText,
   Sun,
   Server,
   Settings,
@@ -31,6 +34,8 @@ import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import {
   AdminApiError,
   addAdminUnauthorizedListener,
+  adminAppLocation,
+  adminOAuthLoginLocation,
   connectAdminSocket,
   deleteNodeProfile,
   exportConfig,
@@ -43,6 +48,7 @@ import {
   fetchPublicSnapshot,
   fetchSettings,
   getStoredAdminToken,
+  publicMonitorPath,
   readAdminBootPayload,
   importConfig,
   loginAdmin,
@@ -62,6 +68,7 @@ import type {
   ConfigImportResponse,
   GroupNode,
   LoginConfigResponse,
+  NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
   PublicSettings,
@@ -69,6 +76,16 @@ import type {
   SystemUpdateInfo,
 } from "@/lib/admin-types";
 import { formatVersionLabel, getErrorMessage, upsertNodeView } from "@/lib/admin-format";
+import {
+  ADMIN_LOCALE_OPTIONS,
+  adminBrowserTitleForLocale,
+  adminText,
+  normalizeAdminLocale,
+  readStoredAdminLocale,
+  translateAdminDOM,
+  writeStoredAdminLocale,
+  type AdminLocale,
+} from "@/lib/admin-i18n";
 import {
   adminDialogCancelClass,
   adminDialogContentClass,
@@ -86,9 +103,10 @@ import {
   adminThemeToggleButtonClass,
 } from "@/lib/admin-ui";
 
-type Page = "dashboard" | "servers" | "groups" | "probes" | "settings" | "alerts" | "ai";
+type Page = "dashboard" | "servers" | "groups" | "probes" | "settings" | "alerts" | "ai" | "logs";
 type LoginErrorType = "none" | "invalid" | "expired" | "locked";
-type ThemeMode = "light" | "dark";
+type ThemeMode = "auto" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
 
 type LoginState = {
   errorMessage: string;
@@ -135,8 +153,13 @@ function createLoginState(
 }
 
 const THEME_STORAGE_KEY = "cm_theme_mode";
+const ADMIN_THEME_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
+  { value: "auto", label: "跟随系统" },
+  { value: "light", label: "浅色主题" },
+  { value: "dark", label: "深色主题" },
+];
 const PAGE_QUERY_KEY = "page";
-const PAGE_VALUES = ["dashboard", "servers", "groups", "probes", "settings", "alerts", "ai"] as const;
+const PAGE_VALUES = ["dashboard", "servers", "groups", "probes", "settings", "alerts", "ai", "logs"] as const;
 const LoginPage = lazy(() => import("./pages/Login"));
 const DashboardPage = lazy(() => import("./pages/Dashboard"));
 const ServerManagementPage = lazy(() => import("./pages/ServerManagement"));
@@ -145,10 +168,23 @@ const ProbeSettingsPage = lazy(() => import("./pages/ProbeSettings"));
 const BasicSettingsPage = lazy(() => import("./pages/BasicSettings"));
 const NotificationAlertPage = lazy(() => import("./pages/NotificationAlert"));
 const AIProviderPage = lazy(() => import("./pages/AIProvider"));
+const AdminLogsPage = lazy(() => import("./pages/AdminLogs"));
 
-function resolveInitialTheme(): ThemeMode {
+function normalizeThemeMode(value: string | null | undefined): ThemeMode {
+  const mode = String(value || "").trim().toLowerCase();
+  return mode === "light" || mode === "dark" ? mode : "auto";
+}
+
+function resolveSystemTheme(): ResolvedTheme {
   if (typeof window === "undefined") {
     return "light";
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function resolveInitialThemeMode(): ThemeMode {
+  if (typeof window === "undefined") {
+    return "auto";
   }
   let storedTheme = "";
   try {
@@ -156,10 +192,7 @@ function resolveInitialTheme(): ThemeMode {
   } catch {
     storedTheme = "";
   }
-  if (storedTheme === "light" || storedTheme === "dark") {
-    return storedTheme;
-  }
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return normalizeThemeMode(storedTheme);
 }
 
 function resolveInitialPage(): Page {
@@ -215,9 +248,21 @@ function resolveBrandTitle(settings: SettingsView | null, publicSettings: Public
   ).trim();
 }
 
-function adminBrowserTitle(settings: SettingsView | null, publicSettings: PublicSettings | null) {
-  const siteTitle = (settings?.site_title || publicSettings?.site_title || "CyberMonitor").trim() || "CyberMonitor";
-  return `${siteTitle} 管理后台`;
+function resolveInitialAdminLocale(settings: PublicSettings | null): AdminLocale {
+  return readStoredAdminLocale() || normalizeAdminLocale(settings?.locale);
+}
+
+function normalizePublicIconURL(value: string | undefined | null) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.startsWith("//") || raw.includes("\\") || /[\u0000-\u001F\u007F]/.test(raw)) {
+    return "";
+  }
+  try {
+    const parsed = new URL(raw, window.location.href);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? raw : "";
+  } catch {
+    return "";
+  }
 }
 
 function publicSettingsFromSettings(settings: SettingsView | null): PublicSettings | null {
@@ -227,11 +272,17 @@ function publicSettingsFromSettings(settings: SettingsView | null): PublicSettin
   return {
     site_title: settings.site_title,
     site_icon: settings.site_icon,
+    site_background_image: settings.site_background_image,
     home_title: settings.home_title,
     home_subtitle: settings.home_subtitle,
+    locale: settings.locale,
     version: settings.version,
     commit: settings.commit,
   };
+}
+
+function publicSettingsFromSnapshot(settings: PublicSettings | undefined): PublicSettings | null {
+  return settings || null;
 }
 
 function mergePublicSettings(
@@ -267,9 +318,174 @@ function SectionLoader({
   );
 }
 
+function AdminLocaleSwitcher({
+  activeLocaleOption,
+  className = "",
+  locale,
+  onLocaleChange,
+  t,
+}: {
+  activeLocaleOption: { value: AdminLocale; label: string; shortLabel: string };
+  className?: string;
+  locale: AdminLocale;
+  onLocaleChange: (value: AdminLocale) => void;
+  t: (text: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      if (menuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={menuRef} className="relative">
+      <Button
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={t("界面语言")}
+        className={`${adminThemeToggleButtonClass} ${className}`}
+        size="icon"
+        title={t("界面语言")}
+        variant="outline"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Languages className="h-4 w-4" />
+      </Button>
+      {open ? (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1.5 text-popover-foreground shadow-xl"
+        >
+          {ADMIN_LOCALE_OPTIONS.map((item) => (
+            <button
+              key={item.value}
+              aria-checked={item.value === locale}
+              className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
+              role="menuitemradio"
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onLocaleChange(item.value);
+              }}
+            >
+              <span>{item.label}</span>
+              {item.value === locale ? <Languages className="h-4 w-4 text-sky-500" /> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AdminThemeSwitcher({
+  activeThemeOption,
+  className = "",
+  isDark,
+  onThemeModeChange,
+  t,
+  themeMode,
+}: {
+  activeThemeOption: { value: ThemeMode; label: string };
+  className?: string;
+  isDark: boolean;
+  onThemeModeChange: (value: ThemeMode) => void;
+  t: (text: string) => string;
+  themeMode: ThemeMode;
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const ThemeIcon = themeMode === "auto" ? Monitor : isDark ? Moon : Sun;
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      if (menuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div ref={menuRef} className="relative">
+      <Button
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label={t("主题模式")}
+        className={`${adminThemeToggleButtonClass} ${className}`}
+        size="icon"
+        title={t(activeThemeOption.label)}
+        variant="outline"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ThemeIcon className="h-4 w-4" />
+      </Button>
+      {open ? (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1.5 text-popover-foreground shadow-xl"
+        >
+          {ADMIN_THEME_OPTIONS.map((item) => (
+            <button
+              key={item.value}
+              aria-checked={item.value === themeMode}
+              className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
+              role="menuitemradio"
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onThemeModeChange(item.value);
+              }}
+            >
+              <span>{t(item.label)}</span>
+              {item.value === themeMode ? <ThemeIcon className="h-4 w-4 text-sky-500" /> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export default function App() {
   const bootPayload = readAdminBootPayload();
-  const [theme, setTheme] = useState<ThemeMode>(() => resolveInitialTheme());
+  const [locale, setLocale] = useState<AdminLocale>(() => resolveInitialAdminLocale(bootPayload.settings || null));
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => resolveInitialThemeMode());
+  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() => resolveSystemTheme());
   const [token, setToken] = useState(() => getStoredAdminToken());
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [loginConfig, setLoginConfig] = useState<LoginConfigResponse | null>(null);
@@ -290,27 +506,91 @@ export default function App() {
   const socketRef = useRef<{ close: () => void } | null>(null);
   const systemUpdatePollRef = useRef<number | null>(null);
   const loadAllRequestRef = useRef(0);
+  const theme = themeMode === "auto" ? systemTheme : themeMode;
   const isDark = theme === "dark";
-  const siteIcon = (settings?.site_icon || publicSettings?.site_icon || "").trim();
+  const siteIcon = normalizePublicIconURL(settings?.site_icon || publicSettings?.site_icon || "");
   const siteTitle = resolveBrandTitle(settings, publicSettings);
   const deployedVersion = (settings?.version || publicSettings?.version || "").trim();
   const deployedVersionLabel = formatVersionLabel(deployedVersion);
+  const activeLocaleOption = ADMIN_LOCALE_OPTIONS.find((item) => item.value === locale) || ADMIN_LOCALE_OPTIONS[0];
+  const activeThemeOption = ADMIN_THEME_OPTIONS.find((item) => item.value === themeMode) || ADMIN_THEME_OPTIONS[0];
+  const t = (text: string) => adminText(locale, text);
 
   useEffect(() => {
     const root = document.documentElement;
     root.classList.toggle("dark", isDark);
     root.setAttribute("data-theme", theme);
+    root.setAttribute("data-theme-mode", themeMode);
     root.style.colorScheme = theme;
     try {
-      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
     } catch {
       // storage may be disabled by browser policy
     }
-  }, [isDark, theme]);
+  }, [isDark, theme, themeMode]);
 
   useEffect(() => {
-    document.title = adminBrowserTitle(settings, publicSettings);
-  }, [publicSettings, settings]);
+    if (typeof window === "undefined" || !window.matchMedia) {
+      return;
+    }
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleSystemThemeChange = () => {
+      setSystemTheme(resolveSystemTheme());
+    };
+    handleSystemThemeChange();
+    media.addEventListener("change", handleSystemThemeChange);
+    return () => {
+      media.removeEventListener("change", handleSystemThemeChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    document.title = adminBrowserTitleForLocale(locale, siteTitle);
+  }, [locale, siteTitle]);
+
+  useEffect(() => {
+    const storedLocale = readStoredAdminLocale();
+    if (storedLocale) {
+      return;
+    }
+    setLocale(normalizeAdminLocale(settings?.locale || publicSettings?.locale));
+  }, [publicSettings?.locale, settings?.locale]);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+    const root = document.body;
+    if (!root) {
+      return;
+    }
+
+    let frame = 0;
+    const applyTranslations = () => {
+      frame = 0;
+      translateAdminDOM(root, locale);
+    };
+
+    applyTranslations();
+    const observer = new MutationObserver(() => {
+      if (frame) {
+        return;
+      }
+      frame = window.requestAnimationFrame(applyTranslations);
+    });
+    observer.observe(root, {
+      attributes: true,
+      attributeFilter: ["aria-label", "placeholder", "title"],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+
+    return () => {
+      observer.disconnect();
+      if (frame) {
+        window.cancelAnimationFrame(frame);
+      }
+    };
+  }, [locale]);
 
   useEffect(() => {
     syncPageToURL(currentPage, true);
@@ -350,8 +630,32 @@ export default function App() {
     };
   }, [hasUnsavedPageChanges]);
 
-  function toggleTheme() {
-    setTheme((current) => (current === "light" ? "dark" : "light"));
+  function handleThemeModeChange(value: ThemeMode) {
+    setThemeMode(normalizeThemeMode(value));
+  }
+
+  async function handleAdminLocaleChange(value: AdminLocale) {
+    const nextLocale = normalizeAdminLocale(value);
+    setLocale(nextLocale);
+    writeStoredAdminLocale(nextLocale);
+    if (!token) {
+      return;
+    }
+    try {
+      const data = await saveSettings({ locale: nextLocale });
+      setSettings(data);
+      setPublicSettings((current) => mergePublicSettings(data, current));
+      toast.success(adminText(nextLocale, "界面语言已更新"));
+    } catch (error) {
+      if (error instanceof AdminApiError && error.status === 401) {
+        handleLogout({
+          errorMessage: adminText(nextLocale, "当前登录态已失效，请重新登录。"),
+          errorType: "expired",
+        });
+        return;
+      }
+      toast.error(getErrorMessage(error, adminText(nextLocale, "界面语言更新失败")));
+    }
   }
 
   function proceedToPage(page: Page) {
@@ -514,6 +818,11 @@ export default function App() {
     }
   }
 
+  function handleOAuthLogin(providerID: string) {
+    const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.location.assign(adminOAuthLoginLocation(providerID, returnTo));
+  }
+
   async function handleUserLogout() {
     try {
       await logoutAdmin();
@@ -629,6 +938,10 @@ export default function App() {
         if (Array.isArray(snapshot.nodes)) {
           setNodes(snapshot.nodes);
         }
+        const snapshotSettings = publicSettingsFromSnapshot(snapshot.settings);
+        if (snapshotSettings) {
+          setPublicSettings((current) => ({ ...(current || {}), ...snapshotSettings }));
+        }
       },
       (node) => {
         setNodes((current) => upsertNodeView(current, node));
@@ -645,23 +958,24 @@ export default function App() {
 
   const navigation = [
     {
-      title: "总览",
-      items: [{ id: "dashboard", label: "首页", icon: LayoutDashboard }],
+      title: t("总览"),
+      items: [{ id: "dashboard", label: t("首页"), icon: LayoutDashboard }],
     },
     {
-      title: "节点与策略",
+      title: t("节点与策略"),
       items: [
-        { id: "servers", label: "节点管理", icon: Server },
-        { id: "groups", label: "分组管理", icon: FolderTree },
-        { id: "probes", label: "探测设置", icon: Activity },
+        { id: "servers", label: t("节点管理"), icon: Server },
+        { id: "groups", label: t("分组管理"), icon: FolderTree },
+        { id: "probes", label: t("探测设置"), icon: Activity },
       ],
     },
     {
-      title: "系统配置",
+      title: t("系统配置"),
       items: [
-        { id: "settings", label: "基础设置", icon: Settings },
-        { id: "alerts", label: "通知告警", icon: Bell },
-        { id: "ai", label: "AI 服务商", icon: Bot },
+        { id: "settings", label: t("基础设置"), icon: Settings },
+        { id: "alerts", label: t("通知告警"), icon: Bell },
+        { id: "ai", label: t("AI 服务商"), icon: Bot },
+        { id: "logs", label: t("日志查看"), icon: ScrollText },
       ],
     },
   ] as const;
@@ -675,10 +989,25 @@ export default function App() {
           src={siteIcon}
           width={40}
           height={40}
+          referrerPolicy="no-referrer"
         />
       );
     }
     return <Activity className={sizeClass} />;
+  }
+
+  async function refreshNodesAfterMutation(successLabel: string, successLocale: AdminLocale = locale) {
+    try {
+      const snapshot = await fetchNodes();
+      setNodes(snapshot.nodes || []);
+    } catch (error) {
+      const message = getErrorMessage(error, adminText(successLocale, "节点列表刷新失败"));
+      toast.warning(
+        successLocale === "en-US"
+          ? `${successLabel}, but node refresh failed: ${message}`
+          : `${successLabel}，但节点列表刷新失败：${message}`,
+      );
+    }
   }
 
   async function updateSettings(page: Page, payload: Record<string, unknown>) {
@@ -687,10 +1016,12 @@ export default function App() {
       const data = await saveSettings(payload);
       setSettings(data);
       setPublicSettings((current) => mergePublicSettings(data, current));
+      const nextLocale = normalizeAdminLocale(data.locale);
+      setLocale(nextLocale);
+      writeStoredAdminLocale(nextLocale);
       setStoredAdminToken("session");
       setToken("session");
-      const nextNodes = await fetchNodes();
-      setNodes(nextNodes.nodes || []);
+      void refreshNodesAfterMutation(adminText(nextLocale, "设置已保存"), nextLocale);
       return data;
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
@@ -714,16 +1045,22 @@ export default function App() {
     setSavingPage("settings");
     try {
       const data = await importConfig(payload);
+      let nextLocale = locale;
       if (data.settings) {
         setSettings(data.settings);
         setPublicSettings((current) => mergePublicSettings(data.settings || null, current));
+        nextLocale = normalizeAdminLocale(data.settings.locale);
+        setLocale(nextLocale);
+        writeStoredAdminLocale(nextLocale);
       }
       setStoredAdminToken("session");
       setToken("session");
-      const snapshot = await fetchNodes();
-      setNodes(snapshot.nodes || []);
+      void refreshNodesAfterMutation(adminText(nextLocale, "配置已导入"), nextLocale);
       if (data.settings?.admin_path) {
-        window.history.replaceState({}, "", data.settings.admin_path);
+        const nextAdminPath = adminAppLocation(data.settings.admin_path);
+        if (nextAdminPath) {
+          window.history.replaceState({}, "", nextAdminPath);
+        }
       }
       return data;
     } finally {
@@ -826,7 +1163,7 @@ export default function App() {
   async function handleSaveNode(nodeID: string, payload: NodeProfilePayload) {
     try {
       await saveNodeProfile(nodeID, payload);
-      await handleRefreshNodes();
+      void refreshNodesAfterMutation(t("节点配置已保存并下发"));
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
         handleLogout({
@@ -838,10 +1175,18 @@ export default function App() {
     }
   }
 
-  async function handleDeleteNode(nodeID: string): Promise<void> {
+  async function handleDeleteNode(nodeID: string): Promise<NodeDeleteResponse> {
     try {
-      await deleteNodeProfile(nodeID);
-      await handleRefreshNodes();
+      const result = await deleteNodeProfile(nodeID);
+      void refreshNodesAfterMutation(t("节点已删除"));
+      if (result.history_error) {
+        toast.warning(
+          locale === "en-US"
+            ? `${t("节点已删除")}, but history cleanup failed: ${result.history_error}`
+            : `${t("节点已删除")}，但历史数据清理失败：${result.history_error}`,
+        );
+      }
+      return result;
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
         handleLogout({
@@ -854,10 +1199,16 @@ export default function App() {
   }
 
   function NavContent() {
+    const monitorHref = publicMonitorPath();
+
     return (
       <div className="m-4 flex h-[calc(100vh-2rem)] flex-col rounded-[2.5rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] text-sidebar-foreground shadow-[var(--cm-panel-shadow)] backdrop-blur-3xl">
         <div className="border-b border-[var(--cm-sidebar-border)] px-6 py-8">
-          <div className="flex items-center gap-4 text-[18px] font-black tracking-tighter text-sidebar-foreground">
+          <a
+            aria-label={t("打开监控页")}
+            className="flex items-center gap-4 rounded-2xl text-[18px] font-black tracking-tighter text-sidebar-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+            href={monitorHref}
+          >
             <div className={`${adminSidebarLogoChipClass} h-12 w-12 shrink-0 overflow-hidden shadow-lg`}>
               <BrandIcon sizeClass="h-7 w-7" />
             </div>
@@ -871,7 +1222,7 @@ export default function App() {
                 </span>
               </div>
             </div>
-          </div>
+          </a>
         </div>
         <ScrollArea className="flex-1 px-5 py-8">
           <div className="space-y-9 pb-8">
@@ -901,7 +1252,7 @@ export default function App() {
                           <Icon
                             className={`h-4 w-4 ${active ? "text-white" : "text-slate-400 group-hover:text-current"}`}
                           />
-                          <span className="tracking-tight">{item.label}</span>
+            <span className="tracking-tight">{item.label}</span>
                         </span>
                         {active ? (
                           <div className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />
@@ -923,7 +1274,7 @@ export default function App() {
             }}
           >
             <LogOut className="mr-3 h-4 w-4" />
-            <span className="tracking-tight">退出登录</span>
+            <span className="tracking-tight">{t("退出登录")}</span>
           </Button>
         </div>
       </div>
@@ -934,18 +1285,19 @@ export default function App() {
     switch (currentPage) {
       case "dashboard":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载首页…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载首页…")} />}>
             <DashboardPage settings={settings} nodes={nodes} onNavigate={navigateToPage} />
           </Suspense>
         );
       case "servers":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载节点管理…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载节点管理…")} />}>
             <ServerManagementPage
               loading={refreshingNodes || loading}
               nodes={nodes}
               onCheckAgentUpdate={(nodeID) => fetchAgentUpdateInfo(nodeID)}
               onDeleteNode={handleDeleteNode}
+              onDirtyChange={setHasUnsavedPageChanges}
               onRefresh={handleRefreshNodes}
               onSaveNode={handleSaveNode}
               onTriggerAgentUpdate={(nodeID) => triggerAgentUpdate(nodeID)}
@@ -955,21 +1307,19 @@ export default function App() {
         );
       case "groups":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载分组管理…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载分组管理…")} />}>
             <GroupManagementPage
               groupTree={settings?.group_tree || []}
               nodes={nodes}
               onDirtyChange={setHasUnsavedPageChanges}
-              onSave={(groupTree: GroupNode[]) =>
-                updateSettings("groups", { group_tree: groupTree }).then(() => undefined)
-              }
+              onSave={(groupTree: GroupNode[]) => updateSettings("groups", { group_tree: groupTree })}
               saving={savingPage === "groups"}
             />
           </Suspense>
         );
       case "probes":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载探测设置…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载探测设置…")} />}>
             <ProbeSettingsPage
               onDirtyChange={setHasUnsavedPageChanges}
               onSave={(testCatalog) => updateSettings("probes", { test_catalog: testCatalog })}
@@ -980,7 +1330,7 @@ export default function App() {
         );
       case "settings":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载基础设置…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载基础设置…")} />}>
             <BasicSettingsPage
               onDirtyChange={setHasUnsavedPageChanges}
               onExport={handleExport}
@@ -997,11 +1347,11 @@ export default function App() {
         );
       case "alerts":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载通知告警…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载通知告警…")} />}>
             <NotificationAlertPage
               nodes={nodes}
               onDirtyChange={setHasUnsavedPageChanges}
-              onSave={(payload) => updateSettings("alerts", payload).then(() => undefined)}
+              onSave={(payload) => updateSettings("alerts", payload)}
               onTest={(payload: AlertTestPayload) =>
                 testAlertChannels(payload).then(() => undefined)
               }
@@ -1012,18 +1362,25 @@ export default function App() {
         );
       case "ai":
         return (
-          <Suspense fallback={<SectionLoader label="正在加载 AI 服务商…" />}>
+          <Suspense fallback={<SectionLoader label={t("正在加载 AI 服务商…")} />}>
             <AIProviderPage
               onFetchModels={(provider: string, config: AIProviderConfig) =>
                 fetchAIModels(provider, config).then((data) => data.models || [])
               }
               onDirtyChange={setHasUnsavedPageChanges}
-              onSave={(payload) => updateSettings("ai", payload).then(() => undefined)}
+              onSave={(payload) => updateSettings("ai", payload)}
               onTestProvider={(provider: string, config: AIProviderConfig) =>
                 testAIProvider(provider, config).then(() => undefined)
               }
+              saving={savingPage === "ai"}
               settings={settings}
             />
+          </Suspense>
+        );
+      case "logs":
+        return (
+          <Suspense fallback={<SectionLoader label={t("正在加载日志查看…")} />}>
+            <AdminLogsPage />
           </Suspense>
         );
       default:
@@ -1041,20 +1398,42 @@ export default function App() {
     startingSystemUpdate,
     systemUpdateInfo,
     token,
+    locale,
   ]);
 
   if (!token) {
     return (
-      <Suspense fallback={<SectionLoader label="正在加载登录页…" />}>
+      <Suspense fallback={<SectionLoader label={t("正在加载登录页…")} />}>
         <LoginPage
           errorMessage={loginState.errorMessage}
           errorType={loginState.errorType}
           homeSubtitle={publicSettings?.home_subtitle || "主机监控"}
           homeTitle={publicSettings?.home_title || "CyberMonitor"}
           onLogin={handleLogin}
-          onToggleTheme={toggleTheme}
+          onOAuthLogin={handleOAuthLogin}
+          oauthProviders={loginConfig?.oauth_providers || []}
+          passwordLoginEnabled={loginConfig?.password_login_enabled !== false}
           retryAfterSec={loginState.retryAfterSec}
           theme={theme}
+            topControls={
+              <>
+                <AdminLocaleSwitcher
+                  activeLocaleOption={activeLocaleOption}
+                  locale={locale}
+                  t={t}
+                  onLocaleChange={(nextLocale) => {
+                    void handleAdminLocaleChange(nextLocale);
+                  }}
+                />
+                <AdminThemeSwitcher
+                  activeThemeOption={activeThemeOption}
+                  isDark={isDark}
+                  t={t}
+                  themeMode={themeMode}
+                  onThemeModeChange={handleThemeModeChange}
+                />
+              </>
+            }
           turnstileSiteKey={loginConfig?.turnstile_enabled ? loginConfig.turnstile_site_key : ""}
         />
       </Suspense>
@@ -1067,7 +1446,7 @@ export default function App() {
         href="#admin-main-content"
         className="sr-only fixed left-4 top-4 z-[70] rounded-full bg-slate-950 px-4 py-2 text-sm font-medium text-white shadow-lg focus:not-sr-only focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 dark:bg-white dark:text-slate-950"
       >
-        跳转到主要内容
+        {t("跳转到主要内容")}
       </a>
       <aside className="fixed inset-y-0 z-50 hidden w-72 flex-col md:flex">
         <NavContent />
@@ -1078,7 +1457,7 @@ export default function App() {
           <SheetTrigger
             render={(
               <Button
-                aria-label="打开导航菜单"
+                aria-label={t("打开导航菜单")}
                 className={adminSidebarIconButtonClass}
                 size="icon"
                 variant="outline"
@@ -1091,7 +1470,11 @@ export default function App() {
             <NavContent />
           </SheetContent>
         </Sheet>
-        <div className="ml-4 flex items-center gap-3 font-black tracking-tighter text-foreground">
+        <a
+          aria-label={t("打开监控页")}
+          className="ml-4 flex min-w-0 items-center gap-3 rounded-xl font-black tracking-tighter text-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+          href={publicMonitorPath()}
+        >
           <div className={`${adminSidebarLogoChipClass} h-10 w-10 rounded-xl overflow-hidden shadow-lg`}>
             <BrandIcon sizeClass="h-5 w-5" />
           </div>
@@ -1101,34 +1484,48 @@ export default function App() {
               {deployedVersionLabel}
             </div>
           </div>
+        </a>
+        <div className="ml-auto flex items-center gap-2">
+          <AdminLocaleSwitcher
+            activeLocaleOption={activeLocaleOption}
+            locale={locale}
+            t={t}
+            onLocaleChange={(nextLocale) => {
+              void handleAdminLocaleChange(nextLocale);
+            }}
+          />
+          <AdminThemeSwitcher
+            activeThemeOption={activeThemeOption}
+            isDark={isDark}
+            t={t}
+            themeMode={themeMode}
+            onThemeModeChange={handleThemeModeChange}
+          />
         </div>
-        <Button
-          aria-label={isDark ? "切换到浅色模式" : "切换到深色模式"}
-          className={`ml-auto ${adminThemeToggleButtonClass}`}
-          variant="outline"
-          size="icon"
-          onClick={toggleTheme}
-        >
-          {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </Button>
       </header>
 
       <main id="admin-main-content" className="relative flex min-h-screen flex-1 flex-col pt-20 md:pl-72 md:pt-4">
         <ScrollArea className="flex-1">
           <div className="w-full p-6 md:p-10 md:pt-10">
-            <div className="mb-8 hidden justify-end md:flex">
-              <Button
-                aria-label={isDark ? "切换到浅色模式" : "切换到深色模式"}
-                className={adminThemeToggleButtonClass}
-                variant="outline"
-                size="icon"
-                onClick={toggleTheme}
-              >
-                {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-              </Button>
+            <div className="mb-8 hidden justify-end gap-2 md:flex">
+              <AdminLocaleSwitcher
+                activeLocaleOption={activeLocaleOption}
+                locale={locale}
+                t={t}
+                onLocaleChange={(nextLocale) => {
+                  void handleAdminLocaleChange(nextLocale);
+                }}
+              />
+              <AdminThemeSwitcher
+                activeThemeOption={activeThemeOption}
+                isDark={isDark}
+                t={t}
+                themeMode={themeMode}
+                onThemeModeChange={handleThemeModeChange}
+              />
             </div>
             {loading ? (
-              <SectionLoader label="正在加载数据…" minHeightClass="min-h-[50vh]" />
+              <SectionLoader label={t("正在加载数据…")} minHeightClass="min-h-[50vh]" />
             ) : (
               <div className="animate-in fade-in slide-in-from-bottom-6 duration-1000 ease-out fill-mode-both">
                 {pageContent}
@@ -1148,11 +1545,11 @@ export default function App() {
       >
         <AlertDialogContent className={adminDialogContentClass}>
           <AlertDialogHeader className={adminDialogHeaderClass}>
-            <AlertDialogTitle>离开当前页面前先处理未保存内容？</AlertDialogTitle>
+            <AlertDialogTitle>{t("离开当前页面前先处理未保存内容？")}</AlertDialogTitle>
           </AlertDialogHeader>
           <AlertDialogFooter className={adminDialogFooterClass}>
             <AlertDialogCancel className={`${adminDialogCancelClass} ${adminOutlineButtonClass}`}>
-              继续编辑
+              {t("继续编辑")}
             </AlertDialogCancel>
             <AlertDialogAction
               className={adminPrimaryButtonClass}
@@ -1164,7 +1561,7 @@ export default function App() {
                 }
               }}
             >
-              放弃未保存修改
+              {t("放弃未保存修改")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

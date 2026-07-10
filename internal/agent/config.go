@@ -27,6 +27,7 @@ type RemoteConfig struct {
 }
 
 type RemoteUpdateInstruction struct {
+	ID          string `json:"id"`
 	Version     string `json:"version"`
 	DownloadURL string `json:"download_url"`
 	ChecksumURL string `json:"checksum_url,omitempty"`
@@ -35,13 +36,39 @@ type RemoteUpdateInstruction struct {
 
 const maxAgentAPIErrorBodyBytes = 4096
 
+type agentAPIStatusError struct {
+	statusCode int
+	operation  string
+	message    string
+}
+
+func (e *agentAPIStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	statusText := fmt.Sprintf("status %d", e.statusCode)
+	operation := strings.TrimSpace(e.operation)
+	message := strings.TrimSpace(e.message)
+	if message == "" || message == statusText {
+		if operation == "" {
+			return statusText
+		}
+		return operation + " " + statusText
+	}
+	if operation == "" {
+		return statusText + ": " + message
+	}
+	return operation + " " + statusText + ": " + message
+}
+
 type runtimeConfig struct {
-	mu       sync.RWMutex
-	alias    string
-	group    string
-	tests    []metrics.NetworkTestConfig
-	interval time.Duration
-	update   *RemoteUpdateInstruction
+	mu                      sync.RWMutex
+	alias                   string
+	group                   string
+	tests                   []metrics.NetworkTestConfig
+	interval                time.Duration
+	update                  *RemoteUpdateInstruction
+	allowPrivateRemoteTests bool
 }
 
 func newRuntimeConfig(cfg Config) *runtimeConfig {
@@ -50,10 +77,11 @@ func newRuntimeConfig(cfg Config) *runtimeConfig {
 		interval = 5 * time.Second
 	}
 	return &runtimeConfig{
-		alias:    cfg.NodeAlias,
-		group:    cfg.NodeGroup,
-		tests:    cfg.NetTests,
-		interval: interval,
+		alias:                   cfg.NodeAlias,
+		group:                   cfg.NodeGroup,
+		tests:                   cfg.NetTests,
+		interval:                interval,
+		allowPrivateRemoteTests: cfg.AllowPrivateRemoteTests,
 	}
 }
 
@@ -67,7 +95,7 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 		r.interval = time.Duration(remote.TestIntervalSec) * time.Second
 	}
 	if remote.Tests != nil {
-		r.tests = remote.Tests
+		r.tests = markRemoteNetworkTests(remote.Tests, !r.allowPrivateRemoteTests)
 	}
 	r.update = cloneRemoteUpdateInstruction(remote.Update)
 }
@@ -89,7 +117,42 @@ func cloneRemoteUpdateInstruction(value *RemoteUpdateInstruction) *RemoteUpdateI
 	return &cloned
 }
 
-func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeID, token string) (RemoteConfig, error) {
+func markRemoteNetworkTests(tests []metrics.NetworkTestConfig, publicOnly bool) []metrics.NetworkTestConfig {
+	if len(tests) == 0 {
+		return tests
+	}
+	marked := make([]metrics.NetworkTestConfig, len(tests))
+	copy(marked, tests)
+	for i := range marked {
+		marked[i].PublicOnly = publicOnly
+	}
+	return marked
+}
+
+func remoteUpdateCapableForConfig(cfg Config) bool {
+	return !cfg.DisableUpdate && remoteUpdateControlPlaneSecure(cfg.ServerURL)
+}
+
+func agentCapabilitiesForConfig(cfg Config) []string {
+	capabilities := []string{agentrpc.AgentCapabilityDedicatedToken}
+	if remoteUpdateCapableForConfig(cfg) {
+		capabilities = append(capabilities, agentrpc.AgentCapabilityRemoteUpdate)
+	}
+	return capabilities
+}
+
+func agentCapabilitiesHeader(capabilities []string) string {
+	normalized := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		capability = strings.TrimSpace(capability)
+		if capability != "" {
+			normalized = append(normalized, capability)
+		}
+	}
+	return strings.Join(normalized, ",")
+}
+
+func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeID, token string, capabilities []string) (RemoteConfig, error) {
 	if nodeID == "" {
 		return RemoteConfig{}, fmt.Errorf("node id required")
 	}
@@ -108,7 +171,9 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	if token != "" {
 		req.Header.Set("X-AGENT-TOKEN", token)
 	}
-	req.Header.Set(agentrpc.AgentCapabilitiesHeader, agentrpc.AgentCapabilityDedicatedToken+","+agentrpc.AgentCapabilityRemoteUpdate)
+	if header := agentCapabilitiesHeader(capabilities); header != "" {
+		req.Header.Set(agentrpc.AgentCapabilitiesHeader, header)
+	}
 
 	var payload RemoteConfig
 	if err := performAgentJSONRequest(client, req, "config", "config response has trailing data", &payload); err != nil {
@@ -169,7 +234,7 @@ func newAgentJSONRequest(
 	return req, nil
 }
 
-func performAgentStatusRequest(client *http.Client, req *http.Request, action string) error {
+func performAgentStatusRequest(client *http.Client, req *http.Request, operation string) error {
 	if client == nil {
 		return fmt.Errorf("http client required")
 	}
@@ -182,7 +247,7 @@ func performAgentStatusRequest(client *http.Client, req *http.Request, action st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return readAgentAPIActionError(resp, action)
+		return readAgentAPIStatusError(resp, operation)
 	}
 	return nil
 }
@@ -197,6 +262,14 @@ func readAgentAPIErrorMessage(resp *http.Response, fallback string) string {
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxAgentAPIErrorBodyBytes))
 	if text := strings.TrimSpace(string(body)); text != "" {
+		var payload struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(text), &payload); err == nil {
+			if message := strings.TrimSpace(payload.Error); message != "" {
+				return message
+			}
+		}
 		return text
 	}
 	if message != "" {
@@ -205,35 +278,20 @@ func readAgentAPIErrorMessage(resp *http.Response, fallback string) string {
 	return fmt.Sprintf("status %d", resp.StatusCode)
 }
 
-func readAgentAPIStatusError(resp *http.Response, label string) error {
-	trimmedLabel := strings.TrimSpace(label)
+func readAgentAPIStatusError(resp *http.Response, operation string) error {
+	operation = strings.TrimSpace(operation)
 	if resp == nil {
-		if trimmedLabel == "" {
+		if operation == "" {
 			return fmt.Errorf("request failed")
 		}
-		return fmt.Errorf("%s request failed", trimmedLabel)
+		return fmt.Errorf("%s request failed", operation)
 	}
 	statusText := fmt.Sprintf("status %d", resp.StatusCode)
-	message := readAgentAPIErrorMessage(resp, statusText)
-	if message == statusText {
-		if trimmedLabel == "" {
-			return fmt.Errorf("%s", statusText)
-		}
-		return fmt.Errorf("%s %s", trimmedLabel, statusText)
+	return &agentAPIStatusError{
+		statusCode: resp.StatusCode,
+		operation:  operation,
+		message:    readAgentAPIErrorMessage(resp, statusText),
 	}
-	if trimmedLabel == "" {
-		return fmt.Errorf("%s", message)
-	}
-	return fmt.Errorf("%s %s: %s", trimmedLabel, statusText, message)
-}
-
-func readAgentAPIActionError(resp *http.Response, action string) error {
-	trimmedAction := strings.TrimSpace(action)
-	message := readAgentAPIErrorMessage(resp, "")
-	if trimmedAction == "" {
-		return fmt.Errorf("%s", message)
-	}
-	return fmt.Errorf("%s: %s", trimmedAction, message)
 }
 
 func decodeStrictAgentJSON(body io.Reader, target any, trailingMessage string) error {

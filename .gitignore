@@ -38,8 +38,11 @@ go.work.sum
 .cache/
 .gocache/
 .gomodcache/
+.gopath/
 .tmp/
 .serena/
+.codex/
+.agents/
 output/
 internal/server/web/admin/node_modules/
 internal/server/web/admin/.DS_Store

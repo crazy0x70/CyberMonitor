@@ -364,8 +364,8 @@ func validateAIBaseURL(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	if err := validateHTTPCallbackURL(raw); err != nil {
-		if errors.Is(err, errCallbackURLScheme) {
+	if err := validateHTTPBaseURL(raw); err != nil {
+		if errors.Is(err, errHTTPBaseURLScheme) {
 			return errors.New("AI base url 需为 http 或 https")
 		}
 		return errors.New("AI base url 无效")
@@ -550,12 +550,14 @@ func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSe
 	return finalizeAIProviderSelection(selection)
 }
 
-func resolveAIProviderConfigWithOverride(settings AISettings, provider string, override AIProviderConfig) (aiProviderSelection, error) {
+func resolveAIProviderConfigWithOverride(settings AISettings, provider string, override *AIProviderConfig) (aiProviderSelection, error) {
 	selection, err := selectAIProviderConfig(settings, provider)
 	if err != nil {
 		return aiProviderSelection{}, err
 	}
-	selection.Config = mergeAIProviderOverride(selection.Config, override)
+	if override != nil {
+		selection.Config = normalizeAIProviderConfig(*override)
+	}
 	return finalizeAIProviderSelection(selection)
 }
 
@@ -565,21 +567,6 @@ func finalizeAIProviderSelection(selection aiProviderSelection) (aiProviderSelec
 		return aiProviderSelection{}, err
 	}
 	return selection, nil
-}
-
-func mergeAIProviderOverride(base, override AIProviderConfig) AIProviderConfig {
-	base = normalizeAIProviderConfig(base)
-	override = normalizeAIProviderConfig(override)
-	if override.APIKey != "" {
-		base.APIKey = override.APIKey
-	}
-	if override.BaseURL != "" {
-		base.BaseURL = override.BaseURL
-	}
-	if override.Model != "" {
-		base.Model = override.Model
-	}
-	return base
 }
 
 func validateResolvedAISelection(selection aiProviderSelection) error {

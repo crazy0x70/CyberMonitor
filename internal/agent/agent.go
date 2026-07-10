@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,25 +27,26 @@ var (
 		return updater.NewDockerManagedUpdaterContext(ctx)
 	}
 	dockerManagedInitTimeout   = 10 * time.Second
-	dockerManagedLaunchTimeout = 15 * time.Second
+	dockerManagedLaunchTimeout = 10 * time.Minute
 	updateReportTimeout        = 8 * time.Second
 )
 
 type Config struct {
-	ServerURL     string
-	Interval      time.Duration
-	NodeID        string
-	NodeName      string
-	NodeAlias     string
-	NodeGroup     string
-	AgentToken    string
-	AgentVersion  string
-	HostRoot      string
-	NetTests      []metrics.NetworkTestConfig
-	TestInterval  time.Duration
-	NetIfaces     []string
-	DisableUpdate bool
-	TokenFile     string
+	ServerURL               string
+	Interval                time.Duration
+	NodeID                  string
+	NodeName                string
+	NodeAlias               string
+	NodeGroup               string
+	AgentToken              string
+	AgentVersion            string
+	HostRoot                string
+	NetTests                []metrics.NetworkTestConfig
+	TestInterval            time.Duration
+	NetIfaces               []string
+	DisableUpdate           bool
+	AllowPrivateRemoteTests bool
+	TokenFile               string
 
 	transportOptions grpcTransportOptions
 }
@@ -83,7 +85,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
-type updateReporter func(context.Context, string, string, string) error
+type updateReporter func(context.Context, string, string, string, string) error
 
 func maybeApplyRemoteUpdate(
 	ctx context.Context,
@@ -103,13 +105,21 @@ func maybeApplyRemoteUpdate(
 		currentVersion = "unknown"
 	}
 	log.Printf("收到远程更新指令: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
-	if currentVersion == targetVersion {
+	if updater.VersionsEqual(currentVersion, targetVersion) {
 		log.Printf("跳过远程更新: Agent 已运行目标版本 %s", targetVersion)
-		return reportUpdateState(report, "succeeded", targetVersion, "Agent 已运行目标版本")
+		return reportUpdateState(report, update, "succeeded", targetVersion, "Agent 已运行目标版本")
+	}
+	if !updater.HasVersionUpdate(currentVersion, targetVersion) {
+		log.Printf("拒绝远程更新: 目标版本不是可验证的新版本，当前版本=%s，目标版本=%s", currentVersion, targetVersion)
+		return reportUpdateState(report, update, "failed", targetVersion, "拒绝非升级版本或无法验证的目标版本")
 	}
 	if cfg.DisableUpdate {
 		log.Printf("拒绝远程更新: 当前 Agent 已禁用远程更新，目标版本=%s", targetVersion)
-		return reportUpdateState(report, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+		return reportUpdateState(report, update, "failed", targetVersion, "当前 Agent 已禁用远程更新")
+	}
+	if !remoteUpdateControlPlaneSecure(cfg.ServerURL) {
+		log.Printf("拒绝远程更新: Agent 控制面未使用 HTTPS，目标版本=%s", targetVersion)
+		return reportUpdateState(report, update, "failed", targetVersion, "控制面未使用 HTTPS，拒绝远程更新")
 	}
 	if canDockerManagedUpdate() {
 		log.Printf("检测到 Docker 托管更新能力，正在初始化 Docker updater")
@@ -119,26 +129,31 @@ func maybeApplyRemoteUpdate(
 		if err != nil {
 			err = wrapDockerManagedUpdateError("初始化 Docker updater", err)
 			log.Printf("%v", err)
-			return reportUpdateState(report, "failed", targetVersion, err.Error())
+			return reportUpdateState(report, update, "failed", targetVersion, err.Error())
+		}
+		targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
+		if err != nil {
+			err = wrapDockerManagedUpdateError("解析 Docker 目标镜像", err)
+			log.Printf("%v", err)
+			return reportUpdateState(report, update, "failed", targetVersion, err.Error())
 		}
 		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
-		if err := reportUpdateState(report, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+		if err := reportUpdateState(report, update, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
 			return err
 		}
-		targetImage := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
 		dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(context.Background(), dockerManagedLaunchTimeout)
 		err = dockerUpdater.LaunchSelfContainerUpdate(dockerLaunchCtx, targetImage, cfg.NodeID)
 		cancelDockerLaunch()
 		if err != nil {
 			err = wrapDockerManagedUpdateError("执行 Docker 更新 helper", err)
 			log.Printf("%v", err)
-			reportErr := reportUpdateState(report, "failed", targetVersion, err.Error())
+			reportErr := reportUpdateState(report, update, "failed", targetVersion, err.Error())
 			if reportErr != nil {
 				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 			}
 			return err
 		}
-		if err := reportUpdateState(report, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+		if err := reportUpdateState(report, update, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
 			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
 		}
 		log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
@@ -146,34 +161,46 @@ func maybeApplyRemoteUpdate(
 	}
 	if !updater.CanSelfUpdate() {
 		log.Printf("拒绝远程更新: 当前部署模式不支持 Agent 自更新，目标版本=%s", targetVersion)
-		return reportUpdateState(report, "failed", targetVersion, resolveUnsupportedUpdateMessage())
+		return reportUpdateState(report, update, "failed", targetVersion, resolveUnsupportedUpdateMessage())
 	}
 	log.Printf("开始下载并替换 Agent 二进制: 当前版本=%s，目标版本=%s，下载地址=%s", currentVersion, targetVersion, strings.TrimSpace(update.DownloadURL))
-	if err := reportUpdateState(report, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
+	if err := reportUpdateState(report, update, "updating", targetVersion, "正在下载并替换 Agent 二进制"); err != nil {
 		return err
 	}
 	clientUpdater := updater.NewClient(updater.DefaultRepo, updater.KindAgent, currentVersion)
-	if err := clientUpdater.ApplyAsset(ctx, update.DownloadURL, update.ChecksumURL); err != nil {
-		reportErr := reportUpdateState(report, "failed", targetVersion, err.Error())
+	if err := clientUpdater.ApplyReleaseAsset(ctx, targetVersion, update.DownloadURL, update.ChecksumURL); err != nil {
+		reportErr := reportUpdateState(report, update, "failed", targetVersion, err.Error())
 		if reportErr != nil {
 			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
 		}
 		return err
 	}
 	log.Printf("Agent 更新包写入完成，准备重启到版本 %s", targetVersion)
-	if err := reportUpdateState(report, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
+	if err := reportUpdateState(report, update, "restarting", targetVersion, "更新包已写入，Agent 正在重启"); err != nil {
 		log.Printf("上报 Agent 重启状态失败: %v", err)
 	}
 	return updater.RestartSelf()
 }
 
-func reportUpdateState(report updateReporter, state, version, message string) error {
+func remoteUpdateControlPlaneSecure(serverURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "https") && strings.TrimSpace(parsed.Host) != ""
+}
+
+func reportUpdateState(report updateReporter, update *RemoteUpdateInstruction, state, version, message string) error {
 	if report == nil {
 		return nil
 	}
 	reportCtx, cancel := context.WithTimeout(context.Background(), updateReportTimeout)
 	defer cancel()
-	return report(reportCtx, state, version, message)
+	updateID := ""
+	if update != nil {
+		updateID = strings.TrimSpace(update.ID)
+	}
+	return report(reportCtx, updateID, state, version, message)
 }
 
 func wrapDockerManagedUpdateError(step string, err error) error {
@@ -219,20 +246,22 @@ func postAgentUpdateReport(
 	endpoint string,
 	nodeID string,
 	token string,
+	updateID string,
 	state string,
 	version string,
 	message string,
 ) error {
 	req, err := newAgentJSONRequest(ctx, http.MethodPost, endpoint, map[string]string{
-		"node_id": nodeID,
-		"state":   state,
-		"version": version,
-		"message": message,
+		"node_id":   nodeID,
+		"update_id": updateID,
+		"state":     state,
+		"version":   version,
+		"message":   message,
 	}, token)
 	if err != nil {
 		return err
 	}
-	return performAgentStatusRequest(client, req, "update report failed")
+	return performAgentStatusRequest(client, req, "update report")
 }
 
 type cachedTest struct {
@@ -372,7 +401,7 @@ func testKey(cfg metrics.NetworkTestConfig) string {
 	if host == "" {
 		return ""
 	}
-	return strings.ToLower(fmt.Sprintf("%s|%s|%d|%s", cfg.Type, host, cfg.Port, cfg.Name))
+	return strings.ToLower(fmt.Sprintf("%s|%s|%d|%s|public=%t|interval=%d", cfg.Type, host, cfg.Port, cfg.Name, cfg.PublicOnly, cfg.IntervalSec))
 }
 
 func networkTestConfigSignature(configs []metrics.NetworkTestConfig) string {

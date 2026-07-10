@@ -9,6 +9,45 @@ export interface LoginResponse {
 export interface LoginConfigResponse {
   turnstile_enabled?: boolean;
   turnstile_site_key?: string;
+  password_login_enabled?: boolean;
+  oauth_providers?: OAuthLoginProvider[];
+}
+
+export interface OAuthLoginProvider {
+  id: string;
+  display_name: string;
+  type: string;
+}
+
+export interface OAuth2ProviderSettings {
+  enabled?: boolean;
+  display_name?: string;
+  client_id?: string;
+  client_secret?: string;
+  scopes?: string[];
+  allowed_logins?: string[];
+  allowed_emails?: string[];
+  allowed_email_domains?: string[];
+  require_verified_email?: boolean;
+}
+
+export interface OIDCProviderSettings {
+  enabled?: boolean;
+  display_name?: string;
+  issuer_url?: string;
+  client_id?: string;
+  client_secret?: string;
+  scopes?: string[];
+  allowed_subjects?: string[];
+  allowed_emails?: string[];
+  allowed_email_domains?: string[];
+  require_email_verified?: boolean;
+}
+
+export interface AdminAuthSettings {
+  password_login_enabled?: boolean;
+  github?: OAuth2ProviderSettings;
+  oidc?: OIDCProviderSettings;
 }
 
 export interface GroupNode {
@@ -59,18 +98,19 @@ export interface SettingsView {
   agent_token?: string;
   site_title?: string;
   site_icon?: string;
+  site_background_image?: string;
   home_title?: string;
   home_subtitle?: string;
+  locale?: string;
   alert_webhook?: string;
   alert_offline_sec?: number;
-  alert_all?: boolean;
-  alert_nodes?: string[];
   alert_telegram_token?: string;
   alert_telegram_user_ids?: number[];
   alert_telegram_user_id?: number;
   login_fail_limit?: number;
   login_fail_window_sec?: number;
   login_lock_sec?: number;
+  admin_auth?: AdminAuthSettings;
   ai_settings?: AISettings;
   version?: string;
   commit?: string;
@@ -85,8 +125,26 @@ export interface ConfigImportResponse {
   settings?: SettingsView;
 }
 
+export type AdminLogLevel = "all" | "info" | "warning" | "error" | "debug" | "silent";
+
+export interface AdminLogEntry {
+  id: number;
+  timestamp: number;
+  time: string;
+  level: Exclude<AdminLogLevel, "all">;
+  source: string;
+  message: string;
+}
+
+export interface AdminLogsResponse {
+  entries: AdminLogEntry[];
+  levels: AdminLogLevel[];
+  limit: number;
+}
+
 export interface NodeDeleteResponse {
   status: string;
+  history_error?: string;
 }
 
 export interface NetworkTestResult {
@@ -141,6 +199,21 @@ export interface NetworkIO {
   rx_bytes_per_sec: number;
 }
 
+export interface GPUInfo {
+  index: number;
+  id?: string;
+  name?: string;
+  vendor?: string;
+  driver_version?: string;
+  utilization_percent: number;
+  memory_total: number;
+  memory_used: number;
+  memory_free: number;
+  memory_used_percent: number;
+  temperature_c?: number;
+  power_w?: number;
+}
+
 export interface NodeStats {
   node_id: string;
   node_name: string;
@@ -151,6 +224,8 @@ export interface NodeStats {
   public_ipv6?: string;
   os: string;
   arch: string;
+  static_info?: boolean;
+  static_updated_at?: number;
   agent_version?: string;
   uptime_sec: number;
   timestamp: number;
@@ -161,6 +236,8 @@ export interface NodeStats {
   disk_type?: string;
   disk_io: DiskIO;
   network: NetworkIO;
+  gpu?: GPUInfo[];
+  gpu_collected?: boolean;
   process_count?: number;
   tcp_conns?: number;
   udp_conns?: number;
@@ -201,14 +278,17 @@ export interface NodeView {
 export interface PublicSettings {
   site_title?: string;
   site_icon?: string;
+  site_background_image?: string;
   home_title?: string;
   home_subtitle?: string;
+  locale?: string;
   version?: string;
   commit?: string;
 }
 
 export interface AdminBootPayload {
   settings?: PublicSettings | null;
+  base_path?: string;
 }
 
 export interface SystemUpdateInfo {

@@ -1,5 +1,6 @@
-ARG GO_IMAGE_VERSION=1.26.2
-ARG NODE_IMAGE_VERSION=24
+# syntax=docker/dockerfile:1.7
+ARG GO_IMAGE_VERSION=1.26.5
+ARG NODE_IMAGE_VERSION=26.5.0
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
@@ -90,6 +91,58 @@ FROM runtime-base AS release-agent
 ARG VERSION=dev
 ARG COMMIT=none
 COPY --from=build-agent /out/cyber-monitor /app/cyber-monitor
+RUN apk add --no-cache iputils libcap-utils && \
+    setcap cap_net_raw+ep /bin/ping && \
+    ping6_path="$(command -v ping6 || true)" && \
+    if [ -n "$ping6_path" ] && [ ! -L "$ping6_path" ] && [ "$ping6_path" != "/bin/ping" ]; then \
+      setcap cap_net_raw+ep "$ping6_path"; \
+    fi
+ENV CM_DEPLOY_MODE=docker \
+    CM_VERSION=${VERSION} \
+    CM_COMMIT=${COMMIT}
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+FROM runtime-base AS release-server-prebuilt
+ARG VERSION=dev
+ARG COMMIT=none
+ARG TARGETARCH
+RUN mkdir -p /data && chown -R cm:cm /data
+RUN --mount=type=bind,source=docker-release,target=/release,readonly \
+    set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) binary="/release/cyber-monitor-server-linux-amd64" ;; \
+      arm64) binary="/release/cyber-monitor-server-linux-arm64" ;; \
+      *) echo "Unsupported server Docker target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    test -f "$binary"; \
+    cp "$binary" /app/cyber-monitor; \
+    chmod 0755 /app/cyber-monitor; \
+    chown cm:cm /app/cyber-monitor
+ENV CM_DATA_DIR=/data \
+    CM_DEPLOY_MODE=docker \
+    CM_VERSION=${VERSION} \
+    CM_COMMIT=${COMMIT}
+EXPOSE 25012
+EXPOSE 25013
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -q -O - http://127.0.0.1:25012/api/v1/health || exit 1
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+FROM runtime-base AS release-agent-prebuilt
+ARG VERSION=dev
+ARG COMMIT=none
+ARG TARGETARCH
+RUN --mount=type=bind,source=docker-release,target=/release,readonly \
+    set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) binary="/release/cyber-monitor-agent-linux-amd64" ;; \
+      arm64) binary="/release/cyber-monitor-agent-linux-arm64" ;; \
+      *) echo "Unsupported agent Docker target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    test -f "$binary"; \
+    cp "$binary" /app/cyber-monitor; \
+    chmod 0755 /app/cyber-monitor; \
+    chown cm:cm /app/cyber-monitor
 RUN apk add --no-cache iputils libcap-utils && \
     setcap cap_net_raw+ep /bin/ping && \
     ping6_path="$(command -v ping6 || true)" && \

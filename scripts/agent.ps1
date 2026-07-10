@@ -176,7 +176,7 @@ function Get-ServiceSnapshot {
   )
   $trimmedName = Get-TrimmedText -Value $Name
   if (-not $trimmedName) {
-    return [pscustomobject]@{ Exists = $false; PathName = ""; StartMode = ""; Running = $false }
+    return [pscustomobject]@{ Exists = $false; PathName = ""; StartMode = ""; DelayedAutoStart = $false; Running = $false }
   }
   try {
     $escapedName = $trimmedName.Replace("'", "''")
@@ -186,12 +186,39 @@ function Get-ServiceSnapshot {
         Exists = $true
         PathName = [string]$service.PathName
         StartMode = [string]$service.StartMode
+        DelayedAutoStart = [bool]$service.DelayedAutoStart
         Running = ([string]$service.State -eq "Running")
       }
     }
   } catch {
   }
-  return [pscustomobject]@{ Exists = $false; PathName = ""; StartMode = ""; Running = $false }
+  return [pscustomobject]@{ Exists = $false; PathName = ""; StartMode = ""; DelayedAutoStart = $false; Running = $false }
+}
+
+function ConvertTo-ScStartMode {
+  param(
+    [string]$StartMode,
+    [bool]$DelayedAutoStart = $false
+  )
+  switch ((Get-TrimmedText -Value $StartMode).ToLowerInvariant()) {
+    "auto" {
+      if ($DelayedAutoStart) {
+        return "delayed-auto"
+      }
+      return "auto"
+    }
+    "automatic" {
+      if ($DelayedAutoStart) {
+        return "delayed-auto"
+      }
+      return "auto"
+    }
+    "delayed-auto" { return "delayed-auto" }
+    "automaticdelayedstart" { return "delayed-auto" }
+    "manual" { return "demand" }
+    "disabled" { return "disabled" }
+    default { return "" }
+  }
 }
 
 function Backup-FileIfExists {
@@ -585,9 +612,21 @@ try {
   $binaryReplaced = $true
 
   if ($previousService.Exists) {
-    Invoke-Sc -Arguments @("config", $serviceName, "binPath=", $serviceBinPath, "start=", "auto")
+    $previousStartMode = ConvertTo-ScStartMode -StartMode $previousService.StartMode -DelayedAutoStart $previousService.DelayedAutoStart
+    $serviceConfigStartMode = $previousStartMode
+    $deferDisabledStartMode = $previousStartMode -eq "disabled"
+    if ($deferDisabledStartMode) {
+      $serviceConfigStartMode = "demand"
+    }
+    if (-not $serviceConfigStartMode) {
+      $serviceConfigStartMode = "auto"
+    }
+    Invoke-Sc -Arguments @("config", $serviceName, "binPath=", $serviceBinPath, "start=", $serviceConfigStartMode)
     Invoke-Sc -Arguments @("start", $serviceName)
     Wait-ServiceRunning -Name $serviceName
+    if ($deferDisabledStartMode) {
+      Invoke-Sc -Arguments @("config", $serviceName, "start=", $previousStartMode)
+    }
   } else {
     Invoke-Sc -Arguments @("create", $serviceName, "binPath=", $serviceBinPath, "start=", "auto")
     $serviceCreated = $true
@@ -627,10 +666,24 @@ try {
       Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
     }
     if ($previousService.Exists -and $rollbackBinaryAvailable -and $previousService.PathName) {
-      Invoke-Sc -Arguments @("config", $serviceName, "binPath=", $previousService.PathName)
+      $previousStartMode = ConvertTo-ScStartMode -StartMode $previousService.StartMode -DelayedAutoStart $previousService.DelayedAutoStart
+      $deferDisabledStartMode = $previousService.Running -and $previousStartMode -eq "disabled"
+      $restoreServiceArgs = @("config", $serviceName, "binPath=", $previousService.PathName)
+      if ($deferDisabledStartMode) {
+        $restoreServiceArgs += @("start=", "demand")
+      } elseif ($previousStartMode) {
+        $restoreServiceArgs += @("start=", $previousStartMode)
+      }
+      Invoke-Sc -Arguments $restoreServiceArgs
       if ($previousService.Running) {
-        Invoke-Sc -Arguments @("start", $serviceName)
-        Wait-ServiceRunning -Name $serviceName
+        try {
+          Invoke-Sc -Arguments @("start", $serviceName)
+          Wait-ServiceRunning -Name $serviceName
+        } finally {
+          if ($deferDisabledStartMode) {
+            Invoke-Sc -Arguments @("config", $serviceName, "start=", $previousStartMode)
+          }
+        }
       }
       Write-Host "Rollback restored the previous agent binary and service path."
     }

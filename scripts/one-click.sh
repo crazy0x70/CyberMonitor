@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./install-common.sh
 source "${SCRIPT_DIR}/install-common.sh"
 
+SERVER_DATA_OWNED_MARKER=".cybermonitor-server-data"
+
 print_install_menu() {
   cat <<'EOF'
 CyberMonitor 一键脚本
@@ -23,12 +25,36 @@ print_remove_menu() {
 EOF
 }
 
+generate_admin_password() {
+  local password=""
+  if command -v openssl >/dev/null 2>&1; then
+    password="$(openssl rand -base64 18 | tr -d '\n' | tr '+/' '-_' | cut -c1-24)"
+  fi
+  if [[ -z "${password}" ]]; then
+    password="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | cut -c1-24)"
+  fi
+  [[ "${#password}" -eq 24 ]] || return 1
+  printf '%s\n' "${password}"
+}
+
 write_server_conf() {
+  local listen="$1"
+  local data_dir="$2"
+  local admin_pass="${3:-}"
   mkdir -p "${CONF_DIR}"
-  {
-    write_systemd_env "CM_LISTEN" "$1" || return 1
-    write_systemd_env "CM_DATA_DIR" "$2" || return 1
-  } > "${CONF_DIR}/server.conf"
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  if ! {
+    write_systemd_env "CM_LISTEN" "${listen}" &&
+      write_systemd_env "CM_DATA_DIR" "${data_dir}" &&
+      { [[ -z "${admin_pass}" ]] || write_systemd_env "CM_ADMIN_PASS" "${admin_pass}"; }
+  } > "${CONF_DIR}/server.conf"; then
+    umask "${old_umask}"
+    return 1
+  fi
+  umask "${old_umask}"
+  chmod 600 "${CONF_DIR}/server.conf" || return 1
 }
 
 write_agent_conf() {
@@ -79,23 +105,21 @@ read_admin_settings() {
   local state_file="${data_dir}/state.json"
   local admin_path=""
   local admin_user=""
-  local admin_pass=""
 
   for _ in {1..20}; do
     if [[ -f "${state_file}" ]]; then
       admin_path="$(sed -n 's/.*"admin_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
       admin_user="$(sed -n 's/.*"admin_user"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
-      admin_pass="$(sed -n 's/.*"admin_pass"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_file}" | head -n 1)"
-      if [[ -n "${admin_path}" && -n "${admin_user}" && -n "${admin_pass}" ]]; then
+      if [[ -n "${admin_path}" && -n "${admin_user}" ]]; then
         break
       fi
     fi
     sleep 1
   done
-  if [[ -z "${admin_path}" || -z "${admin_user}" || -z "${admin_pass}" ]]; then
+  if [[ -z "${admin_path}" || -z "${admin_user}" ]]; then
     return 1
   fi
-  echo -e "${admin_path}\t${admin_user}\t${admin_pass}"
+  echo -e "${admin_path}\t${admin_user}"
 }
 
 is_valid_ipv4() {
@@ -139,8 +163,9 @@ resolve_host_port() {
 print_admin_info() {
   local listen="$1"
   local data_dir="$2"
-  local admin_path admin_user admin_pass
-  if ! read -r admin_path admin_user admin_pass < <(read_admin_settings "${data_dir}"); then
+  local admin_pass="$3"
+  local admin_path admin_user
+  if ! read -r admin_path admin_user < <(read_admin_settings "${data_dir}"); then
     echo "无法读取管理后台信息，请稍后查看服务日志。"
     return
   fi
@@ -152,7 +177,11 @@ print_admin_info() {
   local admin_url="http://${host}:${port}${admin_path}"
   echo "管理后台地址: ${admin_url}"
   echo "初始管理员账号: ${admin_user}"
-  echo "初始管理员密码: ${admin_pass}"
+  if [[ -n "${admin_pass}" ]]; then
+    echo "初始管理员密码: ${admin_pass}"
+  else
+    echo "初始管理员密码: 已设置，请使用重置密码命令获取新密码。"
+  fi
 }
 
 install_server() {
@@ -161,13 +190,22 @@ install_server() {
   local version="$3"
   local data_dir_created=""
   validate_systemd_unit_paths || die "systemd unit 路径包含非法值"
+  reject_unsafe_path "${data_dir}" || die "数据目录包含不安全路径"
   local arch
   arch="$(detect_arch)"
   version="$(resolve_version "${version}")"
+  local admin_pass=""
+  if [[ ! -f "${data_dir}/state.json" ]]; then
+    admin_pass="$(generate_admin_password)" || die "生成管理员初始密码失败"
+  fi
   if [[ ! -e "${data_dir}" ]]; then
     data_dir_created="1"
   fi
   mkdir -p "${data_dir}"
+  if [[ "${data_dir_created}" == "1" ]] && ! mark_server_data_dir_owned "${data_dir}"; then
+    cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+    die "安装 cyber-monitor-server 失败，无法标记数据目录归属"
+  fi
 
   local service="cyber-monitor-server"
   local service_file="${SYSTEMD_SERVICE_DIR}/${service}.service"
@@ -187,7 +225,7 @@ install_server() {
 
   local bin
   if ! download_binary "server" "${version}" "${arch}" bin ||
-    ! write_server_conf "${listen}" "${data_dir}" ||
+    ! write_server_conf "${listen}" "${data_dir}" "${admin_pass}" ||
     ! write_service_file "${service_file}" "CyberMonitor Server" "${CONF_DIR}/server.conf" "${bin}" ||
     ! enable_service "${service}"; then
     if ! rollback_install_failure "server" "${service}" "" "" "${CONF_DIR}/server.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
@@ -197,11 +235,19 @@ install_server() {
     cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
     die "安装 ${service} 失败，已执行回滚流程"
   fi
+  if [[ -n "${admin_pass}" ]] && (! write_server_conf "${listen}" "${data_dir}" || ! systemctl restart "${service}"); then
+    if ! rollback_install_failure "server" "${service}" "" "" "${CONF_DIR}/server.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
+      cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+      die "清理 ${service} 初始管理员密码失败；回滚后服务仍未运行"
+    fi
+    cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+    die "安装 ${service} 失败，已执行回滚流程"
+  fi
   cleanup_file_backup "${conf_backup}"
   cleanup_file_backup "${service_backup}"
   cleanup_binary_backup
   echo "已安装并启动 ${service}"
-  print_admin_info "${listen}" "${data_dir}"
+  print_admin_info "${listen}" "${data_dir}" "${admin_pass}"
 }
 
 install_agent() {
@@ -302,7 +348,31 @@ cleanup_created_data_dir() {
   if [[ "${created}" != "1" || -z "${data_dir}" || "${data_dir}" == "/" ]]; then
     return 0
   fi
+  rm -f -- "${data_dir}/${SERVER_DATA_OWNED_MARKER}" 2>/dev/null || true
   rmdir "${data_dir}" 2>/dev/null || echo "保留非空数据目录: ${data_dir}" >&2
+}
+
+mark_server_data_dir_owned() {
+  local data_dir="$1"
+  [[ -n "${data_dir}" && "${data_dir}" != "/" ]] || return 1
+  reject_unsafe_path "${data_dir}" || return 1
+  touch "${data_dir}/${SERVER_DATA_OWNED_MARKER}"
+}
+
+server_data_dir_is_owned() {
+  local data_dir="$1"
+  [[ -f "${data_dir}/${SERVER_DATA_OWNED_MARKER}" ]]
+}
+
+server_data_dir_is_mountpoint_or_unknown() {
+  local data_dir="$1"
+  command -v mountpoint >/dev/null 2>&1 || return 0
+  mountpoint -q -- "${data_dir}"
+  local status="$?"
+  if [[ "${status}" -eq 32 ]]; then
+    return 1
+  fi
+  return 0
 }
 
 cleanup_server_config() {
@@ -319,7 +389,13 @@ cleanup_server_config() {
   fi
   rm -f "${CONF_DIR}/server.conf"
   if [[ -n "${data_real}" && "${data_real}" != "${install_real}" && "${data_real}" == "${install_real}/"* ]]; then
-    rm -rf "${data_dir}"
+    if ! server_data_dir_is_owned "${data_real}"; then
+      echo "未自动删除未标记为 CyberMonitor 管理的数据目录: ${data_dir}"
+    elif server_data_dir_is_mountpoint_or_unknown "${data_real}"; then
+      echo "未自动删除挂载点或无法确认挂载状态的数据目录: ${data_dir}"
+    else
+      rm -rf -- "${data_real}"
+    fi
   elif [[ -n "${data_dir}" && "${data_dir}" != "/" ]]; then
     echo "未自动删除自定义数据目录: ${data_dir}"
   fi

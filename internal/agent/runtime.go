@@ -2,14 +2,19 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"cyber_monitor/internal/metrics"
 	"cyber_monitor/internal/updater"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type agentRunner struct {
@@ -19,8 +24,8 @@ type agentRunner struct {
 	runtimeCfg          *runtimeConfig
 	testCache           map[string]cachedTest
 	lastTestConfigSig   string
-	dockerManagedUpdate bool
 	agentToken          string
+	lastUpdateReportID  string
 	lastUpdateState     string
 	lastUpdateVersion   string
 	lastUpdateSignature string
@@ -33,13 +38,12 @@ var remoteUpdateNow = time.Now
 
 func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.Collector) *agentRunner {
 	return &agentRunner{
-		cfg:                 cfg,
-		transport:           transport,
-		collector:           collector,
-		runtimeCfg:          newRuntimeConfig(cfg),
-		testCache:           make(map[string]cachedTest),
-		dockerManagedUpdate: updater.CanDockerManagedUpdate(),
-		agentToken:          strings.TrimSpace(cfg.AgentToken),
+		cfg:        cfg,
+		transport:  transport,
+		collector:  collector,
+		runtimeCfg: newRuntimeConfig(cfg),
+		testCache:  make(map[string]cachedTest),
+		agentToken: strings.TrimSpace(cfg.AgentToken),
 	}
 }
 
@@ -54,25 +58,49 @@ func (r *agentRunner) bootstrapToken(ctx context.Context) {
 		return
 	}
 
-	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, bootstrapToken)
-	if err == nil && issuedToken != "" {
-		if err := r.updateAgentToken(issuedToken); err != nil {
-			log.Printf("持久化 Agent 专属凭据失败: %v", err)
-		}
-		return
-	}
-	if err != nil && !strings.Contains(err.Error(), "register status 401") {
-		log.Printf("节点注册未成功，继续尝试使用当前 Agent Token: %v", err)
-	}
+	r.registerAgentToken(ctx, "节点注册")
 }
 
 func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 	remote, err := r.transport.FetchConfig(ctx, r.cfg.NodeID, r.agentToken)
 	if err != nil {
+		if isUnauthorizedStatusError(err) && r.registerAgentToken(ctx, "Agent Token 失效后重新注册") {
+			remote, err = r.transport.FetchConfig(ctx, r.cfg.NodeID, r.agentToken)
+			if err == nil {
+				r.applyRemoteConfig(ctx, remote)
+				return
+			}
+		}
 		log.Printf("拉取远程配置失败: %v", err)
 		return
 	}
 
+	r.applyRemoteConfig(ctx, remote)
+}
+
+func (r *agentRunner) registerAgentToken(ctx context.Context, label string) bool {
+	bootstrapToken := strings.TrimSpace(r.cfg.AgentToken)
+	if bootstrapToken == "" || strings.TrimSpace(r.agentToken) != bootstrapToken {
+		return false
+	}
+	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, bootstrapToken)
+	if err == nil && strings.TrimSpace(issuedToken) != "" {
+		if err := r.updateAgentToken(issuedToken); err != nil {
+			log.Printf("持久化 Agent 专属凭据失败: %v", err)
+		}
+		return true
+	}
+	if err != nil && !isUnauthorizedStatusError(err) {
+		action := strings.TrimSpace(label)
+		if action == "" {
+			action = "节点注册"
+		}
+		log.Printf("%s未成功，继续尝试使用当前 Agent Token: %v", action, err)
+	}
+	return false
+}
+
+func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig) {
 	r.runtimeCfg.Update(remote)
 	if err := r.updateAgentToken(resolveRemoteAgentToken(r.agentToken, remote)); err != nil {
 		log.Printf("持久化 Agent 专属凭据失败: %v", err)
@@ -80,6 +108,7 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 	if remote.Update == nil {
 		r.lastUpdateState = ""
 		r.lastUpdateVersion = ""
+		r.lastUpdateReportID = ""
 		r.lastUpdateSignature = ""
 		r.lastUpdateAppliedAt = time.Time{}
 		return
@@ -88,6 +117,11 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 	now := remoteUpdateNow()
 	if r.shouldSuppressRemoteUpdate(signature, now) {
 		return
+	}
+	if signature != r.lastUpdateSignature {
+		r.lastUpdateState = ""
+		r.lastUpdateVersion = ""
+		r.lastUpdateReportID = ""
 	}
 	if err := maybeApplyRemoteUpdate(ctx, r.reportRemoteUpdate, r.cfg, remote.Update); err != nil {
 		log.Printf("执行远程更新失败: %v", err)
@@ -109,6 +143,7 @@ func remoteUpdateInstructionSignature(update *RemoteUpdateInstruction) string {
 		return ""
 	}
 	return strings.Join([]string{
+		strings.TrimSpace(update.ID),
 		strings.TrimSpace(update.Version),
 		strings.TrimSpace(update.DownloadURL),
 		strings.TrimSpace(update.ChecksumURL),
@@ -116,15 +151,22 @@ func remoteUpdateInstructionSignature(update *RemoteUpdateInstruction) string {
 	}, "\x00")
 }
 
-func (r *agentRunner) reportRemoteUpdate(ctx context.Context, state, version, message string) error {
+func (r *agentRunner) reportRemoteUpdate(ctx context.Context, updateID, state, version, message string) error {
+	updateID = strings.TrimSpace(updateID)
 	terminalState := isTerminalUpdateState(state)
-	if terminalState && r.lastUpdateState == state && r.lastUpdateVersion == version {
+	if terminalState && r.lastUpdateReportID == updateID && r.lastUpdateState == state && r.lastUpdateVersion == version {
 		return nil
 	}
-	if err := r.transport.ReportUpdate(ctx, r.cfg.NodeID, r.agentToken, state, version, message); err != nil {
-		return err
+	if err := r.transport.ReportUpdate(ctx, r.cfg.NodeID, r.agentToken, updateID, state, version, message); err != nil {
+		if !isUnauthorizedStatusError(err) || !r.registerAgentToken(ctx, "Agent Token 失效后重新注册") {
+			return err
+		}
+		if err := r.transport.ReportUpdate(ctx, r.cfg.NodeID, r.agentToken, updateID, state, version, message); err != nil {
+			return err
+		}
 	}
 	if terminalState {
+		r.lastUpdateReportID = updateID
 		r.lastUpdateState = state
 		r.lastUpdateVersion = version
 	}
@@ -147,8 +189,8 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 		sample.AgentVersion = r.cfg.AgentVersion
 	}
 	sample.DeployMode = string(updater.DetectDeployMode())
-	sample.DockerManagedUpdate = r.dockerManagedUpdate
-	sample.AgentUpdateDisabled = r.cfg.DisableUpdate
+	sample.DockerManagedUpdate = canDockerManagedUpdate()
+	annotateAgentUpdateCapability(&sample, r.cfg)
 
 	alias, group, tests, interval, _ := r.runtimeCfg.Snapshot()
 	if alias != "" {
@@ -172,9 +214,27 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 	}
 }
 
+func annotateAgentUpdateCapability(sample *metrics.NodeStats, cfg Config) {
+	if sample == nil {
+		return
+	}
+	sample.AgentUpdateDisabled = cfg.DisableUpdate
+	sample.AgentUpdateInsecure = !remoteUpdateControlPlaneSecure(cfg.ServerURL)
+	sample.AgentRemoteUpdate = !sample.AgentUpdateDisabled && !sample.AgentUpdateInsecure
+}
+
 func (r *agentRunner) reportStats(ctx context.Context, sample metrics.NodeStats) error {
 	refreshConfig, err := r.transport.ReportStats(ctx, sample, r.agentToken)
 	if err != nil {
+		if isUnauthorizedStatusError(err) && r.registerAgentToken(ctx, "Agent Token 失效后重新注册") {
+			refreshConfig, err = r.transport.ReportStats(ctx, sample, r.agentToken)
+			if err == nil {
+				if refreshConfig {
+					r.syncRemoteConfig(ctx)
+				}
+				return nil
+			}
+		}
 		return err
 	}
 	if refreshConfig {
@@ -205,10 +265,12 @@ func (r *agentRunner) updateAgentToken(next string) error {
 		return nil
 	}
 	r.agentToken = trimmed
-	if r.cfg.TokenFile == "" {
-		return nil
+	if r.cfg.TokenFile != "" {
+		if err := persistAgentToken(r.cfg.TokenFile, trimmed); err != nil {
+			return err
+		}
 	}
-	return persistAgentToken(r.cfg.TokenFile, trimmed)
+	return nil
 }
 
 func resolveRemoteAgentToken(current string, remote RemoteConfig) string {
@@ -216,4 +278,15 @@ func resolveRemoteAgentToken(current string, remote RemoteConfig) string {
 		return issuedToken
 	}
 	return current
+}
+
+func isUnauthorizedStatusError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.Unauthenticated {
+		return true
+	}
+	var apiErr *agentAPIStatusError
+	return errors.As(err, &apiErr) && apiErr.statusCode == http.StatusUnauthorized
 }

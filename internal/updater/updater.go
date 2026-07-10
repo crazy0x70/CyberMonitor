@@ -149,22 +149,36 @@ func (c *Client) ApplyLatest(ctx context.Context) (ReleaseInfo, error) {
 	if err != nil {
 		return ReleaseInfo{}, err
 	}
-	if !info.HasUpdate && CompareVersions(info.CurrentVersion, info.LatestVersion) >= 0 {
+	if !ValidReleaseVersion(info.LatestVersion) {
+		return info, fmt.Errorf("更新目标版本无效: %s", info.LatestVersion)
+	}
+	if !info.HasUpdate && VersionCurrentOrNewer(info.CurrentVersion, info.LatestVersion) {
 		return info, fmt.Errorf("当前已是最新版本")
 	}
-	if err := c.ApplyAsset(ctx, info.DownloadURL, info.ChecksumURL); err != nil {
+	if err := c.ApplyReleaseAsset(ctx, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
 		return info, err
 	}
 	return info, nil
 }
 
-func (c *Client) ApplyAsset(ctx context.Context, downloadURL, checksumURL string) error {
+func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloadURL, checksumURL string) error {
 	if !CanSelfUpdate() {
 		return fmt.Errorf("当前平台暂不支持自更新")
+	}
+	expectedVersion = strings.TrimSpace(expectedVersion)
+	if expectedVersion == "" {
+		return fmt.Errorf("缺少更新目标版本")
 	}
 	downloadURL = strings.TrimSpace(downloadURL)
 	if downloadURL == "" {
 		return fmt.Errorf("缺少更新下载地址")
+	}
+	checksumURL = strings.TrimSpace(checksumURL)
+	if checksumURL == "" {
+		return fmt.Errorf("缺少更新校验地址")
+	}
+	if err := c.ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL); err != nil {
+		return err
 	}
 	exePath, err := resolveExecutablePath()
 	if err != nil {
@@ -183,10 +197,6 @@ func (c *Client) ApplyAsset(ctx context.Context, downloadURL, checksumURL string
 	if err := c.downloadFile(ctx, downloadURL, tmpBinary); err != nil {
 		return err
 	}
-	checksumURL = strings.TrimSpace(checksumURL)
-	if checksumURL == "" {
-		return fmt.Errorf("缺少更新校验地址")
-	}
 	if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
 		return err
 	}
@@ -197,6 +207,86 @@ func (c *Client) ApplyAsset(ctx context.Context, downloadURL, checksumURL string
 		return err
 	}
 	return nil
+}
+
+type releaseAssetRef struct {
+	tag   string
+	asset string
+}
+
+func ValidateReleaseAssetURLs(kind Kind, expectedVersion, downloadURL, checksumURL string) error {
+	return NewClient(DefaultRepo, kind, "").ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL)
+}
+
+func (c *Client) ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL string) error {
+	download, err := c.parseGitHubReleaseAssetURL(downloadURL, AssetName(c.Kind))
+	if err != nil {
+		return fmt.Errorf("拒绝更新下载地址: %w", err)
+	}
+	checksum, err := c.parseGitHubReleaseAssetURL(checksumURL, checksumAssetName)
+	if err != nil {
+		return fmt.Errorf("拒绝更新校验地址: %w", err)
+	}
+	if download.tag != checksum.tag {
+		return fmt.Errorf("更新下载地址和校验地址不属于同一 release tag")
+	}
+	if !VersionsEqual(download.tag, expectedVersion) {
+		return fmt.Errorf("更新地址版本 %s 与目标版本 %s 不一致", download.tag, expectedVersion)
+	}
+	return nil
+}
+
+func (c *Client) parseGitHubReleaseAssetURL(rawURL, expectedAsset string) (releaseAssetRef, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return releaseAssetRef{}, err
+	}
+	if parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") {
+		return releaseAssetRef{}, fmt.Errorf("必须使用 github.com 的 HTTPS release 地址")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return releaseAssetRef{}, fmt.Errorf("release 地址不能包含 query 或 fragment")
+	}
+
+	owner, repo, ok := strings.Cut(strings.Trim(strings.TrimSpace(c.Repo), "/"), "/")
+	if !ok || owner == "" || repo == "" {
+		return releaseAssetRef{}, fmt.Errorf("更新仓库配置无效")
+	}
+	segments, err := splitEscapedPathSegments(parsed.EscapedPath())
+	if err != nil {
+		return releaseAssetRef{}, err
+	}
+	if len(segments) != 6 ||
+		!strings.EqualFold(segments[0], owner) ||
+		!strings.EqualFold(segments[1], repo) ||
+		segments[2] != "releases" ||
+		segments[3] != "download" {
+		return releaseAssetRef{}, fmt.Errorf("必须指向 %s 的 release asset", c.Repo)
+	}
+	if segments[5] != expectedAsset {
+		return releaseAssetRef{}, fmt.Errorf("asset %q 与期望 %q 不一致", segments[5], expectedAsset)
+	}
+	return releaseAssetRef{tag: segments[4], asset: segments[5]}, nil
+}
+
+func splitEscapedPathSegments(escapedPath string) ([]string, error) {
+	trimmed := strings.Trim(escapedPath, "/")
+	if trimmed == "" {
+		return nil, fmt.Errorf("release 地址路径为空")
+	}
+	rawSegments := strings.Split(trimmed, "/")
+	segments := make([]string, 0, len(rawSegments))
+	for _, raw := range rawSegments {
+		segment, err := url.PathUnescape(raw)
+		if err != nil {
+			return nil, fmt.Errorf("release 地址路径编码无效")
+		}
+		if segment == "" || segment == "." || segment == ".." || strings.ContainsAny(segment, `/\`) {
+			return nil, fmt.Errorf("release 地址路径包含非法片段")
+		}
+		segments = append(segments, segment)
+	}
+	return segments, nil
 }
 
 func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
@@ -217,7 +307,7 @@ func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
 		PublishedAt:    strings.TrimSpace(release.PublishedAt),
 		Assets:         assets,
 	}
-	info.HasUpdate = CompareVersions(info.CurrentVersion, info.LatestVersion) < 0
+	info.HasUpdate = HasVersionUpdate(info.CurrentVersion, info.LatestVersion)
 
 	assetName := AssetName(c.Kind)
 	info.AssetName = assetName
@@ -418,8 +508,15 @@ func AssetName(kind Kind) string {
 }
 
 func CompareVersions(current, latest string) int {
-	currentParts := parseVersion(current)
-	latestParts := parseVersion(latest)
+	currentVersion, currentOK := parseComparableVersion(current)
+	latestVersion, latestOK := parseComparableVersion(latest)
+	if !currentOK || !latestOK {
+		return 0
+	}
+	return compareComparableVersions(currentVersion, latestVersion)
+}
+
+func compareVersionParts(currentParts, latestParts [3]int) int {
 	for idx := 0; idx < 3; idx++ {
 		switch {
 		case currentParts[idx] < latestParts[idx]:
@@ -431,20 +528,208 @@ func CompareVersions(current, latest string) int {
 	return 0
 }
 
+type comparableVersion struct {
+	parts      [3]int
+	prerelease []string
+}
+
+func HasVersionUpdate(current, latest string) bool {
+	current = strings.TrimSpace(current)
+	latest = strings.TrimSpace(latest)
+	if latest == "" || VersionsEqual(current, latest) {
+		return false
+	}
+	latestVersion, latestOK := parseComparableVersion(latest)
+	if !latestOK {
+		return false
+	}
+	currentVersion, currentOK := parseComparableVersion(current)
+	if !currentOK {
+		return current != ""
+	}
+	return compareComparableVersions(currentVersion, latestVersion) < 0
+}
+
+func ValidReleaseVersion(version string) bool {
+	_, ok := parseComparableVersion(version)
+	return ok
+}
+
+func VersionCurrentOrNewer(current, latest string) bool {
+	current = strings.TrimSpace(current)
+	latest = strings.TrimSpace(latest)
+	if VersionsEqual(current, latest) {
+		return true
+	}
+	currentVersion, currentOK := parseComparableVersion(current)
+	latestVersion, latestOK := parseComparableVersion(latest)
+	if !currentOK || !latestOK {
+		return false
+	}
+	return compareComparableVersions(currentVersion, latestVersion) >= 0
+}
+
+// VersionsEqual reports whether two non-empty version strings refer to the same version.
+func VersionsEqual(current, latest string) bool {
+	current = strings.TrimSpace(current)
+	latest = strings.TrimSpace(latest)
+	if current == "" || latest == "" {
+		return false
+	}
+	if current == latest {
+		return true
+	}
+	currentVersion, currentOK := parseComparableVersion(current)
+	latestVersion, latestOK := parseComparableVersion(latest)
+	if !currentOK || !latestOK {
+		return false
+	}
+	return compareComparableVersions(currentVersion, latestVersion) == 0
+}
+
 func parseVersion(value string) [3]int {
+	version, _ := parseComparableVersion(value)
+	return version.parts
+}
+
+func parseComparableVersion(value string) (comparableVersion, bool) {
 	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
+	if plus := strings.IndexByte(value, '+'); plus >= 0 {
+		value = value[:plus]
+	}
+	var version comparableVersion
 	if dash := strings.IndexByte(value, '-'); dash >= 0 {
+		prerelease := value[dash+1:]
+		if prerelease == "" {
+			return version, false
+		}
+		identifiers, ok := parsePrereleaseIdentifiers(prerelease)
+		if !ok {
+			return version, false
+		}
+		version.prerelease = identifiers
 		value = value[:dash]
 	}
+	if value == "" {
+		return version, false
+	}
 	parts := strings.Split(value, ".")
-	var result [3]int
-	for idx := 0; idx < len(parts) && idx < len(result); idx++ {
+	if len(parts) > len(version.parts) {
+		return version, false
+	}
+	for idx := 0; idx < len(parts); idx++ {
+		if strings.TrimSpace(parts[idx]) == "" {
+			return version, false
+		}
 		parsed, err := strconv.Atoi(parts[idx])
-		if err == nil {
-			result[idx] = parsed
+		if err != nil || parsed < 0 {
+			return version, false
+		}
+		version.parts[idx] = parsed
+	}
+	return version, true
+}
+
+func compareComparableVersions(current, latest comparableVersion) int {
+	if result := compareVersionParts(current.parts, latest.parts); result != 0 {
+		return result
+	}
+	if len(current.prerelease) == 0 && len(latest.prerelease) == 0 {
+		return 0
+	}
+	if len(current.prerelease) == 0 {
+		return 1
+	}
+	if len(latest.prerelease) == 0 {
+		return -1
+	}
+	return comparePrereleaseIdentifiers(current.prerelease, latest.prerelease)
+}
+
+func parsePrereleaseIdentifiers(value string) ([]string, bool) {
+	parts := strings.Split(value, ".")
+	for _, part := range parts {
+		if part == "" || !isPrereleaseIdentifier(part) {
+			return nil, false
+		}
+		if len(part) > 1 && part[0] == '0' && isDecimalIdentifier(part) {
+			return nil, false
 		}
 	}
-	return result
+	return parts, true
+}
+
+func isPrereleaseIdentifier(value string) bool {
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func comparePrereleaseIdentifiers(current, latest []string) int {
+	for idx := 0; idx < len(current) && idx < len(latest); idx++ {
+		if current[idx] == latest[idx] {
+			continue
+		}
+		currentNumber, currentNumeric := parseNumericPrereleaseIdentifier(current[idx])
+		latestNumber, latestNumeric := parseNumericPrereleaseIdentifier(latest[idx])
+		switch {
+		case currentNumeric && latestNumeric:
+			switch {
+			case currentNumber < latestNumber:
+				return -1
+			case currentNumber > latestNumber:
+				return 1
+			default:
+				continue
+			}
+		case currentNumeric:
+			return -1
+		case latestNumeric:
+			return 1
+		case current[idx] < latest[idx]:
+			return -1
+		default:
+			return 1
+		}
+	}
+	switch {
+	case len(current) < len(latest):
+		return -1
+	case len(current) > len(latest):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func parseNumericPrereleaseIdentifier(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if len(value) > 1 && value[0] == '0' {
+		return 0, false
+	}
+	if !isDecimalIdentifier(value) {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func isDecimalIdentifier(value string) bool {
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func (c *Client) httpClient() *http.Client {

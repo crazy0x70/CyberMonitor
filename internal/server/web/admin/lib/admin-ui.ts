@@ -61,7 +61,7 @@ export const adminActionButtonClass =
   `${adminOutlineButtonClass} inline-flex min-w-[110px] items-center justify-center px-5`;
 
 export const adminCompactActionButtonClass =
-  `${adminOutlineButtonClass} inline-flex items-center justify-center gap-1.5 h-9 px-4 text-xs font-bold`;
+  `${adminOutlineButtonClass} inline-flex items-center justify-center gap-1.5 h-9 whitespace-nowrap px-4 text-xs font-bold leading-none`;
 
 export const adminDangerOutlineButtonClass =
   "h-11 rounded-full border-rose-200/80 bg-rose-50/80 text-rose-600 shadow-none backdrop-blur-sm hover:bg-rose-100 hover:text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/60";
@@ -269,7 +269,7 @@ export const adminSummaryWarningTextClass =
   "mt-0.5 text-xs leading-relaxed text-amber-700/80 dark:text-amber-200/70";
 
 export const adminWarningOutlineButtonClass =
-  "h-9 rounded-full border border-amber-200 bg-white/80 text-amber-700 px-4 text-xs font-bold outline-none transition-[border-color,background-color,color] hover:bg-amber-50 focus-visible:border-amber-300 focus-visible:ring-2 focus-visible:ring-amber-300/60 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-200 dark:hover:bg-amber-900 dark:focus-visible:border-amber-700";
+  "inline-flex h-9 items-center justify-center gap-1.5 rounded-full border border-amber-200 bg-white/80 px-4 text-xs font-bold text-amber-700 outline-none transition-[border-color,background-color,color] hover:bg-amber-50 focus-visible:border-amber-300 focus-visible:ring-2 focus-visible:ring-amber-300/60 dark:border-amber-800 dark:bg-amber-950/80 dark:text-amber-200 dark:hover:bg-amber-900 dark:focus-visible:border-amber-700";
 
 export const adminQuickActionButtonClass =
   "inline-flex h-11 w-full items-center justify-start gap-3 rounded-xl border border-slate-200 bg-white/60 px-4 text-sm font-bold text-slate-800 outline-none transition-[border-color,background-color,color,transform] hover:border-sky-300 hover:bg-slate-50 hover:text-sky-700 focus-visible:border-sky-300 focus-visible:ring-2 focus-visible:ring-sky-400/60 active:scale-[0.98] dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-200 dark:hover:border-sky-700 dark:hover:text-sky-400 dark:focus-visible:border-sky-700";

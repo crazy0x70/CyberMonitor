@@ -47,6 +47,7 @@ func main() {
 	jwtSecret := flag.String("jwt-secret", cmdutil.EnvOrDefault("CM_JWT_SECRET", ""), "JWT 密钥")
 	agentToken := flag.String("agent-token", cmdutil.EnvOrDefault("CM_AGENT_TOKEN", ""), "Agent Token")
 	dataDir := flag.String("data-dir", cmdutil.EnvOrDefault("CM_DATA_DIR", cmdutil.DefaultDataDir()), "数据目录")
+	trustProxyHeaders := flag.Bool("trust-proxy-headers", cmdutil.EnvBool("CM_TRUST_PROXY_HEADERS", false), "信任反向代理设置的 X-Forwarded-* 头")
 	flag.Parse()
 
 	if *showVersion {
@@ -69,16 +70,17 @@ func main() {
 	defer stop()
 
 	cfg := server.Config{
-		Addr:       *listen,
-		PublicAddr: *publicListen,
-		AdminUser:  *adminUser,
-		AdminPass:  *adminPass,
-		AdminPath:  *adminPath,
-		JWTSecret:  *jwtSecret,
-		AgentToken: *agentToken,
-		DataDir:    *dataDir,
-		Version:    resolvedVersion(),
-		Commit:     resolvedCommit(),
+		Addr:                *listen,
+		PublicAddr:          *publicListen,
+		AdminUser:           *adminUser,
+		AdminPass:           *adminPass,
+		AdminPath:           *adminPath,
+		JWTSecret:           *jwtSecret,
+		AgentToken:          *agentToken,
+		DataDir:             *dataDir,
+		Version:             resolvedVersion(),
+		Commit:              resolvedCommit(),
+		TrustedProxyHeaders: *trustProxyHeaders,
 	}
 	if err := server.Run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("服务启动失败: %v", err)

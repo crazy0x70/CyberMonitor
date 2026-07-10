@@ -60,6 +60,10 @@ func agentServiceUnavailable(message string) *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusServiceUnavailable, message: message}
 }
 
+func agentUpdateReportConflict() *agentAPIError {
+	return &agentAPIError{statusCode: http.StatusConflict, message: "agent update report does not match pending instruction"}
+}
+
 func normalizeAgentNodeID(nodeID string) (string, *agentAPIError) {
 	var err error
 	nodeID, err = history.NormalizeNodeID(nodeID)
@@ -188,15 +192,20 @@ func agentRateLimitError() *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusTooManyRequests, message: "rate limit exceeded"}
 }
 
-func (a *agentAPI) broadcastPublicDelta(nodeID string) {
+func (a *agentAPI) broadcastNodeDelta(nodeID string) {
 	if a.hub == nil {
 		return
 	}
-	if delta, ok := a.store.PublicNodeDelta(nodeID); ok {
-		if data, err := json.Marshal(delta); err == nil {
-			a.hub.BroadcastVariant(data, publicVariantBalanced)
-		}
+	delta, ok := a.store.PublicNodeDelta(nodeID)
+	if !ok {
+		return
 	}
+	data, err := json.Marshal(delta)
+	if err != nil {
+		return
+	}
+	a.hub.BroadcastVariant(data, publicVariantBalanced)
+	a.hub.BroadcastAdmin(data, a.store.Credentials().TokenSalt)
 }
 
 func (a *agentAPI) broadcastSnapshot() {
@@ -208,25 +217,28 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	if apiErr != nil {
 		return false, apiErr
 	}
-	updateReconciled, refreshConfig, apiErr := func() (bool, bool, *agentAPIError) {
+	updateReconciled, refreshConfig, recoveryCandidate, apiErr := func() (bool, bool, *offlineRecoveryCandidate, *agentAPIError) {
 		unlock := a.store.lockAgentNodeRead(payload.NodeID)
 		defer unlock()
 		if apiErr := a.validateAgentToken(payload.NodeID, token); apiErr != nil {
-			return false, false, apiErr
+			return false, false, nil, apiErr
 		}
 		if !a.store.allowAgentRate("ingest:"+payload.NodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), true) {
-			return false, false, agentRateLimitError()
+			return false, false, nil, agentRateLimitError()
 		}
-		updateReconciled, err := a.store.updateNodeStats(payload)
+		updateReconciled, recoveryCandidate, err := a.store.updateNodeStats(payload)
 		if err != nil {
-			return false, false, agentServiceUnavailable(err.Error())
+			return false, false, nil, agentServiceUnavailable(err.Error())
 		}
-		return updateReconciled, a.store.HasPendingAgentConfigRefresh(payload.NodeID), nil
+		return updateReconciled, a.store.HasPendingAgentConfigRefresh(payload.NodeID), recoveryCandidate, nil
 	}()
 	if apiErr != nil {
 		return false, apiErr
 	}
-	a.broadcastPublicDelta(payload.NodeID)
+	if recoveryCandidate != nil {
+		a.store.completeOfflineRecovery(*recoveryCandidate)
+	}
+	a.broadcastNodeDelta(payload.NodeID)
 	if updateReconciled {
 		a.broadcastSnapshot()
 	}
@@ -236,7 +248,7 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	return refreshConfig, nil
 }
 
-func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
+func (a *agentAPI) config(nodeID, token string, remoteUpdateCapable bool) (AgentConfig, *agentAPIError) {
 	nodeID, apiErr := normalizeAgentNodeID(nodeID)
 	if apiErr != nil {
 		return AgentConfig{}, apiErr
@@ -247,7 +259,7 @@ func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
 			return AgentConfig{}, false, apiErr
 		}
-		config, leaseUpdated := a.store.DeliverAgentConfig(nodeID)
+		config, leaseUpdated := a.store.DeliverAgentConfig(nodeID, remoteUpdateCapable)
 		return config, leaseUpdated, nil
 	}()
 	if apiErr != nil {
@@ -257,6 +269,19 @@ func (a *agentAPI) config(nodeID, token string) (AgentConfig, *agentAPIError) {
 		a.store.persist()
 	}
 	return config, nil
+}
+
+func agentRemoteUpdateCapable(capabilities []string) bool {
+	for _, capability := range capabilities {
+		if strings.TrimSpace(capability) == agentrpc.AgentCapabilityRemoteUpdate {
+			return true
+		}
+	}
+	return false
+}
+
+func agentRemoteUpdateCapableHeader(header string) bool {
+	return agentRemoteUpdateCapable(strings.Split(header, ","))
 }
 
 func (a *agentAPI) register(nodeID, bootstrapToken string) (string, *agentAPIError) {
@@ -274,16 +299,25 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 	if apiErr != nil {
 		return apiErr
 	}
-	if apiErr := func() *agentAPIError {
+	state, ok := normalizeAgentUpdateReportState(report.State)
+	if !ok {
+		return badAgentRequest("invalid agent update state")
+	}
+	report.State = state
+	applied, apiErr := func() (bool, *agentAPIError) {
 		unlock := a.store.lockAgentNodeRead(nodeID)
 		defer unlock()
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
-			return apiErr
+			return false, apiErr
 		}
-		a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
-		return nil
-	}(); apiErr != nil {
+		_, applied := a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
+		return applied, nil
+	}()
+	if apiErr != nil {
 		return apiErr
+	}
+	if !applied {
+		return agentUpdateReportConflict()
 	}
 	a.broadcastSnapshot()
 	return nil
@@ -337,7 +371,7 @@ func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterReq
 }
 
 func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequest) (*agentrpc.ConfigResponse, error) {
-	config, apiErr := s.api.config(req.NodeID, req.AgentToken)
+	config, apiErr := s.api.config(req.NodeID, req.AgentToken, agentRemoteUpdateCapable(req.Capabilities))
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
@@ -368,6 +402,7 @@ func (s *agentRPCServer) ReportUpdate(ctx context.Context, req *agentrpc.ReportU
 	}
 	apiErr := s.api.reportUpdate(req.NodeID, req.AgentToken, AgentUpdateReport{
 		State:   req.State,
+		ID:      req.UpdateID,
 		Version: req.Version,
 		Message: req.Message,
 	})
@@ -382,6 +417,7 @@ func toRPCUpdateInstruction(update *AgentUpdateInstruction) *agentrpc.UpdateInst
 		return nil
 	}
 	return &agentrpc.UpdateInstruction{
+		ID:          update.ID,
 		Version:     update.Version,
 		DownloadURL: update.DownloadURL,
 		ChecksumURL: update.ChecksumURL,
@@ -400,6 +436,8 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 		return status.Error(codes.Unauthenticated, err.message)
 	case http.StatusNotFound:
 		return status.Error(codes.NotFound, err.message)
+	case http.StatusConflict:
+		return status.Error(codes.FailedPrecondition, err.message)
 	case http.StatusTooManyRequests:
 		return status.Error(codes.ResourceExhausted, err.message)
 	case http.StatusServiceUnavailable:

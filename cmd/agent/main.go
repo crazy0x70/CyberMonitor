@@ -42,6 +42,7 @@ func main() {
 	agentToken := flag.String("agent-token", cmdutil.EnvOrDefault("CM_AGENT_TOKEN", ""), "Agent Token")
 	agentTokenFile := flag.String("agent-token-file", cmdutil.EnvOrDefault("CM_AGENT_TOKEN_FILE", ""), "Agent 专属凭据持久化文件")
 	disableUpdate := flag.Bool("disable-update", cmdutil.EnvBool("CM_DISABLE_UPDATE", false), "禁用服务端下发的 Agent 远程更新")
+	allowPrivateRemoteTests := flag.Bool("allow-private-remote-tests", cmdutil.EnvBool("CM_ALLOW_PRIVATE_REMOTE_TESTS", false), "允许服务端下发内网网络测试目标")
 	netIface := flag.String("net-iface", cmdutil.EnvOrDefault("CM_NET_IFACE", ""), "采集指定网卡(逗号分隔)")
 	netTestsRaw := flag.String("net-tests", cmdutil.EnvOrDefault("CM_NET_TESTS", ""), "网络测试目标列表")
 	testInterval := flag.Duration("test-interval", cmdutil.EnvDuration("CM_TEST_INTERVAL", 5*time.Second), "网络测试间隔")
@@ -81,20 +82,21 @@ func main() {
 	defer stop()
 
 	cfg := agent.Config{
-		ServerURL:     *serverURL,
-		Interval:      *interval,
-		NodeID:        resolvedNodeID,
-		NodeName:      resolvedNodeName,
-		NodeAlias:     *nodeAlias,
-		NodeGroup:     *nodeGroup,
-		AgentToken:    *agentToken,
-		AgentVersion:  agentVersion,
-		HostRoot:      *hostRoot,
-		NetTests:      agent.ParseNetTests(*netTestsRaw),
-		TestInterval:  *testInterval,
-		NetIfaces:     cmdutil.ParseCommaList(*netIface),
-		DisableUpdate: *disableUpdate,
-		TokenFile:     resolvedTokenFile,
+		ServerURL:               *serverURL,
+		Interval:                *interval,
+		NodeID:                  resolvedNodeID,
+		NodeName:                resolvedNodeName,
+		NodeAlias:               *nodeAlias,
+		NodeGroup:               *nodeGroup,
+		AgentToken:              *agentToken,
+		AgentVersion:            agentVersion,
+		HostRoot:                *hostRoot,
+		NetTests:                agent.ParseNetTests(*netTestsRaw),
+		TestInterval:            *testInterval,
+		NetIfaces:               cmdutil.ParseCommaList(*netIface),
+		DisableUpdate:           *disableUpdate,
+		AllowPrivateRemoteTests: *allowPrivateRemoteTests,
+		TokenFile:               resolvedTokenFile,
 	}
 	if handled, err := maybeRunAsService(cfg); handled {
 		if err != nil {

@@ -13,11 +13,13 @@ type RegisterResponse struct {
 }
 
 type ConfigRequest struct {
-	NodeID     string
-	AgentToken string
+	NodeID       string
+	AgentToken   string
+	Capabilities []string
 }
 
 type UpdateInstruction struct {
+	ID          string
 	Version     string
 	DownloadURL string
 	ChecksumURL string
@@ -46,6 +48,7 @@ type ReportStatsResponse struct {
 type ReportUpdateRequest struct {
 	NodeID     string
 	AgentToken string
+	UpdateID   string
 	State      string
 	Version    string
 	Message    string

@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +26,7 @@ const (
 	defaultSiteTitle       = "CyberMonitor"
 	defaultHomeTitle       = "CyberMonitor"
 	defaultHomeSub         = "主机监控"
+	defaultLocale          = "zh-CN"
 	defaultAlertOfflineSec = 300
 	defaultLoginFailLimit  = 5
 	defaultLoginFailWindow = 15 * 60
@@ -49,18 +52,19 @@ type Settings struct {
 	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
 	SiteTitle            string            `json:"site_title,omitempty"`
 	SiteIcon             string            `json:"site_icon,omitempty"`
+	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
 	HomeTitle            string            `json:"home_title,omitempty"`
 	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
+	Locale               string            `json:"locale,omitempty"`
 	AlertWebhook         string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll             bool              `json:"alert_all"`
-	AlertNodes           []string          `json:"alert_nodes,omitempty"`
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
 	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
 	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
 	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth            AdminAuthSettings `json:"admin_auth,omitempty"`
 	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Groups               []string          `json:"groups,omitempty"`
 	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
@@ -76,18 +80,19 @@ type SettingsView struct {
 	AgentToken           string            `json:"agent_token,omitempty"`
 	SiteTitle            string            `json:"site_title,omitempty"`
 	SiteIcon             string            `json:"site_icon,omitempty"`
+	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
 	HomeTitle            string            `json:"home_title,omitempty"`
 	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
+	Locale               string            `json:"locale,omitempty"`
 	AlertWebhook         string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
-	AlertAll             bool              `json:"alert_all"`
-	AlertNodes           []string          `json:"alert_nodes,omitempty"`
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
 	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
 	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
 	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
 	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth            AdminAuthSettings `json:"admin_auth,omitempty"`
 	AISettings           AISettings        `json:"ai_settings,omitempty"`
 	Version              string            `json:"version,omitempty"`
 	Commit               string            `json:"commit,omitempty"`
@@ -108,22 +113,54 @@ type SettingsUpdate struct {
 	AgentEndpoint        *string            `json:"agent_endpoint"`
 	SiteTitle            *string            `json:"site_title"`
 	SiteIcon             *string            `json:"site_icon"`
+	SiteBackgroundImage  *string            `json:"site_background_image"`
 	HomeTitle            *string            `json:"home_title"`
 	HomeSubtitle         *string            `json:"home_subtitle"`
+	Locale               *string            `json:"locale"`
 	AlertWebhook         *string            `json:"alert_webhook"`
 	AlertOfflineSec      *int64             `json:"alert_offline_sec"`
-	AlertAll             *bool              `json:"alert_all"`
-	AlertNodes           *[]string          `json:"alert_nodes"`
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`
 	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
 	AlertTelegramUserID  *int64             `json:"alert_telegram_user_id"`
 	LoginFailLimit       *int               `json:"login_fail_limit"`
 	LoginFailWindowSec   *int64             `json:"login_fail_window_sec"`
 	LoginLockSec         *int64             `json:"login_lock_sec"`
+	AdminAuth            *AdminAuthSettings `json:"admin_auth"`
 	AISettings           *AISettings        `json:"ai_settings"`
 	Groups               *[]string          `json:"groups"`
 	GroupTree            *[]GroupNode       `json:"group_tree"`
 	TestCatalog          *[]TestCatalogItem `json:"test_catalog"`
+}
+
+type AdminAuthSettings struct {
+	PasswordLoginEnabled bool                   `json:"password_login_enabled"`
+	GitHub               OAuth2ProviderSettings `json:"github,omitempty"`
+	OIDC                 OIDCProviderSettings   `json:"oidc,omitempty"`
+}
+
+type OAuth2ProviderSettings struct {
+	Enabled              bool     `json:"enabled"`
+	DisplayName          string   `json:"display_name,omitempty"`
+	ClientID             string   `json:"client_id,omitempty"`
+	ClientSecret         string   `json:"client_secret,omitempty"`
+	Scopes               []string `json:"scopes,omitempty"`
+	AllowedLogins        []string `json:"allowed_logins,omitempty"`
+	AllowedEmails        []string `json:"allowed_emails,omitempty"`
+	AllowedEmailDomains  []string `json:"allowed_email_domains,omitempty"`
+	RequireVerifiedEmail bool     `json:"require_verified_email"`
+}
+
+type OIDCProviderSettings struct {
+	Enabled              bool     `json:"enabled"`
+	DisplayName          string   `json:"display_name,omitempty"`
+	IssuerURL            string   `json:"issuer_url,omitempty"`
+	ClientID             string   `json:"client_id,omitempty"`
+	ClientSecret         string   `json:"client_secret,omitempty"`
+	Scopes               []string `json:"scopes,omitempty"`
+	AllowedSubjects      []string `json:"allowed_subjects,omitempty"`
+	AllowedEmails        []string `json:"allowed_emails,omitempty"`
+	AllowedEmailDomains  []string `json:"allowed_email_domains,omitempty"`
+	RequireVerifiedEmail bool     `json:"require_email_verified"`
 }
 
 type PersistedData struct {
@@ -159,10 +196,26 @@ type TestHistoryData struct {
 }
 
 type ConfigTransferData struct {
-	Version    int                     `json:"version"`
-	ExportedAt int64                   `json:"exported_at"`
-	Settings   SettingsView            `json:"settings"`
-	Profiles   map[string]*NodeProfile `json:"profiles,omitempty"`
+	Version    int                               `json:"version"`
+	ExportedAt int64                             `json:"exported_at"`
+	Settings   SettingsView                      `json:"settings"`
+	Profiles   map[string]*ConfigTransferProfile `json:"profiles,omitempty"`
+}
+
+type ConfigTransferProfile struct {
+	AlertEnabled     *bool           `json:"alert_enabled,omitempty"`
+	Alias            string          `json:"alias,omitempty"`
+	Group            string          `json:"group,omitempty"`
+	Tags             []string        `json:"tags,omitempty"`
+	Groups           []string        `json:"groups,omitempty"`
+	Region           string          `json:"region,omitempty"`
+	DiskType         string          `json:"disk_type,omitempty"`
+	NetSpeedMbps     int             `json:"net_speed_mbps,omitempty"`
+	ExpireAt         int64           `json:"expire_at,omitempty"`
+	AutoRenew        bool            `json:"auto_renew,omitempty"`
+	RenewIntervalSec int64           `json:"renew_interval_sec,omitempty"`
+	TestIntervalSec  int             `json:"test_interval_sec"`
+	TestSelections   []TestSelection `json:"test_selections,omitempty"`
 }
 
 type ResetResult struct {
@@ -516,7 +569,6 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 		if len(profile.TestSelections) > 0 {
 			profile.TestSelections = normalizeTestSelections(payload.Settings.TestCatalog, profile.TestSelections)
 			if len(profile.TestSelections) > 0 {
-				profile.Tests = nil
 				continue
 			}
 		}
@@ -547,7 +599,6 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 		}
 		if len(selections) > 0 {
 			profile.TestSelections = selections
-			profile.Tests = nil
 		}
 	}
 	return nil
@@ -781,7 +832,6 @@ func cloneNodeProfileValue(profile *NodeProfile) NodeProfile {
 	copyProfile := *profile
 	copyProfile.Tags = cloneStringSlice(profile.Tags)
 	copyProfile.Groups = cloneStringSlice(profile.Groups)
-	copyProfile.Tests = cloneNetworkTestConfigs(profile.Tests)
 	copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
 	copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
 	if profile.AlertEnabled != nil {
@@ -789,16 +839,6 @@ func cloneNodeProfileValue(profile *NodeProfile) NodeProfile {
 		copyProfile.AlertEnabled = &value
 	}
 	return copyProfile
-}
-
-func cloneProfilesForExport(profiles map[string]*NodeProfile) map[string]*NodeProfile {
-	cloned := cloneProfiles(profiles)
-	for _, profile := range cloned {
-		if profile != nil {
-			redactProfileRuntimeForTransfer(profile)
-		}
-	}
-	return cloned
 }
 
 func redactProfileRuntimeForTransfer(profile *NodeProfile) {
@@ -812,6 +852,72 @@ func redactProfileRuntimeForTransfer(profile *NodeProfile) {
 	profile.AgentUpdateMessage = ""
 	profile.AgentUpdateLeaseUntil = 0
 	profile.AgentUpdateReportedAt = 0
+}
+
+func configTransferProfilesFromNodeProfiles(profiles map[string]*NodeProfile) map[string]*ConfigTransferProfile {
+	if len(profiles) == 0 {
+		return map[string]*ConfigTransferProfile{}
+	}
+	transfers := make(map[string]*ConfigTransferProfile, len(profiles))
+	for nodeID, profile := range profiles {
+		if profile == nil {
+			transfers[nodeID] = &ConfigTransferProfile{}
+			continue
+		}
+		transfer := ConfigTransferProfile{
+			Alias:            profile.Alias,
+			Group:            profile.Group,
+			Tags:             cloneStringSlice(profile.Tags),
+			Groups:           cloneStringSlice(profile.Groups),
+			Region:           profile.Region,
+			DiskType:         profile.DiskType,
+			NetSpeedMbps:     profile.NetSpeedMbps,
+			ExpireAt:         profile.ExpireAt,
+			AutoRenew:        profile.AutoRenew,
+			RenewIntervalSec: profile.RenewIntervalSec,
+			TestIntervalSec:  profile.TestIntervalSec,
+			TestSelections:   cloneTestSelections(profile.TestSelections),
+		}
+		if profile.AlertEnabled != nil {
+			value := *profile.AlertEnabled
+			transfer.AlertEnabled = &value
+		}
+		transfers[nodeID] = &transfer
+	}
+	return transfers
+}
+
+func configTransferProfilesToNodeProfiles(profiles map[string]*ConfigTransferProfile) map[string]*NodeProfile {
+	if len(profiles) == 0 {
+		return map[string]*NodeProfile{}
+	}
+	nodes := make(map[string]*NodeProfile, len(profiles))
+	for nodeID, transfer := range profiles {
+		if transfer == nil {
+			nodes[nodeID] = &NodeProfile{}
+			continue
+		}
+		profile := NodeProfile{
+			Alias:            transfer.Alias,
+			Group:            transfer.Group,
+			Tags:             cloneStringSlice(transfer.Tags),
+			Groups:           cloneStringSlice(transfer.Groups),
+			Region:           transfer.Region,
+			DiskType:         transfer.DiskType,
+			NetSpeedMbps:     transfer.NetSpeedMbps,
+			ExpireAt:         transfer.ExpireAt,
+			AutoRenew:        transfer.AutoRenew,
+			RenewIntervalSec: transfer.RenewIntervalSec,
+			TestIntervalSec:  transfer.TestIntervalSec,
+			TestSelections:   cloneTestSelections(transfer.TestSelections),
+		}
+		if transfer.AlertEnabled != nil {
+			value := *transfer.AlertEnabled
+			profile.AlertEnabled = &value
+		}
+		nodes[nodeID] = &profile
+	}
+	return nodes
 }
 
 func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]OfflineSessionState {
@@ -873,18 +979,19 @@ func initSettings(cfg Config) (Settings, error) {
 		AgentEndpoint:        "",
 		SiteTitle:            defaultSiteTitle,
 		SiteIcon:             "",
+		SiteBackgroundImage:  "",
 		HomeTitle:            defaultHomeTitle,
 		HomeSubtitle:         defaultHomeSub,
+		Locale:               defaultLocale,
 		AlertWebhook:         "",
 		AlertOfflineSec:      defaultAlertOfflineSec,
-		AlertAll:             true,
-		AlertNodes:           []string{},
 		AlertTelegramToken:   "",
 		AlertTelegramUserIDs: []int64{},
 		AlertTelegramUserID:  0,
 		LoginFailLimit:       defaultLoginFailLimit,
 		LoginFailWindowSec:   defaultLoginFailWindow,
 		LoginLockSec:         defaultLoginLockSec,
+		AdminAuth:            defaultAdminAuthSettings(),
 		AISettings:           defaultAISettings(),
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
@@ -951,16 +1058,15 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 	mergeString(&existing.HomeTitle, fallback.HomeTitle)
 	mergeString(&existing.HomeSubtitle, fallback.HomeSubtitle)
 	mergeString(&existing.SiteIcon, fallback.SiteIcon)
+	mergeString(&existing.Locale, fallback.Locale)
+	existing.Locale = normalizeLocale(existing.Locale)
 	mergeString(&existing.AlertTelegramToken, fallback.AlertTelegramToken)
 
 	mergeInt64(&existing.AlertOfflineSec, fallback.AlertOfflineSec)
 	mergeInt64(&existing.LoginFailWindowSec, fallback.LoginFailWindowSec)
 	mergeInt64(&existing.LoginLockSec, fallback.LoginLockSec)
 	mergeInt(&existing.LoginFailLimit, fallback.LoginFailLimit)
-
-	if existing.AlertNodes == nil {
-		existing.AlertNodes = fallback.AlertNodes
-	}
+	existing.AdminAuth = mergeAdminAuthSettings(existing.AdminAuth, fallback.AdminAuth)
 
 	if len(existing.AlertTelegramUserIDs) == 0 && existing.AlertTelegramUserID > 0 {
 		existing.AlertTelegramUserIDs = []int64{existing.AlertTelegramUserID}
@@ -972,10 +1078,6 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 	if strings.TrimSpace(existing.AlertTelegramToken) == "" || len(existing.AlertTelegramUserIDs) == 0 {
 		existing.AlertTelegramToken = ""
 		existing.AlertTelegramUserIDs = []int64{}
-	}
-
-	if !existing.AlertAll && existing.AlertWebhook == "" && len(existing.AlertNodes) == 0 {
-		existing.AlertAll = fallback.AlertAll
 	}
 
 	aiSettings, err := mergeAISettings(existing.AISettings, fallback.AISettings)
@@ -1001,21 +1103,52 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 
 func normalizeAdminPath(path string) (string, error) {
 	trimmed := strings.TrimSpace(path)
-	if trimmed == "" {
-		return "", errors.New("admin path empty")
+	if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+		return "", errors.New("admin path invalid")
+	}
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" {
+		return "", errors.New("admin path invalid")
+	}
+	if strings.ContainsAny(trimmed, "?#") || strings.ContainsFunc(trimmed, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) {
+		return "", errors.New("admin path invalid")
+	}
+	for i := 0; i < 3; i++ {
+		decoded, err := url.PathUnescape(trimmed)
+		if err != nil {
+			return "", errors.New("admin path invalid")
+		}
+		if decoded == trimmed {
+			break
+		}
+		trimmed = decoded
+	}
+	if strings.ContainsAny(trimmed, "?#") || strings.ContainsFunc(trimmed, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) {
+		return "", errors.New("admin path invalid")
 	}
 	if !strings.HasPrefix(trimmed, "/") {
 		trimmed = "/" + trimmed
 	}
-	if len(trimmed) > 1 && strings.HasSuffix(trimmed, "/") {
-		trimmed = strings.TrimRight(trimmed, "/")
+	segments := strings.Split(trimmed, "/")
+	normalizedSegments := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment == "" {
+			continue
+		}
+		if segment == "." || segment == ".." || strings.ContainsAny(segment, ":\\") || strings.ContainsFunc(segment, func(r rune) bool {
+			return r < 0x20 || r == 0x7f
+		}) {
+			return "", errors.New("admin path invalid")
+		}
+		normalizedSegments = append(normalizedSegments, segment)
 	}
-	if trimmed == "/" {
+	if len(normalizedSegments) == 0 {
 		return "", errors.New("admin path invalid")
 	}
-	if strings.Contains(trimmed, "..") {
-		return "", errors.New("admin path invalid")
-	}
+	trimmed = "/" + strings.Join(normalizedSegments, "/")
 	for _, prefix := range []string{"/api", "/assets", "/ws"} {
 		if trimmed == prefix || strings.HasPrefix(trimmed, prefix+"/") {
 			return "", fmt.Errorf("admin path conflicts with %s", prefix)
@@ -1069,10 +1202,6 @@ func normalizeGroups(groups []string) []string {
 	return normalizeUniqueStrings(groups, func(value string) bool {
 		return value == "全部"
 	})
-}
-
-func normalizeAlertNodes(nodes []string) []string {
-	return normalizeUniqueStrings(nodes, nil)
 }
 
 func normalizeTagValues(tags []string) []string {
@@ -1455,10 +1584,71 @@ func isValidTestHost(host string) bool {
 	if strings.Contains(host, "://") || strings.Contains(host, "/") || strings.Contains(host, " ") {
 		return false
 	}
+	if isAmbiguousIPv4LiteralHost(host) {
+		return false
+	}
 	if net.ParseIP(host) != nil {
 		return true
 	}
 	return isValidHostname(host)
+}
+
+func isAmbiguousIPv4LiteralHost(host string) bool {
+	value := strings.TrimRight(strings.Trim(strings.ToLower(host), "[]"), ".")
+	if value == "" || strings.Contains(value, ":") {
+		return false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 4 {
+		return false
+	}
+	allIPv4LiteralParts := true
+	for _, part := range parts {
+		if !isIPv4LiteralPart(part) {
+			allIPv4LiteralParts = false
+			break
+		}
+	}
+	if !allIPv4LiteralParts {
+		return false
+	}
+	if len(parts) != 4 {
+		return true
+	}
+	for _, part := range parts {
+		if len(part) > 1 && strings.HasPrefix(part, "0") {
+			return true
+		}
+		num, err := strconv.Atoi(part)
+		if err != nil || num < 0 || num > 255 || strconv.Itoa(num) != part {
+			return true
+		}
+	}
+	return false
+}
+
+func isIPv4LiteralPart(part string) bool {
+	if part == "" {
+		return false
+	}
+	if strings.HasPrefix(part, "0x") {
+		if len(part) == 2 {
+			return false
+		}
+		for _, r := range part[2:] {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	for _, r := range part {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidHostname(host string) bool {

@@ -3,6 +3,8 @@ import type {
   AlertTestPayload,
   AgentUpdateInfo,
   AIProviderConfig,
+  AdminLogLevel,
+  AdminLogsResponse,
   ApiErrorPayload,
   ConfigImportResponse,
   LoginConfigResponse,
@@ -89,9 +91,105 @@ async function unwrapResponse<T>(resp: Response, fallback: string) {
   return (await resp.json()) as T;
 }
 
+function normalizeBasePath(value: string) {
+  let path = value.trim();
+  if (!path || path.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(path)) {
+    return "";
+  }
+  let settled = false;
+  for (let i = 0; i < 4; i += 1) {
+    try {
+      const decoded = decodeURIComponent(path);
+      if (decoded === path) {
+        settled = true;
+        break;
+      }
+      path = decoded;
+      if (hasInvalidBasePathChar(path)) {
+        return "";
+      }
+    } catch {
+      return "";
+    }
+  }
+  if (!settled) {
+    return "";
+  }
+  if (!path.startsWith("/")) {
+    path = `/${path}`;
+  }
+  if (hasInvalidBasePathChar(path)) {
+    return "";
+  }
+  const segments = path.split("/").filter(Boolean);
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => segment === "." || segment === ".." || segment.includes(":") || segment.includes("\\"))
+  ) {
+    return "";
+  }
+  return `/${segments.join("/")}`;
+}
+
+function hasInvalidBasePathChar(value: string) {
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if (char === "?" || char === "#" || code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function adminBasePath() {
+  return normalizeBasePath(readAdminBootPayload().base_path || "");
+}
+
+function apiPath(path: string) {
+  if (!path.startsWith("/")) {
+    return path;
+  }
+  const basePath = adminBasePath();
+  return basePath ? `${basePath}${path}` : path;
+}
+
+export function adminAppPath(adminPath: string) {
+  const normalizedAdminPath = normalizeBasePath(adminPath);
+  if (!normalizedAdminPath) {
+    return "";
+  }
+  return `${apiPath(normalizedAdminPath)}/`;
+}
+
+export function adminAppLocation(adminPath: string) {
+  const nextPath = adminAppPath(adminPath);
+  if (!nextPath || typeof window === "undefined") {
+    return nextPath;
+  }
+  return `${nextPath}${window.location.search}${window.location.hash}`;
+}
+
+export function publicMonitorPath() {
+  const basePath = adminBasePath();
+  return basePath ? `${basePath}/` : "/";
+}
+
+export function adminOAuthLoginLocation(providerID: string, returnTo = "") {
+  const params = new URLSearchParams({ provider: providerID });
+  if (returnTo.trim()) {
+    params.set("return_to", returnTo.trim());
+  }
+  return `${apiPath("/api/v1/login/oauth/start")}?${params.toString()}`;
+}
+
+function adminSocketURL() {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${window.location.host}${apiPath("/ws")}`;
+}
+
 async function apiFetch(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers || {});
-  const resp = await fetch(path, { ...init, headers, credentials: "same-origin" });
+  const resp = await fetch(apiPath(path), { ...init, headers, credentials: "same-origin" });
   if (resp.status === 401) {
     setStoredAdminToken("");
     notifyAdminUnauthorized();
@@ -100,17 +198,17 @@ async function apiFetch(path: string, init: RequestInit = {}) {
 }
 
 export async function fetchLoginConfig() {
-  const resp = await fetch("/api/v1/login/config");
+  const resp = await fetch(apiPath("/api/v1/login/config"));
   return unwrapResponse<LoginConfigResponse>(resp, "加载登录配置失败");
 }
 
 export async function fetchPublicSnapshot() {
-  const resp = await fetch("/api/v1/public/snapshot");
+  const resp = await fetch(apiPath("/api/v1/public/snapshot"));
   return unwrapResponse<Snapshot>(resp, "加载公开展示配置失败");
 }
 
 export async function fetchSessionStatus() {
-  const resp = await fetch("/api/v1/admin/session", { credentials: "same-origin" });
+  const resp = await apiFetch("/api/v1/admin/session");
   return unwrapResponse<{ authenticated: boolean }>(resp, "检测登录会话失败");
 }
 
@@ -135,7 +233,7 @@ export function readAdminBootPayload(): AdminBootPayload {
 }
 
 export async function loginAdmin(username: string, password: string, turnstileToken = "") {
-  const resp = await fetch("/api/v1/login", {
+  const resp = await fetch(apiPath("/api/v1/login"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -188,7 +286,7 @@ export async function importConfig(payload: Record<string, unknown>) {
 }
 
 export async function logoutAdmin() {
-  const resp = await fetch("/api/v1/logout", {
+  const resp = await fetch(apiPath("/api/v1/logout"), {
     method: "POST",
     credentials: "same-origin",
   });
@@ -204,6 +302,15 @@ export async function fetchNodes() {
   return unwrapResponse<Snapshot>(resp, "加载节点失败");
 }
 
+export async function fetchAdminLogs(level: AdminLogLevel = "all", limit = 300) {
+  const params = new URLSearchParams({
+    level,
+    limit: String(limit),
+  });
+  const resp = await apiFetch(`/api/v1/admin/logs?${params.toString()}`);
+  return unwrapResponse<AdminLogsResponse>(resp, "加载日志失败");
+}
+
 export async function saveNodeProfile(nodeID: string, payload: NodeProfilePayload) {
   const resp = await apiFetch(
     `/api/v1/admin/nodes/${encodeURIComponent(nodeID)}`,
@@ -213,7 +320,7 @@ export async function saveNodeProfile(nodeID: string, payload: NodeProfilePayloa
       body: JSON.stringify(payload),
     },
   );
-  return unwrapResponse<NodeView>(resp, "保存节点失败");
+  return unwrapResponse<{ status: string }>(resp, "保存节点失败");
 }
 
 export async function deleteNodeProfile(nodeID: string) {
@@ -336,8 +443,7 @@ export function connectAdminSocket(
     if (closed) {
       return;
     }
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+    socket = new WebSocket(adminSocketURL());
     socket.addEventListener("open", () => {
       nextReconnectDelayMs = reconnectDelayMs;
     });

@@ -64,7 +64,7 @@ type agentControlPlane interface {
 	RegisterNodeToken(context.Context, string, string) (string, error)
 	FetchConfig(context.Context, string, string) (RemoteConfig, error)
 	ReportStats(context.Context, metrics.NodeStats, string) (bool, error)
-	ReportUpdate(context.Context, string, string, string, string, string) error
+	ReportUpdate(context.Context, string, string, string, string, string, string) error
 	Close() error
 }
 
@@ -84,13 +84,15 @@ type httpControlPlane struct {
 	registerEndpoint string
 	statsEndpoint    string
 	updateEndpoint   string
+	capabilities     []string
 }
 
 type grpcControlPlane struct {
-	target      string
-	secure      bool
-	opts        grpcTransportOptions
-	dialContext func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
+	target       string
+	secure       bool
+	opts         grpcTransportOptions
+	capabilities []string
+	dialContext  func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
 
 	mu       sync.Mutex
 	conn     *grpc.ClientConn
@@ -106,6 +108,7 @@ func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane
 func newControlPlaneTransportWithOptions(cfg Config, client *http.Client, options grpcTransportOptions) agentControlPlane {
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.ServerURL), "/")
 	options = options.normalized()
+	capabilities := agentCapabilitiesForConfig(cfg)
 	return &controlPlaneTransport{
 		http: &httpControlPlane{
 			client:           client,
@@ -113,22 +116,24 @@ func newControlPlaneTransportWithOptions(cfg Config, client *http.Client, option
 			configEndpoint:   baseURL + "/api/v1/agent/config",
 			registerEndpoint: baseURL + "/api/v1/agent/register",
 			updateEndpoint:   baseURL + "/api/v1/agent/update/report",
+			capabilities:     capabilities,
 		},
-		grpc: newGRPCControlPlane(baseURL, options),
+		grpc: newGRPCControlPlane(baseURL, options, capabilities),
 		opts: options,
 	}
 }
 
-func newGRPCControlPlane(serverURL string, options grpcTransportOptions) *grpcControlPlane {
+func newGRPCControlPlane(serverURL string, options grpcTransportOptions, capabilities []string) *grpcControlPlane {
 	target, secure, err := parseGRPCTarget(serverURL)
 	if err != nil || target == "" {
 		return nil
 	}
 	return &grpcControlPlane{
-		target:      target,
-		secure:      secure,
-		opts:        options,
-		dialContext: grpc.DialContext,
+		target:       target,
+		secure:       secure,
+		opts:         options,
+		capabilities: append([]string(nil), capabilities...),
+		dialContext:  grpc.DialContext,
 	}
 }
 
@@ -201,15 +206,15 @@ func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.N
 	)
 }
 
-func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
+func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token, updateID, state, version, message string) error {
 	_, err := callWithFallback(
 		t,
 		ctx,
 		func(callCtx context.Context, grpcPlane *grpcControlPlane) (struct{}, error) {
-			return struct{}{}, grpcPlane.ReportUpdate(callCtx, nodeID, token, state, version, message)
+			return struct{}{}, grpcPlane.ReportUpdate(callCtx, nodeID, token, updateID, state, version, message)
 		},
 		func(callCtx context.Context, httpPlane *httpControlPlane) (struct{}, error) {
-			return struct{}{}, httpPlane.ReportUpdate(callCtx, nodeID, token, state, version, message)
+			return struct{}{}, httpPlane.ReportUpdate(callCtx, nodeID, token, updateID, state, version, message)
 		},
 	)
 	return err
@@ -218,7 +223,7 @@ func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token,
 func (t *controlPlaneTransport) useHTTPForStats() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.lastMode == "http"
+	return !t.grpcBackoffUntil.IsZero() && time.Now().Before(t.grpcBackoffUntil)
 }
 
 func (t *controlPlaneTransport) Close() error {
@@ -288,7 +293,7 @@ func (h *httpControlPlane) RegisterNodeToken(ctx context.Context, nodeID, bootst
 }
 
 func (h *httpControlPlane) FetchConfig(ctx context.Context, nodeID, token string) (RemoteConfig, error) {
-	return fetchRemoteConfig(ctx, h.client, h.configEndpoint, nodeID, token)
+	return fetchRemoteConfig(ctx, h.client, h.configEndpoint, nodeID, token, h.capabilities)
 }
 
 func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
@@ -302,7 +307,7 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return false, readAgentAPIActionError(resp, "ingest failed")
+		return false, readAgentAPIStatusError(resp, "ingest")
 	}
 	var result struct {
 		RefreshConfig bool `json:"refresh_config"`
@@ -313,8 +318,8 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	return result.RefreshConfig, nil
 }
 
-func (h *httpControlPlane) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
-	return postAgentUpdateReport(ctx, h.client, h.updateEndpoint, nodeID, token, state, version, message)
+func (h *httpControlPlane) ReportUpdate(ctx context.Context, nodeID, token, updateID, state, version, message string) error {
+	return postAgentUpdateReport(ctx, h.client, h.updateEndpoint, nodeID, token, updateID, state, version, message)
 }
 
 func (g *grpcControlPlane) RegisterNodeToken(ctx context.Context, nodeID, bootstrapToken string) (string, error) {
@@ -340,8 +345,9 @@ func (g *grpcControlPlane) FetchConfig(ctx context.Context, nodeID, token string
 	}
 	defer cancel()
 	resp, err := client.GetConfig(callCtx, &agentrpc.ConfigRequest{
-		NodeID:     nodeID,
-		AgentToken: token,
+		NodeID:       nodeID,
+		AgentToken:   token,
+		Capabilities: append([]string(nil), g.capabilities...),
 	})
 	if err != nil {
 		return RemoteConfig{}, err
@@ -372,7 +378,7 @@ func (g *grpcControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	return resp.RefreshConfig, nil
 }
 
-func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, state, version, message string) error {
+func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, updateID, state, version, message string) error {
 	client, callCtx, cancel, err := g.prepareCall(ctx)
 	if err != nil {
 		return err
@@ -381,6 +387,7 @@ func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, stat
 	_, err = client.ReportUpdate(callCtx, &agentrpc.ReportUpdateRequest{
 		NodeID:     nodeID,
 		AgentToken: token,
+		UpdateID:   updateID,
 		State:      state,
 		Version:    version,
 		Message:    message,
@@ -503,6 +510,7 @@ func fromRPCUpdateInstruction(update *agentrpc.UpdateInstruction) *RemoteUpdateI
 		return nil
 	}
 	return &RemoteUpdateInstruction{
+		ID:          update.ID,
 		Version:     update.Version,
 		DownloadURL: update.DownloadURL,
 		ChecksumURL: update.ChecksumURL,

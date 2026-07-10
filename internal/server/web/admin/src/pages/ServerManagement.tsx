@@ -59,6 +59,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import type {
   AgentUpdateInfo,
+  NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
   SettingsView,
@@ -67,6 +68,7 @@ import type {
 } from "@/lib/admin-types";
 import {
   flattenGroupTree,
+  formatBytes,
   formatDateTime,
   formatMbps,
   formatRelativeTime,
@@ -216,11 +218,32 @@ export interface ServerManagementProps {
   settings: SettingsView | null;
   nodes: NodeView[];
   loading?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
   onCheckAgentUpdate: (nodeID: string) => Promise<AgentUpdateInfo>;
   onRefresh: () => Promise<void>;
   onSaveNode: (nodeID: string, payload: NodeProfilePayload) => Promise<void>;
-  onDeleteNode: (nodeID: string) => Promise<void>;
+  onDeleteNode: (nodeID: string) => Promise<NodeDeleteResponse>;
   onTriggerAgentUpdate: (nodeID: string) => Promise<{ status: string; target_version?: string }>;
+}
+
+function formatGPUSummary(node: NodeView | null | undefined) {
+  const gpus = Array.isArray(node?.stats?.gpu) ? node.stats.gpu : [];
+  if (gpus.length === 0) {
+    return "--";
+  }
+  return gpus
+    .map((gpu) => {
+      const name = (gpu.name || gpu.vendor || `GPU ${Number(gpu.index || 0) + 1}`).trim();
+      const usage = Number.isFinite(gpu.utilization_percent)
+        ? `${Math.round(Math.max(0, Math.min(100, gpu.utilization_percent)))}%`
+        : "--";
+      const memory =
+        Number.isFinite(gpu.memory_used) && Number.isFinite(gpu.memory_total) && gpu.memory_total > 0
+          ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
+          : "";
+      return [name, usage, memory].filter(Boolean).join(" / ");
+    })
+    .join("；");
 }
 
 function toDateTimeLocalValue(value?: number) {
@@ -415,6 +438,29 @@ function buildFormState(node: NodeView, catalog: TestCatalogItem[]): FormState {
   };
 }
 
+function formDraftSignature(form: FormState) {
+  return JSON.stringify({
+    alias: form.alias,
+    alertEnabled: form.alertEnabled,
+    diskType: form.diskType,
+    expireAt: form.expireAt,
+    groups: normalizeSelectionValues(form.groups),
+    netSpeedMbps: form.netSpeedMbps,
+    region: form.region,
+    renewPlan: form.renewPlan,
+    testSelections: Object.entries(form.testSelections)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => [key, value]),
+  });
+}
+
+function formSourceSignature(form: FormState, catalogSignature: string) {
+  return JSON.stringify({
+    draft: formDraftSignature(form),
+    testCatalog: catalogSignature,
+  });
+}
+
 function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfilePayload {
   const expireAt = parseDateTimeLocalValue(form.expireAt);
   if (form.expireAt && !expireAt) {
@@ -593,6 +639,7 @@ export default function ServerManagement({
   settings,
   nodes,
   loading = false,
+  onDirtyChange,
   onCheckAgentUpdate,
   onRefresh,
   onSaveNode,
@@ -609,8 +656,12 @@ export default function ServerManagement({
   const [refreshingAgentUpdate, setRefreshingAgentUpdate] = useState(false);
   const [agentUpdateInfo, setAgentUpdateInfo] = useState<AgentUpdateInfo | null>(null);
   const [updatingAgent, setUpdatingAgent] = useState(false);
+  const [sourceConflict, setSourceConflict] = useState(false);
   const [installPlatform, setInstallPlatform] = useState<"unix" | "windows">("unix");
   const formInitializationKeyRef = useRef("");
+  const formBaselineSignatureRef = useRef("");
+  const formSourceSignatureRef = useRef("");
+  const agentUpdateRequestSeqRef = useRef(0);
   const lastOpenedNodeCardRef = useRef("");
   const lastScrollYRef = useRef(0);
 
@@ -732,23 +783,72 @@ export default function ServerManagement({
     () => nodeLookup.get(editingNodeId) || null,
     [editingNodeId, nodeLookup],
   );
+  const currentFormSignature = form ? formDraftSignature(form) : "";
+  const isEditingDraftDirty = Boolean(
+    form && formBaselineSignatureRef.current && currentFormSignature !== formBaselineSignatureRef.current,
+  );
+  const editorBusy = saving || deleting || refreshing || refreshingAgentUpdate || updatingAgent;
+  const editorInputDisabled = editorBusy || sourceConflict;
+
+  useEffect(() => {
+    onDirtyChange?.(isEditingDraftDirty);
+  }, [isEditingDraftDirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [onDirtyChange]);
 
   useEffect(() => {
     if (!editingNode) {
       setForm(null);
       setAgentUpdateInfo(null);
+      setSourceConflict(false);
       formInitializationKeyRef.current = "";
+      formBaselineSignatureRef.current = "";
+      formSourceSignatureRef.current = "";
       return;
     }
-    const nextKey = `${editingNodeId}::${testCatalogSignature}`;
-    if (formInitializationKeyRef.current === nextKey) {
+    const nextKey = editingNodeId;
+    const nextForm = buildFormState(editingNode, testCatalog);
+    const nextDraftSignature = formDraftSignature(nextForm);
+    const nextSourceSignature = formSourceSignature(nextForm, testCatalogSignature);
+    const currentDraftMatchesIncoming = currentFormSignature === nextDraftSignature;
+    if (formInitializationKeyRef.current !== nextKey) {
+      setForm(nextForm);
+      setAgentUpdateInfo(null);
+      setSourceConflict(false);
+      formInitializationKeyRef.current = nextKey;
+      formBaselineSignatureRef.current = nextDraftSignature;
+      formSourceSignatureRef.current = nextSourceSignature;
       return;
     }
-    setForm(buildFormState(editingNode, testCatalog));
-    formInitializationKeyRef.current = nextKey;
-  }, [editingNode, editingNodeId, testCatalog, testCatalogSignature]);
+    if (formSourceSignatureRef.current === nextSourceSignature || saving || deleting) {
+      return;
+    }
+    if (isEditingDraftDirty) {
+      if (currentDraftMatchesIncoming) {
+        formBaselineSignatureRef.current = nextDraftSignature;
+        formSourceSignatureRef.current = nextSourceSignature;
+        setSourceConflict(false);
+        return;
+      }
+      formSourceSignatureRef.current = nextSourceSignature;
+      setSourceConflict(true);
+      toast.warning("服务端节点配置已更新，当前未保存修改已保留。请取消后重新打开再保存。");
+      return;
+    }
+    setForm(nextForm);
+    setSourceConflict(false);
+    formBaselineSignatureRef.current = nextDraftSignature;
+    formSourceSignatureRef.current = nextSourceSignature;
+  }, [currentFormSignature, deleting, editingNode, editingNodeId, isEditingDraftDirty, saving, testCatalog, testCatalogSignature]);
 
   const patchForm = (updater: (current: FormState) => FormState) => {
+    if (editorInputDisabled) {
+      return;
+    }
     setForm((current) => (current ? updater(current) : current));
   };
   const updateFormField = <Key extends keyof FormState>(key: Key, value: FormState[Key]) => {
@@ -803,9 +903,17 @@ export default function ServerManagement({
     setEditingNodeId(nodeID);
   };
 
-  const closeEditor = () => {
+  const closeEditor = (force = false) => {
+    if (!force && editorBusy) {
+      return;
+    }
+    if (!force && isEditingDraftDirty) {
+      toast.warning("节点配置有未保存修改，请先保存或使用放弃修改。");
+      return;
+    }
     const restoreNodeID = lastOpenedNodeCardRef.current;
     setEditingNodeId("");
+    onDirtyChange?.(false);
     if (!restoreNodeID) {
       return;
     }
@@ -818,6 +926,13 @@ export default function ServerManagement({
   };
 
   const handleRefresh = async () => {
+    if (editorBusy) {
+      return;
+    }
+    if (isEditingDraftDirty) {
+      toast.warning("当前节点配置有未保存修改，请先保存或取消后再刷新。");
+      return;
+    }
     setRefreshing(true);
     try {
       await onRefresh();
@@ -881,12 +996,19 @@ export default function ServerManagement({
     if (!editingNode || !form) {
       return;
     }
+    if (sourceConflict) {
+      toast.warning("服务端节点配置已更新，请取消后重新打开再保存。");
+      return;
+    }
+    if (editorBusy) {
+      return;
+    }
     setSaving(true);
     try {
       const payload = buildPayload(form, testCatalog);
       await onSaveNode(resolveNodeId(editingNode), payload);
       toast.success("节点配置已保存并下发");
-      closeEditor();
+      closeEditor(true);
     } catch (error) {
       toast.error(getErrorMessage(error, "保存节点配置失败"));
     } finally {
@@ -895,15 +1017,17 @@ export default function ServerManagement({
   };
 
   const handleDelete = async () => {
-    if (!editingNode) {
+    if (!editingNode || editorInputDisabled) {
       return;
     }
     setDeleting(true);
     try {
-      await onDeleteNode(resolveNodeId(editingNode));
-      toast.success("节点已删除");
+      const deleteResult = await onDeleteNode(resolveNodeId(editingNode));
+      if (!deleteResult.history_error) {
+        toast.success("节点已删除");
+      }
       setDeleteDialogOpen(false);
-      closeEditor();
+      closeEditor(true);
     } catch (error) {
       toast.error(getErrorMessage(error, "删除节点失败"));
     } finally {
@@ -924,12 +1048,18 @@ export default function ServerManagement({
   };
 
   const handleCheckAgentUpdate = async () => {
-    if (!editingNode) {
+    if (!editingNode || editorInputDisabled) {
       return;
     }
+    const requestNodeID = resolveNodeId(editingNode);
+    const requestSeq = agentUpdateRequestSeqRef.current + 1;
+    agentUpdateRequestSeqRef.current = requestSeq;
     setRefreshingAgentUpdate(true);
     try {
-      const info = await onCheckAgentUpdate(resolveNodeId(editingNode));
+      const info = await onCheckAgentUpdate(requestNodeID);
+      if (agentUpdateRequestSeqRef.current !== requestSeq || formInitializationKeyRef.current !== requestNodeID) {
+        return;
+      }
       setAgentUpdateInfo(info);
       if (info.supported === false) {
         toast.error(info.message || "当前节点平台暂不支持后台自更新");
@@ -947,17 +1077,25 @@ export default function ServerManagement({
     } catch (error) {
       toast.error(getErrorMessage(error, "检查 Agent 更新失败"));
     } finally {
-      setRefreshingAgentUpdate(false);
+      if (agentUpdateRequestSeqRef.current === requestSeq) {
+        setRefreshingAgentUpdate(false);
+      }
     }
   };
 
   const handleAgentUpdate = async () => {
-    if (!editingNode) {
+    if (!editingNode || editorInputDisabled) {
       return;
     }
+    const requestNodeID = resolveNodeId(editingNode);
+    const requestSeq = agentUpdateRequestSeqRef.current + 1;
+    agentUpdateRequestSeqRef.current = requestSeq;
     setUpdatingAgent(true);
     try {
-      const result = await onTriggerAgentUpdate(resolveNodeId(editingNode));
+      const result = await onTriggerAgentUpdate(requestNodeID);
+      if (agentUpdateRequestSeqRef.current !== requestSeq || formInitializationKeyRef.current !== requestNodeID) {
+        return;
+      }
       if (result.status === "up_to_date") {
         toast.success("当前 Agent 已经是最新正式版");
       } else {
@@ -976,7 +1114,9 @@ export default function ServerManagement({
     } catch (error) {
       toast.error(getErrorMessage(error, "下发 Agent 更新失败"));
     } finally {
-      setUpdatingAgent(false);
+      if (agentUpdateRequestSeqRef.current === requestSeq) {
+        setUpdatingAgent(false);
+      }
     }
   };
 
@@ -1004,7 +1144,7 @@ export default function ServerManagement({
             variant="outline"
             className={outlineActionClass}
             onClick={handleRefresh}
-            disabled={refreshing || loading}
+            disabled={refreshing || loading || editorBusy || isEditingDraftDirty}
           >
             {refreshing || loading ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1141,7 +1281,7 @@ export default function ServerManagement({
                           ) : null}
                         </div>
                         <div className="text-xs text-slate-500 dark:text-slate-400">
-                          Node ID：{nodeId} ／ 主机名：{node.stats.hostname || "--"} ／ Agent：{node.stats.agent_version || "--"}
+                          {`Node ID: ${nodeId} / 主机名：${node.stats.hostname || "--"} / Agent: ${node.stats.agent_version || "--"}`}
                         </div>
                       </div>
                       <div className={adminWorkspaceActionChipClass}>
@@ -1161,11 +1301,13 @@ export default function ServerManagement({
                       <div className={adminWorkspaceMetaCardClass}>
                         <div className={adminWorkspaceMetaLabelClass}>资源快照</div>
                         <div className="mt-1 font-medium">
-                          CPU {Math.round(node.stats.cpu.usage_percent || 0)}% ／ 内存{" "}
-                          {Math.round(node.stats.memory.used_percent || 0)}%
+                          {`CPU ${Math.round(node.stats.cpu.usage_percent || 0)}% / 内存 ${Math.round(node.stats.memory.used_percent || 0)}%`}
                         </div>
                         <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                          带宽：{formatMbps(node.net_speed_mbps)}
+                          {`带宽：${formatMbps(node.net_speed_mbps)}`}
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                          GPU: {formatGPUSummary(node)}
                         </div>
                       </div>
                       <div className={adminWorkspaceMetaCardClass}>
@@ -1227,14 +1369,16 @@ export default function ServerManagement({
                     <div className={adminWorkspaceMetaCardClass}>
                       <div className={adminWorkspaceMetaLabelClass}>资源快照</div>
                       <div className="mt-2 text-sm font-medium text-slate-700 dark:text-slate-200">
-                        CPU {Math.round(editingNode.stats.cpu.usage_percent || 0)}% ／ 内存{" "}
-                        {Math.round(editingNode.stats.memory.used_percent || 0)}%
+                        {`CPU ${Math.round(editingNode.stats.cpu.usage_percent || 0)}% / 内存 ${Math.round(editingNode.stats.memory.used_percent || 0)}%`}
                       </div>
                     </div>
                     <div className={adminWorkspaceMetaCardClass}>
                       <div className={adminWorkspaceMetaLabelClass}>运行环境</div>
                       <div className="mt-2 text-sm font-medium text-slate-700 dark:text-slate-200">
                         {editingNode.stats.os} ／ {editingNode.stats.arch}
+                      </div>
+                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                        GPU: {formatGPUSummary(editingNode)}
                       </div>
                     </div>
                   </div>
@@ -1267,7 +1411,7 @@ export default function ServerManagement({
                             variant="outline"
                             className={`${adminActionButtonClass} h-11 px-5`}
                             onClick={handleCheckAgentUpdate}
-                            disabled={Boolean(agentUpdateDisabledReason) || refreshingAgentUpdate || updatingAgent}
+                            disabled={Boolean(agentUpdateDisabledReason) || editorInputDisabled}
                             title={agentUpdateDisabledReason || undefined}
                           >
                             {refreshingAgentUpdate ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
@@ -1277,7 +1421,7 @@ export default function ServerManagement({
                             type="button"
                             className={`${adminPrimaryButtonClass} h-11 px-5`}
                             onClick={handleAgentUpdate}
-                            disabled={Boolean(agentUpdateActionDisabledReason) || refreshingAgentUpdate || updatingAgent}
+                            disabled={Boolean(agentUpdateActionDisabledReason) || editorInputDisabled}
                             title={agentUpdateActionDisabledReason || undefined}
                           >
                             {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -1312,6 +1456,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               className={formInputClass}
                               value={form.alias}
+                              disabled={editorInputDisabled}
                               onChange={(event) => updateFormField("alias", event.target.value)}
                               placeholder={editingNode.stats.node_name || editingNode.stats.hostname}
                             />
@@ -1324,6 +1469,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               className={formInputClass}
                               value={form.region}
+                              disabled={editorInputDisabled}
                               onChange={(event) =>
                                 updateFormField("region", event.target.value.toUpperCase())
                               }
@@ -1356,6 +1502,7 @@ export default function ServerManagement({
                               autoComplete="off"
                               className={formInputClass}
                               value={form.diskType}
+                              disabled={editorInputDisabled}
                               onChange={(event) => updateFormField("diskType", event.target.value)}
                               placeholder="NVMe / SSD / HDD"
                             />
@@ -1370,6 +1517,7 @@ export default function ServerManagement({
                               min={0}
                               autoComplete="off"
                               value={form.netSpeedMbps}
+                              disabled={editorInputDisabled}
                               onChange={(event) =>
                                 updateFormField("netSpeedMbps", event.target.value)
                               }
@@ -1390,10 +1538,11 @@ export default function ServerManagement({
                     </CardHeader>
                     <CardContent className="space-y-5 p-6">
                       <div className={adminDetailHintPanelClass}>
-                        已选 {testDraftState.summary.selected} 个探测节点。
-                        {testDraftState.summary.tcpCustom > 0
-                          ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
-                          : ""}
+                        {`已选 ${testDraftState.summary.selected} 个探测节点。${
+                          testDraftState.summary.tcpCustom > 0
+                            ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
+                            : ""
+                        }`}
                       </div>
 
                       {testCatalog.length === 0 ? (
@@ -1420,7 +1569,7 @@ export default function ServerManagement({
                                       type="checkbox"
                                       className="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 dark:border-slate-700 dark:bg-slate-950"
                                       checked={active}
-                                      disabled={!itemId}
+                                      disabled={!itemId || editorInputDisabled}
                                       onChange={() => handleToggleTest(entry)}
                                     />
                                     <div className="min-w-0 space-y-1">
@@ -1455,7 +1604,7 @@ export default function ServerManagement({
                                           min={0}
                                           max={3600}
                                           autoComplete="off"
-                                          disabled={!active || !itemId}
+                                          disabled={!active || !itemId || editorInputDisabled}
                                           value={intervalValue}
                                           onChange={(event) =>
                                             handleTestIntervalChange(itemId, event.target.value)
@@ -1501,6 +1650,7 @@ export default function ServerManagement({
                               type="datetime-local"
                               autoComplete="off"
                               value={form.expireAt}
+                              disabled={editorInputDisabled}
                               onChange={(event) => updateFormField("expireAt", event.target.value)}
                             />
                           </div>
@@ -1509,12 +1659,12 @@ export default function ServerManagement({
                             <Select
                               value={form.renewPlan}
                               onValueChange={(value) => {
-                                if (value === null) {
+                                if (editorInputDisabled || value === null) {
                                   return;
                                 }
                                 updateFormField("renewPlan", value as RenewPlan);
                               }}
-                              disabled={!hasExpireAt}
+                              disabled={!hasExpireAt || editorInputDisabled}
                             >
                               <SelectTrigger id="node-renew-plan" className={adminSelectTriggerClass}>
                                 <SelectValue placeholder="选择续费方案…" />
@@ -1543,6 +1693,7 @@ export default function ServerManagement({
                           <div className="flex items-center gap-3 bg-white/50 dark:bg-slate-950/50 p-1.5 rounded-full border border-slate-200 dark:border-slate-800">
                             <button
                               type="button"
+                              disabled={editorInputDisabled}
                               onClick={() => updateFormField("alertEnabled", true)}
                               className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
@@ -1550,6 +1701,7 @@ export default function ServerManagement({
                             </button>
                             <button
                               type="button"
+                              disabled={editorInputDisabled}
                               onClick={() => updateFormField("alertEnabled", false)}
                               className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${!form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
                             >
@@ -1583,6 +1735,7 @@ export default function ServerManagement({
                                   type="button"
                                   variant="outline"
                                   className="h-11 w-full justify-between rounded-[1.1rem] border-slate-200 bg-white px-4 text-left text-sm font-medium text-slate-700 shadow-none hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
+                                  disabled={editorInputDisabled}
                                 >
                                   <span
                                     className={`truncate ${
@@ -1623,7 +1776,7 @@ export default function ServerManagement({
                                             ? "bg-sky-600 text-white"
                                             : "text-slate-700 hover:bg-white dark:text-slate-200 dark:hover:bg-slate-950"
                                         }`}
-                                        disabled={tagSelectedCount > 0}
+                                        disabled={tagSelectedCount > 0 || editorInputDisabled}
                                         onClick={() => handleToggleGroupSelection(item.group)}
                                       >
                                         <span className="flex items-center gap-2">
@@ -1639,7 +1792,7 @@ export default function ServerManagement({
                                                   : "bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
                                               }`}
                                             >
-                                              {tagSelectedCount} 个标签
+                                              {`${tagSelectedCount} 个标签`}
                                             </span>
                                           ) : null}
                                           {groupSelected ? <Check className="h-4 w-4" /> : null}
@@ -1660,7 +1813,7 @@ export default function ServerManagement({
                                                     ? "bg-indigo-600 text-white"
                                                     : "text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-950"
                                                 }`}
-                                                disabled={groupSelected}
+                                                disabled={groupSelected || editorInputDisabled}
                                                 onClick={() => handleToggleGroupSelection(value)}
                                               >
                                                 <span className="truncate">{tag}</span>
@@ -1690,6 +1843,7 @@ export default function ServerManagement({
                               key={item.value}
                               type="button"
                               className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-white dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-700"
+                              disabled={editorInputDisabled}
                               onClick={() => handleRemoveGroupSelection(item.value)}
                             >
                               <span>{item.label}</span>
@@ -1711,14 +1865,22 @@ export default function ServerManagement({
               <Separator className="bg-slate-200 dark:bg-slate-800" />
 
               <DialogFooter className={`${adminDialogFooterClass} flex-col-reverse gap-3 sm:flex-row sm:justify-between items-center px-8 py-6`}>
-                <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+                <AlertDialog
+                  open={deleteDialogOpen}
+                  onOpenChange={(open) => {
+                    if (deleting && !open) {
+                      return;
+                    }
+                    setDeleteDialogOpen(open);
+                  }}
+                >
                   <AlertDialogTrigger
                     render={(
                       <Button
                         type="button"
                         variant="destructive"
                         className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
-                        disabled={saving || deleting}
+                        disabled={editorInputDisabled}
                       >
                         {deleting ? (
                           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1739,6 +1901,7 @@ export default function ServerManagement({
                       <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
                       <AlertDialogAction
                         className={adminDialogDangerActionClass}
+                        disabled={deleting || saving || refreshingAgentUpdate || updatingAgent}
                         onClick={handleDelete}
                       >
                         {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -1752,16 +1915,16 @@ export default function ServerManagement({
                     type="button"
                     variant="outline"
                     className={`${adminOutlineButtonClass} h-12 flex-1 sm:flex-none min-w-[100px] px-8 font-bold`}
-                    onClick={closeEditor}
-                    disabled={saving || deleting}
+                    onClick={() => closeEditor(isEditingDraftDirty)}
+                    disabled={editorBusy}
                   >
-                    取消
+                    {isEditingDraftDirty ? "放弃修改" : "取消"}
                   </Button>
                   <Button
                     type="button"
                     className={`${adminPrimaryButtonClass} h-12 flex-1 sm:flex-none min-w-[140px] px-8 font-bold`}
                     onClick={handleSave}
-                    disabled={saving || deleting}
+                    disabled={!isEditingDraftDirty || editorInputDisabled}
                   >
                     {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                     保存配置

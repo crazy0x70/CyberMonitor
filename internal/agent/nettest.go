@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os/exec"
 	"regexp"
@@ -13,14 +14,16 @@ import (
 	"time"
 
 	"cyber_monitor/internal/metrics"
+	"cyber_monitor/internal/netguard"
 )
 
 const (
-	defaultTCPPort    = 80
-	icmpTimeout       = 3 * time.Second
-	tcpTimeout        = 3 * time.Second
-	pingSampleCount   = 3
-	maxNetTestWorkers = 16
+	defaultTCPPort           = 80
+	icmpTimeout              = 3 * time.Second
+	tcpTimeout               = 3 * time.Second
+	publicProbeLookupTimeout = 2 * time.Second
+	pingSampleCount          = 3
+	maxNetTestWorkers        = 16
 )
 
 var (
@@ -161,9 +164,16 @@ func runSingleNetworkTest(
 		Status: "error",
 	}
 
+	probeHost, err := resolveNetworkTestProbeHost(ctx, config)
+	if err != nil {
+		result.Error = err.Error()
+		result.CheckedAt = now().Unix()
+		return result
+	}
+
 	switch config.Type {
 	case "tcp":
-		latency, status, errText := tcpProbe(config.Host, config.Port)
+		latency, status, errText := tcpProbe(probeHost, config.Port)
 		result.LatencyMs = latency
 		result.Status = status
 		if status == "ok" {
@@ -173,7 +183,7 @@ func runSingleNetworkTest(
 		}
 		result.Error = errText
 	default:
-		latency, loss, status, errText := icmpProbe(ctx, config.Host)
+		latency, loss, status, errText := icmpProbe(ctx, probeHost)
 		result.LatencyMs = latency
 		result.PacketLoss = loss
 		result.Status = status
@@ -182,6 +192,17 @@ func runSingleNetworkTest(
 
 	result.CheckedAt = now().Unix()
 	return result
+}
+
+func resolveNetworkTestProbeHost(ctx context.Context, config metrics.NetworkTestConfig) (string, error) {
+	if config.PublicOnly {
+		return resolvePublicProbeHost(ctx, config.Host)
+	}
+	host := strings.TrimSpace(config.Host)
+	if err := validateProbeHost(host); err != nil {
+		return "", err
+	}
+	return host, nil
 }
 
 func testTCP(host string, port int) (*float64, string, string) {
@@ -244,6 +265,99 @@ func validateProbeHost(host string) error {
 		}
 	}
 	return nil
+}
+
+type probeLookupFunc func(context.Context, string) ([]net.IP, error)
+
+func validatePublicProbeHost(ctx context.Context, host string) error {
+	_, err := resolvePublicProbeHostWithResolver(ctx, host, lookupProbeHostIPs)
+	return err
+}
+
+func validatePublicProbeHostWithResolver(ctx context.Context, host string, lookup probeLookupFunc) error {
+	_, err := resolvePublicProbeHostWithResolver(ctx, host, lookup)
+	return err
+}
+
+func resolvePublicProbeHost(ctx context.Context, host string) (string, error) {
+	return resolvePublicProbeHostWithResolver(ctx, host, lookupProbeHostIPs)
+}
+
+func resolvePublicProbeHostWithResolver(ctx context.Context, host string, lookup probeLookupFunc) (string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		if err := validatePublicProbeIP(ip); err != nil {
+			return "", err
+		}
+		return canonicalProbeIP(ip), nil
+	}
+	name := normalizeProbeHostname(host)
+	if err := validateProbeHost(name); err != nil {
+		return "", err
+	}
+	if name == "localhost" || strings.HasSuffix(name, ".localhost") || !strings.Contains(name, ".") {
+		return "", errors.New("远程网络测试不允许使用本地或内网主机名")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if lookup == nil {
+		lookup = lookupProbeHostIPs
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, publicProbeLookupTimeout)
+	defer cancel()
+	ips, err := lookup(lookupCtx, name)
+	if err != nil {
+		return "", fmt.Errorf("解析远程网络测试主机失败: %w", err)
+	}
+	if len(ips) == 0 {
+		return "", errors.New("解析远程网络测试主机失败: empty address set")
+	}
+	resolved := ""
+	for _, ip := range ips {
+		if err := validatePublicProbeIP(ip); err != nil {
+			return "", err
+		}
+		if resolved == "" {
+			resolved = canonicalProbeIP(ip)
+		}
+	}
+	return resolved, nil
+}
+
+var lookupProbeHostIPs probeLookupFunc = defaultLookupProbeHostIPs
+
+func defaultLookupProbeHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr.IP != nil {
+			ips = append(ips, addr.IP)
+		}
+	}
+	return ips, nil
+}
+
+func validatePublicProbeIP(ip net.IP) error {
+	if !netguard.IsAllowedPublicIP(ip) {
+		return errors.New("远程网络测试不允许使用本地或内网地址")
+	}
+	return nil
+}
+
+func canonicalProbeIP(ip net.IP) string {
+	addr, ok := netguard.AddrFromIP(ip)
+	if !ok {
+		return strings.TrimSpace(ip.String())
+	}
+	return addr.String()
+}
+
+func normalizeProbeHostname(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
 func isValidDNSLabel(label string) bool {

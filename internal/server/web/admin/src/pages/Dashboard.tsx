@@ -37,11 +37,6 @@ import {
   adminSummaryIconChipClass,
   adminSummaryIconToneClassByTone,
   adminSummaryRowClass,
-  adminSummaryWarningIconChipClass,
-  adminSummaryWarningRowClass,
-  adminSummaryWarningTextClass,
-  adminSummaryWarningTitleClass,
-  adminWarningOutlineButtonClass,
 } from "@/lib/admin-ui";
 import type { NodeView, SettingsView } from "@/lib/admin-types";
 import { cn } from "@/lib/utils";
@@ -112,7 +107,6 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
   const online = nodes.filter((node) => node.status === "online").length;
   const offline = total - online;
   const ungrouped = countUngrouped(nodes);
-  const adminPathRisk = settings?.admin_path === "/admin";
 
   const metrics = [
     {
@@ -233,54 +227,34 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
                     className={cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")}
                     onClick={(event) => handleNavigateLink(event, item.page)}
                   >
-                    管理 <ChevronRight className="ml-1 h-4 w-4" />
+                    <span className="leading-none">管理</span>
+                    <ChevronRight className="h-4 w-4 shrink-0" />
                   </a>
                 </div>
               );
             })}
 
-            <div className={adminPathRisk ? adminSummaryWarningRowClass : adminSummaryRowClass}>
+            <div className={adminSummaryRowClass}>
               <div className="flex min-w-0 items-center gap-4">
-                <div
-                  className={
-                    adminPathRisk
-                      ? adminSummaryWarningIconChipClass
-                      : `${adminSummaryIconChipClass} ${adminSummaryIconToneClassByTone.neutral}`
-                  }
-                >
+                <div className={`${adminSummaryIconChipClass} ${adminSummaryIconToneClassByTone.neutral}`}>
                   <ShieldAlert className="h-5 w-5" />
                 </div>
                 <div className="min-w-0">
-                  <h4
-                    className={
-                      adminPathRisk
-                        ? adminSummaryWarningTitleClass
-                        : "font-bold text-slate-900 dark:text-slate-100"
-                    }
-                  >
+                  <h4 className="font-bold text-slate-900 dark:text-slate-100">
                     安全入口
                   </h4>
-                  <p
-                    className={
-                      adminPathRisk
-                        ? `mt-1 line-clamp-1 text-[13px] font-medium leading-relaxed ${adminSummaryWarningTextClass}`
-                        : `mt-1 line-clamp-1 text-[13px] font-medium leading-relaxed ${adminMutedTextClass}`
-                    }
-                  >
+                  <p className={`mt-1 line-clamp-1 text-[13px] font-medium leading-relaxed ${adminMutedTextClass}`}>
                     路径: {settings?.admin_path || "/admin"}
                   </p>
                 </div>
               </div>
               <a
                 href={dashboardPageHref("settings")}
-                className={
-                  adminPathRisk
-                    ? `${adminWarningOutlineButtonClass} self-start h-10 px-5 sm:self-auto`
-                    : cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")
-                }
+                className={cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")}
                 onClick={(event) => handleNavigateLink(event, "settings")}
               >
-                配置 <ChevronRight className="ml-1 h-4 w-4" />
+                <span className="leading-none">配置</span>
+                <ChevronRight className="h-4 w-4 shrink-0" />
               </a>
             </div>
           </CardContent>

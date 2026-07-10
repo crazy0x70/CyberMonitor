@@ -3,12 +3,14 @@ package metrics
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -63,12 +65,28 @@ type NetworkIO struct {
 	RxBytesPerSec float64 `json:"rx_bytes_per_sec"`
 }
 
+type GPUInfo struct {
+	Index              int     `json:"index"`
+	ID                 string  `json:"id,omitempty"`
+	Name               string  `json:"name,omitempty"`
+	Vendor             string  `json:"vendor,omitempty"`
+	DriverVersion      string  `json:"driver_version,omitempty"`
+	UtilizationPercent float64 `json:"utilization_percent"`
+	MemoryTotal        uint64  `json:"memory_total"`
+	MemoryUsed         uint64  `json:"memory_used"`
+	MemoryFree         uint64  `json:"memory_free"`
+	MemoryUsedPercent  float64 `json:"memory_used_percent"`
+	TemperatureC       float64 `json:"temperature_c,omitempty"`
+	PowerW             float64 `json:"power_w,omitempty"`
+}
+
 type NetworkTestConfig struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
 	Host        string `json:"host"`
 	Port        int    `json:"port,omitempty"`
 	IntervalSec int    `json:"interval_sec,omitempty"`
+	PublicOnly  bool   `json:"-"`
 }
 
 type NetworkTestResult struct {
@@ -91,12 +109,16 @@ type NodeStats struct {
 	Hostname            string              `json:"hostname"`
 	PublicIPv4          string              `json:"public_ipv4,omitempty"`
 	PublicIPv6          string              `json:"public_ipv6,omitempty"`
-	OS                  string              `json:"os"`
-	Arch                string              `json:"arch"`
+	OS                  string              `json:"os,omitempty"`
+	Arch                string              `json:"arch,omitempty"`
+	StaticInfo          bool                `json:"static_info,omitempty"`
+	StaticUpdatedAt     int64               `json:"static_updated_at,omitempty"`
 	DeployMode          string              `json:"deploy_mode,omitempty"`
 	DockerManagedUpdate bool                `json:"docker_managed_update,omitempty"`
 	AgentVersion        string              `json:"agent_version,omitempty"`
 	AgentUpdateDisabled bool                `json:"agent_update_disabled,omitempty"`
+	AgentUpdateInsecure bool                `json:"agent_update_insecure,omitempty"`
+	AgentRemoteUpdate   bool                `json:"agent_remote_update,omitempty"`
 	UptimeSec           uint64              `json:"uptime_sec"`
 	Timestamp           int64               `json:"timestamp"`
 	NetSpeedMbps        float64             `json:"net_speed_mbps,omitempty"`
@@ -106,6 +128,8 @@ type NodeStats struct {
 	DiskType            string              `json:"disk_type,omitempty"`
 	DiskIO              DiskIO              `json:"disk_io"`
 	Network             NetworkIO           `json:"network"`
+	GPU                 []GPUInfo           `json:"gpu,omitempty"`
+	GPUCollected        bool                `json:"gpu_collected,omitempty"`
 	ProcessCount        int                 `json:"process_count,omitempty"`
 	TCPConns            int                 `json:"tcp_conns,omitempty"`
 	UDPConns            int                 `json:"udp_conns,omitempty"`
@@ -116,9 +140,10 @@ type NodeStats struct {
 type publicIPFamily string
 
 const (
-	defaultPublicIPRefreshInterval = 10 * time.Minute
-	defaultPublicIPRetryInterval   = time.Minute
-	defaultPublicIPLookupTimeout   = 2 * time.Second
+	defaultStaticInfoRefreshInterval = 30 * time.Minute
+	defaultPublicIPRefreshInterval   = 10 * time.Minute
+	defaultPublicIPRetryInterval     = time.Minute
+	defaultPublicIPLookupTimeout     = 2 * time.Second
 
 	publicIPv4Family publicIPFamily = "ipv4"
 	publicIPv6Family publicIPFamily = "ipv6"
@@ -149,6 +174,14 @@ type publicIPInfo struct {
 	ipv6Failed bool
 }
 
+type collectorStaticInfo struct {
+	CPUModel string
+	Cores    int
+	Arch     string
+	OS       string
+	DiskType string
+}
+
 type Collector struct {
 	nodeID     string
 	nodeName   string
@@ -165,10 +198,10 @@ type Collector struct {
 	publicIPRefreshInterval time.Duration
 	publicIPLookup          publicIPLookupFunc
 
-	cachedCPUModel        string
-	cachedCoreCount       int
-	cachedArch            string
-	staticInfoInitialized bool
+	staticInfo                collectorStaticInfo
+	staticInfoInitialized     bool
+	staticInfoUpdatedAt       time.Time
+	staticInfoRefreshInterval time.Duration
 }
 
 func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collector {
@@ -181,35 +214,18 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		filter[name] = struct{}{}
 	}
 	return &Collector{
-		nodeID:                  nodeID,
-		nodeName:                nodeName,
-		hostRoot:                hostRoot,
-		netIfaces:               filter,
-		publicIPRefreshInterval: defaultPublicIPRefreshInterval,
-		publicIPLookup:          newPublicIPLookup(defaultPublicIPLookupTimeout),
+		nodeID:                    nodeID,
+		nodeName:                  nodeName,
+		hostRoot:                  hostRoot,
+		netIfaces:                 filter,
+		publicIPRefreshInterval:   defaultPublicIPRefreshInterval,
+		publicIPLookup:            newPublicIPLookup(defaultPublicIPLookupTimeout),
+		staticInfoRefreshInterval: defaultStaticInfoRefreshInterval,
 	}
 }
 
 func (c *Collector) Collect() (NodeStats, error) {
 	now := time.Now()
-
-	if !c.staticInfoInitialized {
-		cpuInfos, _ := cpu.Info()
-		if len(cpuInfos) > 0 {
-			c.cachedCPUModel = strings.TrimSpace(cpuInfos[0].ModelName)
-		}
-		coreCount, err := cpu.Counts(true)
-		if err == nil && coreCount > 0 {
-			c.cachedCoreCount = coreCount
-		}
-		c.cachedArch = detectArch()
-		if hostInfo, _ := host.Info(); hostInfo != nil {
-			if normalized := normalizeArch(hostInfo.KernelArch); normalized != "" {
-				c.cachedArch = normalized
-			}
-		}
-		c.staticInfoInitialized = true
-	}
 
 	cpuPercents, _ := cpu.Percent(0, false)
 	usage := 0.0
@@ -220,9 +236,9 @@ func (c *Collector) Collect() (NodeStats, error) {
 	loadAvg, _ := load.Avg()
 	memStat := c.collectMemoryStat()
 	partitions, _ := disk.Partitions(false)
+	staticInfoIncluded := c.refreshStaticInfoAt(now, partitions)
 
 	diskUsage := c.collectDiskUsage(partitions)
-	diskType := detectDiskType(partitions, c.hostRoot)
 
 	diskCounters, _ := disk.IOCounters()
 	var diskRead, diskWrite uint64
@@ -241,22 +257,13 @@ func (c *Collector) Collect() (NodeStats, error) {
 	netStat := sumNetCounters(netCounters, netFilter)
 
 	hostInfo, _ := host.Info()
-	osLabel := normalizeOSLabel(runtime.GOOS, "")
 	hostname := ""
 	uptime := uint64(0)
 	processCount := 0
-	arch := c.cachedArch
 	if hostInfo != nil {
-		osLabel = normalizeOSLabel(hostInfo.Platform, hostInfo.PlatformVersion)
 		hostname = hostInfo.Hostname
 		uptime = hostInfo.Uptime
 		processCount = int(hostInfo.Procs)
-	}
-	if hostOS := readHostOSRelease(c.hostRoot); hostOS != "" {
-		osLabel = hostOS
-	}
-	if osLabel != "" {
-		osLabel = normalizeOSLabel(osLabel, "")
 	}
 	if hostName := readHostHostname(c.hostRoot); hostName != "" {
 		hostname = hostName
@@ -266,26 +273,25 @@ func (c *Collector) Collect() (NodeStats, error) {
 
 	netSpeedMbps := collectNetSpeedMbps(netFilter)
 	publicIPs := c.collectPublicIPsAt(now)
+	gpuStats := collectGPUStats(staticInfoIncluded)
 	loadStat := valueOrZero(loadAvg)
 	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
-		NodeID:       c.nodeID,
-		NodeName:     c.nodeName,
-		Hostname:     hostname,
-		PublicIPv4:   publicIPs.IPv4,
-		PublicIPv6:   publicIPs.IPv6,
-		OS:           osLabel,
-		Arch:         arch,
-		UptimeSec:    uptime,
-		Timestamp:    now.Unix(),
-		NetSpeedMbps: netSpeedMbps,
+		NodeID:          c.nodeID,
+		NodeName:        c.nodeName,
+		Hostname:        hostname,
+		PublicIPv4:      publicIPs.IPv4,
+		PublicIPv6:      publicIPs.IPv6,
+		StaticInfo:      staticInfoIncluded,
+		StaticUpdatedAt: c.staticInfoUpdatedAt.Unix(),
+		UptimeSec:       uptime,
+		Timestamp:       now.Unix(),
+		NetSpeedMbps:    netSpeedMbps,
 		CPU: CPUInfo{
 			UsagePercent: usage,
 			Load1:        loadStat.Load1,
 			Load5:        loadStat.Load5,
 			Load15:       loadStat.Load15,
-			Model:        c.cachedCPUModel,
-			Cores:        c.cachedCoreCount,
 		},
 		Memory: MemInfo{
 			Total:       memoryStat.Total,
@@ -293,8 +299,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 			Free:        memoryStat.Free,
 			UsedPercent: memoryStat.UsedPercent,
 		},
-		Disk:     diskUsage,
-		DiskType: diskType,
+		Disk: diskUsage,
 		DiskIO: DiskIO{
 			ReadBytes:  diskRead,
 			WriteBytes: diskWrite,
@@ -306,6 +311,15 @@ func (c *Collector) Collect() (NodeStats, error) {
 		ProcessCount: processCount,
 		TCPConns:     tcpConns,
 		UDPConns:     udpConns,
+		GPU:          gpuStats,
+		GPUCollected: true,
+	}
+	if staticInfoIncluded {
+		stats.OS = c.staticInfo.OS
+		stats.Arch = c.staticInfo.Arch
+		stats.CPU.Model = c.staticInfo.CPUModel
+		stats.CPU.Cores = c.staticInfo.Cores
+		stats.DiskType = c.staticInfo.DiskType
 	}
 
 	// 计算速率需要前后采样差值
@@ -328,6 +342,39 @@ func (c *Collector) Collect() (NodeStats, error) {
 	c.prevDisk = &disk.IOCountersStat{ReadBytes: diskRead, WriteBytes: diskWrite}
 
 	return stats, nil
+}
+
+func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.PartitionStat) bool {
+	interval := c.staticInfoRefreshInterval
+	if interval <= 0 {
+		interval = defaultStaticInfoRefreshInterval
+	}
+	if c.staticInfoInitialized && now.Sub(c.staticInfoUpdatedAt) < interval {
+		return false
+	}
+	next := collectorStaticInfo{
+		Arch:     detectArch(),
+		DiskType: detectDiskType(partitions, c.hostRoot),
+	}
+	if cpuInfos, _ := cpu.Info(); len(cpuInfos) > 0 {
+		next.CPUModel = strings.TrimSpace(cpuInfos[0].ModelName)
+	}
+	if coreCount, err := cpu.Counts(true); err == nil && coreCount > 0 {
+		next.Cores = coreCount
+	}
+	if hostInfo, _ := host.Info(); hostInfo != nil {
+		next.OS = normalizeOSLabel(hostInfo.Platform, hostInfo.PlatformVersion)
+		if normalized := normalizeArch(hostInfo.KernelArch); normalized != "" {
+			next.Arch = normalized
+		}
+	}
+	if hostOS := readHostOSRelease(c.hostRoot); hostOS != "" {
+		next.OS = normalizeOSLabel(hostOS, "")
+	}
+	c.staticInfo = next
+	c.staticInfoInitialized = true
+	c.staticInfoUpdatedAt = now
+	return true
 }
 
 func (c *Collector) sampleConnectionCountsAt(
@@ -862,7 +909,6 @@ func (c *Collector) collectHostDiskUsage() []DiskPartition {
 		if err != nil {
 			continue
 		}
-		usageStat = applyDeviceTotal(usageStat, readBlockDeviceTotal(hostRoot, mount.Device))
 		if mount.Fstype != "" {
 			usageStat.Fstype = mount.Fstype
 		}
@@ -1047,51 +1093,6 @@ func resolveHostMountPath(hostRoot, mountpoint string) string {
 		return hostRoot
 	}
 	return filepath.Join(hostRoot, strings.TrimPrefix(cleaned, "/"))
-}
-
-func applyDeviceTotal(usage filesystemUsage, deviceTotal uint64) filesystemUsage {
-	if deviceTotal == 0 || deviceTotal <= usage.Total {
-		return usage
-	}
-	usage.Total = deviceTotal
-	if usage.Used > usage.Total {
-		usage.Used = usage.Total
-	}
-	usage.Free = usage.Total - usage.Used
-	usage.UsedPercent = percentOf(usage.Used, usage.Total)
-	return usage
-}
-
-func readBlockDeviceTotal(hostRoot, device string) uint64 {
-	root := strings.TrimSpace(hostRoot)
-	if root == "" {
-		return 0
-	}
-	for _, candidate := range blockDeviceCandidates(device) {
-		sizePath := filepath.Join(root, "sys", "class", "block", candidate, "size")
-		data, err := os.ReadFile(sizePath)
-		if err != nil {
-			continue
-		}
-		sectors, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-		if err != nil || sectors == 0 {
-			continue
-		}
-		return sectors * 512
-	}
-	return 0
-}
-
-func blockDeviceCandidates(device string) []string {
-	base := filepath.Base(strings.TrimSpace(device))
-	if base == "" {
-		return nil
-	}
-	candidates := []string{base}
-	if parent := blockDeviceName(base); parent != "" && parent != base {
-		candidates = append(candidates, parent)
-	}
-	return candidates
 }
 
 func readHostMounts(hostRoot string) ([]hostMount, error) {
@@ -1425,4 +1426,137 @@ func readRotational(hostRoot, device string) (int, bool) {
 		return 0, false
 	}
 	return value, true
+}
+
+func collectGPUStats(includeStatic bool) []GPUInfo {
+	return collectNVIDIAGPUStats(includeStatic)
+}
+
+func collectNVIDIAGPUStats(includeStatic bool) []GPUInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	path, err := exec.LookPath("nvidia-smi")
+	if err != nil {
+		return nil
+	}
+	output, err := exec.CommandContext(
+		ctx,
+		path,
+		"--query-gpu=index,uuid,name,driver_version,utilization.gpu,memory.total,memory.used,memory.free,temperature.gpu,power.draw",
+		"--format=csv,noheader,nounits",
+	).Output()
+	if err != nil {
+		return nil
+	}
+	return parseNVIDIAGPUStats(string(output), includeStatic)
+}
+
+func parseNVIDIAGPUStats(raw string, includeStatic bool) []GPUInfo {
+	reader := csv.NewReader(strings.NewReader(raw))
+	reader.TrimLeadingSpace = true
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil
+	}
+	gpus := make([]GPUInfo, 0, len(records))
+	for _, record := range records {
+		if len(record) < 10 {
+			continue
+		}
+		index, ok := parseOptionalInt(record[0])
+		if !ok {
+			continue
+		}
+		totalMiB, _ := parseOptionalFloat(record[5])
+		usedMiB, _ := parseOptionalFloat(record[6])
+		freeMiB, _ := parseOptionalFloat(record[7])
+		gpu := GPUInfo{
+			Index:              index,
+			ID:                 cleanGPUText(record[1], 128),
+			UtilizationPercent: clampPercent(parseOptionalFloatZero(record[4])),
+			MemoryTotal:        mibToBytes(totalMiB),
+			MemoryUsed:         mibToBytes(usedMiB),
+			MemoryFree:         mibToBytes(freeMiB),
+			TemperatureC:       parseOptionalFloatZero(record[8]),
+			PowerW:             parseOptionalFloatZero(record[9]),
+		}
+		if gpu.MemoryTotal > 0 {
+			gpu.MemoryUsedPercent = clampPercent(float64(gpu.MemoryUsed) * 100 / float64(gpu.MemoryTotal))
+		}
+		if includeStatic {
+			gpu.Name = cleanGPUText(record[2], 160)
+			gpu.Vendor = "NVIDIA"
+			gpu.DriverVersion = cleanGPUText(record[3], 64)
+		}
+		gpus = append(gpus, gpu)
+	}
+	return gpus
+}
+
+func parseOptionalInt(raw string) (int, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.EqualFold(value, "N/A") || strings.Contains(strings.ToLower(value), "not supported") {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func parseOptionalFloatZero(raw string) float64 {
+	value, ok := parseOptionalFloat(raw)
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+func parseOptionalFloat(raw string) (float64, bool) {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimSuffix(value, "%")
+	value = strings.TrimSuffix(value, "W")
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "N/A") || strings.Contains(strings.ToLower(value), "not supported") {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func mibToBytes(value float64) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value * 1024 * 1024)
+}
+
+func clampPercent(value float64) float64 {
+	switch {
+	case value < 0:
+		return 0
+	case value > 100:
+		return 100
+	default:
+		return value
+	}
+}
+
+func cleanGPUText(raw string, maxLen int) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.EqualFold(value, "N/A") || strings.Contains(strings.ToLower(value), "not supported") {
+		return ""
+	}
+	value = strings.Join(strings.Fields(value), " ")
+	if maxLen > 0 {
+		runes := []rune(value)
+		if len(runes) > maxLen {
+			value = string(runes[:maxLen])
+		}
+	}
+	return value
 }

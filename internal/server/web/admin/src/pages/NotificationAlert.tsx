@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { AlertTriangle, Bell, Clock3, Send, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Bell, Send, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { getErrorMessage, parseTelegramUserIds } from "@/lib/admin-format";
@@ -58,9 +58,16 @@ export interface NotificationAlertProps {
   nodes: NodeView[];
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
-  onSave: (payload: Record<string, unknown>) => Promise<void>;
+  onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
   onTest: (payload: AlertTestPayload) => Promise<void>;
 }
+
+type AlertSettingsDraft = {
+  webhook: string;
+  telegramToken: string;
+  telegramUserIds: string;
+  offlineMinutes: string;
+};
 
 function isValidHTTPURL(value: string) {
   try {
@@ -71,6 +78,32 @@ function isValidHTTPURL(value: string) {
   }
 }
 
+function makeAlertSettingsDraft(settings: SettingsView | null): AlertSettingsDraft {
+  const userIds = Array.isArray(settings?.alert_telegram_user_ids)
+    ? settings?.alert_telegram_user_ids
+    : typeof settings?.alert_telegram_user_id === "number" && settings.alert_telegram_user_id > 0
+      ? [settings.alert_telegram_user_id]
+      : [];
+
+  return {
+    webhook: settings?.alert_webhook || "",
+    telegramToken: settings?.alert_telegram_token || "",
+    telegramUserIds: userIds.length > 0 ? userIds.join(",") : "",
+    offlineMinutes:
+      settings?.alert_offline_sec && settings.alert_offline_sec > 0
+        ? String(Math.round(settings.alert_offline_sec / 60))
+        : "5",
+  };
+}
+
+function alertSettingsDraftSignature(draft: AlertSettingsDraft) {
+  return JSON.stringify(draft);
+}
+
+function alertSettingsSourceSignature(settings: SettingsView | null) {
+  return alertSettingsDraftSignature(makeAlertSettingsDraft(settings));
+}
+
 export default function NotificationAlert({
   settings,
   nodes,
@@ -79,33 +112,52 @@ export default function NotificationAlert({
   onSave,
   onTest,
 }: NotificationAlertProps) {
-  const [webhook, setWebhook] = useState("");
-  const [telegramToken, setTelegramToken] = useState("");
-  const [telegramUserIds, setTelegramUserIds] = useState("");
-  const [offlineMinutes, setOfflineMinutes] = useState("5");
+  const [webhook, setWebhook] = useState(() => makeAlertSettingsDraft(settings).webhook);
+  const [telegramToken, setTelegramToken] = useState(() => makeAlertSettingsDraft(settings).telegramToken);
+  const [telegramUserIds, setTelegramUserIds] = useState(() => makeAlertSettingsDraft(settings).telegramUserIds);
+  const [offlineMinutes, setOfflineMinutes] = useState(() => makeAlertSettingsDraft(settings).offlineMinutes);
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [testingChannel, setTestingChannel] = useState<"telegram" | "feishu" | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<AlertField, string>>>({});
+  const [sourceSignature, setSourceSignature] = useState(() => alertSettingsSourceSignature(settings));
+  const isBusy = isSaving || saving || testingChannel !== null;
+  const currentDraftSignature = alertSettingsDraftSignature({
+    webhook,
+    telegramToken,
+    telegramUserIds,
+    offlineMinutes,
+  });
 
   useEffect(() => {
-    const userIds = Array.isArray(settings?.alert_telegram_user_ids)
-      ? settings?.alert_telegram_user_ids
-      : typeof settings?.alert_telegram_user_id === "number" && settings.alert_telegram_user_id > 0
-        ? [settings.alert_telegram_user_id]
-        : [];
-
-    setWebhook(settings?.alert_webhook || "");
-    setTelegramToken(settings?.alert_telegram_token || "");
-    setTelegramUserIds(userIds.length > 0 ? userIds.join(",") : "");
-    setOfflineMinutes(
-      settings?.alert_offline_sec && settings.alert_offline_sec > 0
-        ? String(Math.round(settings.alert_offline_sec / 60))
-        : "5",
-    );
+    if (isBusy) {
+      return;
+    }
+    const nextSourceSignature = alertSettingsSourceSignature(settings);
+    const currentDraftMatchesIncoming = currentDraftSignature === nextSourceSignature;
+    if (isDirty && currentDraftMatchesIncoming) {
+      setSourceSignature(nextSourceSignature);
+      setIsDirty(false);
+      setFieldErrors({});
+      return;
+    }
+    if (nextSourceSignature === sourceSignature) {
+      return;
+    }
+    if (isDirty) {
+      setSourceSignature(nextSourceSignature);
+      toast.warning("服务端告警配置已更新，当前未保存修改已保留。");
+      return;
+    }
+    const draft = makeAlertSettingsDraft(settings);
+    setWebhook(draft.webhook);
+    setTelegramToken(draft.telegramToken);
+    setTelegramUserIds(draft.telegramUserIds);
+    setOfflineMinutes(draft.offlineMinutes);
+    setSourceSignature(nextSourceSignature);
     setIsDirty(false);
     setFieldErrors({});
-  }, [settings]);
+  }, [currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -134,6 +186,9 @@ export default function NotificationAlert({
   const createFieldChangeHandler =
     (field: AlertField, setter: (value: string) => void) =>
     (event: ChangeEvent<HTMLInputElement>) => {
+      if (isBusy) {
+        return;
+      }
       setter(event.target.value);
       setFieldErrors((current) =>
         current[field] ? { ...current, [field]: undefined } : current,
@@ -219,6 +274,9 @@ export default function NotificationAlert({
         };
 
   const handleSave = async () => {
+    if (isBusy) {
+      return;
+    }
     const validation = validateAlertForm({});
     if (!applyValidationResult(validation)) {
       return;
@@ -226,7 +284,13 @@ export default function NotificationAlert({
 
     setIsSaving(true);
     try {
-      await onSave(buildSavePayload(validation));
+      const savedSettings = await onSave(buildSavePayload(validation));
+      const canonicalDraft = makeAlertSettingsDraft(savedSettings);
+      setWebhook(canonicalDraft.webhook);
+      setTelegramToken(canonicalDraft.telegramToken);
+      setTelegramUserIds(canonicalDraft.telegramUserIds);
+      setOfflineMinutes(canonicalDraft.offlineMinutes);
+      setSourceSignature(alertSettingsDraftSignature(canonicalDraft));
       toast.success("告警配置已保存");
       setIsDirty(false);
       setFieldErrors({});
@@ -238,6 +302,9 @@ export default function NotificationAlert({
   };
 
   const handleTest = async (channel: "telegram" | "feishu") => {
+    if (isBusy) {
+      return;
+    }
     const validation = validateAlertForm({
       requireTelegram: channel === "telegram",
       requireWebhook: channel === "feishu",
@@ -276,12 +343,6 @@ export default function NotificationAlert({
       tone: "warning",
       icon: AlertTriangle,
     },
-    {
-      label: "离线阈值",
-      value: `${offlineMinutes || "5"} 分钟`,
-      tone: "info",
-      icon: Clock3,
-    },
   ] as const;
 
   return (
@@ -297,14 +358,14 @@ export default function NotificationAlert({
           <Button
             className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
             onClick={handleSave}
-            disabled={!isDirty || isSaving || saving}
+            disabled={!isDirty || isBusy}
           >
             {isSaving || saving ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>
 
-      <div className="grid auto-rows-fr gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid auto-rows-fr gap-4 md:grid-cols-3">
         {statCards.map((item) => {
           const Icon = item.icon;
           return (
@@ -355,6 +416,7 @@ export default function NotificationAlert({
                   aria-invalid={Boolean(fieldErrors.offlineMinutes)}
                   aria-describedby={fieldErrors.offlineMinutes ? "offline-minutes-error" : undefined}
                   value={offlineMinutes}
+                  disabled={isBusy}
                   onChange={createFieldChangeHandler("offlineMinutes", setOfflineMinutes)}
                 />
                 {fieldErrors.offlineMinutes ? (
@@ -392,6 +454,7 @@ export default function NotificationAlert({
                     aria-invalid={Boolean(fieldErrors.telegramToken)}
                     aria-describedby={fieldErrors.telegramToken ? "telegram-token-error" : undefined}
                     value={telegramToken}
+                    disabled={isBusy}
                     onChange={createFieldChangeHandler("telegramToken", setTelegramToken)}
                     placeholder="例如：123456789:ABC…"
                   />
@@ -413,6 +476,7 @@ export default function NotificationAlert({
                     aria-invalid={Boolean(fieldErrors.telegramUserIds)}
                     aria-describedby={fieldErrors.telegramUserIds ? "telegram-user-ids-error" : undefined}
                     value={telegramUserIds}
+                    disabled={isBusy}
                     onChange={createFieldChangeHandler("telegramUserIds", setTelegramUserIds)}
                     placeholder="例如：123456789,987654321…"
                   />
@@ -433,7 +497,7 @@ export default function NotificationAlert({
               variant="outline"
               className={cn(adminActionButtonClass, "h-11 shadow-none")}
               onClick={() => handleTest("telegram")}
-              disabled={testingChannel !== null}
+              disabled={isBusy}
             >
               <Send className="mr-2 h-4 w-4" />
               {testingChannel === "telegram" ? "正在发送…" : "测试推送"}
@@ -465,6 +529,7 @@ export default function NotificationAlert({
                   aria-invalid={Boolean(fieldErrors.webhook)}
                   aria-describedby={fieldErrors.webhook ? "feishu-webhook-error" : undefined}
                   value={webhook}
+                  disabled={isBusy}
                   onChange={createFieldChangeHandler("webhook", setWebhook)}
                   placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
                 />
@@ -481,7 +546,7 @@ export default function NotificationAlert({
               variant="outline"
               className={cn(adminActionButtonClass, "h-11 shadow-none")}
               onClick={() => handleTest("feishu")}
-              disabled={testingChannel !== null}
+              disabled={isBusy}
             >
               <Send className="mr-2 h-4 w-4" />
               {testingChannel === "feishu" ? "正在发送…" : "测试推送"}

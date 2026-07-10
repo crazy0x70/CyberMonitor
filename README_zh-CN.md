@@ -4,7 +4,7 @@
 
   <p>
     <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.26.2-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/Go-1.26.5-blue" alt="Go Version">
     <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
   </p>
 </div>
@@ -31,11 +31,12 @@ docker run -d \
   -p 25012:25012 \
   -e CM_DATA_DIR=/data \
   -v "$(pwd)/data:/data" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   --name cyber-monitor-server \
   --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
+
+默认 Server 命令不会挂载 Docker socket。若确实需要在管理后台一键更新 Docker Server，请设置 `CM_ENABLE_DOCKER_UPDATE=1` 并挂载 `/var/run/docker.sock`；否则应手动拉取最新镜像并重建容器。
 
 ### 3. Docker 部署探针 (Agent)
 

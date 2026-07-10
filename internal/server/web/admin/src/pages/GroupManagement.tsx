@@ -78,14 +78,14 @@ import {
   adminWorkspaceHeaderClass,
 } from "@/lib/admin-ui";
 import { getErrorMessage, resolveNodeSelections } from "@/lib/admin-format";
-import type { GroupNode, NodeView } from "@/lib/admin-types";
+import type { GroupNode, NodeView, SettingsView } from "@/lib/admin-types";
 
 export interface GroupManagementProps {
   groupTree: GroupNode[];
   nodes: NodeView[];
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
-  onSave: (groupTree: GroupNode[]) => Promise<void>;
+  onSave: (groupTree: GroupNode[]) => Promise<SettingsView>;
 }
 
 type ValidationIssue = {
@@ -367,7 +367,9 @@ export default function GroupManagement({
   const incomingTree = useMemo(() => toEditableTree(groupTree), [groupTree]);
   const incomingSignature = useMemo(() => serializeEditableTree(incomingTree), [incomingTree]);
   const [draftTree, setDraftTree] = useState<EditableGroupNode[]>(incomingTree);
+  const [sourceSignature, setSourceSignature] = useState(incomingSignature);
   const [isSaving, setIsSaving] = useState(false);
+  const isBusy = isSaving || saving;
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: {
@@ -376,12 +378,29 @@ export default function GroupManagement({
     }),
   );
 
-  useEffect(() => {
-    setDraftTree(incomingTree);
-  }, [incomingSignature]);
-
   const draftSignature = useMemo(() => serializeEditableTree(draftTree), [draftTree]);
-  const isDirty = incomingSignature !== draftSignature;
+  const isDirty = sourceSignature !== draftSignature;
+
+  useEffect(() => {
+    if (isBusy) {
+      return;
+    }
+    const currentDraftMatchesIncoming = draftSignature === incomingSignature;
+    if (isDirty && currentDraftMatchesIncoming) {
+      setSourceSignature(incomingSignature);
+      return;
+    }
+    if (incomingSignature === sourceSignature) {
+      return;
+    }
+    if (isDirty) {
+      setSourceSignature(incomingSignature);
+      toast.warning("服务端分组配置已更新，当前未保存修改已保留。");
+      return;
+    }
+    setDraftTree(incomingTree);
+    setSourceSignature(incomingSignature);
+  }, [draftSignature, incomingSignature, incomingTree, isBusy, isDirty, sourceSignature]);
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -461,6 +480,9 @@ export default function GroupManagement({
   ] as const;
 
   const updateDraftTree = (updater: (current: EditableGroupNode[]) => EditableGroupNode[]) => {
+    if (isBusy) {
+      return;
+    }
     setDraftTree(updater);
   };
 
@@ -478,8 +500,11 @@ export default function GroupManagement({
     updateDraftTree((current) => updateGroupChildren(current, groupIndex, updater));
   };
 
-  const finishSave = (nextTree: GroupNode[]) => {
-    setDraftTree(toEditableTree(nextTree));
+  const finishSave = (next: SettingsView, fallbackTree: GroupNode[]) => {
+    const canonicalTree = Array.isArray(next.group_tree) ? next.group_tree : fallbackTree;
+    const nextDraftTree = toEditableTree(canonicalTree);
+    setDraftTree(nextDraftTree);
+    setSourceSignature(serializeEditableTree(nextDraftTree));
     toast.success("分组配置已保存。");
   };
 
@@ -516,6 +541,9 @@ export default function GroupManagement({
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
+    if (isBusy) {
+      return;
+    }
     const { active, over } = event;
     if (!over || active.id === over.id) {
       return;
@@ -524,6 +552,9 @@ export default function GroupManagement({
   };
 
   const handleSave = async () => {
+    if (isBusy) {
+      return;
+    }
     if (validationIssues.length > 0) {
       const firstIssue = validationIssues[0];
       if (firstIssue.target) {
@@ -546,8 +577,8 @@ export default function GroupManagement({
 
     setIsSaving(true);
     try {
-      await onSave(nextTree);
-      finishSave(nextTree);
+      const savedSettings = await onSave(nextTree);
+      finishSave(savedSettings, nextTree);
     } catch (error) {
       toast.error(getErrorMessage(error, "保存分组失败。"));
     } finally {
@@ -569,7 +600,7 @@ export default function GroupManagement({
             variant="outline"
             className={`${adminActionButtonClass} h-11 min-w-[140px] px-5 font-bold`}
             onClick={addGroup}
-            disabled={isSaving || saving}
+            disabled={isBusy}
           >
             <Plus className="mr-2 h-4 w-4" />
             新建分组
@@ -577,9 +608,9 @@ export default function GroupManagement({
           <Button
             className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
             onClick={handleSave}
-            disabled={!isDirty || isSaving || saving}
+            disabled={!isDirty || isBusy}
           >
-            {isSaving || saving ? "保存中…" : "保存更改"}
+            {isBusy ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </section>
@@ -637,7 +668,7 @@ export default function GroupManagement({
                 className={`mt-5 ${outlineActionClass}`}
                 variant="outline"
                 onClick={addGroup}
-                disabled={isSaving || saving}
+                disabled={isBusy}
               >
                 <Plus className="mr-2 h-4 w-4" />
                 新建分组
@@ -656,7 +687,7 @@ export default function GroupManagement({
                   tagUsageStats={usageStats.tagCount}
                   groupCardClass={groupCardClass}
                   groupCardHeaderClass={groupCardHeaderClass}
-                  isBusy={isSaving || saving}
+                  isBusy={isBusy}
                   validationLookup={validationLookup}
                   onAddTag={addTag}
                   onRemoveGroup={removeGroup}
@@ -708,6 +739,7 @@ function SortableGroupCard({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: group.id,
+    disabled: isBusy,
   });
   const groupName = String(group.name || "").trim();
   const tags = group.children || [];
@@ -729,6 +761,7 @@ function SortableGroupCard({
               type="button"
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400 transition-colors hover:border-sky-200 hover:text-sky-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-500 dark:hover:border-sky-800 dark:hover:text-sky-300"
               aria-label="拖动排序"
+              disabled={isBusy}
               {...attributes}
               {...listeners}
             >
@@ -752,6 +785,7 @@ function SortableGroupCard({
                     ? `group-name-${groupIndex}-error`
                     : undefined
                 }
+                disabled={isBusy}
                 onChange={(event) => onUpdateGroupName(groupIndex, event.target.value)}
               />
               {validationLookup.groupErrors[String(groupIndex)] ? (
@@ -765,10 +799,10 @@ function SortableGroupCard({
               ) : null}
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                 <Badge variant="secondary" className={adminNeutralBadgeClass}>
-                  {groupUsageCount} 个节点
+                  {`${groupUsageCount} 个节点`}
                 </Badge>
                 <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
-                  {effectiveTagCount} 个标签
+                  {`${effectiveTagCount} 个标签`}
                 </Badge>
               </div>
             </div>
@@ -803,6 +837,7 @@ function SortableGroupCard({
                 <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
                 <AlertDialogAction
                   className={adminDialogDangerActionClass}
+                  disabled={isBusy}
                   onClick={() => onRemoveGroup(groupIndex)}
                 >
                   确认删除
@@ -817,7 +852,7 @@ function SortableGroupCard({
         <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
           <h4 className="text-sm font-medium text-slate-900 dark:text-slate-100">二级标签</h4>
           <Badge variant="outline" className={`w-fit ${adminSubtleOutlineBadgeClass}`}>
-            共 {effectiveTagCount} 个有效标签
+            {`共 ${effectiveTagCount} 个有效标签`}
           </Badge>
         </div>
 
@@ -846,7 +881,7 @@ function SortableGroupCard({
                   <div className="min-w-0 flex-1 space-y-2">
                     <div className="flex items-center justify-between gap-2">
                       <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
-                        {tagUsageCount} 个节点
+                        {`${tagUsageCount} 个节点`}
                       </Badge>
                     </div>
 
@@ -863,6 +898,7 @@ function SortableGroupCard({
                           ? `group-tag-name-${groupIndex}-${tagIndex}-error`
                           : undefined
                       }
+                      disabled={isBusy}
                       onChange={(event) => onUpdateTagName(groupIndex, tagIndex, event.target.value)}
                     />
                     {validationLookup.tagErrors[`${groupIndex}-${tagIndex}`] ? (

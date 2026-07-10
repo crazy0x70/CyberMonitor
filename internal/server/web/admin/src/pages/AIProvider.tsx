@@ -53,7 +53,8 @@ import type { AIProviderConfig, SettingsView } from "@/lib/admin-types";
 export interface AIProviderProps {
   settings: SettingsView | null;
   onDirtyChange?: (dirty: boolean) => void;
-  onSave: (payload: Record<string, unknown>) => Promise<void>;
+  saving?: boolean;
+  onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
   onTestProvider: (provider: string, config: AIProviderConfig) => Promise<void>;
   onFetchModels: (provider: string, config: AIProviderConfig) => Promise<string[]>;
 }
@@ -160,6 +161,44 @@ function resolveProviderSelection(options: Array<{ value: string }>, currentValu
   return options[0]?.value || "openai";
 }
 
+type AISettingsDraft = {
+  providers: ProviderDraft[];
+  commandProvider: string;
+  prompt: string;
+};
+
+function makeAISettingsDraft(settings: SettingsView | null): AISettingsDraft {
+  const providers = makeProviderDrafts(settings);
+  const commandProvider = resolveProviderSelection(
+    providers.map((item) => ({ value: toProviderValue(item) })),
+    settings?.ai_settings?.command_provider || "openai",
+  );
+  return {
+    providers,
+    commandProvider,
+    prompt: settings?.ai_settings?.prompt || "",
+  };
+}
+
+function aiSettingsDraftSignature(draft: AISettingsDraft) {
+  return JSON.stringify({
+    commandProvider: draft.commandProvider,
+    prompt: draft.prompt,
+    providers: draft.providers.map((item) => ({
+      id: item.id,
+      name: item.name,
+      provider: item.provider,
+      apiKey: item.apiKey,
+      baseURL: item.baseURL,
+      model: item.model,
+    })),
+  });
+}
+
+function aiSettingsSourceSignature(settings: SettingsView | null) {
+  return aiSettingsDraftSignature(makeAISettingsDraft(settings));
+}
+
 function renderStatusBadge(status: ProviderStatus) {
   switch (status) {
     case "verified":
@@ -186,24 +225,51 @@ function renderStatusBadge(status: ProviderStatus) {
 export default function AIProvider({
   settings,
   onDirtyChange,
+  saving: externalSaving = false,
   onSave,
   onTestProvider,
   onFetchModels,
 }: AIProviderProps) {
-  const [providers, setProviders] = useState<ProviderDraft[]>(() => makeProviderDrafts(settings));
-  const [commandProvider, setCommandProvider] = useState("openai");
-  const [prompt, setPrompt] = useState("");
+  const [providers, setProviders] = useState<ProviderDraft[]>(() => makeAISettingsDraft(settings).providers);
+  const [commandProvider, setCommandProvider] = useState(() => makeAISettingsDraft(settings).commandProvider);
+  const [prompt, setPrompt] = useState(() => makeAISettingsDraft(settings).prompt);
   const [isDirty, setIsDirty] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [fetchingModelsId, setFetchingModelsId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const isBusy = isSaving || externalSaving || testingId !== null || fetchingModelsId !== null;
+  const [sourceSignature, setSourceSignature] = useState(() => aiSettingsSourceSignature(settings));
+  const currentDraftSignature = useMemo(
+    () => aiSettingsDraftSignature({ providers, commandProvider, prompt }),
+    [commandProvider, prompt, providers],
+  );
 
   useEffect(() => {
-    setProviders(makeProviderDrafts(settings));
-    setCommandProvider(settings?.ai_settings?.command_provider || "openai");
-    setPrompt(settings?.ai_settings?.prompt || "");
+    if (isBusy) {
+      return;
+    }
+    const nextSourceSignature = aiSettingsSourceSignature(settings);
+    const currentDraftMatchesIncoming = currentDraftSignature === nextSourceSignature;
+    if (isDirty && currentDraftMatchesIncoming) {
+      setSourceSignature(nextSourceSignature);
+      setIsDirty(false);
+      return;
+    }
+    if (nextSourceSignature === sourceSignature) {
+      return;
+    }
+    if (isDirty) {
+      setSourceSignature(nextSourceSignature);
+      toast.warning("服务端 AI 配置已更新，当前未保存修改已保留。");
+      return;
+    }
+    const draft = makeAISettingsDraft(settings);
+    setProviders(draft.providers);
+    setCommandProvider(draft.commandProvider);
+    setPrompt(draft.prompt);
+    setSourceSignature(nextSourceSignature);
     setIsDirty(false);
-  }, [settings]);
+  }, [currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -225,12 +291,15 @@ export default function AIProvider({
   }, [providers]);
 
   useEffect(() => {
+    if (isBusy) {
+      return;
+    }
     const nextCommand = resolveProviderSelection(providerOptions, commandProvider);
     if (nextCommand !== commandProvider) {
       setCommandProvider(nextCommand);
       setIsDirty(true);
     }
-  }, [commandProvider, providerOptions]);
+  }, [commandProvider, isBusy, providerOptions]);
 
   const markDirty = () => {
     setIsDirty(true);
@@ -262,6 +331,9 @@ export default function AIProvider({
     field: "name" | "apiKey" | "baseURL" | "model",
     value: string,
   ) => {
+    if (isBusy) {
+      return;
+    }
     updateProviderDraft(id, (current) => {
       if (field === "name") {
         return { ...current, name: value };
@@ -284,6 +356,9 @@ export default function AIProvider({
   };
 
   const addCompatible = () => {
+    if (isBusy) {
+      return;
+    }
     const id = `compatible-${Date.now()}`;
     setProviderDrafts(
       (current) => [
@@ -304,6 +379,9 @@ export default function AIProvider({
   };
 
   const removeCompatible = (id: string) => {
+    if (isBusy) {
+      return;
+    }
     const removingSelectedProvider = commandProvider === `openai_compatible:${id}`;
     setProviderDrafts((current) => {
       const next = current.filter((item) => item.id !== id);
@@ -315,6 +393,9 @@ export default function AIProvider({
   };
 
   const handleTest = async (item: ProviderDraft) => {
+    if (isBusy) {
+      return;
+    }
     setTestingId(item.id);
     try {
       await onTestProvider(toProviderRequestKey(item), toConfig(item));
@@ -328,6 +409,9 @@ export default function AIProvider({
   };
 
   const handleFetchModels = async (item: ProviderDraft) => {
+    if (isBusy) {
+      return;
+    }
     setFetchingModelsId(item.id);
     try {
       const models = await onFetchModels(toProviderRequestKey(item), toConfig(item));
@@ -350,14 +434,17 @@ export default function AIProvider({
   };
 
   const handleSave = async () => {
+    if (isBusy) {
+      return;
+    }
     const openai = providers.find((item) => item.provider === "openai");
     const gemini = providers.find((item) => item.provider === "gemini");
     const volcengine = providers.find((item) => item.provider === "volcengine");
     const compatibles = providers.filter((item) => item.provider === "openai_compatible");
 
-    setSaving(true);
+    setIsSaving(true);
     try {
-      await onSave({
+      const savedSettings = await onSave({
         ai_settings: {
           command_provider: commandProvider,
           prompt,
@@ -371,12 +458,17 @@ export default function AIProvider({
           })),
         },
       });
+      const canonicalDraft = makeAISettingsDraft(savedSettings);
+      setProviders(canonicalDraft.providers);
+      setCommandProvider(canonicalDraft.commandProvider);
+      setPrompt(canonicalDraft.prompt);
+      setSourceSignature(aiSettingsDraftSignature(canonicalDraft));
       toast.success("AI 服务商配置已保存");
       setIsDirty(false);
     } catch (error) {
       toast.error(getErrorMessage(error, "保存 AI 配置失败"));
     } finally {
-      setSaving(false);
+      setIsSaving(false);
     }
   };
 
@@ -393,9 +485,9 @@ export default function AIProvider({
           <Button
             className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
             onClick={handleSave}
-            disabled={!isDirty || saving}
+            disabled={!isDirty || isBusy}
           >
-            {saving ? "保存中…" : "保存更改"}
+            {isSaving || externalSaving ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>
@@ -414,8 +506,9 @@ export default function AIProvider({
             <Label htmlFor="ai-command-provider" className="text-xs font-black uppercase tracking-widest text-slate-400">Telegram AI 指令服务商</Label>
             <Select
               value={commandProvider}
+              disabled={isBusy}
               onValueChange={(value) => {
-                if (value === null) {
+                if (isBusy || value === null) {
                   return;
                 }
                 setCommandProvider(value);
@@ -453,9 +546,13 @@ export default function AIProvider({
             className={`min-h-[156px] ${adminTextareaClass}`}
             value={prompt}
             onChange={(event) => {
+              if (isBusy) {
+                return;
+              }
               setPrompt(event.target.value);
               markDirty();
             }}
+            disabled={isBusy}
             placeholder="例如：请重点关注网络流量、下载量与离线情况…"
           />
         </CardContent>
@@ -473,6 +570,7 @@ export default function AIProvider({
             variant="outline"
             className={adminActionButtonClass}
             onClick={addCompatible}
+            disabled={isBusy}
           >
             <Plus className="mr-2 h-4 w-4" />
             新增兼容服务商
@@ -501,6 +599,7 @@ export default function AIProvider({
                         className={adminInputClass}
                         autoComplete="off"
                         value={item.name}
+                        disabled={isBusy}
                         onChange={(event) => updateProviderInput(item.id, "name", event.target.value)}
                       />
                     </div>
@@ -513,6 +612,7 @@ export default function AIProvider({
                         autoComplete="new-password"
                         spellCheck={false}
                         value={item.apiKey}
+                        disabled={isBusy}
                         onChange={(event) => updateProviderInput(item.id, "apiKey", event.target.value)}
                       />
                     </div>
@@ -526,6 +626,7 @@ export default function AIProvider({
                         inputMode="url"
                         spellCheck={false}
                         value={item.baseURL}
+                        disabled={isBusy}
                         onChange={(event) => updateProviderInput(item.id, "baseURL", event.target.value)}
                       />
                     </div>
@@ -538,6 +639,7 @@ export default function AIProvider({
                         autoComplete="off"
                         spellCheck={false}
                         value={item.model}
+                        disabled={isBusy}
                         onChange={(event) => updateProviderInput(item.id, "model", event.target.value)}
                       />
                       <datalist id={`models-${item.id}`}>
@@ -559,7 +661,7 @@ export default function AIProvider({
                         variant="outline"
                         className={adminActionButtonClass}
                         onClick={() => handleFetchModels(item)}
-                        disabled={fetchingModelsId !== null}
+                        disabled={isBusy}
                       >
                         {fetchingModelsId === item.id ? (
                           <>
@@ -574,7 +676,7 @@ export default function AIProvider({
                         variant="outline"
                         className={adminActionButtonClass}
                         onClick={() => handleTest(item)}
-                        disabled={testingId !== null}
+                        disabled={isBusy}
                       >
                         {testingId === item.id ? (
                           <>
@@ -590,6 +692,7 @@ export default function AIProvider({
                           variant="outline"
                           className={`${adminDangerOutlineButtonClass} h-11 min-w-[132px] px-5`}
                           onClick={() => removeCompatible(item.id)}
+                          disabled={isBusy}
                         >
                           <Trash2 className="mr-2 h-4 w-4" />
                           删除
