@@ -92,6 +92,7 @@ func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agent
 	if payload.NodeName == "" {
 		payload.NodeName = payload.NodeID
 	}
+	metrics.SanitizeNodeStats(&payload)
 	payload.NetworkTests = normalizeAgentNetworkTestResults(payload.NetworkTests)
 	return payload, nil
 }

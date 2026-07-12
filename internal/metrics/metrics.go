@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -236,7 +237,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 	loadAvg, _ := load.Avg()
 	memStat := c.collectMemoryStat()
 	partitions, _ := disk.Partitions(false)
-	staticInfoIncluded := c.refreshStaticInfoAt(now, partitions)
+	staticInfoRefreshed := c.refreshStaticInfoAt(now, partitions)
 
 	diskUsage := c.collectDiskUsage(partitions)
 
@@ -273,7 +274,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 
 	netSpeedMbps := collectNetSpeedMbps(netFilter)
 	publicIPs := c.collectPublicIPsAt(now)
-	gpuStats := collectGPUStats(staticInfoIncluded)
+	gpuStats := collectGPUStats(staticInfoRefreshed)
 	loadStat := valueOrZero(loadAvg)
 	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
@@ -282,7 +283,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 		Hostname:        hostname,
 		PublicIPv4:      publicIPs.IPv4,
 		PublicIPv6:      publicIPs.IPv6,
-		StaticInfo:      staticInfoIncluded,
+		StaticInfo:      true,
 		StaticUpdatedAt: c.staticInfoUpdatedAt.Unix(),
 		UptimeSec:       uptime,
 		Timestamp:       now.Unix(),
@@ -314,13 +315,11 @@ func (c *Collector) Collect() (NodeStats, error) {
 		GPU:          gpuStats,
 		GPUCollected: true,
 	}
-	if staticInfoIncluded {
-		stats.OS = c.staticInfo.OS
-		stats.Arch = c.staticInfo.Arch
-		stats.CPU.Model = c.staticInfo.CPUModel
-		stats.CPU.Cores = c.staticInfo.Cores
-		stats.DiskType = c.staticInfo.DiskType
-	}
+	stats.OS = c.staticInfo.OS
+	stats.Arch = c.staticInfo.Arch
+	stats.CPU.Model = c.staticInfo.CPUModel
+	stats.CPU.Cores = c.staticInfo.Cores
+	stats.DiskType = c.staticInfo.DiskType
 
 	// 计算速率需要前后采样差值
 	if !c.prevTime.IsZero() && c.prevNet != nil && c.prevDisk != nil {
@@ -340,8 +339,59 @@ func (c *Collector) Collect() (NodeStats, error) {
 	c.prevTime = now
 	c.prevNet = &netStat
 	c.prevDisk = &disk.IOCountersStat{ReadBytes: diskRead, WriteBytes: diskWrite}
+	SanitizeNodeStats(&stats)
 
 	return stats, nil
+}
+
+// SanitizeNodeStats removes non-finite floating-point values before stats are
+// serialized or persisted. Some gopsutil backends can emit NaN during the
+// first Docker sample when a counter delta has no usable denominator.
+func SanitizeNodeStats(stats *NodeStats) {
+	if stats == nil {
+		return
+	}
+	stats.NetSpeedMbps = finiteNonNegative(stats.NetSpeedMbps)
+	stats.CPU.UsagePercent = clampPercent(stats.CPU.UsagePercent)
+	stats.CPU.Load1 = finiteNonNegative(stats.CPU.Load1)
+	stats.CPU.Load5 = finiteNonNegative(stats.CPU.Load5)
+	stats.CPU.Load15 = finiteNonNegative(stats.CPU.Load15)
+	stats.Memory.UsedPercent = clampPercent(stats.Memory.UsedPercent)
+	stats.DiskIO.ReadBytesPerSec = finiteNonNegative(stats.DiskIO.ReadBytesPerSec)
+	stats.DiskIO.WriteBytesPerSec = finiteNonNegative(stats.DiskIO.WriteBytesPerSec)
+	stats.Network.TxBytesPerSec = finiteNonNegative(stats.Network.TxBytesPerSec)
+	stats.Network.RxBytesPerSec = finiteNonNegative(stats.Network.RxBytesPerSec)
+	for i := range stats.Disk {
+		stats.Disk[i].UsedPercent = clampPercent(stats.Disk[i].UsedPercent)
+	}
+	for i := range stats.GPU {
+		stats.GPU[i].UtilizationPercent = clampPercent(stats.GPU[i].UtilizationPercent)
+		stats.GPU[i].MemoryUsedPercent = clampPercent(stats.GPU[i].MemoryUsedPercent)
+		stats.GPU[i].TemperatureC = finiteOrZero(stats.GPU[i].TemperatureC)
+		stats.GPU[i].PowerW = finiteNonNegative(stats.GPU[i].PowerW)
+	}
+	for i := range stats.NetworkTests {
+		stats.NetworkTests[i].PacketLoss = clampPercent(stats.NetworkTests[i].PacketLoss)
+		if latency := stats.NetworkTests[i].LatencyMs; latency != nil {
+			value := finiteNonNegative(*latency)
+			stats.NetworkTests[i].LatencyMs = &value
+		}
+	}
+}
+
+func finiteOrZero(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
+}
+
+func finiteNonNegative(value float64) float64 {
+	value = finiteOrZero(value)
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.PartitionStat) bool {
@@ -356,11 +406,17 @@ func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.Partiti
 		Arch:     detectArch(),
 		DiskType: detectDiskType(partitions, c.hostRoot),
 	}
-	if cpuInfos, _ := cpu.Info(); len(cpuInfos) > 0 {
-		next.CPUModel = strings.TrimSpace(cpuInfos[0].ModelName)
+	next.CPUModel, next.Cores = readHostCPUInfo(c.hostRoot)
+	if next.CPUModel == "" {
+		cpuInfos, _ := cpu.Info()
+		if len(cpuInfos) > 0 {
+			next.CPUModel = strings.TrimSpace(cpuInfos[0].ModelName)
+		}
 	}
-	if coreCount, err := cpu.Counts(true); err == nil && coreCount > 0 {
-		next.Cores = coreCount
+	if next.Cores <= 0 {
+		if coreCount, err := cpu.Counts(true); err == nil && coreCount > 0 {
+			next.Cores = coreCount
+		}
 	}
 	if hostInfo, _ := host.Info(); hostInfo != nil {
 		next.OS = normalizeOSLabel(hostInfo.Platform, hostInfo.PlatformVersion)
@@ -1210,8 +1266,10 @@ func readHostOSRelease(hostRoot string) string {
 	if hostRoot == "" {
 		return ""
 	}
-	path := filepath.Join(hostRoot, "etc", "os-release")
-	file, err := os.Open(path)
+	file, err := openHostRootFile(hostRoot, filepath.Join("etc", "os-release"))
+	if err != nil {
+		file, err = openHostRootFile(hostRoot, filepath.Join("usr", "lib", "os-release"))
+	}
 	if err != nil {
 		return ""
 	}
@@ -1236,6 +1294,72 @@ func readHostOSRelease(hostRoot string) string {
 		return name + " " + version
 	}
 	return name
+}
+
+func openHostRootFile(hostRoot, relativePath string) (*os.File, error) {
+	root := filepath.Clean(strings.TrimSpace(hostRoot))
+	if root == "" || root == "." {
+		return nil, os.ErrNotExist
+	}
+	path := filepath.Join(root, filepath.Clean(relativePath))
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return nil, err
+		}
+		if filepath.IsAbs(target) {
+			path = filepath.Join(root, strings.TrimPrefix(filepath.Clean(target), string(filepath.Separator)))
+		} else {
+			path = filepath.Join(filepath.Dir(path), target)
+		}
+	}
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, os.ErrPermission
+	}
+	return os.Open(path)
+}
+
+func readHostCPUInfo(hostRoot string) (string, int) {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		return "", 0
+	}
+	file, err := os.Open(filepath.Join(root, "proc", "cpuinfo"))
+	if err != nil {
+		return "", 0
+	}
+	defer file.Close()
+
+	model := ""
+	hardware := ""
+	cores := 0
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), ":")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.Join(strings.Fields(value), " ")
+		switch key {
+		case "processor":
+			cores++
+		case "model name", "cpu model":
+			if model == "" && value != "" {
+				model = value
+			}
+		case "hardware":
+			if hardware == "" && value != "" {
+				hardware = value
+			}
+		}
+	}
+	if model == "" {
+		model = hardware
+	}
+	return model, cores
 }
 
 func readHostHostname(hostRoot string) string {
@@ -1537,6 +1661,8 @@ func mibToBytes(value float64) uint64 {
 
 func clampPercent(value float64) float64 {
 	switch {
+	case math.IsNaN(value), math.IsInf(value, 0):
+		return 0
 	case value < 0:
 		return 0
 	case value > 100:

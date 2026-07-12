@@ -4512,12 +4512,8 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	if profile := s.profiles[nodeID]; profile != nil {
 		token := strings.TrimSpace(profile.AgentAuthToken)
 		if token != "" && !s.isAgentAuthTokenDuplicateLocked(nodeID, token) {
-			if canRecoverAgentTokenDuringPendingUpdate(profile) {
-				s.mu.Unlock()
-				return token, nil
-			}
 			s.mu.Unlock()
-			return "", invalidBootstrapTokenError()
+			return token, nil
 		}
 	}
 	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
@@ -4563,31 +4559,6 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 		s.persist()
 	}
 	return token, nil
-}
-
-// canRecoverAgentTokenDuringPendingUpdate limits bootstrap-based credential
-// recovery to an update that the authenticated Agent has already acknowledged.
-// The restarting report is best-effort, so a successfully replaced Agent may
-// legitimately leave the server in updating state. A target-version report
-// completes and clears the pending update, closing this recovery path. Normal
-// bootstrap registration remains fail-closed.
-func canRecoverAgentTokenDuringPendingUpdate(profile *NodeProfile) bool {
-	if profile == nil || profile.AgentUpdate == nil {
-		return false
-	}
-	switch strings.TrimSpace(profile.AgentUpdateState) {
-	case agentUpdateStateUpdating, agentUpdateStateRestarting:
-	default:
-		return false
-	}
-	if strings.TrimSpace(profile.AgentUpdate.ID) == "" {
-		return false
-	}
-	targetVersion := strings.TrimSpace(profile.AgentUpdateTargetVersion)
-	if targetVersion == "" {
-		targetVersion = strings.TrimSpace(profile.AgentUpdate.Version)
-	}
-	return targetVersion != ""
 }
 
 func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
