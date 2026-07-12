@@ -360,6 +360,9 @@ func isAgentGRPCRequest(r *http.Request) bool {
 }
 
 func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterRequest) (*agentrpc.RegisterResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request required")
+	}
 	agentToken, apiErr := s.api.register(req.NodeID, req.BootstrapToken)
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
@@ -371,6 +374,9 @@ func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterReq
 }
 
 func (s *agentRPCServer) GetConfig(ctx context.Context, req *agentrpc.ConfigRequest) (*agentrpc.ConfigResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request required")
+	}
 	config, apiErr := s.api.config(req.NodeID, req.AgentToken, agentRemoteUpdateCapable(req.Capabilities))
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)

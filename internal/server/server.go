@@ -4512,7 +4512,7 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	if profile := s.profiles[nodeID]; profile != nil {
 		token := strings.TrimSpace(profile.AgentAuthToken)
 		if token != "" && !s.isAgentAuthTokenDuplicateLocked(nodeID, token) {
-			if canRecoverAgentTokenDuringPendingUpdateRestart(profile) {
+			if canRecoverAgentTokenDuringPendingUpdate(profile) {
 				s.mu.Unlock()
 				return token, nil
 			}
@@ -4565,16 +4565,19 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	return token, nil
 }
 
-// canRecoverAgentTokenDuringPendingUpdateRestart limits bootstrap-based
-// credential recovery to an update that the authenticated Agent has already
-// acknowledged as restarting. A successful report from the replacement Agent
+// canRecoverAgentTokenDuringPendingUpdate limits bootstrap-based credential
+// recovery to an update that the authenticated Agent has already acknowledged.
+// The restarting report is best-effort, so a successfully replaced Agent may
+// legitimately leave the server in updating state. A target-version report
 // completes and clears the pending update, closing this recovery path. Normal
 // bootstrap registration remains fail-closed.
-func canRecoverAgentTokenDuringPendingUpdateRestart(profile *NodeProfile) bool {
+func canRecoverAgentTokenDuringPendingUpdate(profile *NodeProfile) bool {
 	if profile == nil || profile.AgentUpdate == nil {
 		return false
 	}
-	if strings.TrimSpace(profile.AgentUpdateState) != agentUpdateStateRestarting {
+	switch strings.TrimSpace(profile.AgentUpdateState) {
+	case agentUpdateStateUpdating, agentUpdateStateRestarting:
+	default:
 		return false
 	}
 	if strings.TrimSpace(profile.AgentUpdate.ID) == "" {

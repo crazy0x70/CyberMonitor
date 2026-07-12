@@ -25,6 +25,8 @@ type agentRunner struct {
 	testCache           map[string]cachedTest
 	lastTestConfigSig   string
 	agentToken          string
+	agentTokenDurable   bool
+	nextRegisterAttempt time.Time
 	lastUpdateReportID  string
 	lastUpdateState     string
 	lastUpdateVersion   string
@@ -32,7 +34,10 @@ type agentRunner struct {
 	lastUpdateAppliedAt time.Time
 }
 
-const remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
+const (
+	remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
+	agentTokenRegisterRetryInterval     = 30 * time.Second
+)
 
 var remoteUpdateNow = time.Now
 
@@ -80,22 +85,28 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 
 func (r *agentRunner) registerAgentToken(ctx context.Context, label string) bool {
 	bootstrapToken := strings.TrimSpace(r.cfg.AgentToken)
-	if bootstrapToken == "" || strings.TrimSpace(r.agentToken) != bootstrapToken {
+	if bootstrapToken == "" {
 		return false
 	}
+	now := time.Now()
+	if !r.nextRegisterAttempt.IsZero() && now.Before(r.nextRegisterAttempt) {
+		return false
+	}
+	r.nextRegisterAttempt = now.Add(agentTokenRegisterRetryInterval)
 	issuedToken, err := r.transport.RegisterNodeToken(ctx, r.cfg.NodeID, bootstrapToken)
 	if err == nil && strings.TrimSpace(issuedToken) != "" {
+		r.nextRegisterAttempt = time.Time{}
 		if err := r.updateAgentToken(issuedToken); err != nil {
 			log.Printf("持久化 Agent 专属凭据失败: %v", err)
 		}
 		return true
 	}
-	if err != nil && !isUnauthorizedStatusError(err) {
+	if err != nil {
 		action := strings.TrimSpace(label)
 		if action == "" {
 			action = "节点注册"
 		}
-		log.Printf("%s未成功，继续尝试使用当前 Agent Token: %v", action, err)
+		log.Printf("%s失败，继续尝试使用当前 Agent Token: %v", action, err)
 	}
 	return false
 }
@@ -111,6 +122,10 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 		r.lastUpdateReportID = ""
 		r.lastUpdateSignature = ""
 		r.lastUpdateAppliedAt = time.Time{}
+		return
+	}
+	if !r.agentTokenDurable {
+		log.Printf("拒绝执行远程更新: Agent 专属凭据尚未可靠写入 %s", strings.TrimSpace(r.cfg.TokenFile))
 		return
 	}
 	signature := remoteUpdateInstructionSignature(remote.Update)
@@ -251,25 +266,36 @@ func (r *agentRunner) restorePersistedAgentToken() error {
 	switch {
 	case err == nil && persisted != "":
 		r.agentToken = persisted
+		r.agentTokenDurable = true
 		return nil
 	case err == nil, os.IsNotExist(err):
+		r.agentTokenDurable = false
 		return nil
 	default:
+		r.agentTokenDurable = false
 		return err
 	}
 }
 
 func (r *agentRunner) updateAgentToken(next string) error {
 	trimmed := strings.TrimSpace(next)
-	if trimmed == "" || trimmed == r.agentToken {
+	if trimmed == "" {
 		return nil
 	}
+	changed := trimmed != r.agentToken
 	r.agentToken = trimmed
-	if r.cfg.TokenFile != "" {
-		if err := persistAgentToken(r.cfg.TokenFile, trimmed); err != nil {
-			return err
-		}
+	if strings.TrimSpace(r.cfg.TokenFile) == "" {
+		r.agentTokenDurable = false
+		return nil
 	}
+	if !changed && r.agentTokenDurable {
+		return nil
+	}
+	if err := persistAgentToken(r.cfg.TokenFile, trimmed); err != nil {
+		r.agentTokenDurable = false
+		return err
+	}
+	r.agentTokenDurable = true
 	return nil
 }
 
