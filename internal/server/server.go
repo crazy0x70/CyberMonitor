@@ -4512,6 +4512,10 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	if profile := s.profiles[nodeID]; profile != nil {
 		token := strings.TrimSpace(profile.AgentAuthToken)
 		if token != "" && !s.isAgentAuthTokenDuplicateLocked(nodeID, token) {
+			if canRecoverAgentTokenDuringPendingUpdateRestart(profile) {
+				s.mu.Unlock()
+				return token, nil
+			}
 			s.mu.Unlock()
 			return "", invalidBootstrapTokenError()
 		}
@@ -4559,6 +4563,28 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 		s.persist()
 	}
 	return token, nil
+}
+
+// canRecoverAgentTokenDuringPendingUpdateRestart limits bootstrap-based
+// credential recovery to an update that the authenticated Agent has already
+// acknowledged as restarting. A successful report from the replacement Agent
+// completes and clears the pending update, closing this recovery path. Normal
+// bootstrap registration remains fail-closed.
+func canRecoverAgentTokenDuringPendingUpdateRestart(profile *NodeProfile) bool {
+	if profile == nil || profile.AgentUpdate == nil {
+		return false
+	}
+	if strings.TrimSpace(profile.AgentUpdateState) != agentUpdateStateRestarting {
+		return false
+	}
+	if strings.TrimSpace(profile.AgentUpdate.ID) == "" {
+		return false
+	}
+	targetVersion := strings.TrimSpace(profile.AgentUpdateTargetVersion)
+	if targetVersion == "" {
+		targetVersion = strings.TrimSpace(profile.AgentUpdate.Version)
+	}
+	return targetVersion != ""
 }
 
 func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
