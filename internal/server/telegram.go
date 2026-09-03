@@ -268,10 +268,43 @@ func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []st
 	return errs
 }
 
-func sendTelegramMessage(token string, userID int64, text string) error {
+func telegramBotAPICall(client *http.Client, token, method string, payload any, label string) (telegramSendResponse, error) {
 	if err := validateTelegramToken(token); err != nil {
-		return err
+		return telegramSendResponse{}, err
 	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return telegramSendResponse{}, fmt.Errorf("telegram %s编码失败: %w", label, err)
+	}
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return telegramSendResponse{}, fmt.Errorf("telegram %s请求创建失败: %s", label, telegramRequestErrorMessage(err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if client == nil {
+		client = &http.Client{Timeout: 8 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return telegramSendResponse{}, fmt.Errorf("telegram %s发送失败: %s", label, telegramRequestErrorMessage(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := readResponseBodyLimited(resp.Body)
+		return telegramSendResponse{}, fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var result telegramSendResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return telegramSendResponse{}, fmt.Errorf("telegram %s响应解析失败: %w", label, err)
+	}
+	if !result.Ok {
+		return telegramSendResponse{}, errors.New(formatTelegramError(result.Description, "telegram "+label+"失败"))
+	}
+	return result, nil
+}
+
+func sendTelegramMessage(token string, userID int64, text string) error {
 	if userID <= 0 {
 		return errors.New("telegram 用户 ID 无效")
 	}
@@ -282,34 +315,8 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 		"chat_id": userID,
 		"text":    text,
 	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("telegram 消息编码失败: %w", err)
-	}
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("telegram 请求创建失败: %s", telegramRequestErrorMessage(err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("telegram 发送失败: %s", telegramRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		body, _ := readResponseBodyLimited(resp.Body)
-		return fmt.Errorf("telegram 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var result telegramSendResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("telegram 响应解析失败: %w", err)
-	}
-	if !result.Ok {
-		return errors.New(formatTelegramError(result.Description, "telegram 发送失败"))
-	}
-	return nil
+	_, err := telegramBotAPICall(nil, token, "sendMessage", payload, "消息")
+	return err
 }
 
 func handleTelegramCommand(command string, store *Store, userID, chatID int64) string {
@@ -452,7 +459,7 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, string, bool)
 	}
 	matched := make([]string, 0, 1)
 	for _, node := range nodes {
-		display := resolveNodeDisplayNameForAI(node)
+		display := resolveNodeDisplayName(node)
 		if display == "" || display == "未命名节点" {
 			continue
 		}
@@ -518,17 +525,17 @@ func buildTelegramServerList(store *Store) string {
 		}
 	}
 	sort.Slice(online, func(i, j int) bool {
-		return resolveTelegramDisplay(online[i]) < resolveTelegramDisplay(online[j])
+		return resolveNodeDisplayName(online[i]) < resolveNodeDisplayName(online[j])
 	})
 	sort.Slice(offline, func(i, j int) bool {
-		return resolveTelegramDisplay(offline[i]) < resolveTelegramDisplay(offline[j])
+		return resolveNodeDisplayName(offline[i]) < resolveNodeDisplayName(offline[j])
 	})
 	lines := []string{"服务器列表：", "在线服务器："}
 	if len(online) == 0 {
 		lines = append(lines, "• 无")
 	} else {
 		for _, node := range online {
-			display := resolveTelegramDisplay(node)
+			display := resolveNodeDisplayName(node)
 			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
 		}
 	}
@@ -537,7 +544,7 @@ func buildTelegramServerList(store *Store) string {
 		lines = append(lines, "• 无")
 	} else {
 		for _, node := range offline {
-			display := resolveTelegramDisplay(node)
+			display := resolveNodeDisplayName(node)
 			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
 		}
 	}
@@ -558,7 +565,7 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 		if node.Status == "offline" {
 			statusLabel = "离线"
 		}
-		display := resolveTelegramDisplay(node)
+		display := resolveNodeDisplayName(node)
 		lastSeen := formatTelegramTime(node.LastSeen)
 		firstSeen := formatTelegramTime(node.FirstSeen)
 		uptime := formatAlertDuration(int64(node.Stats.UptimeSec))
@@ -601,9 +608,6 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 }
 
 func setTelegramCommands(token string) error {
-	if err := validateTelegramToken(token); err != nil {
-		return err
-	}
 	commands := []map[string]string{
 		{"command": "cmall", "description": "查看所有服务器统计"},
 		{"command": "server", "description": "查看服务器列表"},
@@ -614,34 +618,8 @@ func setTelegramCommands(token string) error {
 		{"command": "help", "description": "查看可用命令"},
 	}
 	payload := map[string]any{"commands": commands}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("telegram 菜单编码失败: %w", err)
-	}
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", token)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("telegram 菜单请求创建失败: %s", telegramRequestErrorMessage(err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("telegram 菜单设置失败: %s", telegramRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		body, _ := readResponseBodyLimited(resp.Body)
-		return fmt.Errorf("telegram 菜单响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var result telegramSendResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("telegram 菜单响应解析失败: %w", err)
-	}
-	if !result.Ok {
-		return errors.New(formatTelegramError(result.Description, "telegram 菜单设置失败"))
-	}
-	return nil
+	_, err := telegramBotAPICall(nil, token, "setMyCommands", payload, "菜单")
+	return err
 }
 
 func buildTelegramUserKey(ids []int64) string {
@@ -665,22 +643,6 @@ func isAllowedTelegramUser(allowed map[int64]struct{}, fromID, chatID int64) boo
 		return false
 	}
 	return true
-}
-
-func resolveTelegramDisplay(node NodeView) string {
-	if value := strings.TrimSpace(node.Alias); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(node.Stats.NodeName); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(node.Stats.Hostname); value != "" {
-		return value
-	}
-	if value := strings.TrimSpace(node.Stats.NodeID); value != "" {
-		return value
-	}
-	return "未命名节点"
 }
 
 func formatTelegramTime(value int64) string {

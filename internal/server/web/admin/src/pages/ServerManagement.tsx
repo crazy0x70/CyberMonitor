@@ -75,12 +75,14 @@ import {
   formatVersionLabel,
   getErrorMessage,
   normalizeSelectionValues,
+  parseDateTimeLocalValue,
   resolveNodeSelectionValues,
   resolveNodeIdentitySummary,
   parseSelectionValue,
   resolveNodeId,
   resolveNodeName,
   resolveProbeLabel,
+  toDateTimeLocalValue,
   upsertSelectionValue,
 } from "@/lib/admin-format";
 import {
@@ -244,25 +246,6 @@ function formatGPUSummary(node: NodeView | null | undefined) {
       return [name, usage, memory].filter(Boolean).join(" / ");
     })
     .join("；");
-}
-
-function toDateTimeLocalValue(value?: number) {
-  if (!value) return "";
-  const date = new Date(value * 1000);
-  const pad = (num: number) => String(num).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}`;
-}
-
-function parseDateTimeLocalValue(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return 0;
-  const timestamp = new Date(trimmed).getTime();
-  if (Number.isNaN(timestamp)) {
-    return 0;
-  }
-  return Math.floor(timestamp / 1000);
 }
 
 function planToSeconds(plan: RenewPlan) {

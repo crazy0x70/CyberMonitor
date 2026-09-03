@@ -101,10 +101,6 @@ type grpcControlPlane struct {
 	dialErr  error
 }
 
-func newControlPlaneTransport(cfg Config, client *http.Client) agentControlPlane {
-	return newControlPlaneTransportWithOptions(cfg, client, cfg.transportOptions)
-}
-
 func newControlPlaneTransportWithOptions(cfg Config, client *http.Client, options grpcTransportOptions) agentControlPlane {
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.ServerURL), "/")
 	options = options.normalized()
@@ -396,14 +392,21 @@ func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, upda
 }
 
 func (g *grpcControlPlane) Close() error {
+	// Close rewrites dialOnce without holding a lock that clientConn's Do
+	// would honor; this is safe because the whole transport (Close included)
+	// is only ever used from the agent's single report loop goroutine.
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.conn == nil {
-		return nil
+	var err error
+	if g.conn != nil {
+		err = g.conn.Close()
+		g.conn = nil
+		g.client = nil
 	}
-	err := g.conn.Close()
-	g.conn = nil
-	g.client = nil
+	// Re-arm the once-synchronized dial even when no connection was ever
+	// established: a transient dial failure must not permanently kill the
+	// gRPC transport, otherwise the HTTP-fallback backoff recovery can
+	// never retry the dial.
 	g.dialErr = nil
 	g.dialOnce = sync.Once{}
 	return err

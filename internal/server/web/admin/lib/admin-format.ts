@@ -52,16 +52,22 @@ export function formatVersionLabel(value?: string | null) {
   return normalized.startsWith("v") ? normalized : `v${normalized}`;
 }
 
-export function toDateInputValue(value?: number) {
+export function toDateTimeLocalValue(value?: number) {
   if (!value) return "";
-  return new Date(value * 1000).toISOString().slice(0, 10);
+  const date = new Date(value * 1000);
+  const pad = (num: number) => String(num).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}`;
 }
 
-export function parseDateInputValue(value: string) {
+export function parseDateTimeLocalValue(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return 0;
-  const timestamp = new Date(`${trimmed}T00:00:00`).getTime();
-  if (Number.isNaN(timestamp)) return 0;
+  const timestamp = new Date(trimmed).getTime();
+  if (Number.isNaN(timestamp)) {
+    return 0;
+  }
   return Math.floor(timestamp / 1000);
 }
 
@@ -99,7 +105,7 @@ function resolveNodeFreshness(node: NodeView) {
   return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
 }
 
-export function shouldReplaceNodeView(existing: NodeView | undefined, candidate: NodeView) {
+function shouldReplaceNodeView(existing: NodeView | undefined, candidate: NodeView) {
   if (!existing) {
     return true;
   }
@@ -187,7 +193,7 @@ function stringifySelectionValue(selection: GroupSelection) {
   return selection.tag ? `${selection.group}:${selection.tag}` : selection.group;
 }
 
-export function buildSelectionValues(group: string, tags: string[]) {
+function buildSelectionValues(group: string, tags: string[]) {
   if (!group) return [];
   if (!tags.length) return [group];
   return tags.map((tag) => `${group}:${tag}`);

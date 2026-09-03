@@ -37,6 +37,7 @@ const (
 	maxAIPromptRunes            = 2000
 	maxHTTPErrorBodyBytes       = 4096
 	aiOfflineRecentSessionLimit = 3
+	aiHTTPTimeout               = 18 * time.Second
 )
 
 func readResponseBodyLimited(body io.Reader) ([]byte, error) {
@@ -62,6 +63,47 @@ func aiRequestErrorMessage(err error) string {
 		msg = msg[:180]
 	}
 	return msg
+}
+
+type aiProviderErrorEnvelope struct {
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]string, body []byte, out any) error {
+	var payload io.Reader
+	if body != nil {
+		payload = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, payload)
+	if err != nil {
+		return err
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	client := &http.Client{Timeout: aiHTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
+	}
+	defer resp.Body.Close()
+	raw, _ := readResponseBodyLimited(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("AI 响应解析失败: %w", err)
+	}
+	var envelope aiProviderErrorEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("AI 响应解析失败: %w", err)
+	}
+	if envelope.Error != nil {
+		return errors.New(envelope.Error.Message)
+	}
+	return nil
 }
 
 type AIProviderConfig struct {
@@ -184,9 +226,6 @@ type openAIChatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
 }
 
 type geminiResponse struct {
@@ -197,27 +236,18 @@ type geminiResponse struct {
 			} `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
 }
 
 type openAIModelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
 	} `json:"data"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
 }
 
 type geminiModelsResponse struct {
 	Models []struct {
 		Name string `json:"name"`
 	} `json:"models"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
 }
 
 func defaultAISettings() AISettings {
@@ -643,27 +673,10 @@ func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, e
 		return nil, errors.New("Base URL 不能为空")
 	}
 	endpoint := fmt.Sprintf("%s/models", baseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", config.APIKey))
-	client := &http.Client{Timeout: 18 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	body, _ := readResponseBodyLimited(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+	headers := map[string]string{"Authorization": fmt.Sprintf("Bearer %s", config.APIKey)}
 	var parsed openAIModelsResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	if parsed.Error != nil {
-		return nil, errors.New(parsed.Error.Message)
+	if err := aiDoJSON(ctx, http.MethodGet, endpoint, headers, nil, &parsed); err != nil {
+		return nil, err
 	}
 	seen := make(map[string]struct{})
 	models := make([]string, 0, len(parsed.Data))
@@ -690,26 +703,9 @@ func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, e
 		return nil, errors.New("Base URL 不能为空")
 	}
 	endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, url.QueryEscape(config.APIKey))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{Timeout: 18 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	body, _ := readResponseBodyLimited(resp.Body)
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
 	var parsed geminiModelsResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	if parsed.Error != nil {
-		return nil, errors.New(parsed.Error.Message)
+	if err := aiDoJSON(ctx, http.MethodGet, endpoint, nil, nil, &parsed); err != nil {
+		return nil, err
 	}
 	seen := make(map[string]struct{})
 	models := make([]string, 0, len(parsed.Models))
@@ -768,7 +764,7 @@ func buildAIServerSummary(node NodeView, offlineStore *history.OfflineStore, sto
 	stats := node.Stats
 
 	diskUsed := calculateMaxDiskUsage(stats.Disk)
-	name := resolveNodeDisplayNameForAI(node)
+	name := resolveNodeDisplayName(node)
 	offlineSummary, offlineHistoryUnavailable := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
 	hostName := resolveHostName(stats)
 	diskType := resolveDiskType(node, stats)
@@ -966,7 +962,7 @@ func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetwork
 			Status:     strings.TrimSpace(test.Status),
 			Error:      strings.TrimSpace(test.Error),
 			CheckedAt:  test.CheckedAt,
-			LatencyMs:  normalizeFloatPointer(test.LatencyMs),
+			LatencyMs:  history.CloneFloatPtr(test.LatencyMs),
 			PacketLoss: test.PacketLoss,
 		})
 	}
@@ -1048,8 +1044,8 @@ func summarizeAINetworkTrend(
 		}
 		if currentCheckedAt >= latestCheckedAt {
 			latestCheckedAt = currentCheckedAt
-			latestLatency = normalizeFloatPointer(current.LatencyMs)
-			latestLoss = normalizeFloatValue(current.PacketLoss)
+			latestLatency = history.CloneFloatPtr(current.LatencyMs)
+			latestLoss = history.NormalizeFloat(current.PacketLoss)
 		}
 	}
 	avgLatency := averageNonNilFloat(entry.Latency)
@@ -1094,7 +1090,7 @@ func parseTestHistoryKey(key string) (kind string, host string, port int, name s
 
 func latestNonNilFloat(values []*float64) *float64 {
 	for idx := len(values) - 1; idx >= 0; idx-- {
-		if value := normalizeFloatPointer(values[idx]); value != nil {
+		if value := history.CloneFloatPtr(values[idx]); value != nil {
 			return value
 		}
 	}
@@ -1105,7 +1101,7 @@ func averageNonNilFloat(values []*float64) *float64 {
 	total := 0.0
 	count := 0
 	for _, raw := range values {
-		value := normalizeFloatPointer(raw)
+		value := history.CloneFloatPtr(raw)
 		if value == nil {
 			continue
 		}
@@ -1122,7 +1118,7 @@ func averageNonNilFloat(values []*float64) *float64 {
 func maxNonNilFloat(values []*float64) *float64 {
 	var maxValue *float64
 	for _, raw := range values {
-		value := normalizeFloatPointer(raw)
+		value := history.CloneFloatPtr(raw)
 		if value == nil {
 			continue
 		}
@@ -1165,7 +1161,7 @@ func deriveAINetworkStatusHint(
 	return "healthy"
 }
 
-func resolveNodeDisplayNameForAI(node NodeView) string {
+func resolveNodeDisplayName(node NodeView) string {
 	if value := strings.TrimSpace(node.Alias); value != "" {
 		return value
 	}
@@ -1217,28 +1213,13 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/chat/completions", baseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", config.APIKey))
-	client := &http.Client{Timeout: 18 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	body, _ := readResponseBodyLimited(resp.Body)
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": fmt.Sprintf("Bearer %s", config.APIKey),
 	}
 	var parsed openAIChatResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	if parsed.Error != nil {
-		return "", errors.New(parsed.Error.Message)
+	if err := aiDoJSON(ctx, http.MethodPost, endpoint, headers, data, &parsed); err != nil {
+		return "", err
 	}
 	if len(parsed.Choices) == 0 {
 		return "", errors.New("AI 未返回结果")
@@ -1282,27 +1263,10 @@ func callGemini(ctx context.Context, config AIProviderConfig, systemPrompt, user
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/%s:generateContent?key=%s", baseURL, model, url.QueryEscape(config.APIKey))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 18 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	body, _ := readResponseBodyLimited(resp.Body)
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+	headers := map[string]string{"Content-Type": "application/json"}
 	var parsed geminiResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	if parsed.Error != nil {
-		return "", errors.New(parsed.Error.Message)
+	if err := aiDoJSON(ctx, http.MethodPost, endpoint, headers, data, &parsed); err != nil {
+		return "", err
 	}
 	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
 		return "", errors.New("AI 未返回结果")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -222,7 +223,9 @@ func registerNodeToken(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 	req.Header.Set("X-AGENT-TOKEN", bootstrapToken)
 	var payload nodeRegisterResponse
-	if err := performAgentJSONRequest(client, req, "register", "register response has trailing data", &payload); err != nil {
+	if err := performAgentRequest(client, req, "register", func(body io.Reader) error {
+		return decodeStrictAgentJSON(body, &payload, "register response has trailing data")
+	}); err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(payload.AgentToken) == "" {

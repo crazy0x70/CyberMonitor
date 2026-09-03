@@ -229,7 +229,6 @@ type Store struct {
 	buildVersion       string
 	buildCommit        string
 	dataPath           string
-	historyPath        string
 	lastPersist        time.Time
 	persistInterval    time.Duration
 	alerted            map[string]alertState
@@ -531,7 +530,6 @@ func Run(ctx context.Context, cfg Config) error {
 		buildVersion:      version,
 		buildCommit:       commit,
 		dataPath:          dataPath,
-		historyPath:       historyPath,
 		persistInterval:   defaultPersistInterval,
 		alerted:           make(map[string]alertState),
 		offlineSessions:   offlineSessions,
@@ -802,18 +800,8 @@ func Run(ctx context.Context, cfg Config) error {
 			agentUpdateAdminHandler(w, r)
 			return
 		}
-		nodeID, err := url.PathUnescape(path)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-			return
-		}
-		nodeID, err = history.NormalizeNodeID(nodeID)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-			return
-		}
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+		nodeID, ok := adminNodeIDFromPath(w, path)
+		if !ok {
 			return
 		}
 		switch r.Method {
@@ -1393,9 +1381,12 @@ func Run(ctx context.Context, cfg Config) error {
 				hasBalanced := hub.HasVariant(publicVariantBalanced)
 				if hasBalanced {
 					snapshot := storeSnapshot(store, false)
-					if payload, err := json.Marshal(snapshot); err == nil {
-						digest := digestPublicSnapshot(snapshot)
-						if digest != lastBalancedDigest {
+					digest := digestPublicSnapshot(snapshot)
+					if digest != lastBalancedDigest {
+						payload, err := json.Marshal(snapshot)
+						if err != nil {
+							log.Printf("序列化节点快照失败: %v", err)
+						} else {
 							hub.BroadcastVariant(payload, publicVariantBalanced)
 							lastBalancedDigest = digest
 						}
@@ -1580,28 +1571,6 @@ func generateBootstrapToken() (string, error) {
 	return signed, nil
 }
 
-func (s *Store) Update(stats metrics.NodeStats) (bool, error) {
-	nodeID, err := history.NormalizeNodeID(stats.NodeID)
-	if err != nil || nodeID == "" {
-		return false, err
-	}
-	stats.NodeID = nodeID
-	hadNodeOrProfile := s.hasNodeOrProfile(nodeID)
-
-	unlock := s.lockAgentNodeRead(stats.NodeID)
-	if hadNodeOrProfile && !s.hasNodeOrProfile(nodeID) {
-		unlock()
-		return false, nil
-	}
-
-	updateReconciled, recoveryCandidate, err := s.updateNodeStats(stats)
-	unlock()
-	if recoveryCandidate != nil {
-		s.completeOfflineRecovery(*recoveryCandidate)
-	}
-	return updateReconciled, err
-}
-
 // updateNodeStats requires the caller to hold lockAgentNodeRead(stats.NodeID).
 func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecoveryCandidate, error) {
 	var persist bool
@@ -1733,20 +1702,6 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	return updateReconciled, recoveryCandidate, nil
 }
 
-func (s *Store) hasNodeOrProfile(nodeID string) bool {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if _, ok := s.nodes[nodeID]; ok {
-		return true
-	}
-	_, ok := s.profiles[nodeID]
-	return ok
-}
-
 func shouldReplaceNodeStats(current, incoming metrics.NodeStats) bool {
 	if strings.TrimSpace(current.NodeID) == "" {
 		return true
@@ -1867,8 +1822,8 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 				}
 			}
 		}
-		entry.Latency = append(entry.Latency, normalizeFloatPointer(test.LatencyMs))
-		entry.Loss = append(entry.Loss, normalizeFloatValue(test.PacketLoss))
+		entry.Latency = append(entry.Latency, history.CloneFloatPtr(test.LatencyMs))
+		entry.Loss = append(entry.Loss, history.NormalizeFloat(test.PacketLoss))
 		entry.Times = append(entry.Times, checkedAt)
 		entry.LastAt = checkedAt
 		trimHistoryEntry(entry, nowSec)
@@ -2024,26 +1979,6 @@ func trimHistoryEntry(entry *TestHistoryEntry, nowSec int64) bool {
 	entry.Loss = newLoss
 	entry.LastAt = entry.Times[len(entry.Times)-1]
 	return true
-}
-
-func normalizeFloatPointer(value *float64) *float64 {
-	if value == nil {
-		return nil
-	}
-	v := *value
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return nil
-	}
-	clone := v
-	return &clone
-}
-
-func normalizeFloatValue(value float64) *float64 {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil
-	}
-	clone := value
-	return &clone
 }
 
 type AlertEvent struct {
@@ -2501,27 +2436,6 @@ func cloneNodeState(value NodeState) NodeState {
 	return value
 }
 
-func cloneTestHistoryNode(source map[string]*TestHistoryEntry) map[string]*TestHistoryEntry {
-	if source == nil {
-		return nil
-	}
-	result := make(map[string]*TestHistoryEntry, len(source))
-	for key, entry := range source {
-		if entry == nil {
-			continue
-		}
-		result[key] = &TestHistoryEntry{
-			Latency:        slices.Clone(entry.Latency),
-			Loss:           slices.Clone(entry.Loss),
-			Times:          slices.Clone(entry.Times),
-			LastAt:         entry.LastAt,
-			MinIntervalSec: entry.MinIntervalSec,
-			AvgIntervalSec: entry.AvgIntervalSec,
-		}
-	}
-	return result
-}
-
 func cloneNodeStates(values map[string]NodeState) map[string]NodeState {
 	if len(values) == 0 {
 		return map[string]NodeState{}
@@ -2837,16 +2751,21 @@ func broadcastStoreSnapshot(hub *Hub, store *Store, withHistory bool) {
 	if hub == nil || store == nil {
 		return
 	}
-	payload, err := json.Marshal(storeSnapshot(store, withHistory))
-	if err != nil {
-		log.Printf("序列化节点快照失败: %v", err)
+	if !hub.HasVariant(publicVariantBalanced) && !hub.HasVariant(adminVariant) {
 		return
 	}
-	hub.BroadcastVariant(payload, publicVariantBalanced)
+	if hub.HasVariant(publicVariantBalanced) {
+		payload, err := json.Marshal(storeSnapshot(store, withHistory))
+		if err != nil {
+			log.Printf("序列化节点快照失败: %v", err)
+			return
+		}
+		hub.BroadcastVariant(payload, publicVariantBalanced)
+	}
 	if !hub.HasVariant(adminVariant) {
 		return
 	}
-	payload, err = json.Marshal(adminStoreSnapshot(store, withHistory))
+	payload, err := json.Marshal(adminStoreSnapshot(store, withHistory))
 	if err != nil {
 		log.Printf("序列化管理端节点快照失败: %v", err)
 		return
@@ -2871,6 +2790,17 @@ func digestPublicSnapshot(snapshot Snapshot) string {
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
+func cloneTestHistoryEntry(entry *TestHistoryEntry) *TestHistoryEntry {
+	return &TestHistoryEntry{
+		Latency:        slices.Clone(entry.Latency),
+		Loss:           slices.Clone(entry.Loss),
+		Times:          slices.Clone(entry.Times),
+		LastAt:         entry.LastAt,
+		MinIntervalSec: entry.MinIntervalSec,
+		AvgIntervalSec: entry.AvgIntervalSec,
+	}
+}
+
 func convertNetworkHistoryToTestHistory(
 	source map[string]*history.NetworkHistoryEntry,
 ) map[string]*TestHistoryEntry {
@@ -2879,14 +2809,14 @@ func convertNetworkHistoryToTestHistory(
 		if entry == nil {
 			continue
 		}
-		result[key] = &TestHistoryEntry{
-			Latency:        slices.Clone(entry.Latency),
-			Loss:           slices.Clone(entry.Loss),
-			Times:          slices.Clone(entry.Times),
+		result[key] = cloneTestHistoryEntry(&TestHistoryEntry{
+			Latency:        entry.Latency,
+			Loss:           entry.Loss,
+			Times:          entry.Times,
 			LastAt:         entry.LastAt,
 			MinIntervalSec: entry.MinIntervalSec,
 			AvgIntervalSec: entry.AvgIntervalSec,
-		}
+		})
 	}
 	return result
 }
@@ -2939,14 +2869,7 @@ func cloneTestHistory(
 			if entry == nil {
 				continue
 			}
-			copiedTests[key] = &TestHistoryEntry{
-				Latency:        slices.Clone(entry.Latency),
-				Loss:           slices.Clone(entry.Loss),
-				Times:          slices.Clone(entry.Times),
-				LastAt:         entry.LastAt,
-				MinIntervalSec: entry.MinIntervalSec,
-				AvgIntervalSec: entry.AvgIntervalSec,
-			}
+			copiedTests[key] = cloneTestHistoryEntry(entry)
 		}
 		if len(copiedTests) > 0 {
 			result[nodeID] = copiedTests
@@ -2998,6 +2921,9 @@ func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
 		leftGroup := views[i].Group
 		rightGroup := views[j].Group
 		if leftGroup == rightGroup {
+			if views[i].Alias == views[j].Alias {
+				return views[i].Stats.NodeID < views[j].Stats.NodeID
+			}
 			return views[i].Alias < views[j].Alias
 		}
 		return leftGroup < rightGroup
@@ -3099,8 +3025,18 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 	groups := normalizeGroupSelections(profile.Groups)
 	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
+	stats := cloneNodeStats(node.Stats)
+	if status == nodeStatusOffline {
+		// Offline nodes keep lifetime counters, but their last-reported
+		// instantaneous rates are stale and must not feed live totals.
+		stats.Network.TxBytesPerSec = 0
+		stats.Network.RxBytesPerSec = 0
+		stats.DiskIO.ReadBytesPerSec = 0
+		stats.DiskIO.WriteBytesPerSec = 0
+	}
+
 	return NodeView{
-		Stats:                    cloneNodeStats(node.Stats),
+		Stats:                    stats,
 		LastSeen:                 node.LastSeen.Unix(),
 		FirstSeen:                node.FirstSeen.Unix(),
 		Status:                   status,
@@ -3179,16 +3115,6 @@ func (h *Hub) Remove(conn *websocket.Conn) {
 func (h *Hub) CloseAdminClients() {
 	for _, client := range h.snapshotClients() {
 		if client != nil && client.variant == adminVariant {
-			h.removeClient(client)
-		}
-	}
-}
-
-func (h *Hub) Broadcast(payload []byte) {
-	clients := h.snapshotClients()
-	for _, client := range clients {
-		copied := bytes.Clone(payload)
-		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3747,9 +3673,8 @@ func (s *Store) PublicSettings() PublicSettings {
 	}
 }
 
-func (s *Store) SettingsView() SettingsView {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// settingsViewLocked requires the caller to hold s.mu (read or write).
+func (s *Store) settingsViewLocked() SettingsView {
 	loginFailLimit := s.settings.LoginFailLimit
 	if loginFailLimit < 0 {
 		loginFailLimit = 0
@@ -3783,6 +3708,12 @@ func (s *Store) SettingsView() SettingsView {
 		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
 		TestCatalog:          cloneTestCatalogItems(s.settings.TestCatalog),
 	}
+}
+
+func (s *Store) SettingsView() SettingsView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settingsViewLocked()
 }
 
 func (s *Store) ExportConfig() ConfigTransferData {
@@ -4210,39 +4141,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.markAgentConfigRefreshForCatalogChangeLocked(previousCatalog, catalog)
 		s.pruneProfileTestSelectionsLocked()
 	}
-	loginFailLimit := s.settings.LoginFailLimit
-	if loginFailLimit < 0 {
-		loginFailLimit = 0
-	}
-	view = SettingsView{
-		AdminPath:            s.settings.AdminPath,
-		AdminUser:            s.settings.AdminUser,
-		TurnstileSiteKey:     strings.TrimSpace(s.settings.TurnstileSiteKey),
-		TurnstileSecretKey:   "",
-		AgentEndpoint:        strings.TrimSpace(s.settings.AgentEndpoint),
-		AgentToken:           s.settings.AgentToken,
-		SiteTitle:            s.settings.SiteTitle,
-		SiteIcon:             s.settings.SiteIcon,
-		SiteBackgroundImage:  s.settings.SiteBackgroundImage,
-		HomeTitle:            s.settings.HomeTitle,
-		HomeSubtitle:         s.settings.HomeSubtitle,
-		Locale:               normalizeLocale(s.settings.Locale),
-		AlertWebhook:         s.settings.AlertWebhook,
-		AlertOfflineSec:      s.settings.AlertOfflineSec,
-		AlertTelegramToken:   s.settings.AlertTelegramToken,
-		AlertTelegramUserIDs: cloneInt64Slice(s.settings.AlertTelegramUserIDs),
-		AlertTelegramUserID:  firstTelegramUserID(s.settings.AlertTelegramUserIDs),
-		LoginFailLimit:       loginFailLimit,
-		LoginFailWindowSec:   s.settings.LoginFailWindowSec,
-		LoginLockSec:         s.settings.LoginLockSec,
-		AdminAuth:            redactAdminAuthSettings(normalizeAdminAuthSettings(s.settings.AdminAuth)),
-		AISettings:           cloneAISettings(s.settings.AISettings),
-		Version:              s.buildVersion,
-		Commit:               s.buildCommit,
-		Groups:               cloneStringSlice(s.settings.Groups),
-		GroupTree:            cloneGroupNodes(s.settings.GroupTree),
-		TestCatalog:          cloneTestCatalogItems(s.settings.TestCatalog),
-	}
+	view = s.settingsViewLocked()
 	s.mu.Unlock()
 
 	s.persist()
@@ -5019,49 +4918,36 @@ func (s *Store) DeleteNode(nodeID string) (bool, error) {
 		s.persist()
 	}
 	if historyCleanupErr != nil {
-		return true, &nodeDeleteHistoryCleanupError{err: historyCleanupErr}
+		return true, newNodeDeleteHistoryCleanupError(historyCleanupErr)
 	}
 	return true, nil
 }
 
-type nodeDeleteHistoryCleanupError struct {
+type historyCleanupError struct {
+	op  string
 	err error
 }
 
-func (e *nodeDeleteHistoryCleanupError) Error() string {
-	return "删除节点成功，" + e.HistoryError()
+func newNodeDeleteHistoryCleanupError(err error) *historyCleanupError {
+	return &historyCleanupError{op: "删除节点成功", err: err}
 }
 
-func (e *nodeDeleteHistoryCleanupError) Unwrap() error {
+func newClearNodesHistoryCleanupError(err error) *historyCleanupError {
+	return &historyCleanupError{op: "清空节点成功", err: err}
+}
+
+func (e *historyCleanupError) Error() string {
+	return e.op + "，" + e.HistoryError()
+}
+
+func (e *historyCleanupError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.err
 }
 
-func (e *nodeDeleteHistoryCleanupError) HistoryError() string {
-	if e == nil || e.err == nil {
-		return "历史数据清理失败"
-	}
-	return fmt.Sprintf("历史数据清理失败: %v", e.err)
-}
-
-type clearNodesHistoryCleanupError struct {
-	err error
-}
-
-func (e *clearNodesHistoryCleanupError) Error() string {
-	return "清空节点成功，" + e.HistoryError()
-}
-
-func (e *clearNodesHistoryCleanupError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.err
-}
-
-func (e *clearNodesHistoryCleanupError) HistoryError() string {
+func (e *historyCleanupError) HistoryError() string {
 	if e == nil || e.err == nil {
 		return "历史数据清理失败"
 	}
@@ -5102,13 +4988,9 @@ func (s *Store) ClearNodes() error {
 		s.persist()
 	}
 	if historyCleanupErr != nil {
-		return &clearNodesHistoryCleanupError{err: historyCleanupErr}
+		return newClearNodesHistoryCleanupError(historyCleanupErr)
 	}
 	return nil
-}
-
-func replayPendingHistoryCleanup(dataPath string, historyManager *history.Manager, payload PersistedData) (PersistedData, error) {
-	return replayPendingHistoryCleanupWithIntentMode(dataPath, historyManager, payload, true)
 }
 
 func replayPendingHistoryCleanupWithIntentMode(dataPath string, historyManager *history.Manager, payload PersistedData, clearIntent bool) (PersistedData, error) {
@@ -5367,18 +5249,6 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	return result, agentUpdateQueueQueued, nil
 }
 
-func (s *Store) ApplyAgentUpdateReport(nodeID string, report AgentUpdateReport) NodeProfile {
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return NodeProfile{}
-	}
-	unlock := s.lockAgentNodeRead(nodeID)
-	defer unlock()
-
-	profile, _ := s.applyAgentUpdateReportNodeLocked(nodeID, report)
-	return profile
-}
-
 // applyAgentUpdateReportNodeLocked requires the caller to hold lockAgentNodeRead(nodeID).
 func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) (NodeProfile, bool) {
 	s.mu.Lock()
@@ -5504,12 +5374,6 @@ func (s *Store) markAgentConfigRefreshLocked(nodeID string) {
 		s.configRefresh = make(map[string]struct{})
 	}
 	s.configRefresh[nodeID] = struct{}{}
-}
-
-func (s *Store) AgentConfig(nodeID string) AgentConfig {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.buildAgentConfigLocked(nodeID, false)
 }
 
 func (s *Store) DeliverAgentConfig(nodeID string, remoteUpdateCapable bool) (AgentConfig, bool) {
@@ -5873,16 +5737,6 @@ func generateToken(secret, subject, tokenSalt string) (string, int64, error) {
 	return str, exp.Unix(), err
 }
 
-func requireJWT(secret string, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if err := validateJWTFromRequest(secret, r); err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
-		}
-		next(w, r)
-	}
-}
-
 func requireAdminJWT(store *Store, secret string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := validateAdminJWT(store, secret, r); err != nil {
@@ -5912,34 +5766,6 @@ func isStateChangingMethod(method string) bool {
 	default:
 		return true
 	}
-}
-
-func validateScopedJWT(secret, token, expectedSubject string) error {
-	if strings.TrimSpace(token) == "" {
-		return errors.New("token required")
-	}
-	claims := &jwt.RegisteredClaims{}
-	parsed, err := jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return []byte(secret), nil
-	})
-	if err != nil {
-		return err
-	}
-	if parsed == nil || !parsed.Valid {
-		return errors.New("token invalid")
-	}
-	if expectedSubject != "" && claims.Subject != expectedSubject {
-		return errors.New("token subject mismatch")
-	}
-	return nil
-}
-
-func validateJWTFromRequest(secret string, r *http.Request) error {
-	token := extractToken(r)
-	return validateScopedJWT(secret, token, "")
 }
 
 func validateAdminJWT(store *Store, secret string, r *http.Request) error {
@@ -6000,9 +5826,6 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) erro
 		return err
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return errors.New("extra json content")
-		}
 		return errors.New("extra json content")
 	}
 	return nil
@@ -6314,6 +6137,26 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// adminNodeIDFromPath unescapes and normalizes the node ID carried in an
+// admin API path segment, writing the 400 response itself on failure.
+func adminNodeIDFromPath(w http.ResponseWriter, rawPath string) (string, bool) {
+	nodeID, err := url.PathUnescape(rawPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+		return "", false
+	}
+	nodeID, err = history.NormalizeNodeID(nodeID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
+		return "", false
+	}
+	if nodeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+		return "", false
+	}
+	return nodeID, true
+}
+
 func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (updater.ReleaseInfo, error) {
 	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(stats.AgentVersion))
 	return client.CheckLatest(ctx)
@@ -6326,18 +6169,8 @@ func adminAgentUpdateHandler(store *Store, hub *Hub, checkRelease agentReleaseCh
 			return
 		}
 		rawNodeID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/"), "/agent/update")
-		nodeID, err := url.PathUnescape(rawNodeID)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-			return
-		}
-		nodeID, err = history.NormalizeNodeID(nodeID)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-			return
-		}
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
+		nodeID, ok := adminNodeIDFromPath(w, rawNodeID)
+		if !ok {
 			return
 		}
 		store.mu.RLock()
@@ -6442,7 +6275,7 @@ func handleAdminPostAgentUpdate(
 
 func handleAdminClearNodesRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub) {
 	if err := store.ClearNodes(); err != nil {
-		var partialHistoryErr *clearNodesHistoryCleanupError
+		var partialHistoryErr *historyCleanupError
 		if errors.As(err, &partialHistoryErr) {
 			broadcastStoreSnapshot(hub, store, false)
 			writeJSON(w, http.StatusOK, map[string]string{
@@ -6461,7 +6294,7 @@ func handleAdminClearNodesRequest(w http.ResponseWriter, r *http.Request, store 
 func handleAdminDeleteNodeRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub, nodeID string) {
 	deleted, err := store.DeleteNode(nodeID)
 	if err != nil {
-		var partialHistoryErr *nodeDeleteHistoryCleanupError
+		var partialHistoryErr *historyCleanupError
 		if errors.As(err, &partialHistoryErr) {
 			broadcastStoreSnapshot(hub, store, false)
 			writeJSON(w, http.StatusOK, map[string]string{

@@ -35,7 +35,7 @@ jobs:
       stable: ${{ steps.version.outputs.stable }}
     steps:
       - name: Checkout release ref
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -96,13 +96,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -176,14 +176,14 @@ jobs:
             output: cyber-monitor-server-freebsd-arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -281,14 +281,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -323,7 +323,7 @@ jobs:
       actions: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
@@ -393,7 +393,7 @@ jobs:
           }
 
       - name: Set up Node
-        uses: actions/setup-node@v6.4.0
+        uses: actions/setup-node@v7.0.0
         with:
           node-version: ${{ steps.build-inputs.outputs.node_version }}
           cache: 'npm'
@@ -422,7 +422,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
@@ -463,7 +463,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
@@ -482,13 +482,13 @@ jobs:
           chmod +x docker-release/cyber-monitor-${{ matrix.suffix }}-linux-*
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4.2.0
+        uses: docker/setup-qemu-action@v4.3.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.2.0
+        uses: docker/setup-buildx-action@v4.3.0
 
       - name: Login to GHCR
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
@@ -531,7 +531,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0

@@ -67,14 +67,13 @@ type runtimeConfig struct {
 	group                   string
 	tests                   []metrics.NetworkTestConfig
 	interval                time.Duration
-	update                  *RemoteUpdateInstruction
 	allowPrivateRemoteTests bool
 }
 
 func newRuntimeConfig(cfg Config) *runtimeConfig {
 	interval := cfg.TestInterval
 	if interval <= 0 {
-		interval = 5 * time.Second
+		interval = DefaultTestInterval
 	}
 	return &runtimeConfig{
 		alias:                   cfg.NodeAlias,
@@ -89,32 +88,30 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.alias = remote.Alias
-	r.group = remote.Group
+	// 空值不覆盖：新节点注册后服务端尚无 alias/group，首次 sync 发生在
+	// 首次上报之前，无条件覆盖会把 -node-alias/-node-group 种子值清掉，
+	// 服务端（以首次上报为种子）就永远收不到它们。
+	if remote.Alias != "" {
+		r.alias = remote.Alias
+	}
+	if remote.Group != "" {
+		r.group = remote.Group
+	}
 	if remote.TestIntervalSec > 0 {
 		r.interval = time.Duration(remote.TestIntervalSec) * time.Second
 	}
 	if remote.Tests != nil {
 		r.tests = markRemoteNetworkTests(remote.Tests, !r.allowPrivateRemoteTests)
 	}
-	r.update = cloneRemoteUpdateInstruction(remote.Update)
 }
 
-func (r *runtimeConfig) Snapshot() (string, string, []metrics.NetworkTestConfig, time.Duration, *RemoteUpdateInstruction) {
+func (r *runtimeConfig) Snapshot() (string, string, []metrics.NetworkTestConfig, time.Duration) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	copyTests := make([]metrics.NetworkTestConfig, len(r.tests))
 	copy(copyTests, r.tests)
-	return r.alias, r.group, copyTests, r.interval, cloneRemoteUpdateInstruction(r.update)
-}
-
-func cloneRemoteUpdateInstruction(value *RemoteUpdateInstruction) *RemoteUpdateInstruction {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
+	return r.alias, r.group, copyTests, r.interval
 }
 
 func markRemoteNetworkTests(tests []metrics.NetworkTestConfig, publicOnly bool) []metrics.NetworkTestConfig {
@@ -176,18 +173,22 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	}
 
 	var payload RemoteConfig
-	if err := performAgentJSONRequest(client, req, "config", "config response has trailing data", &payload); err != nil {
+	if err := performAgentRequest(client, req, "config", func(body io.Reader) error {
+		return decodeStrictAgentJSON(body, &payload, "config response has trailing data")
+	}); err != nil {
 		return RemoteConfig{}, err
 	}
 	return payload, nil
 }
 
-func performAgentJSONRequest(
+// performAgentRequest issues an agent API request and turns >=300 responses
+// into agentAPIStatusError. A non-nil decode callback receives the response
+// body (e.g. the strict-JSON decoder); nil means the body is ignored.
+func performAgentRequest(
 	client *http.Client,
 	req *http.Request,
 	statusLabel string,
-	trailingMessage string,
-	target any,
+	decode func(io.Reader) error,
 ) error {
 	if client == nil {
 		return fmt.Errorf("http client required")
@@ -203,7 +204,10 @@ func performAgentJSONRequest(
 	if resp.StatusCode >= 300 {
 		return readAgentAPIStatusError(resp, statusLabel)
 	}
-	return decodeStrictAgentJSON(resp.Body, target, trailingMessage)
+	if decode == nil {
+		return nil
+	}
+	return decode(resp.Body)
 }
 
 func newAgentJSONRequest(
@@ -232,24 +236,6 @@ func newAgentJSONRequest(
 		req.Header.Set("X-AGENT-TOKEN", token)
 	}
 	return req, nil
-}
-
-func performAgentStatusRequest(client *http.Client, req *http.Request, operation string) error {
-	if client == nil {
-		return fmt.Errorf("http client required")
-	}
-	if req == nil {
-		return fmt.Errorf("http request required")
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return readAgentAPIStatusError(resp, operation)
-	}
-	return nil
 }
 
 func readAgentAPIErrorMessage(resp *http.Response, fallback string) string {

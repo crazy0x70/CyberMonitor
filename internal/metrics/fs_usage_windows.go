@@ -2,7 +2,7 @@
 
 package metrics
 
-import "github.com/shirou/gopsutil/v3/disk"
+import "github.com/shirou/gopsutil/v4/disk"
 
 func statFilesystemUsage(path string) (filesystemUsage, error) {
 	usage, err := disk.Usage(path)

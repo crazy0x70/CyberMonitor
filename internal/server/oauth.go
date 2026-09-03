@@ -265,7 +265,7 @@ func handleAdminOAuthStart(store *Store, jwtSecret string, trustedProxyHeaders b
 		providerID := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
 		settings := normalizeAdminAuthSettings(store.Credentials().AdminAuth)
 		redirectURI := adminOAuthRedirectURI(r, trustedProxyHeaders)
-		oauthConfig, nonce, err := adminOAuthConfigForProvider(r.Context(), providerID, settings, redirectURI)
+		oauthConfig, _, nonce, err := adminOAuthConfigForProvider(r.Context(), providerID, settings, redirectURI)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -325,7 +325,7 @@ func handleAdminOAuthCallback(store *Store, jwtSecret string, trustedProxyHeader
 		}
 
 		settings := normalizeAdminAuthSettings(store.Credentials().AdminAuth)
-		oauthConfig, _, err := adminOAuthConfigForProvider(r.Context(), payload.Provider, settings, adminOAuthRedirectURI(r, trustedProxyHeaders))
+		oauthConfig, provider, _, err := adminOAuthConfigForProvider(r.Context(), payload.Provider, settings, adminOAuthRedirectURI(r, trustedProxyHeaders))
 		if err != nil {
 			http.Error(w, "OAuth provider disabled", http.StatusUnauthorized)
 			return
@@ -336,7 +336,7 @@ func handleAdminOAuthCallback(store *Store, jwtSecret string, trustedProxyHeader
 			http.Error(w, "OAuth exchange failed", http.StatusUnauthorized)
 			return
 		}
-		identity, err := adminOAuthIdentityForProvider(ctx, payload.Provider, settings, token, payload.Nonce)
+		identity, err := adminOAuthIdentityForProvider(ctx, payload.Provider, settings, provider, token, payload.Nonce)
 		if err != nil {
 			http.Error(w, "OAuth identity rejected", http.StatusUnauthorized)
 			return
@@ -354,11 +354,11 @@ func handleAdminOAuthCallback(store *Store, jwtSecret string, trustedProxyHeader
 	}
 }
 
-func adminOAuthConfigForProvider(ctx context.Context, providerID string, settings AdminAuthSettings, redirectURI string) (oauth2.Config, string, error) {
+func adminOAuthConfigForProvider(ctx context.Context, providerID string, settings AdminAuthSettings, redirectURI string) (oauth2.Config, *oidc.Provider, string, error) {
 	switch providerID {
 	case adminOAuthProviderGitHub:
 		if !githubOAuthReady(settings.GitHub) {
-			return oauth2.Config{}, "", errors.New("github oauth disabled")
+			return oauth2.Config{}, nil, "", errors.New("github oauth disabled")
 		}
 		return oauth2.Config{
 			ClientID:     settings.GitHub.ClientID,
@@ -366,18 +366,18 @@ func adminOAuthConfigForProvider(ctx context.Context, providerID string, setting
 			RedirectURL:  redirectURI,
 			Scopes:       settings.GitHub.Scopes,
 			Endpoint:     github.Endpoint,
-		}, "", nil
+		}, nil, "", nil
 	case adminOAuthProviderOIDC:
 		if !oidcOAuthReady(settings.OIDC) {
-			return oauth2.Config{}, "", errors.New("oidc disabled")
+			return oauth2.Config{}, nil, "", errors.New("oidc disabled")
 		}
 		provider, err := oidc.NewProvider(adminOAuthContext(ctx), settings.OIDC.IssuerURL)
 		if err != nil {
-			return oauth2.Config{}, "", err
+			return oauth2.Config{}, nil, "", err
 		}
 		nonce, err := randomToken(32)
 		if err != nil {
-			return oauth2.Config{}, "", err
+			return oauth2.Config{}, nil, "", err
 		}
 		return oauth2.Config{
 			ClientID:     settings.OIDC.ClientID,
@@ -385,18 +385,18 @@ func adminOAuthConfigForProvider(ctx context.Context, providerID string, setting
 			RedirectURL:  redirectURI,
 			Scopes:       settings.OIDC.Scopes,
 			Endpoint:     provider.Endpoint(),
-		}, nonce, nil
+		}, provider, nonce, nil
 	default:
-		return oauth2.Config{}, "", errors.New("unknown oauth provider")
+		return oauth2.Config{}, nil, "", errors.New("unknown oauth provider")
 	}
 }
 
-func adminOAuthIdentityForProvider(ctx context.Context, providerID string, settings AdminAuthSettings, token *oauth2.Token, nonce string) (adminOAuthIdentity, error) {
+func adminOAuthIdentityForProvider(ctx context.Context, providerID string, settings AdminAuthSettings, provider *oidc.Provider, token *oauth2.Token, nonce string) (adminOAuthIdentity, error) {
 	switch providerID {
 	case adminOAuthProviderGitHub:
 		return fetchGitHubOAuthIdentity(ctx, settings.GitHub, token)
 	case adminOAuthProviderOIDC:
-		return verifyOIDCOAuthIdentity(ctx, settings.OIDC, token, nonce)
+		return verifyOIDCOAuthIdentity(ctx, settings.OIDC, provider, token, nonce)
 	default:
 		return adminOAuthIdentity{}, errors.New("unknown oauth provider")
 	}
@@ -422,7 +422,9 @@ func fetchGitHubOAuthIdentity(ctx context.Context, settings OAuth2ProviderSettin
 		Primary  bool   `json:"primary"`
 		Verified bool   `json:"verified"`
 	}
-	if err := fetchOAuthJSON(client, "https://api.github.com/user/emails", &emails); err == nil {
+	if err := fetchOAuthJSON(client, "https://api.github.com/user/emails", &emails); err != nil {
+		log.Printf("管理员 GitHub 邮箱获取失败: %v", err)
+	} else {
 		for _, item := range emails {
 			email := strings.ToLower(strings.TrimSpace(item.Email))
 			if email == "" {
@@ -458,14 +460,10 @@ func fetchOAuthJSON(client *http.Client, endpoint string, target any) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target)
 }
 
-func verifyOIDCOAuthIdentity(ctx context.Context, settings OIDCProviderSettings, token *oauth2.Token, nonce string) (adminOAuthIdentity, error) {
+func verifyOIDCOAuthIdentity(ctx context.Context, settings OIDCProviderSettings, provider *oidc.Provider, token *oauth2.Token, nonce string) (adminOAuthIdentity, error) {
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok || strings.TrimSpace(rawIDToken) == "" {
 		return adminOAuthIdentity{}, errors.New("id_token missing")
-	}
-	provider, err := oidc.NewProvider(adminOAuthContext(ctx), settings.IssuerURL)
-	if err != nil {
-		return adminOAuthIdentity{}, err
 	}
 	verifier := provider.Verifier(&oidc.Config{ClientID: settings.ClientID})
 	idToken, err := verifier.Verify(ctx, rawIDToken)

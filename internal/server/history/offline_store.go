@@ -22,13 +22,6 @@ const offlineRetention = 2 * 365 * 24 * time.Hour
 
 var errNilOfflineStore = errors.New("offline history store is nil")
 
-type OfflineSummary struct {
-	TotalCount             int
-	LongestDurationSec     float64
-	AvgDurationSec         float64
-	LastOfflineRecoveredAt time.Time
-}
-
 type OfflineSession struct {
 	StartedAt   time.Time
 	RecoveredAt time.Time
@@ -108,33 +101,6 @@ func (s *OfflineStore) AppendEvent(nodeID string, recoveredAt time.Time, duratio
 	}
 	committed = true
 	return nil
-}
-
-func (s *OfflineStore) QuerySummary(nodeID string, from, to time.Time) (OfflineSummary, error) {
-	if s == nil || s.db == nil {
-		return OfflineSummary{}, errNilOfflineStore
-	}
-
-	var stats offlineSessionStats
-	if err := s.collectSessions(nodeID, from, to, &stats, nil, nil); err != nil {
-		return OfflineSummary{}, err
-	}
-	return stats.Summary(), nil
-}
-
-func (s *OfflineStore) QueryRecentSessions(nodeID string, from, to time.Time, limit int) ([]OfflineSession, error) {
-	if s == nil || s.db == nil {
-		return nil, errNilOfflineStore
-	}
-	if limit <= 0 {
-		return nil, nil
-	}
-
-	recent := newRecentOfflineSessions(limit)
-	if err := s.collectSessions(nodeID, from, to, nil, recent, nil); err != nil {
-		return nil, err
-	}
-	return recent.NewestFirst(), nil
 }
 
 func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit int) (OfflineInsights, error) {
@@ -322,15 +288,6 @@ func (stats offlineSessionStats) AvgDurationSec() float64 {
 		return 0
 	}
 	return stats.totalSecs / float64(stats.totalCount)
-}
-
-func (stats offlineSessionStats) Summary() OfflineSummary {
-	return OfflineSummary{
-		TotalCount:             stats.totalCount,
-		LongestDurationSec:     stats.longestDurationSec,
-		AvgDurationSec:         stats.AvgDurationSec(),
-		LastOfflineRecoveredAt: stats.lastOfflineRecoveredAt,
-	}
 }
 
 func (stats offlineSessionStats) FillInsights(insights *OfflineInsights) {

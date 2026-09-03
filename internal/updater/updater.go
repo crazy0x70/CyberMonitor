@@ -587,11 +587,6 @@ func VersionsEqual(current, latest string) bool {
 	return compareComparableVersions(currentVersion, latestVersion) == 0
 }
 
-func parseVersion(value string) [3]int {
-	version, _ := parseComparableVersion(value)
-	return version.parts
-}
-
 func parseComparableVersion(value string) (comparableVersion, bool) {
 	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
 	if plus := strings.IndexByte(value, '+'); plus >= 0 {

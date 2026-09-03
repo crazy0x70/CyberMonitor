@@ -284,19 +284,4 @@ function setupThemeToggle() {
   setupGlobalMenuDismiss();
 }
 
-function setupSkipLink() {
-  const link = document.querySelector(".skip-link");
-  const target = document.getElementById("public-main-content");
-  if (!link || !target) return;
-
-  link.addEventListener("click", (event) => {
-    event.preventDefault();
-    target.scrollIntoView({ block: "start" });
-    if (typeof target.focus === "function") {
-      target.focus({ preventScroll: true });
-    }
-  });
-}
-
 setupThemeToggle();
-setupSkipLink();

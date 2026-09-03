@@ -16,6 +16,9 @@ import (
 	"cyber_monitor/internal/updater"
 )
 
+// DefaultTestInterval 是网络测试间隔未配置时的默认值。
+const DefaultTestInterval = 5 * time.Second
+
 type dockerManagedUpdater interface {
 	CurrentImage() string
 	LaunchSelfContainerUpdate(context.Context, string, string) error
@@ -47,8 +50,6 @@ type Config struct {
 	DisableUpdate           bool
 	AllowPrivateRemoteTests bool
 	TokenFile               string
-
-	transportOptions grpcTransportOptions
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -62,7 +63,7 @@ func Run(ctx context.Context, cfg Config) error {
 	configureHostEnv(cfg.HostRoot)
 
 	client := &http.Client{Timeout: 6 * time.Second}
-	transport := newControlPlaneTransport(cfg, client)
+	transport := newControlPlaneTransportWithOptions(cfg, client, grpcTransportOptions{})
 	defer transport.Close()
 	runner := newAgentRunner(cfg, transport, metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces))
 	runner.bootstrapToken(ctx)
@@ -122,43 +123,62 @@ func maybeApplyRemoteUpdate(
 		return reportUpdateState(report, update, "failed", targetVersion, "控制面未使用 HTTPS，拒绝远程更新")
 	}
 	if canDockerManagedUpdate() {
-		log.Printf("检测到 Docker 托管更新能力，正在初始化 Docker updater")
-		dockerInitCtx, cancelDockerInit := context.WithTimeout(ctx, dockerManagedInitTimeout)
-		dockerUpdater, err := newDockerManagedUpdater(dockerInitCtx)
-		cancelDockerInit()
-		if err != nil {
-			err = wrapDockerManagedUpdateError("初始化 Docker updater", err)
-			log.Printf("%v", err)
-			return reportUpdateState(report, update, "failed", targetVersion, err.Error())
-		}
-		targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
-		if err != nil {
-			err = wrapDockerManagedUpdateError("解析 Docker 目标镜像", err)
-			log.Printf("%v", err)
-			return reportUpdateState(report, update, "failed", targetVersion, err.Error())
-		}
-		log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
-		if err := reportUpdateState(report, update, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
-			return err
-		}
-		dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(context.Background(), dockerManagedLaunchTimeout)
-		err = dockerUpdater.LaunchSelfContainerUpdate(dockerLaunchCtx, targetImage, cfg.NodeID)
-		cancelDockerLaunch()
-		if err != nil {
-			err = wrapDockerManagedUpdateError("执行 Docker 更新 helper", err)
-			log.Printf("%v", err)
-			reportErr := reportUpdateState(report, update, "failed", targetVersion, err.Error())
-			if reportErr != nil {
-				return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
-			}
-			return err
-		}
-		if err := reportUpdateState(report, update, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
-			log.Printf("上报 Agent Docker 重建状态失败: %v", err)
-		}
-		log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
-		return nil
+		return applyDockerManagedUpdate(ctx, report, cfg, update, currentVersion, targetVersion)
 	}
+	return applyBinarySelfUpdate(ctx, report, update, currentVersion, targetVersion)
+}
+
+func applyDockerManagedUpdate(
+	ctx context.Context,
+	report updateReporter,
+	cfg Config,
+	update *RemoteUpdateInstruction,
+	currentVersion, targetVersion string,
+) error {
+	log.Printf("检测到 Docker 托管更新能力，正在初始化 Docker updater")
+	dockerInitCtx, cancelDockerInit := context.WithTimeout(ctx, dockerManagedInitTimeout)
+	dockerUpdater, err := newDockerManagedUpdater(dockerInitCtx)
+	cancelDockerInit()
+	if err != nil {
+		err = wrapDockerManagedUpdateError("初始化 Docker updater", err)
+		log.Printf("%v", err)
+		return reportUpdateState(report, update, "failed", targetVersion, err.Error())
+	}
+	targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
+	if err != nil {
+		err = wrapDockerManagedUpdateError("解析 Docker 目标镜像", err)
+		log.Printf("%v", err)
+		return reportUpdateState(report, update, "failed", targetVersion, err.Error())
+	}
+	log.Printf("开始执行 Docker 托管更新: 当前版本=%s，目标版本=%s", currentVersion, targetVersion)
+	if err := reportUpdateState(report, update, "updating", targetVersion, "正在拉取新镜像并准备重建 Agent 容器"); err != nil {
+		return err
+	}
+	dockerLaunchCtx, cancelDockerLaunch := context.WithTimeout(context.Background(), dockerManagedLaunchTimeout)
+	err = dockerUpdater.LaunchSelfContainerUpdate(dockerLaunchCtx, targetImage, cfg.NodeID)
+	cancelDockerLaunch()
+	if err != nil {
+		err = wrapDockerManagedUpdateError("执行 Docker 更新 helper", err)
+		log.Printf("%v", err)
+		reportErr := reportUpdateState(report, update, "failed", targetVersion, err.Error())
+		if reportErr != nil {
+			return fmt.Errorf("%v；上报失败状态时又出错: %w", err, reportErr)
+		}
+		return err
+	}
+	if err := reportUpdateState(report, update, "restarting", targetVersion, "Docker 更新任务已启动，Agent 容器即将重建"); err != nil {
+		log.Printf("上报 Agent Docker 重建状态失败: %v", err)
+	}
+	log.Printf("Docker 更新任务已启动: 目标镜像=%s", targetImage)
+	return nil
+}
+
+func applyBinarySelfUpdate(
+	ctx context.Context,
+	report updateReporter,
+	update *RemoteUpdateInstruction,
+	currentVersion, targetVersion string,
+) error {
 	if !updater.CanSelfUpdate() {
 		log.Printf("拒绝远程更新: 当前部署模式不支持 Agent 自更新，目标版本=%s", targetVersion)
 		return reportUpdateState(report, update, "failed", targetVersion, resolveUnsupportedUpdateMessage())
@@ -261,7 +281,7 @@ func postAgentUpdateReport(
 	if err != nil {
 		return err
 	}
-	return performAgentStatusRequest(client, req, "update report")
+	return performAgentRequest(client, req, "update report", nil)
 }
 
 type cachedTest struct {
@@ -290,7 +310,7 @@ func runNetworkTestsWithCacheAt(
 		return handleEmptyConfigs(cache)
 	}
 	if defaultInterval <= 0 {
-		defaultInterval = 5 * time.Second
+		defaultInterval = DefaultTestInterval
 	}
 	if now == nil {
 		now = time.Now

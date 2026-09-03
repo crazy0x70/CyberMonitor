@@ -45,7 +45,7 @@ func main() {
 	allowPrivateRemoteTests := flag.Bool("allow-private-remote-tests", cmdutil.EnvBool("CM_ALLOW_PRIVATE_REMOTE_TESTS", false), "允许服务端下发内网网络测试目标")
 	netIface := flag.String("net-iface", cmdutil.EnvOrDefault("CM_NET_IFACE", ""), "采集指定网卡(逗号分隔)")
 	netTestsRaw := flag.String("net-tests", cmdutil.EnvOrDefault("CM_NET_TESTS", ""), "网络测试目标列表")
-	testInterval := flag.Duration("test-interval", cmdutil.EnvDuration("CM_TEST_INTERVAL", 5*time.Second), "网络测试间隔")
+	testInterval := flag.Duration("test-interval", cmdutil.EnvDuration("CM_TEST_INTERVAL", agent.DefaultTestInterval), "网络测试间隔")
 	hostRoot := flag.String("host-root", cmdutil.EnvOrDefault("CM_HOST_ROOT", "/host"), "宿主机挂载根目录")
 	flag.Parse()
 

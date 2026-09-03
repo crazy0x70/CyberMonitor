@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -13,17 +14,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/cpu"
-	"github.com/shirou/gopsutil/v3/disk"
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/mem"
-	gnet "github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/load"
+	"github.com/shirou/gopsutil/v4/mem"
+	gnet "github.com/shirou/gopsutil/v4/net"
 )
 
 type CPUInfo struct {
@@ -146,6 +148,16 @@ const (
 	defaultPublicIPRetryInterval     = time.Minute
 	defaultPublicIPLookupTimeout     = 2 * time.Second
 
+	// The agent samples metrics roughly every second; these TTLs keep
+	// identity-like inputs from being re-derived on every tick while staying
+	// short enough to pick up host changes.
+	nvidiaSMIPathRefreshInterval = 60 * time.Second
+	gpuSampleRefreshInterval     = 5 * time.Second
+	netFilterRefreshInterval     = 10 * time.Second
+	netSpeedRefreshInterval      = 10 * time.Second
+	hostHostnameRefreshInterval  = 60 * time.Second
+	hostMountsRefreshInterval    = 10 * time.Second
+
 	publicIPv4Family publicIPFamily = "ipv4"
 	publicIPv6Family publicIPFamily = "ipv6"
 )
@@ -168,11 +180,9 @@ var defaultPublicIPv6Endpoints = []string{
 type publicIPLookupFunc func(context.Context, publicIPFamily) (string, error)
 
 type publicIPInfo struct {
-	IPv4       string
-	IPv6       string
-	checkedAt  time.Time
-	ipv4Failed bool
-	ipv6Failed bool
+	IPv4      string
+	IPv6      string
+	checkedAt time.Time
 }
 
 type collectorStaticInfo struct {
@@ -194,6 +204,24 @@ type Collector struct {
 	prevTCP    int
 	prevUDP    int
 	prevConnAt time.Time
+
+	// TTL caches for identity-like inputs that must not be re-derived on
+	// every ~1s tick. The Collector is used from a single goroutine, like
+	// the other sampler state above.
+	resolvedNetFilter   map[string]struct{}
+	resolvedNetFilterAt time.Time
+	netSpeedMbps        float64
+	netSpeedSampledAt   time.Time
+	hostHostname        string
+	hostHostnameAt      time.Time
+	hostMounts          []hostMount
+	hostMountsAt        time.Time
+	nvidiaSMIPath       string
+	nvidiaSMIPathAt     time.Time
+	gpuSample           []GPUInfo
+	gpuSampleStatic     bool
+	gpuSampleAt         time.Time
+	sourceWarningsShown map[string]struct{}
 
 	publicIPs               publicIPInfo
 	publicIPRefreshInterval time.Duration
@@ -228,36 +256,37 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 func (c *Collector) Collect() (NodeStats, error) {
 	now := time.Now()
 
-	cpuPercents, _ := cpu.Percent(0, false)
+	cpuPercents, err := cpu.Percent(0, false)
+	c.warnOnce("cpu.Percent", err)
 	usage := 0.0
 	if len(cpuPercents) > 0 {
 		usage = cpuPercents[0]
 	}
 
-	loadAvg, _ := load.Avg()
+	loadAvg, err := load.Avg()
+	c.warnOnce("load.Avg", err)
 	memStat := c.collectMemoryStat()
-	partitions, _ := disk.Partitions(false)
+	partitions, err := disk.Partitions(false)
+	c.warnOnce("disk.Partitions", err)
 	staticInfoRefreshed := c.refreshStaticInfoAt(now, partitions)
 
-	diskUsage := c.collectDiskUsage(partitions)
+	diskUsage := c.collectDiskUsage(now, partitions)
 
-	diskCounters, _ := disk.IOCounters()
+	diskCounters, err := disk.IOCounters()
+	c.warnOnce("disk.IOCounters", err)
 	var diskRead, diskWrite uint64
 	for _, stat := range diskCounters {
 		diskRead += stat.ReadBytes
 		diskWrite += stat.WriteBytes
 	}
 
-	netFilter := c.netIfaces
-	if len(netFilter) == 0 {
-		if ifaces, err := gnet.Interfaces(); err == nil {
-			netFilter = resolveInterfaceFilter(nil, ifaces)
-		}
-	}
-	netCounters, _ := gnet.IOCounters(true)
+	netFilter := c.resolveNetFilterAt(now)
+	netCounters, err := gnet.IOCounters(true)
+	c.warnOnce("net.IOCounters", err)
 	netStat := sumNetCounters(netCounters, netFilter)
 
-	hostInfo, _ := host.Info()
+	hostInfo, err := host.Info()
+	c.warnOnce("host.Info", err)
 	hostname := ""
 	uptime := uint64(0)
 	processCount := 0
@@ -266,15 +295,15 @@ func (c *Collector) Collect() (NodeStats, error) {
 		uptime = hostInfo.Uptime
 		processCount = int(hostInfo.Procs)
 	}
-	if hostName := readHostHostname(c.hostRoot); hostName != "" {
+	if hostName := c.readHostHostnameAt(now); hostName != "" {
 		hostname = hostName
 	}
 
 	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
 
-	netSpeedMbps := collectNetSpeedMbps(netFilter)
+	netSpeedMbps := c.collectNetSpeedMbpsAt(now, netFilter)
 	publicIPs := c.collectPublicIPsAt(now)
-	gpuStats := collectGPUStats(staticInfoRefreshed)
+	gpuStats := c.collectGPUStatsAt(now, staticInfoRefreshed, runNVIDIAGPUSample)
 	loadStat := valueOrZero(loadAvg)
 	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
@@ -451,6 +480,62 @@ func (c *Collector) sampleConnectionCountsAt(
 	return c.prevTCP, c.prevUDP
 }
 
+// warnOnce logs the first error seen from a metrics source so a broken input
+// (e.g. a wrong HOST_PROC) surfaces in logs instead of silently producing
+// all-zero telemetry. The Collector runs on a single goroutine, so no locking
+// is needed.
+func (c *Collector) warnOnce(source string, err error) {
+	if err == nil {
+		return
+	}
+	if c.sourceWarningsShown == nil {
+		c.sourceWarningsShown = make(map[string]struct{})
+	}
+	if _, shown := c.sourceWarningsShown[source]; shown {
+		return
+	}
+	c.sourceWarningsShown[source] = struct{}{}
+	log.Printf("指标源 %s 采集失败: %v", source, err)
+}
+
+// resolveNetFilterAt returns the interface filter used to aggregate network
+// counters. An explicitly configured filter (len(c.netIfaces) > 0) is static;
+// otherwise the default filter is re-resolved from the interface list at most
+// once per netFilterRefreshInterval.
+func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
+	if len(c.netIfaces) > 0 {
+		return c.netIfaces
+	}
+	if !c.resolvedNetFilterAt.IsZero() && now.Sub(c.resolvedNetFilterAt) < netFilterRefreshInterval {
+		return c.resolvedNetFilter
+	}
+	if ifaces, err := gnet.Interfaces(); err == nil {
+		c.resolvedNetFilter = resolveInterfaceFilter(nil, ifaces)
+		c.resolvedNetFilterAt = now
+	}
+	return c.resolvedNetFilter
+}
+
+// collectNetSpeedMbpsAt caches the sampled link speed, which re-reads sysfs
+// per interface and changes at most when the interface set does.
+func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struct{}) float64 {
+	if !c.netSpeedSampledAt.IsZero() && now.Sub(c.netSpeedSampledAt) < netSpeedRefreshInterval {
+		return c.netSpeedMbps
+	}
+	c.netSpeedMbps = collectNetSpeedMbps(filter)
+	c.netSpeedSampledAt = now
+	return c.netSpeedMbps
+}
+
+// readHostHostnameAt caches the host's /etc/hostname content.
+func (c *Collector) readHostHostnameAt(now time.Time) string {
+	if c.hostHostnameAt.IsZero() || now.Sub(c.hostHostnameAt) >= hostHostnameRefreshInterval {
+		c.hostHostname = readHostHostname(c.hostRoot)
+		c.hostHostnameAt = now
+	}
+	return c.hostHostname
+}
+
 func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 	refreshInterval := c.publicIPRefreshInterval
 	if refreshInterval <= 0 {
@@ -476,21 +561,16 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 	type lookupResult struct {
 		family publicIPFamily
 		ip     string
-		failed bool
 	}
 
 	familiesToCheck := []publicIPFamily{publicIPv4Family, publicIPv6Family}
-
-	if len(familiesToCheck) == 0 {
-		return c.publicIPs
-	}
 
 	results := make(chan lookupResult, len(familiesToCheck))
 	for _, family := range familiesToCheck {
 		go func(family publicIPFamily) {
 			normalized, err := c.lookupPublicIPAt(ctx, family)
 			if err != nil || normalized == "" {
-				results <- lookupResult{family: family, failed: true}
+				results <- lookupResult{family: family}
 				return
 			}
 			results <- lookupResult{family: family, ip: normalized}
@@ -503,16 +583,10 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 		case publicIPv4Family:
 			if result.ip != "" {
 				next.IPv4 = result.ip
-				next.ipv4Failed = false
-			} else if result.failed {
-				next.ipv4Failed = c.publicIPs.IPv4 == ""
 			}
 		case publicIPv6Family:
 			if result.ip != "" {
 				next.IPv6 = result.ip
-				next.ipv6Failed = false
-			} else if result.failed {
-				next.ipv6Failed = c.publicIPs.IPv6 == ""
 			}
 		}
 	}
@@ -871,8 +945,8 @@ func parseSpeedMbps(raw string) float64 {
 	return parsed * multiplier
 }
 
-func (c *Collector) collectDiskUsage(partitions []disk.PartitionStat) []DiskPartition {
-	if hostUsage := c.collectHostDiskUsage(); len(hostUsage) > 0 {
+func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionStat) []DiskPartition {
+	if hostUsage := c.collectHostDiskUsage(now); len(hostUsage) > 0 {
 		return hostUsage
 	}
 
@@ -892,31 +966,16 @@ func (c *Collector) collectDiskUsage(partitions []disk.PartitionStat) []DiskPart
 		}
 	}
 
-	seen := make(map[string]struct{})
-	diskUsage := make([]DiskPartition, 0, len(partitions))
+	candidates := make([]mountCandidate, 0, len(partitions))
 	for _, p := range partitions {
-		if shouldSkipPartition(p) {
-			continue
-		}
-		if _, exists := seen[p.Mountpoint]; exists {
-			continue
-		}
-		seen[p.Mountpoint] = struct{}{}
-		usageStat, err := statFilesystemUsage(p.Mountpoint)
-		if err != nil {
-			continue
-		}
-		diskUsage = append(diskUsage, DiskPartition{
-			Device:      p.Device,
-			Mountpoint:  p.Mountpoint,
-			Fstype:      p.Fstype,
-			Total:       usageStat.Total,
-			Used:        usageStat.Used,
-			Free:        usageStat.Free,
-			UsedPercent: usageStat.UsedPercent,
+		candidates = append(candidates, mountCandidate{
+			Device:     p.Device,
+			Mountpoint: p.Mountpoint,
+			Fstype:     p.Fstype,
+			StatPath:   p.Mountpoint,
 		})
 	}
-	return diskUsage
+	return collectPartitionUsage(candidates)
 }
 
 type filesystemUsage struct {
@@ -933,45 +992,143 @@ type hostMount struct {
 	Fstype     string
 }
 
-func (c *Collector) collectHostDiskUsage() []DiskPartition {
+type mountCandidate struct {
+	Device     string
+	Mountpoint string
+	Fstype     string
+	StatPath   string
+}
+
+func (c *Collector) collectHostDiskUsage(now time.Time) []DiskPartition {
 	hostRoot := strings.TrimSpace(c.hostRoot)
 	if hostRoot == "" || !isDir(hostRoot) {
 		return nil
 	}
 
-	mounts, err := readHostMounts(hostRoot)
+	mounts, err := c.readHostMountsAt(now)
 	if err != nil || len(mounts) == 0 {
 		return nil
 	}
 
-	seen := make(map[string]struct{})
-	diskUsage := make([]DiskPartition, 0, len(mounts))
+	candidates := make([]mountCandidate, 0, len(mounts))
 	for _, mount := range mounts {
-		partition := disk.PartitionStat{
+		candidates = append(candidates, mountCandidate{
 			Device:     mount.Device,
 			Mountpoint: mount.Mountpoint,
 			Fstype:     mount.Fstype,
-		}
-		if shouldSkipPartition(partition) {
-			continue
-		}
-		if _, exists := seen[mount.Mountpoint]; exists {
-			continue
-		}
-		seen[mount.Mountpoint] = struct{}{}
+			StatPath:   resolveHostMountPath(hostRoot, mount.Mountpoint),
+		})
+	}
+	return collectPartitionUsage(candidates)
+}
 
-		hostPath := resolveHostMountPath(hostRoot, mount.Mountpoint)
-		usageStat, err := statFilesystemUsage(hostPath)
+// readHostMountsAt caches the parsed host mount list. Mounts can appear while
+// the agent runs, so the cache only holds for hostMountsRefreshInterval;
+// failures are not cached and are retried on the next tick.
+func (c *Collector) readHostMountsAt(now time.Time) ([]hostMount, error) {
+	if !c.hostMountsAt.IsZero() && now.Sub(c.hostMountsAt) < hostMountsRefreshInterval {
+		return c.hostMounts, nil
+	}
+	mounts, err := readHostMounts(c.hostRoot)
+	if err != nil {
+		return nil, err
+	}
+	c.hostMounts = mounts
+	c.hostMountsAt = now
+	return mounts, nil
+}
+
+// apfsContainerDevice maps an APFS volume device (e.g. /dev/disk3s1s1) to
+// its container device (/dev/disk3). All volumes of one container share the
+// same physical space and statfs reports container-level totals for every
+// volume, so they must dedupe to one entry or the disk is counted N times
+// (a 1TB Mac shows ~4.6TB across 5 system volumes).
+var apfsContainerDevicePattern = regexp.MustCompile(`^(/dev/disk\d+)(?:s\d+)+$`)
+
+func apfsContainerDevice(fstype, device string) string {
+	if !strings.EqualFold(strings.TrimSpace(fstype), "apfs") {
+		return device
+	}
+	if match := apfsContainerDevicePattern.FindStringSubmatch(device); match != nil {
+		return match[1]
+	}
+	return device
+}
+
+// collectPartitionUsage converts mounts into disk usage entries. It filters
+// virtual and network filesystems, dedupes repeated mountpoints and devices
+// (the same block device mounted at several mountpoints, e.g. btrfs
+// subvolumes or bind mounts, is only counted once; APFS volumes of one
+// container dedupe to the container, preferring the root mountpoint),
+// samples filesystem usage, and overrides the statfs total with the backing
+// block device capacity when sysfs reports one.
+func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
+	seenMountpoints := make(map[string]struct{})
+	seenDevices := make(map[string]struct{})
+	apfsEntryIndex := make(map[string]int)
+	diskUsage := make([]DiskPartition, 0, len(candidates))
+	for _, candidate := range candidates {
+		device := strings.TrimSpace(candidate.Device)
+		if device == "" {
+			continue
+		}
+		if shouldSkipPartition(disk.PartitionStat{
+			Device:     device,
+			Mountpoint: candidate.Mountpoint,
+			Fstype:     candidate.Fstype,
+		}) {
+			continue
+		}
+		if _, exists := seenMountpoints[candidate.Mountpoint]; exists {
+			continue
+		}
+		deviceKey := apfsContainerDevice(candidate.Fstype, device)
+		if device != "none" {
+			if _, exists := seenDevices[deviceKey]; exists {
+				// Same APFS container seen again: every volume reports the
+				// identical container-level statfs, so only upgrade the
+				// representative to the root mountpoint when it shows up.
+				if index, ok := apfsEntryIndex[deviceKey]; ok && candidate.Mountpoint == "/" && diskUsage[index].Mountpoint != "/" {
+					diskUsage[index].Device = deviceKey
+					diskUsage[index].Mountpoint = candidate.Mountpoint
+				}
+				continue
+			}
+		}
+
+		usageStat, err := statFilesystemUsage(candidate.StatPath)
 		if err != nil {
 			continue
 		}
-		if mount.Fstype != "" {
-			usageStat.Fstype = mount.Fstype
+		// Mark the mountpoint and device as seen only after a successful
+		// stat so an unstatable candidate does not block a later statable
+		// candidate for the same mountpoint or device.
+		seenMountpoints[candidate.Mountpoint] = struct{}{}
+		if device != "none" {
+			seenDevices[deviceKey] = struct{}{}
 		}
+		if candidate.Fstype != "" {
+			usageStat.Fstype = candidate.Fstype
+		}
+		total := resolvePartitionTotal(device, usageStat.Total)
+		if usageStat.Used > total {
+			// The device capacity cannot explain the statfs numbers;
+			// keep the filesystem-reported total instead.
+			total = usageStat.Total
+		} else if total != usageStat.Total {
+			usageStat.UsedPercent = percentOf(usageStat.Used, total)
+		}
+		usageStat.Total = total
 
+		entryDevice := device
+		if deviceKey != device {
+			// APFS container representative: report the container device.
+			entryDevice = deviceKey
+			apfsEntryIndex[deviceKey] = len(diskUsage)
+		}
 		diskUsage = append(diskUsage, DiskPartition{
-			Device:      mount.Device,
-			Mountpoint:  mount.Mountpoint,
+			Device:      entryDevice,
+			Mountpoint:  candidate.Mountpoint,
 			Fstype:      usageStat.Fstype,
 			Total:       usageStat.Total,
 			Used:        usageStat.Used,
@@ -979,8 +1136,63 @@ func (c *Collector) collectHostDiskUsage() []DiskPartition {
 			UsedPercent: usageStat.UsedPercent,
 		})
 	}
-
 	return diskUsage
+}
+
+// resolvePartitionTotal returns the total capacity for a mount's backing
+// device. The statfs total (f_blocks * bsize) excludes filesystem metadata,
+// so a 40 GiB provisioned disk only reports ~39 GiB usable; sysfs exposes
+// the real device capacity and is preferred whenever available. statTotal is
+// returned unchanged when the device capacity cannot be determined — also
+// the expected behaviour outside Linux, where /sys/class/block does not
+// exist. When the collector runs in a container with a host root, sysfs
+// still exposes the host kernel's block devices, so the lookup stays valid.
+func resolvePartitionTotal(device string, statTotal uint64) uint64 {
+	if name := sysfsBlockName(device); name != "" {
+		if size := readBlockDeviceSizeBytes(name); size > 0 {
+			return size
+		}
+	}
+	// Device paths such as /dev/mapper/vg-root are symlinks to the real
+	// block node (e.g. ../dm-0); resolve and retry with that name. Inside
+	// containers the symlink may be missing — the statfs fallback covers it.
+	if resolved, err := filepath.EvalSymlinks(device); err == nil {
+		if name := sysfsBlockName(resolved); name != "" {
+			if size := readBlockDeviceSizeBytes(name); size > 0 {
+				return size
+			}
+		}
+	}
+	return statTotal
+}
+
+// sysfsBlockName extracts the sysfs block device entry name (e.g. "sda1")
+// from a device path such as /dev/sda1, /dev/nvme0n1p2 or /dev/mapper/vg-root.
+func sysfsBlockName(device string) string {
+	device = strings.TrimSpace(device)
+	if !strings.HasPrefix(device, "/dev/") {
+		return ""
+	}
+	name := strings.Trim(strings.TrimPrefix(device, "/dev/"), "/")
+	if name == "" {
+		return ""
+	}
+	return name
+}
+
+// readBlockDeviceSizeBytes reads /sys/class/block/<name>/size, which holds
+// the device capacity in 512-byte sectors. It returns 0 when sysfs is
+// unavailable (non-Linux systems or unrecognized device names).
+func readBlockDeviceSizeBytes(name string) uint64 {
+	data, err := os.ReadFile(filepath.Join("/sys/class/block", name, "size"))
+	if err != nil {
+		return 0
+	}
+	sectors, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return sectors * 512
 }
 
 func shouldSkipPartition(p disk.PartitionStat) bool {
@@ -1014,37 +1226,60 @@ func shouldSkipPartition(p disk.PartitionStat) bool {
 		}
 	}
 	ignoreFS := map[string]struct{}{
-		"proc":            {},
-		"sysfs":           {},
-		"tmpfs":           {},
-		"devtmpfs":        {},
-		"squashfs":        {},
-		"overlay":         {},
-		"aufs":            {},
-		"ramfs":           {},
-		"autofs":          {},
-		"securityfs":      {},
-		"pstore":          {},
-		"hugetlbfs":       {},
-		"configfs":        {},
-		"cgroup":          {},
-		"cgroup2":         {},
-		"devpts":          {},
-		"mqueue":          {},
-		"debugfs":         {},
-		"tracefs":         {},
-		"fusectl":         {},
-		"fuse.portal":     {},
-		"fuse.gvfsd-fuse": {},
-		"fuse.lxcfs":      {},
-		"fuse.overlayfs":  {},
-		"binfmt_misc":     {},
-		"rpc_pipefs":      {},
-		"nsfs":            {},
-		"bpf":             {},
-		"lxcfs":           {},
+		"proc":        {},
+		"sysfs":       {},
+		"tmpfs":       {},
+		"devtmpfs":    {},
+		"squashfs":    {},
+		"overlay":     {},
+		"aufs":        {},
+		"ramfs":       {},
+		"autofs":      {},
+		"securityfs":  {},
+		"pstore":      {},
+		"hugetlbfs":   {},
+		"configfs":    {},
+		"cgroup":      {},
+		"cgroup2":     {},
+		"devpts":      {},
+		"mqueue":      {},
+		"debugfs":     {},
+		"tracefs":     {},
+		"fusectl":     {},
+		"binfmt_misc": {},
+		"rpc_pipefs":  {},
+		"nsfs":        {},
+		"bpf":         {},
+		"lxcfs":       {},
+		// Network and cluster filesystems: their capacity is remote or
+		// shared, not local disk.
+		"nfs":       {},
+		"nfs4":      {},
+		"cifs":      {},
+		"smbfs":     {},
+		"smb2":      {},
+		"9p":        {},
+		"virtiofs":  {},
+		"afs":       {},
+		"ceph":      {},
+		"cephfs":    {},
+		"glusterfs": {},
+		"lustre":    {},
+		"gfs":       {},
+		"gfs2":      {},
+		"ocfs2":     {},
+		"beegfs":    {},
+		"sshfs":     {},
+		"fdescfs":   {},
 	}
-	if _, ok := ignoreFS[strings.ToLower(p.Fstype)]; ok && p.Mountpoint != "/" {
+	fstype := strings.ToLower(p.Fstype)
+	if _, ok := ignoreFS[fstype]; ok && p.Mountpoint != "/" {
+		return true
+	}
+	// Any FUSE filesystem (rclone, alist, CloudDrive2, ...) is treated as a
+	// synthetic mount: advertised capacities (256TB/1PB) are fake and would
+	// dwarf the node's real disk size.
+	if strings.HasPrefix(fstype, "fuse.") {
 		return true
 	}
 	return false
@@ -1552,17 +1787,54 @@ func readRotational(hostRoot, device string) (int, bool) {
 	return value, true
 }
 
-func collectGPUStats(includeStatic bool) []GPUInfo {
-	return collectNVIDIAGPUStats(includeStatic)
-}
+// lookupNVIDIASMIPath resolves the nvidia-smi binary path; the empty string
+// means it is not installed. It is a package variable so tests can stub the
+// PATH lookup.
+var lookupNVIDIASMIPath = defaultLookupNVIDIASMIPath
 
-func collectNVIDIAGPUStats(includeStatic bool) []GPUInfo {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+func defaultLookupNVIDIASMIPath() string {
 	path, err := exec.LookPath("nvidia-smi")
 	if err != nil {
+		return ""
+	}
+	return path
+}
+
+// collectGPUStatsAt returns GPU stats with a short cache: nvidia-smi is
+// forked at most once per gpuSampleRefreshInterval even though Collect runs
+// every second. The resolved nvidia-smi path (including the negative result)
+// is re-resolved at most once per nvidiaSMIPathRefreshInterval. When the
+// cached sample is fresh but was taken without static info and static info is
+// now requested, the sample is refreshed early.
+func (c *Collector) collectGPUStatsAt(
+	now time.Time,
+	includeStatic bool,
+	sampler func(path string, includeStatic bool) []GPUInfo,
+) []GPUInfo {
+	if sampler == nil {
+		sampler = runNVIDIAGPUSample
+	}
+	if c.nvidiaSMIPathAt.IsZero() || now.Sub(c.nvidiaSMIPathAt) >= nvidiaSMIPathRefreshInterval {
+		c.nvidiaSMIPath = lookupNVIDIASMIPath()
+		c.nvidiaSMIPathAt = now
+	}
+	if c.nvidiaSMIPath == "" {
 		return nil
 	}
+	fresh := !c.gpuSampleAt.IsZero() && now.Sub(c.gpuSampleAt) < gpuSampleRefreshInterval
+	if fresh && (!includeStatic || c.gpuSampleStatic) {
+		return c.gpuSample
+	}
+	gpus := sampler(c.nvidiaSMIPath, includeStatic)
+	c.gpuSample = gpus
+	c.gpuSampleStatic = includeStatic
+	c.gpuSampleAt = now
+	return gpus
+}
+
+func runNVIDIAGPUSample(path string, includeStatic bool) []GPUInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	output, err := exec.CommandContext(
 		ctx,
 		path,

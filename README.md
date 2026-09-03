@@ -6,7 +6,7 @@
 
   <p>
     <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.26.5-blue" alt="Go Version">
+    <img src="https://img.shields.io/badge/Go-1.27.1-blue" alt="Go Version">
     <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
   </p>
 </div>

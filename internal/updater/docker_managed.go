@@ -291,10 +291,6 @@ func parseContainerIDFromCgroup(raw []byte) string {
 	return ""
 }
 
-func NewDockerManagedUpdater() (*DockerManagedUpdater, error) {
-	return NewDockerManagedUpdaterContext(context.Background())
-}
-
 func NewDockerManagedUpdaterContext(ctx context.Context) (*DockerManagedUpdater, error) {
 	if ctx == nil {
 		ctx = context.Background()

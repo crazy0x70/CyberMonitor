@@ -496,8 +496,8 @@ func prepareNetworkSample(test metrics.NetworkTestResult, now time.Time) (prepar
 			Name: test.Name,
 		}),
 		timestampMillis: resolveTimestampMillis(test.CheckedAt, now),
-		latency:         cloneFloatPointer(test.LatencyMs),
-		loss:            normalizeFloatValue(test.PacketLoss),
+		latency:         CloneFloatPtr(test.LatencyMs),
+		loss:            NormalizeFloat(test.PacketLoss),
 		availability:    availabilityForTest(test),
 	}
 	sample.seriesKey = buildNetworkSeriesKey(sample.identity)
@@ -576,11 +576,11 @@ func collectMetricSeriesBatch(
 			tsSeconds := tsMillis / 1000
 			switch metricName {
 			case networkLatencyMetric:
-				acc.latency[tsSeconds] = normalizeFloatValue(value)
+				acc.latency[tsSeconds] = NormalizeFloat(value)
 			case networkLossMetric:
-				acc.loss[tsSeconds] = normalizeFloatValue(value)
+				acc.loss[tsSeconds] = NormalizeFloat(value)
 			case networkAvailabilityMetric:
-				acc.availability[tsSeconds] = normalizeFloatValue(value)
+				acc.availability[tsSeconds] = NormalizeFloat(value)
 			}
 		}
 		if err := iterator.Err(); err != nil {

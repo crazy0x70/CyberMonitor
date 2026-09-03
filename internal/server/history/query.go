@@ -113,7 +113,9 @@ func ensureSeriesAccumulator(
 	return entry
 }
 
-func cloneFloatPointer(value *float64) *float64 {
+// CloneFloatPtr returns a copy of value, or nil when value is nil or not
+// finite (NaN/Inf).
+func CloneFloatPtr(value *float64) *float64 {
 	if value == nil {
 		return nil
 	}
@@ -125,7 +127,9 @@ func cloneFloatPointer(value *float64) *float64 {
 	return &copyValue
 }
 
-func normalizeFloatValue(value float64) *float64 {
+// NormalizeFloat returns a pointer to value, or nil when value is not finite
+// (NaN/Inf).
+func NormalizeFloat(value float64) *float64 {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return nil
 	}
@@ -166,7 +170,7 @@ func buildNetworkHistoryEntryWithCutoff(acc *seriesAccumulator, cutoffSeconds in
 func cloneHistorySeriesValues(series map[int64]*float64, times []int64) []*float64 {
 	values := make([]*float64, len(times))
 	for idx, ts := range times {
-		values[idx] = cloneFloatPointer(series[ts])
+		values[idx] = CloneFloatPtr(series[ts])
 	}
 	return values
 }

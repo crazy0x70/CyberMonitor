@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
-ARG GO_IMAGE_VERSION=1.26.5
-ARG NODE_IMAGE_VERSION=26.5.0
+ARG GO_IMAGE_VERSION=1.27.1
+ARG NODE_IMAGE_VERSION=26.8.1
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 
@@ -63,7 +63,7 @@ RUN set -eux; \
     -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILD_TIME}" \
     ./cmd/agent
 
-FROM alpine:3.23 AS runtime-base
+FROM alpine:3.24 AS runtime-base
 WORKDIR /app
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN apk add --no-cache su-exec tzdata && \

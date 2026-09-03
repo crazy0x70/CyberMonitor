@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -279,33 +278,8 @@ type GroupNode struct {
 	Children []GroupNode `json:"children,omitempty"`
 }
 
-func ensureDataDir(dir string) error {
-	if dir == "" {
-		return errors.New("data dir required")
-	}
-	return os.MkdirAll(dir, 0o755)
-}
-
-func normalizeJSONBytes(data []byte) []byte {
-	trimmed := bytes.TrimSpace(data)
-	return bytes.TrimPrefix(trimmed, []byte{0xEF, 0xBB, 0xBF})
-}
-
-func decodeFirstJSONValue(data []byte, target any) (bool, error) {
-	normalized := normalizeJSONBytes(data)
-	if len(normalized) == 0 {
-		return false, io.EOF
-	}
-	decoder := json.NewDecoder(bytes.NewReader(normalized))
-	if err := decoder.Decode(target); err != nil {
-		return false, err
-	}
-	rest := bytes.TrimSpace(normalized[decoder.InputOffset():])
-	return len(rest) > 0, nil
-}
-
 func strictUnmarshalJSON(data []byte, target any) error {
-	trailing, err := decodeFirstJSONValue(data, target)
+	trailing, err := history.DecodeFirstJSONValue(data, target)
 	if err != nil {
 		return err
 	}
@@ -372,11 +346,11 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 	}
 
 	var payload TestHistoryData
-	trailing, err := decodeFirstJSONValue(data, &payload)
+	trailing, err := history.DecodeFirstJSONValue(data, &payload)
 	if err == nil {
 		if payload.Version == 0 && payload.UpdatedAt == 0 && payload.Nodes == nil {
 			var legacy map[string]map[string]*TestHistoryEntry
-			legacyTrailing, legacyErr := decodeFirstJSONValue(data, &legacy)
+			legacyTrailing, legacyErr := history.DecodeFirstJSONValue(data, &legacy)
 			if legacyErr == nil {
 				payload = TestHistoryData{
 					Version:   testHistoryVersion,
@@ -388,7 +362,7 @@ func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
 		}
 	} else {
 		var legacy map[string]map[string]*TestHistoryEntry
-		legacyTrailing, legacyErr := decodeFirstJSONValue(data, &legacy)
+		legacyTrailing, legacyErr := history.DecodeFirstJSONValue(data, &legacy)
 		if legacyErr != nil {
 			return TestHistoryData{}, false, false, err
 		}
@@ -760,54 +734,12 @@ func legacyTestCatalogKey(name, testType, host string, port int) string {
 }
 
 func writeJSONFileAtomic(path string, payload any) error {
-	dir := filepath.Dir(path)
-	if err := ensureDataDir(dir); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	committed = true
-	syncParentDir(dir)
-	return nil
-}
-
-func syncParentDir(dir string) {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	defer handle.Close()
-	_ = handle.Sync()
+	return history.WriteFileAtomic(path, data)
 }
 
 func cloneProfiles(profiles map[string]*NodeProfile) map[string]*NodeProfile {

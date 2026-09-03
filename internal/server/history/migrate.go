@@ -290,10 +290,13 @@ func normalizeLegacyHistoryPath(path string) (string, error) {
 }
 
 func writeLegacyMigrationArtifact(path string, pathFunc func(string) string, payload []byte) error {
-	return writeLegacyFileAtomic(pathFunc(path), payload)
+	return WriteFileAtomic(pathFunc(path), payload)
 }
 
-func writeLegacyFileAtomic(path string, payload []byte) error {
+// WriteFileAtomic durably writes data to path: it writes a temp file in the
+// target directory, fsyncs it, renames it into place, and syncs the parent
+// directory. The parent directory is created if missing.
+func WriteFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -310,7 +313,7 @@ func writeLegacyFileAtomic(path string, payload []byte) error {
 		}
 	}()
 
-	if _, err := tmp.Write(payload); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -325,11 +328,11 @@ func writeLegacyFileAtomic(path string, payload []byte) error {
 		return err
 	}
 	committed = true
-	syncLegacyParentDir(dir)
+	syncParentDir(dir)
 	return nil
 }
 
-func syncLegacyParentDir(dir string) {
+func syncParentDir(dir string) {
 	handle, err := os.Open(dir)
 	if err != nil {
 		return
@@ -389,7 +392,7 @@ func legacyEntryValues(entry *legacyHistoryEntry, idx int) (*float64, float64) {
 
 	var latency *float64
 	if idx < len(entry.Latency) {
-		latency = cloneFloatPointer(entry.Latency[idx])
+		latency = CloneFloatPtr(entry.Latency[idx])
 	}
 	if idx >= len(entry.Loss) || entry.Loss[idx] == nil {
 		return latency, 0
@@ -408,7 +411,7 @@ func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload,
 
 	normalized := normalizeJSONBytes(data)
 	var payload legacyHistoryPayload
-	trailing, err := decodeFirstJSONValue(normalized, &payload)
+	trailing, err := DecodeFirstJSONValue(normalized, &payload)
 	if err == nil {
 		if payload.Nodes != nil || payload.Version != 0 || payload.UpdatedAt != 0 {
 			if trailing {
@@ -422,7 +425,7 @@ func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload,
 	}
 
 	var rawNodes map[string]map[string]*legacyHistoryEntry
-	trailing, err = decodeFirstJSONValue(normalized, &rawNodes)
+	trailing, err = DecodeFirstJSONValue(normalized, &rawNodes)
 	if err != nil {
 		return legacyHistoryPayload{}, false, err
 	}
@@ -444,14 +447,19 @@ func normalizeJSONBytes(data []byte) []byte {
 	return bytes.TrimPrefix(trimmed, []byte{0xEF, 0xBB, 0xBF})
 }
 
-func decodeFirstJSONValue(data []byte, target any) (bool, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
+// DecodeFirstJSONValue decodes the first JSON value in data (after trimming
+// surrounding whitespace and any UTF-8 BOM) into target. It reports whether
+// non-whitespace content remains after the decoded value, and returns io.EOF
+// when data holds no JSON value at all.
+func DecodeFirstJSONValue(data []byte, target any) (bool, error) {
+	normalized := normalizeJSONBytes(data)
+	if len(normalized) == 0 {
+		return false, io.EOF
+	}
+	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	if err := decoder.Decode(target); err != nil {
-		if errors.Is(err, io.EOF) {
-			return false, err
-		}
 		return false, err
 	}
-	rest := bytes.TrimSpace(data[decoder.InputOffset():])
+	rest := bytes.TrimSpace(normalized[decoder.InputOffset():])
 	return len(rest) > 0, nil
 }

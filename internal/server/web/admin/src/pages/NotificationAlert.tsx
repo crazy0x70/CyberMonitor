@@ -442,7 +442,7 @@ export default function NotificationAlert({
           <CardContent className="pt-6 pb-6 space-y-4">
             <div className={adminDetailGroupClass}>
               <div className="grid gap-4 md:grid-cols-2">
-                <div className="grid gap-2">
+                <div className="grid content-start gap-2">
                   <Label htmlFor="telegram-token" className="text-xs font-black uppercase tracking-widest text-slate-400">Bot Token</Label>
                   <Input
                     id="telegram-token"
@@ -464,7 +464,7 @@ export default function NotificationAlert({
                     </p>
                   ) : null}
                 </div>
-                <div className="grid gap-2">
+                <div className="grid content-start gap-2">
                   <Label htmlFor="telegram-user-ids" className="text-xs font-black uppercase tracking-widest text-slate-400">用户 ID</Label>
                   <Input
                     id="telegram-user-ids"
@@ -478,11 +478,8 @@ export default function NotificationAlert({
                     value={telegramUserIds}
                     disabled={isBusy}
                     onChange={createFieldChangeHandler("telegramUserIds", setTelegramUserIds)}
-                    placeholder="例如：123456789,987654321…"
+                    placeholder="多个用户 ID 请使用逗号分隔"
                   />
-                  <p className="text-[11px] font-medium text-slate-400">
-                    多个用户 ID 请使用逗号分隔。
-                  </p>
                   {fieldErrors.telegramUserIds ? (
                     <p id="telegram-user-ids-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
                       {fieldErrors.telegramUserIds}

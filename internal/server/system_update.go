@@ -276,26 +276,7 @@ func systemUpdateMessage(message string) string {
 	return updater.DefaultUnsupportedUpdateMessage()
 }
 
-func agentUpdateReleaseAssetError(stats metrics.NodeStats, info updater.ReleaseInfo) string {
-	if strings.TrimSpace(info.LatestVersion) == "" {
-		return "Release 缺少目标版本"
-	}
-	if resolveAgentUpdateMode(stats) == "docker-managed" {
-		return ""
-	}
-	if strings.TrimSpace(info.DownloadURL) == "" {
-		return "未找到当前节点平台对应的 Agent 安装包"
-	}
-	if strings.TrimSpace(info.ChecksumURL) == "" {
-		return "Release 缺少 SHA256SUMS 校验文件"
-	}
-	if err := updater.ValidateReleaseAssetURLs(updater.KindAgent, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
-		return err.Error()
-	}
-	return ""
-}
-
-func systemUpdateReleaseAssetError(info updater.ReleaseInfo, dockerManaged bool) string {
+func releaseUpdateAssetError(kind updater.Kind, dockerManaged bool, missingAssetMessage string, info updater.ReleaseInfo) string {
 	if strings.TrimSpace(info.LatestVersion) == "" {
 		return "Release 缺少目标版本"
 	}
@@ -303,15 +284,23 @@ func systemUpdateReleaseAssetError(info updater.ReleaseInfo, dockerManaged bool)
 		return ""
 	}
 	if strings.TrimSpace(info.DownloadURL) == "" {
-		return "未找到当前平台对应的服务端安装包"
+		return missingAssetMessage
 	}
 	if strings.TrimSpace(info.ChecksumURL) == "" {
 		return "Release 缺少 SHA256SUMS 校验文件"
 	}
-	if err := updater.ValidateReleaseAssetURLs(updater.KindServer, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
+	if err := updater.ValidateReleaseAssetURLs(kind, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
 		return err.Error()
 	}
 	return ""
+}
+
+func agentUpdateReleaseAssetError(stats metrics.NodeStats, info updater.ReleaseInfo) string {
+	return releaseUpdateAssetError(updater.KindAgent, resolveAgentUpdateMode(stats) == "docker-managed", "未找到当前节点平台对应的 Agent 安装包", info)
+}
+
+func systemUpdateReleaseAssetError(info updater.ReleaseInfo, dockerManaged bool) string {
+	return releaseUpdateAssetError(updater.KindServer, dockerManaged, "未找到当前平台对应的服务端安装包", info)
 }
 
 func buildAgentUpdateView(stats metrics.NodeStats, info updater.ReleaseInfo, message string) AgentUpdateView {

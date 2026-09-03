@@ -217,6 +217,16 @@ func testTCP(host string, port int) (*float64, string, string) {
 	return &latency, "ok", ""
 }
 
+// pingPathOnce caches the resolved ping binary path (also when it is not
+// installed), so repeated ICMP tests do not rescan PATH.
+var pingPathOnce = sync.OnceValue(func() string {
+	path, err := exec.LookPath("ping")
+	if err != nil {
+		return ""
+	}
+	return path
+})
+
 func pingHost(ctx context.Context, host string) (*float64, float64, string, string) {
 	if err := validateProbeHost(host); err != nil {
 		return nil, 100, "error", err.Error()
@@ -225,8 +235,8 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	ctx, cancel := context.WithTimeout(ctx, icmpTimeout)
 	defer cancel()
 
-	pingPath, err := exec.LookPath("ping")
-	if err != nil {
+	pingPath := pingPathOnce()
+	if pingPath == "" {
 		return nil, 100, "error", "ping 命令不可用"
 	}
 
@@ -268,16 +278,6 @@ func validateProbeHost(host string) error {
 }
 
 type probeLookupFunc func(context.Context, string) ([]net.IP, error)
-
-func validatePublicProbeHost(ctx context.Context, host string) error {
-	_, err := resolvePublicProbeHostWithResolver(ctx, host, lookupProbeHostIPs)
-	return err
-}
-
-func validatePublicProbeHostWithResolver(ctx context.Context, host string, lookup probeLookupFunc) error {
-	_, err := resolvePublicProbeHostWithResolver(ctx, host, lookup)
-	return err
-}
 
 func resolvePublicProbeHost(ctx context.Context, host string) (string, error) {
 	return resolvePublicProbeHostWithResolver(ctx, host, lookupProbeHostIPs)

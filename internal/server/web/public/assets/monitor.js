@@ -1,7 +1,5 @@
 const list = document.getElementById("list");
 const empty = document.getElementById("empty");
-const nodeCount = document.getElementById("node-count");
-const lastUpdated = document.getElementById("last-updated");
 const groupTabs = document.getElementById("group-tabs");
 const statTotal = document.getElementById("stat-total");
 const statOnline = document.getElementById("stat-online");
@@ -19,7 +17,6 @@ let publicLocale = "zh-CN";
 let currentPublicSettings = {};
 const PUBLIC_I18N = {
   "zh-CN": {
-    skipLink: "跳转到主要内容",
     brandSubtitle: "主机监控",
     themeAuto: "跟随系统",
     themeLight: "浅色主题",
@@ -81,10 +78,8 @@ const PUBLIC_I18N = {
     remainingPrefix: "剩余",
     unnamedNode: "未命名节点",
     totalSuffix: "total",
-    recentTransport: (label, time) => `最近 ${label}：${time}`,
   },
   "en-US": {
-    skipLink: "Skip to main content",
     brandSubtitle: "Host monitoring",
     themeAuto: "Follow system",
     themeLight: "Light theme",
@@ -146,7 +141,6 @@ const PUBLIC_I18N = {
     remainingPrefix: "Remaining",
     unnamedNode: "Unnamed node",
     totalSuffix: "total",
-    recentTransport: (label, time) => `Recent ${label}: ${time}`,
   },
 };
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -213,6 +207,8 @@ const state = {
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
+  mergedProvenance: new Map(),
+  renderedNode: new Map(),
   renderMode: "flat",
   tagSections: new Map(),
   historyCacheTimer: null,
@@ -222,8 +218,6 @@ const state = {
   snapshotFallbackTimer: null,
   snapshotFallbackInflight: false,
   renderFrame: 0,
-  lastTransportAt: 0,
-  lastTransportType: "snapshot",
   realtimeStatus: new Map(),
   groupTabSignature: "",
 };
@@ -287,8 +281,12 @@ function applyStaticTranslations() {
 }
 
 function resetRenderedLocaleState() {
-  state.nodes.forEach((card) => card.remove());
+  state.nodes.forEach((card) => {
+    releaseCardResources(card);
+    card.remove();
+  });
   state.nodes.clear();
+  state.renderedNode.clear();
   state.tagSections.clear();
   state.renderMode = "";
   state.groupTabSignature = "";
@@ -976,14 +974,31 @@ function mergeByNodeID(sourceSnapshots) {
         __sourceKey: sourceKey,
       };
       const existing = merged.get(nodeID);
-      if (shouldReplaceNode(existing, candidate)) {
-        merged.set(nodeID, candidate);
+      if (shouldReplaceNode(existing?.candidate, candidate)) {
+        merged.set(nodeID, { src: node, candidate });
       }
     });
   });
-  return Array.from(merged.values()).map((node) =>
-    cloneNodeWithDisplayTraffic(node, node.__sourceKey || "default")
-  );
+  const mergedNodes = [];
+  merged.forEach((entry, nodeID) => {
+    const provenance = state.mergedProvenance.get(nodeID);
+    if (provenance && provenance.src === entry.src) {
+      mergedNodes.push(provenance.merged);
+      return;
+    }
+    const mergedNode = cloneNodeWithDisplayTraffic(
+      entry.candidate,
+      entry.candidate.__sourceKey || "default"
+    );
+    state.mergedProvenance.set(nodeID, { src: entry.src, merged: mergedNode });
+    mergedNodes.push(mergedNode);
+  });
+  for (const nodeID of state.mergedProvenance.keys()) {
+    if (!merged.has(nodeID)) {
+      state.mergedProvenance.delete(nodeID);
+    }
+  }
+  return mergedNodes;
 }
 
 function mergeGroups(groupsBySource) {
@@ -1029,10 +1044,6 @@ function rebuildMergedSnapshotState() {
 
   cleanupDetachedHistory(state.lastNodes);
 
-  if (lastUpdated) {
-    const ts = latestSnapshot ? (latestSnapshot.generated_at || 0) : 0;
-    lastUpdated.textContent = ts ? timeFormatter.format(new Date(ts * 1000)) : "--";
-  }
   syncRealtimeStatus(mergedNodes);
   scheduleRender();
 }
@@ -1079,6 +1090,7 @@ function refreshRealtimeStatus() {
     const next = resolveNodeStatus(node);
     if (state.realtimeStatus.get(id) !== next) {
       state.realtimeStatus.set(id, next);
+      state.renderedNode.delete(id);
       changed = true;
     }
   });
@@ -1093,15 +1105,6 @@ function dropSourceSnapshot(sourceKey) {
   }
   state.sourceSnapshots.delete(sourceKey);
   rebuildMergedSnapshotState();
-}
-
-function updateTransportState(type, generatedAt) {
-  state.lastTransportType = type || "snapshot";
-  state.lastTransportAt = Number(generatedAt) || Math.floor(Date.now() / 1000);
-  const live = document.querySelector('[data-field="demo-variant-live"]');
-  if (!live) return;
-  const label = state.lastTransportType === "delta" ? "delta" : "snapshot";
-  live.textContent = t("recentTransport", label, formatTime(state.lastTransportAt));
 }
 
 function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
@@ -1135,7 +1138,6 @@ function handleSnapshot(payload, sourceKey = "default") {
     nodes: dedupeNodesByID(payload.nodes),
   });
   state.snapshotFailures.delete(sourceKey);
-  updateTransportState("snapshot", payload.generated_at);
   applyTestHistory(payload.test_history, sourceKey);
   rebuildMergedSnapshotState();
 }
@@ -1162,7 +1164,6 @@ function handleNodeDelta(payload, sourceKey = "default") {
   };
   state.sourceSnapshots.set(sourceKey, next);
   state.snapshotFailures.delete(sourceKey);
-  updateTransportState("delta", payload.generated_at);
   rebuildMergedSnapshotState();
 }
 
@@ -1171,9 +1172,6 @@ function render() {
   renderGroupTabs(groups);
   const groupNodes = filterNodesByGroup(state.lastNodes, state.selectedGroup);
   const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
-  if (nodeCount) {
-    nodeCount.textContent = visibleNodes.length;
-  }
   updateStats(groupNodes);
   updateEmptyState(visibleNodes.length, groupNodes.length);
   const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
@@ -1483,11 +1481,6 @@ function hasAnyHistoryForNode(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) 
   return false;
 }
 
-function trimHistoryRequestState(nodeId, sourceKey) {
-  const cacheKey = historyNodeCacheKey(nodeId, sourceKey);
-  trimHistoryRequestStateByKey(cacheKey);
-}
-
 function trimHistoryRequestStateByKey(cacheKey) {
   bumpHistoryGeneration(cacheKey);
   const controllerEntry = state.testHistoryControllers.get(cacheKey);
@@ -1712,6 +1705,11 @@ function cleanupDetachedHistory(nodes) {
       changed = true;
     }
   }
+  for (const id of state.metricHistory.keys()) {
+    if (!activeNodeIDs.has(id)) {
+      state.metricHistory.delete(id);
+    }
+  }
   if (changed) {
     scheduleHistoryCacheSave();
   }
@@ -1785,10 +1783,6 @@ function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
     }
   });
   return updated;
-}
-
-function mergeHistoryRange(nodeId, rangeKey, tests, sourceKey = resolveNodeSourceKey(nodeId)) {
-  return mergeHistoryRangeByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey), rangeKey, tests);
 }
 
 function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
@@ -2291,12 +2285,12 @@ function updateStats(nodes) {
   let totalDown = 0;
 
   nodes.forEach((node) => {
+    const network = node.stats?.network || {};
     if (resolveNodeStatus(node) !== "offline") {
       online += 1;
+      totalUpRate += Number(network.tx_bytes_per_sec || 0);
+      totalDownRate += Number(network.rx_bytes_per_sec || 0);
     }
-    const network = node.stats?.network || {};
-    totalUpRate += Number(network.tx_bytes_per_sec || 0);
-    totalDownRate += Number(network.rx_bytes_per_sec || 0);
     totalUp += Number(network.bytes_sent || 0);
     totalDown += Number(network.bytes_recv || 0);
   });
@@ -2329,7 +2323,10 @@ function upsertRenderedCard(container, node, id, animationIndex) {
     );
     card.style.animationDelay = `${animationIndex * 0.03}s`;
   }
-  updateCard(card, node, id);
+  if (!(card.isConnected && state.renderedNode.get(id) === node)) {
+    updateCard(card, node, id);
+    state.renderedNode.set(id, node);
+  }
   if (card.parentElement !== container) {
     container.appendChild(card);
   }
@@ -2422,11 +2419,17 @@ function cleanupTagSections(activeTags) {
   }
 }
 
+function releaseCardResources(card) {
+  card?._fields?.testChart?.__latencyHoverCleanup?.();
+}
+
 function cleanupInactive(activeIds) {
   for (const [id, card] of state.nodes.entries()) {
     if (!activeIds.has(id)) {
+      releaseCardResources(card);
       card.remove();
       state.nodes.delete(id);
+      state.renderedNode.delete(id);
     }
   }
 }
@@ -3432,50 +3435,6 @@ function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
   return result;
 }
 
-function buildSummaryExtra(stats, tests) {
-  const parts = [`${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`];
-  const summary = summarizeTests(tests, 2);
-  if (summary) {
-    parts.push(summary);
-  }
-  return parts.join(" · ");
-}
-
-function renderSummaryTests(fields, tests) {
-  if (!fields.summaryTests) return;
-  fields.summaryTests.innerHTML = "";
-  const list = Array.isArray(tests)
-    ? tests.filter((test) => test.latency_ms !== null && test.latency_ms !== undefined).slice(0, 3)
-    : [];
-  if (!list.length) return;
-  list.forEach((test) => {
-    const chip = document.createElement("div");
-    chip.className = "summary-test";
-
-    const name = document.createElement("span");
-    name.className = "summary-test-name";
-    name.textContent = formatTestName(test);
-
-    const value = document.createElement("span");
-    value.className = "summary-test-value";
-    value.textContent = formatLatencyValue(test);
-
-    chip.appendChild(name);
-    chip.appendChild(value);
-    fields.summaryTests.appendChild(chip);
-  });
-}
-
-function summarizeTests(tests, limit) {
-  const list = Array.isArray(tests)
-    ? tests.filter((test) => test.latency_ms !== null && test.latency_ms !== undefined).slice(0, limit)
-    : [];
-  if (!list.length) return "";
-  return list
-    .map((test) => `${formatTestName(test)} ${formatLatencyValue(test)}`)
-    .join(" · ");
-}
-
 function updateMetricHistory(nodeId, stats, values) {
   if (!state.metricHistory.has(nodeId)) {
     state.metricHistory.set(nodeId, {
@@ -3669,7 +3628,7 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
     yLabels.push(
       `<text x="${padding.left - 4}" y="${y.toFixed(
         1
-      )}" text-anchor="end" dominant-baseline="middle">${formatLatencyTick(
+      )}" text-anchor="end" dominant-baseline="middle">${formatLatency(
         value
       )}</text>`
     );
@@ -3851,7 +3810,7 @@ function buildLatencyTooltipRows(meta, labels, hoverIndex) {
       if (value === null || value === undefined) return null;
       const color = meta.colors[idx] || "#4f7cff";
       const name = labels[idx] || t("unnamed");
-      return { color, name, value: formatLatencyStat(value) };
+      return { color, name, value: formatLatency(value) };
     })
     .filter(Boolean)
 }
@@ -4017,32 +3976,6 @@ function padSeries(series, length) {
   return padding.concat(series);
 }
 
-function buildTimeLabels(times, maxLen, count, rangeSec) {
-  if (!Array.isArray(times) || times.length === 0) {
-    return [];
-  }
-  if (!maxLen || maxLen < 2) {
-    return [];
-  }
-  const valid = times.filter(
-    (value) => value !== null && value !== undefined && Number.isFinite(value)
-  );
-  const now = Math.floor(Date.now() / 1000);
-  const end = valid.length ? valid[valid.length - 1] : now;
-  const fallbackRange = rangeSec && rangeSec > 0 ? rangeSec : 3600;
-  const start = rangeSec && rangeSec > 0 ? end - rangeSec : (valid.length ? valid[0] : end - fallbackRange);
-  const safeCount = Math.max(count, 2);
-  const steps = Math.max(safeCount - 1, 1);
-  const labels = [];
-  for (let i = 0; i < safeCount; i += 1) {
-    const ratio = steps === 0 ? 0 : i / steps;
-    const index = ratio * (maxLen - 1);
-    const ts = start + (end - start) * ratio;
-    labels.push({ index, label: formatTimeLabel(ts, rangeSec) });
-  }
-  return labels;
-}
-
 function niceStep(value) {
   if (!value || !Number.isFinite(value)) {
     return 1;
@@ -4057,19 +3990,6 @@ function niceStep(value) {
   return niceFraction * pow;
 }
 
-function formatTimeLabel(timestamp, rangeSec) {
-  if (!timestamp) return "";
-  const date = new Date(timestamp * 1000);
-  const pad = (num) => String(num).padStart(2, "0");
-  if (!rangeSec || rangeSec <= 86400) {
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  }
-  if (rangeSec <= 86400 * 30) {
-    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  }
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
-}
-
 function formatTimeFull(timestamp) {
   if (!timestamp) return "--";
   const date = new Date(timestamp * 1000);
@@ -4077,23 +3997,6 @@ function formatTimeFull(timestamp) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
     date.getDate()
   )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function formatLatencyTick(value) {
-  return formatLatency(value);
-}
-
-function summarizeLatency(series) {
-  const values = (Array.isArray(series) ? series : []).filter(
-    (value) => value !== null && value !== undefined && Number.isFinite(value)
-  );
-  if (!values.length) {
-    return { min: null, avg: null, max: null };
-  }
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
-  return { min, avg, max };
 }
 
 function summarizeLoss(series) {
@@ -4105,10 +4008,6 @@ function summarizeLoss(series) {
   }
   const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
   return avg;
-}
-
-function formatLatencyStat(value) {
-  return formatLatency(value);
 }
 
 function formatLossValue(loss, label = t("loss")) {
@@ -4161,7 +4060,7 @@ function summarizeTestSnapshot(test, rangeHistory, fallbackHistory) {
     latency:
       latestLatency === null
         ? `${t("current")} --`
-        : `${t("current")} ${formatLatencyStat(latestLatency)}`,
+        : `${t("current")} ${formatLatency(latestLatency)}`,
     latencyTone: latencyToneClass(latestLatency),
     loss: formatLossValue(displayLoss, t("lossRate")),
   };
@@ -4233,13 +4132,6 @@ function formatTestName(test) {
   const name = (test.name || "").trim();
   if (name) return name;
   return t("unnamed");
-}
-
-function formatLatencyValue(test) {
-  if (test.latency_ms !== null && test.latency_ms !== undefined) {
-    return formatLatency(test.latency_ms);
-  }
-  return "--";
 }
 
 function formatLatency(value) {
@@ -4315,17 +4207,7 @@ function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
     }
     return autoRenew ? t("renewing") : t("expired");
   }
-  const days = Math.floor(diff / 86400);
-  const hours = Math.floor((diff % 86400) / 3600);
-  const minutes = Math.floor((diff % 3600) / 60);
-  if (publicLocale === "en-US") {
-    if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
-    if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
-    return `${minutes}${t("minutes")}`;
-  }
-  if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
-  if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
-  return `${minutes}${t("minutes")}`;
+  return formatDuration(diff);
 }
 
 function formatRemainingSummary(expireAt, autoRenew, renewIntervalSec) {
@@ -4347,11 +4229,6 @@ function formatDuration(seconds) {
   const days = Math.floor(safe / 86400);
   const hours = Math.floor((safe % 86400) / 3600);
   const minutes = Math.floor((safe % 3600) / 60);
-  if (publicLocale === "en-US") {
-    if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
-    if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
-    return `${minutes}${t("minutes")}`;
-  }
   if (days > 0) return `${days}${t("days")} ${hours}${t("hours")}`;
   if (hours > 0) return `${hours}${t("hours")} ${minutes}${t("minutes")}`;
   return `${minutes}${t("minutes")}`;
