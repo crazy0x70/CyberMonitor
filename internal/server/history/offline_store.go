@@ -52,6 +52,7 @@ func OpenOfflineStore(dir string) (*OfflineStore, error) {
 
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = int64(offlineRetention / time.Millisecond)
+	opts.MaxBytes = offlineMaxBytes
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {

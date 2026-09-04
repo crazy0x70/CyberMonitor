@@ -57,6 +57,7 @@ func OpenNetworkStore(dir string) (*NetworkStore, error) {
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = int64(networkRetention / time.Millisecond)
 	opts.OutOfOrderTimeWindow = int64(networkOutOfOrderWindow / time.Millisecond)
+	opts.MaxBytes = networkMaxBytes
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {
@@ -168,6 +169,9 @@ func (s *NetworkStore) queryRange(
 
 	mint := from.UnixMilli()
 	maxt := to.UnixMilli()
+	// 长窗口（如 1y）必须先定桶再采集：target ≤ ~1000 点/序列。
+	// 短窗口返回 0，走 raw 路径（与历史行为一致）。
+	bucketMillis := downsampleBucketMillis(mint, maxt)
 	querier, err := s.db.Querier(mint, maxt)
 	if err != nil {
 		return nil, err
@@ -182,6 +186,7 @@ func (s *NetworkStore) queryRange(
 		networkMetricNames(includeAvailability),
 		mint,
 		maxt,
+		bucketMillis,
 		accumulators,
 	); err != nil {
 		return nil, err
@@ -538,6 +543,7 @@ func collectMetricSeriesBatch(
 	metricNames []string,
 	mint int64,
 	maxt int64,
+	bucketMillis int64,
 	accumulators map[string]*seriesAccumulator,
 ) error {
 	if len(metricNames) == 0 {
@@ -562,7 +568,7 @@ func collectMetricSeriesBatch(
 		seriesLabels := series.Labels()
 		metricName := strings.TrimSpace(seriesLabels.Get(labels.MetricName))
 		identity := networkIdentityFromLabels(seriesLabels)
-		acc := ensureSeriesAccumulator(accumulators, identity)
+		acc := ensureSeriesAccumulator(accumulators, identity, bucketMillis)
 		if acc == nil {
 			continue
 		}
@@ -576,11 +582,11 @@ func collectMetricSeriesBatch(
 			tsSeconds := tsMillis / 1000
 			switch metricName {
 			case networkLatencyMetric:
-				acc.latency[tsSeconds] = NormalizeFloat(value)
+				acc.latency.observe(tsSeconds, value)
 			case networkLossMetric:
-				acc.loss[tsSeconds] = NormalizeFloat(value)
+				acc.loss.observe(tsSeconds, value)
 			case networkAvailabilityMetric:
-				acc.availability[tsSeconds] = NormalizeFloat(value)
+				acc.availability.observe(tsSeconds, value)
 			}
 		}
 		if err := iterator.Err(); err != nil {

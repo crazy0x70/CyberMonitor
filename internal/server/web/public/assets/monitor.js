@@ -45,6 +45,7 @@ const PUBLIC_I18N = {
     region: "地区",
     os: "系统信息",
     gpu: "GPU",
+    gpuDriver: "驱动",
     load: "负载",
     uploadTotal: "累计上传",
     downloadTotal: "累计下载",
@@ -108,6 +109,7 @@ const PUBLIC_I18N = {
     region: "Region",
     os: "System",
     gpu: "GPU",
+    gpuDriver: "Driver",
     load: "Load",
     uploadTotal: "Total upload",
     downloadTotal: "Total download",
@@ -166,16 +168,10 @@ const fallbackRegionNames = {
   US: "United States",
 };
 
-const CONFIG_PATH = "./config.json";
 const DEFAULT_GROUP = "全部";
 const DEFAULT_STATUS_FILTER = "all";
 const DEFAULT_TEST_RANGE_KEY = "1h";
-const DISPLAY_NODE_ID_SEPARATOR = "::";
 const STATUS_FILTERS = new Set(["all", "online", "offline"]);
-
-const remoteConfig = {
-  targets: [],
-};
 
 function readViewStateFromURL() {
   const params = new URLSearchParams(window.location.search);
@@ -185,14 +181,14 @@ function readViewStateFromURL() {
 const initialViewState = readViewStateFromURL();
 
 const state = {
-  wsConnections: new Map(),
+  wsConnection: null,
+  wsReconnectTimer: null,
+  wsReconnectAttempts: 0,
+  wsWatchdog: null,
+  wsLastMessageAt: 0,
+  snapshot: null,
   nodes: new Map(),
   nodeByDisplayId: new Map(),
-  reconnectTimers: new Map(),
-  wsReconnectAttempts: new Map(),
-  wsWatchdogs: new Map(),
-  wsLastMessageAt: new Map(),
-  snapshotFailures: new Map(),
   selectedGroup: initialViewState.selectedGroup,
   statusFilter: initialViewState.statusFilter,
   lastNodes: [],
@@ -209,11 +205,11 @@ const state = {
   testSmooth: new Map(),
   mergedProvenance: new Map(),
   renderedNode: new Map(),
+  renderedHistorySig: new Map(),
   renderMode: "flat",
   tagSections: new Map(),
   historyCacheTimer: null,
   historyCacheLoading: false,
-  sourceSnapshots: new Map(),
   publicTrafficCounters: new Map(),
   snapshotFallbackTimer: null,
   snapshotFallbackInflight: false,
@@ -223,7 +219,7 @@ const state = {
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
-const HISTORY_CACHE_VERSION = 4;
+const HISTORY_CACHE_VERSION = 5;
 const HISTORY_CACHE_MAX_POINTS = 5000;
 const HISTORY_CACHE_HOT_SECONDS = 60 * 60;
 const HISTORY_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24 * 366;
@@ -287,6 +283,7 @@ function resetRenderedLocaleState() {
   });
   state.nodes.clear();
   state.renderedNode.clear();
+  state.renderedHistorySig.clear();
   state.tagSections.clear();
   state.renderMode = "";
   state.groupTabSignature = "";
@@ -442,25 +439,14 @@ function forceRefreshOpenNodeHistoryViews(nodeId) {
 }
 
 function connectWS() {
-  const targets = resolveTargets();
-  targets.forEach((target) => {
-    connectWSForTarget(target);
-  });
-}
-
-function connectWSForTarget(target) {
-  if (!target || !target.socketURL) {
+  const target = resolveOriginTarget();
+  const existing = state.wsConnection;
+  if (
+    existing &&
+    existing.readyState !== WebSocket.CLOSING &&
+    existing.readyState !== WebSocket.CLOSED
+  ) {
     return;
-  }
-  const existing = state.wsConnections.get(target.key);
-  if (existing) {
-    if (
-      existing.readyState !== WebSocket.CLOSING &&
-      existing.readyState !== WebSocket.CLOSED
-    ) {
-      return;
-    }
-    state.wsConnections.delete(target.key);
   }
 
   let ws;
@@ -468,29 +454,28 @@ function connectWSForTarget(target) {
     ws = new WebSocket(target.socketURL);
   } catch (error) {
     console.error("WebSocket 初始化失败", target.socketURL, error);
-    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
-    scheduleReconnect(target);
+    void fetchPublicSnapshot();
+    scheduleReconnect();
     return;
   }
-  state.wsConnections.set(target.key, ws);
+  state.wsConnection = ws;
 
   ws.onopen = () => {
-    clearReconnectTimer(target.key);
-    state.wsReconnectAttempts.delete(target.key);
-    state.snapshotFailures.delete(target.key);
-    state.wsLastMessageAt.set(target.key, Date.now());
-    armWSWatchdog(target, ws);
-    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
+    clearReconnectTimer();
+    state.wsReconnectAttempts = 0;
+    state.wsLastMessageAt = Date.now();
+    armWSWatchdog(ws);
+    void fetchPublicSnapshot();
   };
 
   ws.onclose = () => {
-    clearWSWatchdog(target.key);
-    state.wsLastMessageAt.delete(target.key);
-    if (state.wsConnections.get(target.key) === ws) {
-      state.wsConnections.delete(target.key);
+    clearWSWatchdog();
+    state.wsLastMessageAt = 0;
+    if (state.wsConnection === ws) {
+      state.wsConnection = null;
     }
-    void fetchPublicSnapshotForTarget(target, { dropOnFailure: false });
-    scheduleReconnect(target);
+    void fetchPublicSnapshot();
+    scheduleReconnect();
   };
 
   ws.onerror = () => {
@@ -500,12 +485,12 @@ function connectWSForTarget(target) {
   ws.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data);
-      state.wsLastMessageAt.set(target.key, Date.now());
-      armWSWatchdog(target, ws);
+      state.wsLastMessageAt = Date.now();
+      armWSWatchdog(ws);
       if (payload.type === "snapshot") {
-        handleSnapshot(payload, target.key);
+        handleSnapshot(payload);
       } else if (payload.type === "node_delta") {
-        handleNodeDelta(payload, target.key);
+        handleNodeDelta(payload);
       }
     } catch (error) {
       console.error(error);
@@ -513,187 +498,99 @@ function connectWSForTarget(target) {
   };
 }
 
-function buildFallbackTarget(currentLocation = document.baseURI || location.href) {
+function resolveAPIBaseOverride() {
+  let raw = "";
+  try {
+    raw = String(
+      document.querySelector('meta[name="cm-api-base"]')?.content || ""
+    ).trim();
+  } catch (error) {
+    raw = "";
+  }
+  if (!raw) {
+    raw = String(window.CYBER_MONITOR_API_BASE || "").trim();
+  }
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+}
+
+function resolveOriginTarget(currentLocation = document.baseURI || location.href) {
+  const overrideBase = resolveAPIBaseOverride();
+  if (overrideBase) {
+    const apiBase = overrideBase.toString().replace(/\/+$/, "");
+    const socketURL = new URL("ws", `${apiBase}/`);
+    socketURL.protocol = overrideBase.protocol === "https:" ? "wss:" : "ws:";
+    return {
+      socketURL: socketURL.toString(),
+      apiBase,
+    };
+  }
   const currentURL = new URL(currentLocation);
   const fallbackBase = new URL("./", currentURL);
   const socketURL = new URL("ws", fallbackBase);
   socketURL.protocol = currentURL.protocol === "https:" ? "wss:" : "ws:";
   return {
-    key: "default",
     socketURL: socketURL.toString(),
     apiBase: fallbackBase.toString().replace(/\/+$/, ""),
   };
-}
-
-function resolveTargets() {
-  if (Array.isArray(remoteConfig.targets) && remoteConfig.targets.length > 0) {
-    return remoteConfig.targets;
-  }
-  return [buildFallbackTarget()];
-}
-
-function normalizeAPIBase(value) {
-  const raw = (value || "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return "";
-    }
-    return parsed.toString().replace(/\/+$/, "");
-  } catch (error) {
-    return "";
-  }
-}
-
-function normalizeSocketURL(value) {
-  const raw = (value || "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-      return "";
-    }
-    return parsed.toString();
-  } catch (error) {
-    return "";
-  }
 }
 
 function buildPublicRequestHeaders() {
   return {};
 }
 
-function pickConfigEntry(entry, key = "") {
-  if (!entry || typeof entry !== "object") {
-    return null;
-  }
-  const socketURL = normalizeSocketURL(entry.socket);
-  const apiBase = normalizeAPIBase(entry.apiURL);
-  if (!socketURL || !apiBase) {
-    return null;
-  }
-  return {
-    key: key || "default",
-    socketURL,
-    apiBase,
-  };
-}
-
-function pickConfigTargets(data) {
-  if (!data || typeof data !== "object") {
-    return [];
-  }
-
-  const targets = [];
-  const seen = new Set();
-  const pushTarget = (entry) => {
-    if (!entry) {
-      return;
-    }
-    const signature = `${entry.socketURL}\n${entry.apiBase}`;
-    if (seen.has(signature)) {
-      return;
-    }
-    seen.add(signature);
-    targets.push(entry);
-  };
-  const direct = pickConfigEntry(data, "default");
-  pushTarget(direct);
-
-  for (const key of Object.keys(data)) {
-    const entry = pickConfigEntry(data[key], key);
-    pushTarget(entry);
-  }
-
-  return targets;
-}
-
-async function loadRemoteConfig() {
+async function fetchPublicSnapshot() {
+  const target = resolveOriginTarget();
   try {
-    const resp = await fetch(CONFIG_PATH, { cache: "no-store" });
-    if (!resp.ok) {
-      return;
-    }
-    const data = await resp.json();
-    const targets = pickConfigTargets(data);
-    if (!targets.length) return;
-    remoteConfig.targets = targets;
-  } catch (error) {
-    return;
-  }
-}
-
-async function fetchPublicSnapshotForTarget(target, options = {}) {
-  const { dropOnFailure = true } = options;
-  const base = target?.apiBase;
-  if (!base || !target?.key) return false;
-  try {
-    const resp = await fetch(`${base}/api/v1/public/snapshot`, {
+    const resp = await fetch(`${target.apiBase}/api/v1/public/snapshot`, {
       cache: "no-store",
       headers: buildPublicRequestHeaders(),
     });
     if (!resp.ok) {
-      state.snapshotFailures.set(
-        target.key,
-        (state.snapshotFailures.get(target.key) || 0) + 1
-      );
-      if (dropOnFailure) {
-        dropSourceSnapshot(target.key);
-      }
       return false;
     }
     const payload = await resp.json();
     if (payload && payload.type === "snapshot") {
-      state.snapshotFailures.delete(target.key);
-      state.wsLastMessageAt.set(target.key, Date.now());
-      handleSnapshot(payload, target.key);
+      state.wsLastMessageAt = Date.now();
+      handleSnapshot(payload);
       return true;
     }
   } catch (error) {
-    state.snapshotFailures.set(
-      target.key,
-      (state.snapshotFailures.get(target.key) || 0) + 1
-    );
-    if (dropOnFailure) {
-      dropSourceSnapshot(target.key);
-    }
+    return false;
   }
   return false;
 }
 
-async function fetchPublicSnapshot() {
-  const targets = resolveTargets();
-  await Promise.all(targets.map((target) => fetchPublicSnapshotForTarget(target)));
-}
-
-function targetHasHealthySocket(target) {
-  if (!target?.key) {
-    return false;
-  }
-  const socket = state.wsConnections.get(target.key);
+function hasHealthySocket() {
+  const socket = state.wsConnection;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return false;
   }
-  const lastMessageAt = Number(state.wsLastMessageAt.get(target.key) || 0);
-  return lastMessageAt > 0 && Date.now() - lastMessageAt <= WS_WATCHDOG_MS;
+  return (
+    state.wsLastMessageAt > 0 && Date.now() - state.wsLastMessageAt <= WS_WATCHDOG_MS
+  );
 }
 
 async function fetchPublicSnapshotFallback() {
   if (state.snapshotFallbackInflight) {
     return;
   }
-  const targets = resolveTargets().filter((target) => !targetHasHealthySocket(target));
-  if (!targets.length) {
+  if (hasHealthySocket()) {
     return;
   }
   state.snapshotFallbackInflight = true;
   try {
-    await Promise.all(
-      targets.map((target) =>
-        fetchPublicSnapshotForTarget(target, { dropOnFailure: false })
-      )
-    );
+    await fetchPublicSnapshot();
   } finally {
     state.snapshotFallbackInflight = false;
   }
@@ -709,77 +606,69 @@ function startPublicSnapshotFallbackPolling() {
   );
 }
 
-function clearReconnectTimer(targetKey) {
-  const timer = state.reconnectTimers.get(targetKey);
-  if (timer) {
-    clearTimeout(timer);
-    state.reconnectTimers.delete(targetKey);
+function clearReconnectTimer() {
+  if (state.wsReconnectTimer) {
+    clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = null;
   }
 }
 
-function clearWSWatchdog(targetKey) {
-  const timer = state.wsWatchdogs.get(targetKey);
-  if (timer) {
-    clearTimeout(timer);
-    state.wsWatchdogs.delete(targetKey);
+function clearWSWatchdog() {
+  if (state.wsWatchdog) {
+    clearTimeout(state.wsWatchdog);
+    state.wsWatchdog = null;
   }
 }
 
-function armWSWatchdog(target, socket) {
-  if (!target?.key || !socket) return;
-  clearWSWatchdog(target.key);
-  const timer = window.setTimeout(() => {
-    handleTargetSocketSilence(target, socket);
+function armWSWatchdog(socket) {
+  if (!socket) return;
+  clearWSWatchdog();
+  state.wsWatchdog = window.setTimeout(() => {
+    handleSocketSilence(socket);
   }, WS_WATCHDOG_MS);
-  state.wsWatchdogs.set(target.key, timer);
 }
 
-function handleTargetSocketSilence(target, socket) {
-  if (!target?.key || !socket) return;
-  clearWSWatchdog(target.key);
-  if (state.wsConnections.get(target.key) !== socket) {
+function handleSocketSilence(socket) {
+  if (!socket) return;
+  clearWSWatchdog();
+  if (state.wsConnection !== socket) {
     return;
   }
-  void fetchPublicSnapshotForTarget(target, { dropOnFailure: false }).then((ok) => {
-    if (state.wsConnections.get(target.key) !== socket) {
+  void fetchPublicSnapshot().then((ok) => {
+    if (state.wsConnection !== socket) {
       return;
     }
     if (ok && socket.readyState === WebSocket.OPEN) {
-      state.wsLastMessageAt.set(target.key, Date.now());
-      armWSWatchdog(target, socket);
+      state.wsLastMessageAt = Date.now();
+      armWSWatchdog(socket);
       return;
     }
-    state.wsConnections.delete(target.key);
-    state.wsLastMessageAt.delete(target.key);
+    state.wsConnection = null;
+    state.wsLastMessageAt = 0;
     try {
       socket.close();
     } catch (error) {
       console.warn("关闭静默 WebSocket 失败", error);
     }
-    scheduleReconnect(target);
+    scheduleReconnect();
   });
 }
 
-function scheduleReconnect(target) {
-  if (!target || !target.key) return;
-  if (state.reconnectTimers.has(target.key)) return;
-  const attempt = state.wsReconnectAttempts.get(target.key) || 0;
+function scheduleReconnect() {
+  if (state.wsReconnectTimer) return;
   const delay = Math.min(
     WS_RECONNECT_MAX_DELAY,
-    WS_RECONNECT_BASE_DELAY * Math.pow(2, attempt)
+    WS_RECONNECT_BASE_DELAY * Math.pow(2, state.wsReconnectAttempts)
   );
-  const timer = setTimeout(() => {
-    state.reconnectTimers.delete(target.key);
-    state.wsReconnectAttempts.set(target.key, attempt + 1);
-    connectWSForTarget(target);
+  state.wsReconnectTimer = setTimeout(() => {
+    state.wsReconnectTimer = null;
+    state.wsReconnectAttempts += 1;
+    connectWS();
   }, delay);
-  state.reconnectTimers.set(target.key, timer);
 }
 
-function buildTrafficCounterKey(sourceKey, nodeID) {
-  const normalizedNodeID = String(nodeID || "").trim();
-  if (!normalizedNodeID) return "";
-  return `${String(sourceKey || "default")}::${normalizedNodeID}`;
+function buildTrafficCounterKey(nodeID) {
+  return String(nodeID || "").trim();
 }
 
 function resolveBackendNodeId(node, fallback) {
@@ -791,35 +680,8 @@ function resolveBackendNodeId(node, fallback) {
   return fallback;
 }
 
-function resolveDisplayNodeId(node, fallback, sourceKey = node?.__sourceKey || "default") {
-  const nodeID = resolveBackendNodeId(node, "").trim();
-  if (!nodeID) return fallback;
-  return `${encodeURIComponent(
-    normalizeHistorySourceKey(sourceKey)
-  )}${DISPLAY_NODE_ID_SEPARATOR}${encodeURIComponent(nodeID)}`;
-}
-
-function parseDisplayNodeId(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-  const separatorIndex = raw.indexOf(DISPLAY_NODE_ID_SEPARATOR);
-  if (separatorIndex <= 0) {
-    return null;
-  }
-  try {
-    const sourceKey = normalizeHistorySourceKey(
-      decodeURIComponent(raw.slice(0, separatorIndex))
-    );
-    const nodeID = decodeURIComponent(
-      raw.slice(separatorIndex + DISPLAY_NODE_ID_SEPARATOR.length)
-    ).trim();
-    if (!nodeID) {
-      return null;
-    }
-    return { sourceKey, nodeID };
-  } catch (error) {
-    return null;
-  }
+function resolveDisplayNodeId(node, fallback) {
+  return resolveBackendNodeId(node, fallback).trim();
 }
 
 function resolveNodeFreshness(node) {
@@ -843,10 +705,10 @@ function shouldReplaceNode(existing, candidate) {
   return candidateLastSeen >= existingLastSeen;
 }
 
-function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
+function cloneNodeWithDisplayTraffic(node) {
   const candidate = node && typeof node === "object" ? node : {};
   const nodeID = resolveBackendNodeId(candidate, "").trim();
-  const trafficKey = buildTrafficCounterKey(sourceKey, nodeID);
+  const trafficKey = buildTrafficCounterKey(nodeID);
   const network = candidate.stats?.network || {};
   const uptimeSec = Number(candidate.stats?.uptime_sec || 0);
   const rawSent = Number(network.bytes_sent || 0);
@@ -866,7 +728,6 @@ function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
   if (previous && freshness > 0 && lastFreshness > 0 && freshness < lastFreshness) {
     return {
       ...candidate,
-      __sourceKey: sourceKey,
       stats: {
         ...(candidate.stats || {}),
         network: {
@@ -910,7 +771,6 @@ function cloneNodeWithDisplayTraffic(node, sourceKey = "default") {
 
   return {
     ...candidate,
-    __sourceKey: sourceKey,
     stats: {
       ...(candidate.stats || {}),
       network: {
@@ -926,7 +786,6 @@ function prunePublicTrafficCounters(nodes) {
   const activeKeys = new Set();
   (nodes || []).forEach((node) => {
     const trafficKey = buildTrafficCounterKey(
-      node?.__sourceKey || "default",
       resolveBackendNodeId(node, "").trim()
     );
     if (trafficKey) {
@@ -940,44 +799,16 @@ function prunePublicTrafficCounters(nodes) {
   });
 }
 
-function attachSourceKeyToNodes(nodes, sourceKey = "default") {
-  const list = Array.isArray(nodes) ? nodes : [];
-  return list.map((node) => ({
-    ...(node && typeof node === "object" ? node : {}),
-    __sourceKey: sourceKey,
-  }));
-}
-
-function dedupeNodesByID(nodes) {
+function mergeSnapshotNodes(nodes) {
   const merged = new Map();
   const list = Array.isArray(nodes) ? nodes : [];
   list.forEach((node) => {
-    const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || "default").trim();
+    const nodeID = resolveDisplayNodeId(node, "").trim();
     if (!nodeID) return;
     const existing = merged.get(nodeID);
-    if (shouldReplaceNode(existing, node)) {
-      merged.set(nodeID, node);
+    if (shouldReplaceNode(existing?.src, node)) {
+      merged.set(nodeID, { src: node });
     }
-  });
-  return Array.from(merged.values());
-}
-
-function mergeByNodeID(sourceSnapshots) {
-  const merged = new Map();
-  sourceSnapshots.forEach(([sourceKey, snapshot]) => {
-    const sourceNodes = dedupeNodesByID(snapshot?.nodes);
-    sourceNodes.forEach((node) => {
-      const nodeID = resolveDisplayNodeId(node, "", node?.__sourceKey || sourceKey).trim();
-      if (!nodeID) return;
-      const candidate = {
-        ...node,
-        __sourceKey: sourceKey,
-      };
-      const existing = merged.get(nodeID);
-      if (shouldReplaceNode(existing?.candidate, candidate)) {
-        merged.set(nodeID, { src: node, candidate });
-      }
-    });
   });
   const mergedNodes = [];
   merged.forEach((entry, nodeID) => {
@@ -986,10 +817,7 @@ function mergeByNodeID(sourceSnapshots) {
       mergedNodes.push(provenance.merged);
       return;
     }
-    const mergedNode = cloneNodeWithDisplayTraffic(
-      entry.candidate,
-      entry.candidate.__sourceKey || "default"
-    );
+    const mergedNode = cloneNodeWithDisplayTraffic(entry.src);
     state.mergedProvenance.set(nodeID, { src: entry.src, merged: mergedNode });
     mergedNodes.push(mergedNode);
   });
@@ -1001,26 +829,18 @@ function mergeByNodeID(sourceSnapshots) {
   return mergedNodes;
 }
 
-function mergeGroups(groupsBySource) {
-  const unique = new Set();
-  groupsBySource.forEach((groups) => {
-    (groups || []).forEach((item) => {
-      const name = String(item || "").trim();
-      if (name) unique.add(name);
-    });
-  });
-  return Array.from(unique);
-}
-
 function rebuildMergedSnapshotState() {
-  const sourceSnapshots = Array.from(state.sourceSnapshots.entries());
-  const snapshots = sourceSnapshots.map(([, snapshot]) => snapshot);
-  const mergedNodes = mergeByNodeID(sourceSnapshots);
+  const snapshot = state.snapshot;
+  const mergedNodes = mergeSnapshotNodes(snapshot?.nodes);
   const nodeByDisplayId = new Map();
-  const mergedGroups = mergeGroups(snapshots.map((item) => item.groups || []));
+  const mergedGroups = new Set();
+  (snapshot?.groups || []).forEach((item) => {
+    const name = String(item || "").trim();
+    if (name) mergedGroups.add(name);
+  });
 
   mergedNodes.forEach((node) => {
-    const displayId = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    const displayId = resolveDisplayNodeId(node, "").trim();
     if (displayId) {
       nodeByDisplayId.set(displayId, node);
     }
@@ -1030,17 +850,9 @@ function rebuildMergedSnapshotState() {
 
   state.lastNodes = mergedNodes;
   state.nodeByDisplayId = nodeByDisplayId;
-  state.settingsGroups = mergedGroups;
+  state.settingsGroups = Array.from(mergedGroups);
 
-  const latestSnapshot = snapshots
-    .slice()
-    .sort((a, b) => (b.generated_at || 0) - (a.generated_at || 0))[0];
-
-  if (latestSnapshot) {
-    applyPublicSettings(latestSnapshot.settings || {});
-  } else {
-    applyPublicSettings({});
-  }
+  applyPublicSettings(snapshot?.settings || {});
 
   cleanupDetachedHistory(state.lastNodes);
 
@@ -1070,7 +882,7 @@ function resolveNodeStaleSeconds(node) {
 function syncRealtimeStatus(nodes) {
   const active = new Set();
   (nodes || []).forEach((node) => {
-    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    const id = resolveDisplayNodeId(node, "").trim();
     if (!id) return;
     active.add(id);
     state.realtimeStatus.set(id, resolveNodeStatus(node));
@@ -1085,12 +897,13 @@ function syncRealtimeStatus(nodes) {
 function refreshRealtimeStatus() {
   let changed = false;
   state.lastNodes.forEach((node) => {
-    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default").trim();
+    const id = resolveDisplayNodeId(node, "").trim();
     if (!id) return;
     const next = resolveNodeStatus(node);
     if (state.realtimeStatus.get(id) !== next) {
       state.realtimeStatus.set(id, next);
       state.renderedNode.delete(id);
+      state.renderedHistorySig.delete(id);
       changed = true;
     }
   });
@@ -1099,20 +912,12 @@ function refreshRealtimeStatus() {
   }
 }
 
-function dropSourceSnapshot(sourceKey) {
-  if (!sourceKey || !state.sourceSnapshots.has(sourceKey)) {
-    return;
-  }
-  state.sourceSnapshots.delete(sourceKey);
-  rebuildMergedSnapshotState();
-}
-
-function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
+function upsertNodeInSnapshot(nodes, nextNode) {
   const list = Array.isArray(nodes) ? nodes.slice() : [];
-  const nodeID = resolveDisplayNodeId(nextNode, "", sourceKey).trim();
+  const nodeID = resolveDisplayNodeId(nextNode, "").trim();
   if (!nodeID) return list;
   const index = list.findIndex(
-    (item) => resolveDisplayNodeId(item, "", sourceKey).trim() === nodeID
+    (item) => resolveDisplayNodeId(item, "").trim() === nodeID
   );
   if (index === -1) {
     list.push(nextNode);
@@ -1124,46 +929,34 @@ function upsertNodeInSnapshot(nodes, nextNode, sourceKey = "default") {
   return list;
 }
 
-function handleSnapshot(payload, sourceKey = "default") {
+function handleSnapshot(payload) {
   if (!payload || typeof payload !== "object") {
     return;
   }
-  payload = {
+  state.snapshot = {
     ...payload,
-    nodes: attachSourceKeyToNodes(payload.nodes, sourceKey),
+    nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
   };
-
-  state.sourceSnapshots.set(sourceKey, {
-    ...payload,
-    nodes: dedupeNodesByID(payload.nodes),
-  });
-  state.snapshotFailures.delete(sourceKey);
-  applyTestHistory(payload.test_history, sourceKey);
+  applyTestHistory(payload.test_history);
   rebuildMergedSnapshotState();
 }
 
-function handleNodeDelta(payload, sourceKey = "default") {
+function handleNodeDelta(payload) {
   if (!payload || typeof payload !== "object" || !payload.node) {
     return;
   }
-  const stampedNode = {
-    ...(payload.node && typeof payload.node === "object" ? payload.node : {}),
-    __sourceKey: sourceKey,
-  };
-  const previous = state.sourceSnapshots.get(sourceKey) || {
+  const previous = state.snapshot || {
     type: "snapshot",
     nodes: [],
     groups: [],
     settings: {},
   };
-  const next = {
+  state.snapshot = {
     ...previous,
     type: "snapshot",
     generated_at: payload.generated_at || Math.floor(Date.now() / 1000),
-    nodes: upsertNodeInSnapshot(previous.nodes, stampedNode, sourceKey),
+    nodes: upsertNodeInSnapshot(previous.nodes, payload.node),
   };
-  state.sourceSnapshots.set(sourceKey, next);
-  state.snapshotFailures.delete(sourceKey);
   rebuildMergedSnapshotState();
 }
 
@@ -1366,33 +1159,20 @@ function normalizeHistoryRangeKey(value) {
     : DEFAULT_TEST_RANGE_KEY;
 }
 
-function normalizeHistorySourceKey(sourceKey) {
-  const raw = String(sourceKey || "").trim();
-  return raw || "default";
-}
-
-function historyKeyPart(value) {
-  return encodeURIComponent(String(value || "").trim());
-}
-
-function historyNodeCacheKey(nodeId, sourceKey) {
-  return `${historyKeyPart(normalizeHistorySourceKey(sourceKey))}::${historyKeyPart(nodeId)}`;
-}
-
 function resolveHistoryNodeId(nodeId) {
   const targetNode = findNodeByDisplayId(nodeId);
   if (targetNode) {
     return resolveBackendNodeId(targetNode, "").trim();
   }
-  return parseDisplayNodeId(nodeId)?.nodeID || String(nodeId || "").trim();
+  return String(nodeId || "").trim();
 }
 
-function resolveHistoryNodeCacheKey(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
-  return historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey);
+function resolveHistoryNodeCacheKey(nodeId) {
+  return resolveHistoryNodeId(nodeId);
 }
 
-function historyRequestKey(nodeId, sourceKey, rangeKey) {
-  return `${historyNodeCacheKey(resolveHistoryNodeId(nodeId), sourceKey)}::${normalizeHistoryRangeKey(rangeKey)}`;
+function historyRequestKey(nodeId, rangeKey) {
+  return `${resolveHistoryNodeCacheKey(nodeId)}::${normalizeHistoryRangeKey(rangeKey)}`;
 }
 
 function historyRequestKeyPrefix(cacheKey) {
@@ -1419,8 +1199,8 @@ function ensureNodeHistoryRangesByKey(cacheKey) {
   return state.testHistory.get(cacheKey);
 }
 
-function ensureNodeHistoryRanges(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
-  return ensureNodeHistoryRangesByKey(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+function ensureNodeHistoryRanges(nodeId) {
+  return ensureNodeHistoryRangesByKey(resolveHistoryNodeCacheKey(nodeId));
 }
 
 function ensureHistoryRangeMapByKey(cacheKey, rangeKey) {
@@ -1432,31 +1212,27 @@ function ensureHistoryRangeMapByKey(cacheKey, rangeKey) {
   return ranges.get(normalizedRange);
 }
 
-function ensureHistoryRangeMap(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+function ensureHistoryRangeMap(nodeId, rangeKey) {
   return ensureHistoryRangeMapByKey(
-    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    resolveHistoryNodeCacheKey(nodeId),
     rangeKey
   );
 }
 
-function getNodeHistoryRange(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
-  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+function getNodeHistoryRange(nodeId, rangeKey) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId));
   if (!ranges) {
     return new Map();
   }
   return ranges.get(normalizeHistoryRangeKey(rangeKey)) || new Map();
 }
 
-function getFallbackHistoryMap(
-  nodeId,
-  rangeKey,
-  sourceKey = resolveNodeSourceKey(nodeId)
-) {
-  const preferred = getNodeHistoryRange(nodeId, rangeKey, sourceKey);
+function getFallbackHistoryMap(nodeId, rangeKey) {
+  const preferred = getNodeHistoryRange(nodeId, rangeKey);
   if (preferred.size > 0) {
     return preferred;
   }
-  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId));
   if (!ranges) {
     return preferred;
   }
@@ -1468,8 +1244,8 @@ function getFallbackHistoryMap(
   return preferred;
 }
 
-function hasAnyHistoryForNode(nodeId, sourceKey = resolveNodeSourceKey(nodeId)) {
-  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId, sourceKey));
+function hasAnyHistoryForNode(nodeId) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId));
   if (!ranges || ranges.size === 0) {
     return false;
   }
@@ -1514,19 +1290,15 @@ function bumpHistoryGeneration(cacheKey) {
   state.testHistoryGeneration.set(cacheKey, historyGeneration(cacheKey) + 1);
 }
 
-function isHistoryRangeFetched(
-  nodeId,
-  rangeKey,
-  sourceKey = resolveNodeSourceKey(nodeId)
-) {
+function isHistoryRangeFetched(nodeId, rangeKey) {
   return state.testHistoryFetched.has(
-    historyRequestKey(nodeId, sourceKey, rangeKey)
+    historyRequestKey(nodeId, rangeKey)
   );
 }
 
-function isNodeHistoryInflight(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
+function isNodeHistoryInflight(nodeId, rangeKey) {
   return state.testHistoryInflight.has(
-    historyRequestKey(nodeId, sourceKey, rangeKey)
+    historyRequestKey(nodeId, rangeKey)
   );
 }
 
@@ -1544,8 +1316,8 @@ function clearNodeHistoryFailure(requestKey) {
   clearNodeHistoryRetryTimer(requestKey);
 }
 
-function scheduleNodeHistoryFailureRetry(nodeId, rangeKey, sourceKey, failedAt) {
-  const requestKey = historyRequestKey(nodeId, sourceKey, rangeKey);
+function scheduleNodeHistoryFailureRetry(nodeId, rangeKey, failedAt) {
+  const requestKey = historyRequestKey(nodeId, rangeKey);
   if (state.testHistoryRetryTimers.has(requestKey)) {
     return;
   }
@@ -1560,8 +1332,8 @@ function scheduleNodeHistoryFailureRetry(nodeId, rangeKey, sourceKey, failedAt) 
   state.testHistoryRetryTimers.set(requestKey, timer);
 }
 
-function isNodeHistoryFailed(nodeId, rangeKey, sourceKey = resolveNodeSourceKey(nodeId)) {
-  const requestKey = historyRequestKey(nodeId, sourceKey, rangeKey);
+function isNodeHistoryFailed(nodeId, rangeKey) {
+  const requestKey = historyRequestKey(nodeId, rangeKey);
   const failedAt = Number(state.testHistoryFailures.get(requestKey) || 0);
   if (!failedAt) {
     return false;
@@ -1678,10 +1450,10 @@ function cleanupDetachedHistory(nodes) {
   const activeHistoryKeys = new Set();
   const activeNodeIDs = new Set();
   nodes.forEach((node) => {
-    const id = resolveDisplayNodeId(node, "", node.__sourceKey || "default");
+    const id = resolveDisplayNodeId(node, "");
     if (id) {
       activeNodeIDs.add(id);
-      activeHistoryKeys.add(resolveHistoryNodeCacheKey(id, node.__sourceKey || "default"));
+      activeHistoryKeys.add(resolveHistoryNodeCacheKey(id));
     }
   });
   let changed = false;
@@ -1715,14 +1487,11 @@ function cleanupDetachedHistory(nodes) {
   }
 }
 
-function applyTestHistory(history, sourceKey) {
+function applyTestHistory(history) {
   if (!history || typeof history !== "object") return;
   let updated = false;
   Object.entries(history).forEach(([nodeId, rangeBuckets]) => {
-    const cacheKey =
-      sourceKey === undefined
-        ? String(nodeId || "").trim()
-        : historyNodeCacheKey(nodeId, sourceKey);
+    const cacheKey = String(nodeId || "").trim();
     if (!cacheKey) return;
     if (!rangeBuckets || typeof rangeBuckets !== "object") return;
     if (isLegacyHistoryBucket(rangeBuckets)) {
@@ -1801,14 +1570,9 @@ function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
   return true;
 }
 
-function replaceHistoryRange(
-  nodeId,
-  rangeKey,
-  tests,
-  sourceKey = resolveNodeSourceKey(nodeId)
-) {
+function replaceHistoryRange(nodeId, rangeKey, tests) {
   return replaceHistoryRangeByKey(
-    resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    resolveHistoryNodeCacheKey(nodeId),
     rangeKey,
     tests
   );
@@ -1865,29 +1629,9 @@ function findNodeByDisplayId(nodeId) {
   return state.nodeByDisplayId.get(normalized) || null;
 }
 
-function resolveNodeSourceKey(nodeId) {
-  const targetNode = findNodeByDisplayId(nodeId);
-  if (!targetNode) {
-    return parseDisplayNodeId(nodeId)?.sourceKey || "default";
-  }
-  return String(targetNode.__sourceKey || "default");
-}
-
-function resolveHistoryTargetBySourceKey(sourceKey) {
-  const normalizedSourceKey = normalizeHistorySourceKey(sourceKey);
-  const targets = resolveTargets();
-  return (
-    targets.find((item) => item.key === normalizedSourceKey) ||
-    targets[0] ||
-    null
-  );
-}
-
 function resolveNodeHistoryContext(nodeId) {
-  const sourceKey = resolveNodeSourceKey(nodeId);
   return {
-    sourceKey,
-    cacheKey: resolveHistoryNodeCacheKey(nodeId, sourceKey),
+    cacheKey: resolveHistoryNodeCacheKey(nodeId),
     rawNodeId: resolveHistoryNodeId(nodeId),
   };
 }
@@ -1897,24 +1641,23 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
   if (!nodeId) {
     return null;
   }
-  const { sourceKey, cacheKey, rawNodeId } = resolveNodeHistoryContext(nodeId);
+  const { cacheKey, rawNodeId } = resolveNodeHistoryContext(nodeId);
   if (!rawNodeId) {
     return null;
   }
-  const requestKey = historyRequestKey(nodeId, sourceKey, normalizedRange);
+  const requestKey = historyRequestKey(nodeId, normalizedRange);
   const requestGeneration = historyGeneration(cacheKey);
   if (state.testHistoryFetched.has(requestKey)) {
-    return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
+    return getNodeHistoryRange(nodeId, normalizedRange);
   }
   if (state.testHistoryInflight.has(requestKey)) {
     return state.testHistoryInflight.get(requestKey);
   }
-  if (isNodeHistoryFailed(nodeId, normalizedRange, sourceKey)) {
-    return getNodeHistoryRange(nodeId, normalizedRange, sourceKey);
+  if (isNodeHistoryFailed(nodeId, normalizedRange)) {
+    return getNodeHistoryRange(nodeId, normalizedRange);
   }
 
-  const target = resolveHistoryTargetBySourceKey(sourceKey);
-  const apiBase = target?.apiBase;
+  const apiBase = resolveOriginTarget().apiBase;
   if (!apiBase) {
     return null;
   }
@@ -1948,23 +1691,23 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
         payload?.range_key || normalizedRange
       );
       if (
-        resolveNodeSourceKey(nodeId) !== sourceKey ||
+        resolveHistoryNodeId(nodeId) !== rawNodeId ||
         historyGeneration(cacheKey) !== requestGeneration
       ) {
         return null;
       }
       if (payload?.tests && typeof payload.tests === "object") {
-        replaceHistoryRange(nodeId, resolvedRange, payload.tests, sourceKey);
+        replaceHistoryRange(nodeId, resolvedRange, payload.tests);
         scheduleHistoryCacheSave();
       }
       clearNodeHistoryFailure(requestKey);
-      clearNodeHistoryFailure(historyRequestKey(nodeId, sourceKey, resolvedRange));
+      clearNodeHistoryFailure(historyRequestKey(nodeId, resolvedRange));
       state.testHistoryFetched.set(
-        historyRequestKey(nodeId, sourceKey, resolvedRange),
+        historyRequestKey(nodeId, resolvedRange),
         true
       );
       forceRefreshOpenNodeHistoryViews(nodeId);
-      return getNodeHistoryRange(nodeId, resolvedRange, sourceKey);
+      return getNodeHistoryRange(nodeId, resolvedRange);
     })
     .catch((error) => {
       if (error?.name === "AbortError") {
@@ -1976,7 +1719,6 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
       scheduleNodeHistoryFailureRetry(
         nodeId,
         normalizedRange,
-        sourceKey,
         failedAt
       );
       console.warn("加载节点历史失败", nodeId, normalizedRange, error);
@@ -2323,9 +2065,17 @@ function upsertRenderedCard(container, node, id, animationIndex) {
     );
     card.style.animationDelay = `${animationIndex * 0.03}s`;
   }
-  if (!(card.isConnected && state.renderedNode.get(id) === node)) {
+  const historySig = latestHistoryAtForNode(id);
+  if (
+    !(
+      card.isConnected &&
+      state.renderedNode.get(id) === node &&
+      state.renderedHistorySig.get(id) === historySig
+    )
+  ) {
     updateCard(card, node, id);
     state.renderedNode.set(id, node);
+    state.renderedHistorySig.set(id, historySig);
   }
   if (card.parentElement !== container) {
     container.appendChild(card);
@@ -2335,11 +2085,7 @@ function upsertRenderedCard(container, node, id, animationIndex) {
 function renderFlatList(nodes) {
   const activeIds = new Set();
   nodes.forEach((node, index) => {
-    const id = resolveDisplayNodeId(
-      node,
-      `node-flat-${index}`,
-      node.__sourceKey || "default"
-    );
+    const id = resolveDisplayNodeId(node, `node-flat-${index}`);
     activeIds.add(id);
     upsertRenderedCard(list, node, id, index);
   });
@@ -2358,8 +2104,7 @@ function renderTagSections(nodes, group) {
     section.nodes.forEach((node, index) => {
       const id = resolveDisplayNodeId(
         node,
-        `node-${sectionIndex}-${index}`,
-        node.__sourceKey || "default"
+        `node-${sectionIndex}-${index}`
       );
       activeIds.add(id);
       upsertRenderedCard(entry.list, node, id, sectionIndex + index);
@@ -2430,6 +2175,7 @@ function cleanupInactive(activeIds) {
       card.remove();
       state.nodes.delete(id);
       state.renderedNode.delete(id);
+      state.renderedHistorySig.delete(id);
     }
   }
 }
@@ -2736,7 +2482,13 @@ function updateCard(card, node, nodeId) {
   const flag = flagEmoji(node.region);
   fields.name.textContent = `${flag}${displayName}`.trim();
 
-  fields.meta.textContent = `${stats.os || "--"} · ${stats.arch || "--"}`;
+  fields.meta.textContent = [
+    stats.os || "--",
+    stats.arch || "--",
+    formatGPUSummaryMeta(stats.gpu),
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   const statusValue = resolveNodeStatus(node);
   const status = statusValue === "offline" ? t("offline") : t("online");
@@ -3020,6 +2772,34 @@ function updateNetworkTests(fields, node, tests, nodeId) {
   renderNetworkSection(fields, nodeId);
 }
 
+function resolveHistoryMapLastAt(historyMap) {
+  let latestHistoryAt = 0;
+  if (historyMap) {
+    historyMap.forEach((history) => {
+      const historyLastAt = resolveHistoryLastAt(history);
+      if (historyLastAt > latestHistoryAt) {
+        latestHistoryAt = historyLastAt;
+      }
+    });
+  }
+  return latestHistoryAt;
+}
+
+function latestHistoryAtForNode(nodeId) {
+  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId));
+  if (!ranges || ranges.size === 0) {
+    return 0;
+  }
+  let latest = 0;
+  ranges.forEach((historyMap) => {
+    const rangeLastAt = resolveHistoryMapLastAt(historyMap);
+    if (rangeLastAt > latest) {
+      latest = rangeLastAt;
+    }
+  });
+  return latest;
+}
+
 function resolveNetworkRenderContext(
   nodeId,
   rangeKey = state.testRange.get(nodeId) || DEFAULT_TEST_RANGE_KEY
@@ -3028,17 +2808,10 @@ function resolveNetworkRenderContext(
   const renderHistoryMap = isNodeHistoryFailed(nodeId, activeRange)
     ? getNodeHistoryRange(nodeId, activeRange)
     : getFallbackHistoryMap(nodeId, activeRange);
-  let latestHistoryAt = 0;
-  renderHistoryMap.forEach((history) => {
-    const historyLastAt = resolveHistoryLastAt(history);
-    if (historyLastAt > latestHistoryAt) {
-      latestHistoryAt = historyLastAt;
-    }
-  });
   return {
     activeRange,
     renderHistoryMap,
-    latestHistoryAt,
+    latestHistoryAt: resolveHistoryMapLastAt(renderHistoryMap),
   };
 }
 
@@ -3478,20 +3251,20 @@ function updateTestHistory(nodeId, tests) {
     return;
   }
 
-  const { sourceKey, cacheKey } = resolveNodeHistoryContext(nodeId);
+  const { cacheKey } = resolveNodeHistoryContext(nodeId);
   const ranges = state.testHistory.get(cacheKey);
   if (!ranges || ranges.size === 0) {
     return;
   }
   const targetRanges = Array.from(ranges.keys()).filter((rangeKey) =>
-    isHistoryRangeFetched(nodeId, rangeKey, sourceKey)
+    isHistoryRangeFetched(nodeId, rangeKey)
   );
   if (targetRanges.length === 0) {
     return;
   }
   let updated = false;
   targetRanges.forEach((rangeKey) => {
-    const map = ensureHistoryRangeMap(nodeId, rangeKey, sourceKey);
+    const map = ensureHistoryRangeMap(nodeId, rangeKey);
     tests.forEach((test) => {
       const key = testKey(test);
       if (!key) return;
@@ -4076,6 +3849,30 @@ function formatCPUModel(cpu) {
   return parts.length ? parts.join(" · ") : "--";
 }
 
+function formatGPUSummaryMeta(gpus) {
+  const items = Array.isArray(gpus) ? gpus : [];
+  if (items.length === 0) {
+    return "";
+  }
+  const names = items
+    .map((gpu) => String(gpu?.name || "").trim())
+    .filter(Boolean);
+  if (names.length === 0) {
+    const withUsage = items.find((gpu) =>
+      Number.isFinite(gpu?.utilization_percent)
+    );
+    if (!withUsage) {
+      return "";
+    }
+    return `${t("gpu")} ${clamp(withUsage.utilization_percent).toFixed(0)}%`;
+  }
+  const parts = [t("gpu"), names.join(" + ")];
+  if (items.length === 1 && Number.isFinite(items[0].utilization_percent)) {
+    parts.push(`${clamp(items[0].utilization_percent).toFixed(0)}%`);
+  }
+  return parts.join(" · ");
+}
+
 function formatGPUDetails(gpus) {
   const items = Array.isArray(gpus) ? gpus : [];
   if (items.length === 0) {
@@ -4091,7 +3888,10 @@ function formatGPUDetails(gpus) {
         Number.isFinite(gpu.memory_used) && Number.isFinite(gpu.memory_total) && gpu.memory_total > 0
           ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
           : "";
-      return [name, usage, memory].filter(Boolean).join(" · ");
+      const driver = String(gpu.driver_version || "").trim();
+      return [name, usage, memory, driver ? `${t("gpuDriver")} ${driver}` : ""]
+        .filter(Boolean)
+        .join(" · ");
     })
     .join(" / ");
 }
@@ -4306,8 +4106,6 @@ loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);
 startPublicSnapshotFallbackPolling();
 
-loadRemoteConfig().finally(() => {
-  fetchPublicSnapshot().finally(() => {
-    connectWS();
-  });
+fetchPublicSnapshot().finally(() => {
+  connectWS();
 });

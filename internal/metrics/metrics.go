@@ -1148,10 +1148,18 @@ func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
 // exist. When the collector runs in a container with a host root, sysfs
 // still exposes the host kernel's block devices, so the lookup stays valid.
 func resolvePartitionTotal(device string, statTotal uint64) uint64 {
-	if name := sysfsBlockName(device); name != "" {
-		if size := readBlockDeviceSizeBytes(name); size > 0 {
-			return size
-		}
+	if sysfsBlockName(device) == "" {
+		// Devices outside /dev/ (Windows drive letters such as "C:" and
+		// volume mount folders, or synthetic host mounts) can never resolve
+		// to a sysfs block entry, so the symlink walk below would be pure
+		// overhead. On Windows it stats every path component of the device,
+		// which can stall for the SMB timeout when the mount folder lives on
+		// a disconnected mapped drive — inside the single-goroutine report
+		// loop.
+		return statTotal
+	}
+	if size := readBlockDeviceSizeBytes(sysfsBlockName(device)); size > 0 {
+		return size
 	}
 	// Device paths such as /dev/mapper/vg-root are symlinks to the real
 	// block node (e.g. ../dm-0); resolve and retry with that name. Inside

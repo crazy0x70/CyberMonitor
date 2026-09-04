@@ -28,8 +28,9 @@ import (
 
 const (
 	defaultGRPCFallbackBackoff = 30 * time.Second
+	maxGRPCFallbackBackoff     = 10 * time.Minute
 	defaultGRPCDialTimeout     = 4 * time.Second
-	defaultGRPCCallTimeout     = 5 * time.Second
+	defaultGRPCCallTimeout     = 4 * time.Second
 )
 
 type grpcTransportOptions struct {
@@ -60,6 +61,24 @@ func (o grpcTransportOptions) normalized() grpcTransportOptions {
 	return o
 }
 
+// nextGRPCBackoff 计算下一次 gRPC 失败后的回退时长：从 base 起按 2 倍
+// 指数增长，封顶 maxGRPCFallbackBackoff。current 为 0 表示当前无连续
+// 失败，直接返回 base。首次 gRPC 成功会将 current 归零，退避重新从
+// base 开始，避免瞬断后恢复过慢。
+func nextGRPCBackoff(base, current time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultGRPCFallbackBackoff
+	}
+	next := base
+	if current > 0 {
+		next = current * 2
+	}
+	if next <= 0 || next > maxGRPCFallbackBackoff {
+		return maxGRPCFallbackBackoff
+	}
+	return next
+}
+
 type agentControlPlane interface {
 	RegisterNodeToken(context.Context, string, string) (string, error)
 	FetchConfig(context.Context, string, string) (RemoteConfig, error)
@@ -73,9 +92,10 @@ type controlPlaneTransport struct {
 	grpc *grpcControlPlane
 	opts grpcTransportOptions
 
-	mu               sync.Mutex
-	grpcBackoffUntil time.Time
-	lastMode         string
+	mu                  sync.Mutex
+	grpcBackoffUntil    time.Time
+	grpcBackoffDuration time.Duration
+	lastMode            string
 }
 
 type httpControlPlane struct {
@@ -237,16 +257,18 @@ func (t *controlPlaneTransport) canUseGRPC() bool {
 
 func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	t.mu.Lock()
-	t.grpcBackoffUntil = time.Now().Add(t.opts.fallbackBackoff)
+	next := nextGRPCBackoff(t.opts.fallbackBackoff, t.grpcBackoffDuration)
+	t.grpcBackoffDuration = next
+	t.grpcBackoffUntil = time.Now().Add(next)
 	t.lastMode = "http"
 	t.mu.Unlock()
 	if t.grpc != nil {
 		target, state := t.grpc.connectionStatus()
-		log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: target=%s state=%s err=%v", t.opts.fallbackBackoff, target, state, err)
+		log.Printf("gRPC 控制链路不可用，已回退 HTTP 并退避 %s: target=%s state=%s err=%v", next, target, state, err)
 		_ = t.grpc.Close()
 		return
 	}
-	log.Printf("gRPC 控制链路不可用，已回退 HTTP %s: %v", t.opts.fallbackBackoff, err)
+	log.Printf("gRPC 控制链路不可用，已回退 HTTP 并退避 %s: %v", next, err)
 }
 
 func callWithFallback[T any](
@@ -278,8 +300,12 @@ func callWithFallback[T any](
 func (t *controlPlaneTransport) noteMode(mode string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if mode == "grpc" && t.lastMode == "http" {
-		log.Printf("gRPC 控制链路已恢复")
+	if mode == "grpc" {
+		if t.lastMode == "http" {
+			log.Printf("gRPC 控制链路已恢复")
+		}
+		// 首次 gRPC 成功即重置连续失败计数，退避从 base 重新开始。
+		t.grpcBackoffDuration = 0
 	}
 	t.lastMode = mode
 }

@@ -65,6 +65,9 @@ RUN set -eux; \
 
 FROM alpine:3.24 AS runtime-base
 WORKDIR /app
+# GOMEMLIMIT 是 Go GC 软上限：实测 30 agent 满负载工作集 <60MiB，
+# 300MiB 留足余量，同时阻止堆水位在分配波动下无限抬升容器 RSS。
+ENV GOMEMLIMIT=300MiB
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN apk add --no-cache su-exec tzdata && \
     addgroup -S cm && \

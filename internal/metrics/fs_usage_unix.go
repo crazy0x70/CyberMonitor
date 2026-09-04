@@ -4,7 +4,12 @@ package metrics
 
 import "syscall"
 
-func statFilesystemUsage(path string) (filesystemUsage, error) {
+// statFilesystemUsage is a package variable so tests can stub the
+// platform-specific stat call with synthetic inputs (e.g. Windows-shaped
+// mountpoints while running the tests on unix).
+var statFilesystemUsage = defaultStatFilesystemUsage
+
+func defaultStatFilesystemUsage(path string) (filesystemUsage, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return filesystemUsage{}, err

@@ -134,14 +134,11 @@ By default, port `25012` handles the public dashboard, administrative management
 
 ### 2. Separated Deployment
 
-To isolate management access from public status pages, use the `CM_PUBLIC_LISTEN` environment variable. You can deploy the frontend as a static site (e.g., via Cloudflare Pages) by providing a `config.json` that points to your backend:
+To isolate management access from public status pages, use the `CM_PUBLIC_LISTEN` environment variable. The public page always serves a single origin — it connects to the WebSocket and API endpoints of the host it is deployed on, so no extra `config.json` is required alongside the frontend.
 
-```json
-{
-  "socket": "wss://api.example.com:25013/ws",
-  "apiURL": "https://api.example.com:25013"
-}
-```
+### 3. Static Hosting
+
+The public page can also be deployed to any static host (Cloudflare Pages / Netlify / any static space). Upload the `internal/server/web/public/` directory, then edit `<meta name="cm-api-base">` in `index.html` to point at your monitor server (e.g. `https://monitor.example.com`). The server must allow cross-origin access to the public API (recent versions ship with CORS built in).
 
 <div align="center">
   If you find CyberMonitor useful, please consider giving us a ⭐️ Star!

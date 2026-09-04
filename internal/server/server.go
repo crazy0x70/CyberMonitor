@@ -654,55 +654,30 @@ func Run(ctx context.Context, cfg Config) error {
 		writeJSON(w, http.StatusOK, payload)
 	})
 
-	healthHandler := func(w http.ResponseWriter, r *http.Request) {
+	healthHandler := withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}
+	})
 	publicMux.HandleFunc("/api/v1/health", healthHandler)
 	if splitMode {
 		adminMux.HandleFunc("/api/v1/health", healthHandler)
 	}
 
-	publicMux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
-		if handlePublicCORSPreflight(w, r) {
-			return
-		}
-		applyPublicCORSHeaders(w)
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		apiBase, socketURL := buildDefaultPublicConfig(r, trustedProxyHeaders)
-		writeJSON(w, http.StatusOK, map[string]string{
-			"socket": socketURL,
-			"apiURL": apiBase,
-		})
-	})
-
-	publicSnapshotHandler := func(w http.ResponseWriter, r *http.Request) {
-		if handlePublicCORSPreflight(w, r) {
-			return
-		}
-		applyPublicCORSHeaders(w)
-		if r.Method != http.MethodGet {
+	publicSnapshotHandler := withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
+		if !isPublicReadMethod(r) {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		snapshot := storeSnapshot(store, false)
 		writeJSON(w, http.StatusOK, snapshot)
-	}
+	})
 	publicMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
 	if splitMode {
 		adminMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
 	}
 
-	publicMux.HandleFunc("/api/v1/public/nodes/", func(w http.ResponseWriter, r *http.Request) {
-		if handlePublicCORSPreflight(w, r) {
-			return
-		}
-		applyPublicCORSHeaders(w)
-		if r.Method != http.MethodGet {
+	publicMux.HandleFunc("/api/v1/public/nodes/", withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
+		if !isPublicReadMethod(r) {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
@@ -748,15 +723,6 @@ func Run(ctx context.Context, cfg Config) error {
 			To:       to.Unix(),
 			Tests:    tests,
 		})
-	})
-
-	adminMux.HandleFunc("/api/v1/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		snapshot := adminStoreSnapshot(store, true)
-		writeJSON(w, http.StatusOK, snapshot)
 	}))
 
 	publicMux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
@@ -1184,7 +1150,11 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			upgrader := websocket.Upgrader{
 				CheckOrigin: func(request *http.Request) bool {
-					if audience == "admin" || strings.TrimSpace(request.Header.Get("Origin")) != "" {
+					// admin 连接保持严格的同源校验（连 token 都要求
+					// same-origin）。public 数据按设计免认证公开，允许
+					// 任意 Origin 连接——静态托管（Cloudflare Pages 等）
+					// 跨源访问公开看板必须如此。
+					if audience == "admin" {
 						return isSameOrigin(request)
 					}
 					return true
@@ -1206,7 +1176,7 @@ func Run(ctx context.Context, cfg Config) error {
 			// 首次连接立即推送快照
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if ok := client.enqueue(websocket.TextMessage, bytes.Clone(payload)); !ok {
+				if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 					hub.Remove(conn)
 					return
 				}
@@ -3120,14 +3090,16 @@ func (h *Hub) CloseAdminClients() {
 	}
 }
 
+// BroadcastVariant/BroadcastAdmin share one immutable payload slice across
+// clients: the payload is never mutated after marshal and every write loop
+// only reads it, so per-client bytes.Clone allocations are pure waste.
 func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 	clients := h.snapshotClients()
 	for _, client := range clients {
 		if client == nil || client.variant != variant {
 			continue
 		}
-		copied := bytes.Clone(payload)
-		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3144,8 +3116,7 @@ func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
 			h.removeClient(client)
 			continue
 		}
-		copied := bytes.Clone(payload)
-		if ok := client.enqueue(websocket.TextMessage, copied); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3257,32 +3228,6 @@ func isSameOrigin(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(parsed.Host, r.Host)
-}
-
-func buildDefaultPublicConfig(r *http.Request, trustedProxyHeaders bool) (string, string) {
-	scheme := "http"
-	if r != nil {
-		if proto := trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Proto"); strings.EqualFold(proto, "https") {
-			scheme = "https"
-		} else if r.TLS != nil {
-			scheme = "https"
-		}
-	}
-	host := ""
-	if r != nil {
-		host = strings.TrimSpace(r.Host)
-	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	wsScheme := "ws"
-	if scheme == "https" {
-		wsScheme = "wss"
-	}
-	prefix := forwardedPrefix(r, trustedProxyHeaders)
-	apiBase := fmt.Sprintf("%s://%s%s", scheme, host, prefix)
-	socketURL := fmt.Sprintf("%s://%s%s/ws", wsScheme, host, prefix)
-	return apiBase, socketURL
 }
 
 func stripForwardedPrefixPath(next http.Handler, trustedProxyHeaders bool) http.Handler {
@@ -6386,19 +6331,37 @@ func withNoStore(next http.Handler) http.Handler {
 	})
 }
 
-func applyPublicCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", http.MethodGet+", "+http.MethodOptions)
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// isPublicReadMethod reports whether the request is a safe read (GET/HEAD)
+// for the public read-only endpoints; HEAD keeps uptime monitors happy and
+// the net/http server discards any body written for HEAD.
+func isPublicReadMethod(r *http.Request) bool {
+	return r != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead)
 }
 
-func handlePublicCORSPreflight(w http.ResponseWriter, r *http.Request) bool {
-	if r == nil || r.Method != http.MethodOptions {
-		return false
+func applyPublicCORSHeaders(w http.ResponseWriter) {
+	// 公开只读数据（snapshot/health/公开历史）按设计就是免认证的，任意
+	// Origin 可读。Vary: Origin 防止共享缓存把响应误用于按 Origin 变化的
+	// 场景。该函数只允许用于公开端点，admin 端点绝不携带 CORS 头。
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Add("Vary", "Origin")
+}
+
+// withPublicCORS wraps a public read-only handler so the public dashboard can
+// be statically hosted on another origin (Cloudflare Pages 等). Preflight
+// OPTIONS is answered with 204. Do NOT wrap admin handlers — they must not
+// emit CORS headers.
+func withPublicCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			applyPublicCORSHeaders(w)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		applyPublicCORSHeaders(w)
+		next(w, r)
 	}
-	applyPublicCORSHeaders(w)
-	w.WriteHeader(http.StatusNoContent)
-	return true
 }
 
 func buildAdminBootPayload(store *Store, r *http.Request, trustedProxyHeaders bool) (string, error) {

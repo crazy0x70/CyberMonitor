@@ -126,14 +126,11 @@ CyberMonitor 采用“探针采集 -> 服务端聚合”的架构模式，支持
 ### 混合模式与协议支持
 
 - **一体化架构**：默认 `25012` 端口同时负载前台展示、管理后台及 Agent 上报。
-- **前后端分离**：利用 `CM_PUBLIC_LISTEN` 环境变量（如 `25013`）可以将展示接口与管理端口隔离。你可以将前端静态部署于 Cloudflare Pages 等托管服务，并通过 `config.json` 指定 API 入口：
+- **前后端分离**：利用 `CM_PUBLIC_LISTEN` 环境变量（如 `25013`）可以将展示接口与管理端口隔离。公开页面固定单源部署——始终连接当前站点自身的 WebSocket 与 API 接口，前端无需额外部署 `config.json`。
 
-```json
-{
-  "socket": "wss://api.example.com:25013/ws",
-  "apiURL": "https://api.example.com:25013"
-}
-```
+### 静态托管
+
+公开页面也可托管到 Cloudflare Pages / Netlify 等任意静态空间：上传 `internal/server/web/public/` 目录，编辑 `index.html` 里的 `<meta name="cm-api-base">` 填入监控服务端地址（如 `https://monitor.example.com`）。服务端需允许该公开 API 跨源访问（新版已内置 CORS）。
 
 <div align="center">
   如果 CyberMonitor 对你有帮助，欢迎点亮 ⭐️ <b>Star</b> 支持！

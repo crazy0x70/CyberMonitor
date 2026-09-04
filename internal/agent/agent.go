@@ -31,7 +31,9 @@ var (
 	}
 	dockerManagedInitTimeout   = 10 * time.Second
 	dockerManagedLaunchTimeout = 10 * time.Minute
-	updateReportTimeout        = 8 * time.Second
+	// updateReportTimeout 与控制面 http.Client 的 Timeout 保持一致，
+	// 避免更短的 per-request ctx 静默压过客户端超时。
+	updateReportTimeout = 10 * time.Second
 )
 
 type Config struct {
@@ -62,7 +64,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	configureHostEnv(cfg.HostRoot)
 
-	client := &http.Client{Timeout: 6 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	transport := newControlPlaneTransportWithOptions(cfg, client, grpcTransportOptions{})
 	defer transport.Close()
 	runner := newAgentRunner(cfg, transport, metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces))

@@ -4,7 +4,11 @@ package metrics
 
 import "github.com/shirou/gopsutil/v4/disk"
 
-func statFilesystemUsage(path string) (filesystemUsage, error) {
+// statFilesystemUsage is a package variable so tests can stub the
+// platform-specific stat call with synthetic inputs.
+var statFilesystemUsage = defaultStatFilesystemUsage
+
+func defaultStatFilesystemUsage(path string) (filesystemUsage, error) {
 	usage, err := disk.Usage(path)
 	if err != nil {
 		return filesystemUsage{}, err
