@@ -13,15 +13,23 @@
 
 ### 1. 快速安装
 
-如需自动配置 systemd 服务或交互式选择安装类型（Server 或 Agent），请执行：
+单文件入口 `one-click.sh` 同时覆盖 Linux（systemd）与 macOS（launchd），支持主控与探针的安装和卸载：
 
 ```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o "$tmp/one-click.sh"
-sudo bash "$tmp/one-click.sh" install
-rm -rf "$tmp"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh
 ```
+
+非交互用法：
+
+```bash
+bash /tmp/one-click.sh install-server  [--listen 25012] [--data-dir 目录] [--version V]
+bash /tmp/one-click.sh install-agent   --server-url http://<主控IP>:25012 --agent-token <你的Token> [--node-id N] [--disable-update]
+bash /tmp/one-click.sh uninstall-agent
+bash /tmp/one-click.sh uninstall-server [--keep-data]
+```
+
+Linux 需要 `sudo`（systemd）。macOS 以 `sudo` 运行安装系统级 LaunchDaemon（开机自启）；普通用户运行安装用户级 LaunchAgent（登录自启）。
 
 ### 2. Docker 部署主控 (Server)
 
@@ -92,50 +100,32 @@ location /cyber_monitor.agentrpc.AgentService/ {
 
 初次安装时，系统会自动生成并持久化 `Node ID`。如需统一资产管理，也可在安装时手动指定。探针的握手过程使用 `HTTP` 完成，随后运行态优先尝试 `gRPC`。
 
-**Linux（systemd）**
+**Linux / macOS**
 
 ```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
-sudo bash "$tmp/agent.sh" --server-url http://<主控IP>:25012 --agent-token <你的Token>
-rm -rf "$tmp"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh install-agent --server-url http://<主控IP>:25012 --agent-token <你的Token>
 ```
 
-**macOS（launchd）**
-
-```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
-bash "$tmp/agent.sh" --server-url http://<主控IP>:25012 --agent-token <你的Token>
-rm -rf "$tmp"
-```
-
-以 `sudo` 运行安装为系统级 LaunchDaemon（`/Library/LaunchDaemons`，开机自启）；普通用户运行则安装为用户级 LaunchAgent（`~/Library/LaunchAgents`，登录自启）。两种方式均自动保活。日志位于 `/var/log/cybermonitor-agent.log`（root）或 `~/Library/Logs/cybermonitor-agent.log`（用户）。
+macOS 不加 `sudo` 则安装为用户级 LaunchAgent；加 `sudo` 为系统级 LaunchDaemon。日志位于 `/var/log/cybermonitor-agent.log`（root）或 `~/Library/Logs/cybermonitor-agent.log`（用户）。自定义参数：`--node-id`、`--net-iface`、`--disable-update`、`--version`。
 
 **Windows**
 
 ```powershell
-$script = Join-Path $env:TEMP 'agent.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script
-& $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
+$script = Join-Path $env:TEMP 'one-click.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
+& $script install-agent -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
 ```
 
-Linux 与 macOS 自定义参数均使用 `--node-id`、`--disable-update` 等 shell 参数。Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
+Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
 
 ### 5. 卸载探针 (Agent)
 
-**Linux（systemd）**
+**Linux / macOS**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
-```
-
-**macOS（launchd）**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && bash /tmp/agent-uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh uninstall-agent
 ```
 
 系统级（sudo）安装的卸载同样需要加 `sudo`；用户级安装无需 root 直接卸载。
@@ -143,12 +133,12 @@ curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts
 **Windows**
 
 ```powershell
-$script = Join-Path $env:TEMP 'agent-uninstall.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.ps1' -OutFile $script
-& $script
+$script = Join-Path $env:TEMP 'one-click.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
+& $script uninstall-agent
 ```
 
-该操作将自动清理 Agent 二进制文件、配置文件及系统服务，恢复系统环境。
+卸载将自动清理 Agent 二进制文件、配置文件及系统服务。主控卸载使用 `uninstall-server`（加 `--keep-data` / `-KeepData` 保留数据目录）。
 
 ## 📖 架构说明
 

@@ -15,15 +15,23 @@
 
 ### 1. Quick Installation
 
-To automatically configure the systemd service and interactively choose between installing the Server or Agent, run:
+The single entry point `one-click.sh` covers Linux (systemd) and macOS (launchd), installing or uninstalling both the Server and the Agent:
 
 ```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o "$tmp/one-click.sh"
-sudo bash "$tmp/one-click.sh" install
-rm -rf "$tmp"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh
 ```
+
+Non-interactive usage:
+
+```bash
+bash /tmp/one-click.sh install-server  [--listen 25012] [--data-dir DIR] [--version V]
+bash /tmp/one-click.sh install-agent   --server-url http://<server-ip>:25012 --agent-token <your-token> [--node-id N] [--disable-update]
+bash /tmp/one-click.sh uninstall-agent
+bash /tmp/one-click.sh uninstall-server [--keep-data]
+```
+
+On Linux, run with `sudo` (systemd required). On macOS, `sudo` installs system-level LaunchDaemons (start at boot); running as a normal user installs per-user LaunchAgents (start at login).
 
 ### 2. Deploying the Server via Docker
 
@@ -97,63 +105,45 @@ A default `Node ID` is generated and persisted during first-time installation. Y
 
 Note: The installation process uses HTTP for the initial bootstrap handshake. Once running, the Agent favors gRPC but falls back to HTTP when necessary. When using an HTTPS address, maintaining HTTP/2 through your proxy is recommended for optimal performance.
 
-**Linux (systemd)**
+**Linux / macOS**
 
 ```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
-sudo bash "$tmp/agent.sh" --server-url http://<server-ip>:25012 --agent-token <your-token>
-rm -rf "$tmp"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh install-agent --server-url http://<server-ip>:25012 --agent-token <your-token>
 ```
 
-**macOS (launchd)**
-
-```bash
-tmp="$(mktemp -d)"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
-bash "$tmp/agent.sh" --server-url http://<server-ip>:25012 --agent-token <your-token>
-rm -rf "$tmp"
-```
-
-With `sudo` the agent is installed as a system-level LaunchDaemon (`/Library/LaunchDaemons`, starts at boot); as a normal user it becomes a per-user LaunchAgent (`~/Library/LaunchAgents`, starts at login). Both keep the agent alive automatically. Logs go to `/var/log/cybermonitor-agent.log` (root) or `~/Library/Logs/cybermonitor-agent.log` (user).
+On macOS, running without `sudo` installs a per-user LaunchAgent; with `sudo` a system-level LaunchDaemon. Logs go to `/var/log/cybermonitor-agent.log` (root) or `~/Library/Logs/cybermonitor-agent.log` (user). Custom flags: `--node-id`, `--net-iface`, `--disable-update`, `--version`.
 
 **Windows**
 
 ```powershell
-$script = Join-Path $env:TEMP 'agent.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.ps1' -OutFile $script
-& $script -ServerUrl 'http://<server-ip>:25012' -AgentToken '<your-token>'
+$script = Join-Path $env:TEMP 'one-click.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
+& $script install-agent -ServerUrl 'http://<server-ip>:25012' -AgentToken '<your-token>'
 ```
 
-Linux custom parameters use shell flags such as `--node-id` and `--disable-update` (macOS uses the same flags). Windows custom parameters use PowerShell flags such as `-NodeId` and `-DisableUpdate`.
+Windows custom parameters use PowerShell flags such as `-NodeId` and `-DisableUpdate`.
 
 ### 5. Uninstalling the Agent
 
-**Linux (systemd)**
+**Linux / macOS**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh uninstall-agent
 ```
 
-**macOS (launchd)**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && bash /tmp/agent-uninstall.sh
-```
-
-For a system-level (sudo) install, run the uninstall with `sudo` as well; a per-user install is removed without it.
+For a system-level (sudo) install, uninstall with `sudo` as well; a per-user install is removed without it.
 
 **Windows**
 
 ```powershell
-$script = Join-Path $env:TEMP 'agent-uninstall.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.ps1' -OutFile $script
-& $script
+$script = Join-Path $env:TEMP 'one-click.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
+& $script uninstall-agent
 ```
 
-The uninstallation script removes the agent binary, configuration files, and system service registrations.
+The uninstallation removes the agent binary, configuration files, and system service registrations. Server uninstall works the same way via `uninstall-server` (add `--keep-data` / `-KeepData` to preserve data).
 
 ## 📖 Deployment Architecture
 

@@ -355,15 +355,9 @@ jobs:
             internal/server/web/public/assets/styles.css \
             internal/server/web/public/assets/theme.js \
             internal/server/web/public/assets/monitor.js \
-            scripts/verify-local.sh \
-            scripts/build-local.sh \
-            scripts/install-common.sh \
-            scripts/agent.sh \
             scripts/one-click.sh \
-            scripts/agent-uninstall.sh \
-            scripts/docker-entrypoint.sh \
-            scripts/agent.ps1 \
-            scripts/agent-uninstall.ps1
+            scripts/one-click.ps1 \
+            scripts/docker-entrypoint.sh
           do
             test -e "$path"
           done
@@ -371,18 +365,13 @@ jobs:
 
       - name: Verify install scripts
         run: |
-          bash -n scripts/verify-local.sh
-          bash -n scripts/build-local.sh
-          bash -n scripts/install-common.sh
-          bash -n scripts/agent.sh
           bash -n scripts/one-click.sh
-          bash -n scripts/agent-uninstall.sh
           sh -n scripts/docker-entrypoint.sh
 
       - name: Verify PowerShell install scripts
         shell: pwsh
         run: |
-          foreach ($file in @("scripts/agent.ps1", "scripts/agent-uninstall.ps1")) {
+          foreach ($file in @("scripts/one-click.ps1")) {
             $tokens = $null
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
@@ -430,7 +419,7 @@ jobs:
       - name: Verify PowerShell install scripts with Windows PowerShell
         shell: powershell
         run: |
-          $files = @("scripts/agent.ps1", "scripts/agent-uninstall.ps1")
+          $files = @("scripts/one-click.ps1")
           foreach ($file in $files) {
             $tokens = $null
             $errors = $null
