@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -207,9 +208,6 @@ func (t *controlPlaneTransport) FetchConfig(ctx context.Context, nodeID, token s
 }
 
 func (t *controlPlaneTransport) ReportStats(ctx context.Context, stats metrics.NodeStats, token string) (bool, error) {
-	if t.useHTTPForStats() {
-		return t.http.ReportStats(ctx, stats, token)
-	}
 	return callWithFallback(
 		t,
 		ctx,
@@ -234,12 +232,6 @@ func (t *controlPlaneTransport) ReportUpdate(ctx context.Context, nodeID, token,
 		},
 	)
 	return err
-}
-
-func (t *controlPlaneTransport) useHTTPForStats() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return !t.grpcBackoffUntil.IsZero() && time.Now().Before(t.grpcBackoffUntil)
 }
 
 func (t *controlPlaneTransport) Close() error {
@@ -323,18 +315,12 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 	if err != nil {
 		return false, err
 	}
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return false, readAgentAPIStatusError(resp, "ingest")
-	}
 	var result struct {
 		RefreshConfig bool `json:"refresh_config"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := performAgentRequest(h.client, req, "ingest", func(body io.Reader) error {
+		return json.NewDecoder(body).Decode(&result)
+	}); err != nil {
 		return false, err
 	}
 	return result.RefreshConfig, nil
@@ -521,7 +507,9 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 	})
 
 	if g.dialErr != nil {
-		return nil, g.dialErr
+		// 包装成 Unavailable 让 shouldFallbackToHTTP 命中，否则裸 dial 错误
+		// 既不会回退 HTTP，也会因 dialOnce 已消耗而永久卡死该传输。
+		return nil, status.Errorf(codes.Unavailable, "grpc dial failed: %v", g.dialErr)
 	}
 
 	g.mu.Lock()

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"math"
 	"net/http"
 	"strings"
@@ -17,7 +18,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
-	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -213,7 +213,7 @@ func (a *agentAPI) broadcastSnapshot() {
 	broadcastStoreSnapshot(a.hub, a.store, false)
 }
 
-func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token string) (bool, *agentAPIError) {
+func (a *agentAPI) ingest(payload metrics.NodeStats, token string) (bool, *agentAPIError) {
 	payload, apiErr := normalizeStatsPayload(payload)
 	if apiErr != nil {
 		return false, apiErr
@@ -229,7 +229,9 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 		}
 		updateReconciled, recoveryCandidate, err := a.store.updateNodeStats(payload)
 		if err != nil {
-			return false, false, nil, agentServiceUnavailable(err.Error())
+			// 错误细节（含磁盘路径等）只留服务端日志，不回传给 agent。
+			log.Printf("节点 %s 数据写入失败: %v", payload.NodeID, err)
+			return false, false, nil, agentServiceUnavailable("节点数据写入失败")
 		}
 		return updateReconciled, a.store.HasPendingAgentConfigRefresh(payload.NodeID), recoveryCandidate, nil
 	}()
@@ -242,9 +244,6 @@ func (a *agentAPI) ingest(remoteAddr string, payload metrics.NodeStats, token st
 	a.broadcastNodeDelta(payload.NodeID)
 	if updateReconciled {
 		a.broadcastSnapshot()
-	}
-	if strings.TrimSpace(remoteAddr) == "" {
-		remoteAddr = "grpc"
 	}
 	return refreshConfig, nil
 }
@@ -396,7 +395,7 @@ func (s *agentRPCServer) ReportStats(ctx context.Context, req *agentrpc.ReportSt
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request required")
 	}
-	refreshConfig, apiErr := s.api.ingest(remoteAddrFromContext(ctx), req.Stats, req.AgentToken)
+	refreshConfig, apiErr := s.api.ingest(req.Stats, req.AgentToken)
 	if apiErr != nil {
 		return nil, grpcStatusFromAPIError(apiErr)
 	}
@@ -452,12 +451,4 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 	default:
 		return status.Error(codes.Internal, err.message)
 	}
-}
-
-func remoteAddrFromContext(ctx context.Context) string {
-	peerInfo, ok := grpcpeer.FromContext(ctx)
-	if !ok || peerInfo.Addr == nil {
-		return "grpc"
-	}
-	return peerInfo.Addr.String()
 }

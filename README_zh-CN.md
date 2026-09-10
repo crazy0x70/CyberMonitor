@@ -63,6 +63,17 @@ docker run -d \
 
 **配置说明**：`CM_SERVER_URL` 是探针的统一接入地址。Agent 启动后会优先尝试建立 `gRPC` 控制链路；若环境（如反向代理或 CDN）仅支持 `HTTP/1.1`，Agent 会自动回退至 `HTTP` 模式。若需长期保持 `gRPC` 模式，请确保 Agent 直连 Server 或使用支持 `HTTP/2` / `h2c` 的代理。此外，若服务端启用了 `CM_PUBLIC_LISTEN` 分离接口，请务必填写该公网端口。
 
+**本地网络测试（`CM_NET_TESTS` / `-net-tests`）**：逗号分隔的目标列表，服务端未在管理后台为该节点配置探测项时生效。单项支持以下形式（`名称` 可选）：
+
+| 形式 | 示例 | 说明 |
+| --- | --- | --- |
+| `host[:port]` | `1.1.1.1`、`example.com:443` | 有端口按 TCP，无端口按 ICMP |
+| `icmp:host` / `tcp:host[:port]` | `tcp:example.com:443` | 显式指定协议 |
+| `名称@目标` | `DNS@tcp:1.1.1.1:443` | 自定义展示名称 |
+| `名称 目标` | `DNS tcp:1.1.1.1:443` | 名称与目标以空格分隔 |
+
+IPv6 地址必须使用方括号：`icmp:[2001:db8::1]`、`tcp:[2001:db8::1]:443`。无法解析的单项会在 Agent 日志中提示并跳过，不影响其余目标。
+
 Docker 部署应持久化 `/state`。`CM_NODE_ID_FILE` 保存节点身份，`CM_AGENT_TOKEN_FILE` 保存注册后的专属凭据。不要在多台服务器上复用同一个 `CM_NODE_ID`。
 
 HTTPS 地址未显式写端口时，Agent 的 gRPC 连接会使用 `443`；HTTP 地址会使用 `80`。反向代理 gRPC 时不要改写为 `/grpc/`，应转发真实服务前缀：

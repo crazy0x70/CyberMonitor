@@ -20,6 +20,9 @@ const offlineDurationMetric = "cm_node_offline_duration_seconds"
 
 const offlineRetention = 2 * 365 * 24 * time.Hour
 
+// offlineOutOfOrderWindow 放行恢复事件的有限时钟乱序。
+const offlineOutOfOrderWindow = 6 * time.Hour
+
 var errNilOfflineStore = errors.New("offline history store is nil")
 
 type OfflineSession struct {
@@ -53,6 +56,9 @@ func OpenOfflineStore(dir string) (*OfflineStore, error) {
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = int64(offlineRetention / time.Millisecond)
 	opts.MaxBytes = offlineMaxBytes
+	// 恢复事件由服务器时钟打点，放行有限乱序，避免 NTP 回拨/重启
+	// 导致迟到的恢复事件被 TSDB 拒收（与网络历史的 OOO 窗口同理）。
+	opts.OutOfOrderTimeWindow = int64(offlineOutOfOrderWindow / time.Millisecond)
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
 	if err != nil {
@@ -104,7 +110,7 @@ func (s *OfflineStore) AppendEvent(nodeID string, recoveredAt time.Time, duratio
 	return nil
 }
 
-func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit int) (OfflineInsights, error) {
+func (s *OfflineStore) QueryInsights(ctx context.Context, nodeID string, now time.Time, recentLimit int) (OfflineInsights, error) {
 	if s == nil || s.db == nil {
 		return OfflineInsights{}, errNilOfflineStore
 	}
@@ -127,7 +133,7 @@ func (s *OfflineStore) QueryInsights(nodeID string, now time.Time, recentLimit i
 	if recentLimit > 0 {
 		recent = newRecentOfflineSessions(recentLimit)
 	}
-	if err := s.collectSessions(nodeID, time.Unix(0, 0).UTC(), now, &stats, recent, func(session OfflineSession) {
+	if err := s.collectSessions(ctx, nodeID, time.Unix(0, 0).UTC(), now, &stats, recent, func(session OfflineSession) {
 		if !session.RecoveredAt.Before(last30dStart) && !session.RecoveredAt.After(now) {
 			insights.Last30dCount++
 		}
@@ -161,7 +167,7 @@ func (s *OfflineStore) HasNodeHistory(nodeID string) (bool, error) {
 	return hasMatchingSeries(s.db, nameMatcher, nodeMatcher)
 }
 
-func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit func(OfflineSession) bool) error {
+func (s *OfflineStore) scanSessions(ctx context.Context, nodeID string, from, to time.Time, visit func(OfflineSession) bool) error {
 	nodeID, ok, err := s.scanNodeID(nodeID)
 	if err != nil {
 		return err
@@ -169,10 +175,10 @@ func (s *OfflineStore) scanSessions(nodeID string, from, to time.Time, visit fun
 	if !ok || to.Before(from) {
 		return nil
 	}
-	return s.scanSessionsMillis(nodeID, from.UnixMilli(), to.UnixMilli(), visit)
+	return s.scanSessionsMillis(ctx, nodeID, from.UnixMilli(), to.UnixMilli(), visit)
 }
 
-func (s *OfflineStore) scanSessionsMillis(nodeID string, mint, maxt int64, visit func(OfflineSession) bool) error {
+func (s *OfflineStore) scanSessionsMillis(ctx context.Context, nodeID string, mint, maxt int64, visit func(OfflineSession) bool) error {
 	nodeID, ok, err := s.scanNodeID(nodeID)
 	if err != nil {
 		return err
@@ -196,7 +202,7 @@ func (s *OfflineStore) scanSessionsMillis(nodeID string, mint, maxt int64, visit
 		return err
 	}
 
-	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
+	seriesSet := querier.Select(ctx, false, &storage.SelectHints{
 		Start: mint,
 		End:   maxt,
 	}, nameMatcher, nodeMatcher)
@@ -243,13 +249,14 @@ func (s *OfflineStore) scanNodeID(nodeID string) (string, bool, error) {
 }
 
 func (s *OfflineStore) collectSessions(
+	ctx context.Context,
 	nodeID string,
 	from, to time.Time,
 	stats *offlineSessionStats,
 	recent *recentOfflineSessions,
 	extra func(OfflineSession),
 ) error {
-	return s.scanSessions(nodeID, from, to, func(session OfflineSession) bool {
+	return s.scanSessions(ctx, nodeID, from, to, func(session OfflineSession) bool {
 		if stats != nil {
 			stats.Append(session)
 		}
@@ -354,7 +361,7 @@ func (s *OfflineStore) HasEventForSession(nodeID string, startedAt time.Time) (b
 	targetStartedAt := normalizeOfflineSessionStartedAt(startedAt)
 	mint := targetStartedAt.UnixMilli()
 	found := false
-	if err := s.scanSessionsMillis(nodeID, mint, math.MaxInt64, func(session OfflineSession) bool {
+	if err := s.scanSessionsMillis(context.Background(), nodeID, mint, math.MaxInt64, func(session OfflineSession) bool {
 		if session.DurationSec <= 0 {
 			return true
 		}

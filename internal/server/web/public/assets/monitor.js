@@ -212,7 +212,7 @@ const state = {
   historyCacheLoading: false,
   publicTrafficCounters: new Map(),
   snapshotFallbackTimer: null,
-  snapshotFallbackInflight: false,
+  snapshotFetchInflight: null,
   renderFrame: 0,
   realtimeStatus: new Map(),
   groupTabSignature: "",
@@ -545,30 +545,39 @@ function resolveOriginTarget(currentLocation = document.baseURI || location.href
   };
 }
 
-function buildPublicRequestHeaders() {
-  return {};
-}
-
 async function fetchPublicSnapshot() {
-  const target = resolveOriginTarget();
-  try {
-    const resp = await fetch(`${target.apiBase}/api/v1/public/snapshot`, {
-      cache: "no-store",
-      headers: buildPublicRequestHeaders(),
-    });
-    if (!resp.ok) {
+  // 所有调用方（onopen/onclose/watchdog/轮询/启动）共享同一个在途请求，
+  // 避免重叠请求乱序返回互相覆盖。
+  if (state.snapshotFetchInflight) {
+    return state.snapshotFetchInflight;
+  }
+  const promise = (async () => {
+    const target = resolveOriginTarget();
+    try {
+      const resp = await fetch(`${target.apiBase}/api/v1/public/snapshot`, {
+        cache: "no-store",
+      });
+      if (!resp.ok) {
+        return false;
+      }
+      const payload = await resp.json();
+      if (payload && payload.type === "snapshot") {
+        state.wsLastMessageAt = Date.now();
+        handleSnapshot(payload);
+        return true;
+      }
+    } catch (error) {
       return false;
     }
-    const payload = await resp.json();
-    if (payload && payload.type === "snapshot") {
-      state.wsLastMessageAt = Date.now();
-      handleSnapshot(payload);
-      return true;
-    }
-  } catch (error) {
     return false;
-  }
-  return false;
+  })();
+  state.snapshotFetchInflight = promise;
+  promise.finally(() => {
+    if (state.snapshotFetchInflight === promise) {
+      state.snapshotFetchInflight = null;
+    }
+  });
+  return promise;
 }
 
 function hasHealthySocket() {
@@ -582,18 +591,10 @@ function hasHealthySocket() {
 }
 
 async function fetchPublicSnapshotFallback() {
-  if (state.snapshotFallbackInflight) {
-    return;
-  }
   if (hasHealthySocket()) {
     return;
   }
-  state.snapshotFallbackInflight = true;
-  try {
-    await fetchPublicSnapshot();
-  } finally {
-    state.snapshotFallbackInflight = false;
-  }
+  await fetchPublicSnapshot();
 }
 
 function startPublicSnapshotFallbackPolling() {
@@ -691,6 +692,16 @@ function resolveNodeFreshness(node) {
   }
   const lastSeen = Number(node?.last_seen || 0);
   return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
+}
+
+// nodeSignature 生成节点内容签名，用于跨快照判断"数据是否真的变化"。
+// 序列化失败时返回空串，退回逐 tick 重合并（正确性不受影响）。
+function nodeSignature(node) {
+  try {
+    return JSON.stringify(node);
+  } catch (error) {
+    return "";
+  }
 }
 
 function shouldReplaceNode(existing, candidate) {
@@ -813,12 +824,27 @@ function mergeSnapshotNodes(nodes) {
   const mergedNodes = [];
   merged.forEach((entry, nodeID) => {
     const provenance = state.mergedProvenance.get(nodeID);
-    if (provenance && provenance.src === entry.src) {
-      mergedNodes.push(provenance.merged);
+    if (provenance) {
+      if (provenance.src === entry.src) {
+        mergedNodes.push(provenance.merged);
+        return;
+      }
+      // 每次广播都会重新序列化，src 引用必然不同；内容一致时复用旧
+      // 合并对象，保持下游身份比较有效，未变化节点不再整卡重渲染。
+      const srcKey = nodeSignature(entry.src);
+      if (provenance.srcKey === srcKey) {
+        provenance.src = entry.src;
+        mergedNodes.push(provenance.merged);
+        return;
+      }
+      const mergedNode = cloneNodeWithDisplayTraffic(entry.src);
+      state.mergedProvenance.set(nodeID, { src: entry.src, srcKey, merged: mergedNode });
+      mergedNodes.push(mergedNode);
       return;
     }
+    const srcKey = nodeSignature(entry.src);
     const mergedNode = cloneNodeWithDisplayTraffic(entry.src);
-    state.mergedProvenance.set(nodeID, { src: entry.src, merged: mergedNode });
+    state.mergedProvenance.set(nodeID, { src: entry.src, srcKey, merged: mergedNode });
     mergedNodes.push(mergedNode);
   });
   for (const nodeID of state.mergedProvenance.keys()) {
@@ -933,6 +959,13 @@ function handleSnapshot(payload) {
   if (!payload || typeof payload !== "object") {
     return;
   }
+  // WS 增量可能先于在途 HTTP 快照到达：更旧的完整快照直接丢弃，
+  // 避免节点状态/CPU 等被回退造成闪烁。
+  const generatedAt = Number(payload.generated_at || 0);
+  const currentAt = Number((state.snapshot && state.snapshot.generated_at) || 0);
+  if (generatedAt && currentAt && generatedAt < currentAt) {
+    return;
+  }
   state.snapshot = {
     ...payload,
     nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
@@ -1014,14 +1047,10 @@ function normalizePublicImageURL(value) {
   }
 }
 
-function normalizePublicIconURL(value) {
-  return normalizePublicImageURL(value);
-}
-
 function applyPublicIdentitySettings(settings) {
   const activeSettings = settings || {};
   const title = (activeSettings.site_title || "").trim();
-  const icon = normalizePublicIconURL(activeSettings.site_icon);
+  const icon = normalizePublicImageURL(activeSettings.site_icon);
   const homeTitle = (activeSettings.home_title || "").trim();
   const homeSubtitle = (activeSettings.home_subtitle || "").trim();
   const resolvedTitle = title || "CyberMonitor";
@@ -1197,10 +1226,6 @@ function ensureNodeHistoryRangesByKey(cacheKey) {
     state.testHistory.set(cacheKey, new Map());
   }
   return state.testHistory.get(cacheKey);
-}
-
-function ensureNodeHistoryRanges(nodeId) {
-  return ensureNodeHistoryRangesByKey(resolveHistoryNodeCacheKey(nodeId));
 }
 
 function ensureHistoryRangeMapByKey(cacheKey, rangeKey) {
@@ -1677,7 +1702,6 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
     )}/history?range=${encodeURIComponent(normalizedRange)}`,
     {
       cache: "no-store",
-      headers: buildPublicRequestHeaders(),
       signal: controller.signal,
     })
     .then(async (resp) => {
@@ -2698,6 +2722,14 @@ function renderNetworkLoadingState(fields) {
 }
 
 function resetNetworkChartInteractions(fields) {
+  if (fields.testChart) {
+    // 加载/错误/空态会整体替换图表内容，必须先拆掉挂在旧内容上的
+    // hover 监听与 onmousemove，避免窗口级捕获监听残留。
+    if (typeof fields.testChart.__latencyHoverCleanup === "function") {
+      fields.testChart.__latencyHoverCleanup();
+    }
+    fields.testChart.onmousemove = null;
+  }
   if (fields.testSmooth) {
     fields.testSmooth.disabled = true;
     fields.testSmooth.classList.remove("active");
@@ -4101,7 +4133,7 @@ function aggregateDisk(list) {
   return { total, used, percent };
 }
 
-updateFooter("");
+updateFooter();
 loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);
 startPublicSnapshotFallbackPolling();

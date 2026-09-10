@@ -95,6 +95,10 @@ func startTelegramBot(ctx context.Context, store *Store) {
 		var offset int64
 		var lastToken string
 		var lastUserKey string
+		// menuSetupPending 与 token 变更解耦：菜单设置失败只重试
+		// setTelegramCommands，不得触发 offset 重置（会把 Telegram
+		// 未确认 update 重新投递，造成命令重复执行）。
+		menuSetupPending := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -115,11 +119,16 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				offset = 0
 				lastToken = token
 				lastUserKey = userKey
-				if err := setTelegramCommands(token); err != nil {
-					log.Printf("Telegram 菜单设置失败: %v", err)
-				}
+				menuSetupPending = true
 			} else if userKey != lastUserKey {
 				lastUserKey = userKey
+			}
+			if menuSetupPending {
+				if err := setTelegramCommands(token); err != nil {
+					log.Printf("Telegram 菜单设置失败，将自动重试: %v", err)
+				} else {
+					menuSetupPending = false
+				}
 			}
 
 			updates, err := fetchTelegramUpdates(client, token, offset)
@@ -213,30 +222,43 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 	return payload.Result, nil
 }
 
-func sendTelegramAlert(token string, userIDs []int64, siteTitle string, events []AlertEvent) {
+func sendTelegramAlert(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
 	if token == "" || len(userIDs) == 0 || len(events) == 0 {
-		return
+		return true
 	}
 	message := buildAlertMessage(siteTitle, events)
-	for _, err := range sendTelegramMessageToUsers(token, userIDs, message) {
+	errs := sendTelegramMessageToUsers(token, userIDs, message)
+	for _, err := range errs {
 		log.Printf("Telegram 告警发送失败: %v", err)
 	}
+	return len(errs) == 0
 }
 
-func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, events []AlertEvent) {
+func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
 	if token == "" || len(userIDs) == 0 || len(events) == 0 {
-		return
+		return true
 	}
 	message := buildRecoveryMessage(siteTitle, events)
-	for _, err := range sendTelegramMessageToUsers(token, userIDs, message) {
+	errs := sendTelegramMessageToUsers(token, userIDs, message)
+	for _, err := range errs {
 		log.Printf("Telegram 恢复通知发送失败: %v", err)
 	}
+	return len(errs) == 0
 }
 
 func sendTelegramTest(token string, userIDs []int64, siteTitle string) []string {
 	message := fmt.Sprintf("【%s】Telegram 告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
 	return sendTelegramMessageToUsers(token, userIDs, message)
 }
+
+// telegramPermanentError 标记不可通过重试解决的发送失败（无效 chat、
+// bot 被拉黑等），在告警投递中跳过重臂。
+type telegramPermanentError struct {
+	err error
+}
+
+func (e *telegramPermanentError) Error() string { return e.err.Error() }
+func (e *telegramPermanentError) Unwrap() error { return e.err }
 
 func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []string {
 	ids := normalizeTelegramUserIDs(userIDs)
@@ -254,6 +276,11 @@ func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []st
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			if err := telegramSendFunc(token, id, text); err != nil {
+				var perm *telegramPermanentError
+				if errors.As(err, &perm) {
+					log.Printf("Telegram 收件人 %d 不可达，跳过该收件人: %v", id, err)
+					return
+				}
 				errCh <- err.Error()
 			}
 		}()
@@ -292,7 +319,14 @@ func telegramBotAPICall(client *http.Client, token, method string, payload any, 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := readResponseBodyLimited(resp.Body)
-		return telegramSendResponse{}, fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
+		err := fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
+		// 400/403/404/401 属配置类永久失败（token 无效、chat 不存在、
+		// bot 被拉黑等），重试无意义；豁免后不触发告警重臂，避免向
+		// 其余收件人重发风暴。
+		if resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
+			return telegramSendResponse{}, &telegramPermanentError{err: err}
+		}
+		return telegramSendResponse{}, err
 	}
 	var result telegramSendResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -373,10 +407,8 @@ func handleTelegramAICommand(command string, store *Store, userID, chatID int64)
 	if query == "" {
 		return "用法: /ai 你的问题"
 	}
-	if enabled, serverID, message, ok := parseAIAlertToggle(query, store); ok {
+	if enabled, serverID, ok := parseAIAlertToggle(query, store); ok {
 		return toggleAlertForServer(store, serverID, enabled)
-	} else if message != "" {
-		return message
 	}
 	rateKey := fmt.Sprintf("telegram-ai:%d:%d", userID, chatID)
 	if !store.allowAgentRate(rateKey, telegramAIWindow, telegramAILimit, time.Now(), false) {
@@ -423,10 +455,14 @@ func toggleAlertForServer(store *Store, serverID string, enabled bool) string {
 	return fmt.Sprintf("%s告警：%s （%s）", action, display, serverID)
 }
 
-func parseAIAlertToggle(query string, store *Store) (bool, string, string, bool) {
+// parseAIAlertToggle 仅当 /ai 查询同时包含告警开关词且节点可被唯一
+// 识别（服务器ID 或显示名恰命中一个）时才视为开关命令；其余情况
+// （如"怎么恢复告警服务"）一律返回 false，交给 AI 回答，避免关键词
+// 劫持提问或误触发状态变更。
+func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 	query = strings.TrimSpace(query)
 	if query == "" {
-		return false, "", "", false
+		return false, "", false
 	}
 	enableKeywords := []string{"开启告警", "打开告警", "启用告警", "恢复告警", "开告警"}
 	disableKeywords := []string{"关闭告警", "禁用告警", "停用告警", "关掉告警", "关告警", "关停告警"}
@@ -449,33 +485,33 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, string, bool)
 		}
 	}
 	if !recognized {
-		return false, "", "", false
+		return false, "", false
 	}
 	nodes := store.Snapshot()
+	matched := 0
+	serverID := ""
 	for _, node := range nodes {
 		if node.ServerID != "" && strings.Contains(query, node.ServerID) {
-			return enabled, node.ServerID, "", true
+			matched++
+			serverID = node.ServerID
 		}
 	}
-	matched := make([]string, 0, 1)
-	for _, node := range nodes {
-		display := resolveNodeDisplayName(node)
-		if display == "" || display == "未命名节点" {
-			continue
-		}
-		if strings.Contains(query, display) {
-			if node.ServerID != "" {
-				matched = append(matched, node.ServerID)
+	if matched == 0 {
+		for _, node := range nodes {
+			display := resolveNodeDisplayName(node)
+			if display == "" || display == "未命名节点" {
+				continue
+			}
+			if strings.Contains(query, display) && node.ServerID != "" {
+				matched++
+				serverID = node.ServerID
 			}
 		}
 	}
-	if len(matched) == 1 {
-		return enabled, matched[0], "", true
+	if matched == 1 {
+		return enabled, serverID, true
 	}
-	if len(matched) > 1 {
-		return false, "", "匹配到多个服务器，请使用服务器ID 进行操作", false
-	}
-	return false, "", "未识别服务器ID，请使用 /alarmson 或 /alarmsoff 服务器ID", false
+	return false, "", false
 }
 
 func buildTelegramAllStats(store *Store) string {

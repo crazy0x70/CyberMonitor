@@ -66,6 +66,17 @@ docker run -d \
 Configuration notes:
 The `CM_SERVER_URL` serves as the unified entry point for the Agent. Upon startup, the Agent attempts to establish a gRPC control link. If your environment, such as a reverse proxy or CDN, only supports HTTP/1.1, the Agent will automatically fall back to HTTP. For persistent gRPC connectivity, ensure the Agent has a direct connection to the Server or use a proxy supporting HTTP/2 or h2c. If the server is configured to use a separate public port via `CM_PUBLIC_LISTEN`, please use that port instead of the management port.
 
+**Local network tests (`CM_NET_TESTS` / `-net-tests`)**: a comma-separated target list, effective when the admin console defines no probes for this node. Each item supports the following forms (`name` optional):
+
+| Form | Example | Notes |
+| --- | --- | --- |
+| `host[:port]` | `1.1.1.1`, `example.com:443` | TCP when a port is present, ICMP otherwise |
+| `icmp:host` / `tcp:host[:port]` | `tcp:example.com:443` | Explicit protocol |
+| `name@target` | `DNS@tcp:1.1.1.1:443` | Custom display name |
+| `name target` | `DNS tcp:1.1.1.1:443` | Name and target separated by a space |
+
+IPv6 addresses require brackets: `icmp:[2001:db8::1]`, `tcp:[2001:db8::1]:443`. Unparsable items are logged and skipped by the Agent without affecting the rest.
+
 Docker deployments should persist `/state`. `CM_NODE_ID_FILE` stores the node identity, and `CM_AGENT_TOKEN_FILE` stores the dedicated token returned after registration. Do not reuse the same `CM_NODE_ID` across multiple servers.
 
 When an HTTPS URL omits the port, the Agent uses `443` for gRPC. When an HTTP URL omits the port, it uses `80`. If you proxy gRPC, do not rewrite it to `/grpc/`; forward the real service prefix:

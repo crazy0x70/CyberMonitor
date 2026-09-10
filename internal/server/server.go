@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/subtle"
 	"embed"
@@ -40,17 +41,21 @@ import (
 )
 
 const (
-	maxLogSize                      = 10 * 1024 * 1024
-	maxLogBackupCount               = 3
-	maxTestHistoryPoints            = 5000
-	testHistoryHotSeconds           = 60 * 60
-	testHistoryMaxAgeSeconds        = 60 * 60 * 24 * 365
-	maxJSONBodySize                 = 4 * 1024 * 1024
+	maxLogSize               = 10 * 1024 * 1024
+	maxLogBackupCount        = 3
+	maxTestHistoryPoints     = 5000
+	testHistoryHotSeconds    = 60 * 60
+	testHistoryMaxAgeSeconds = 60 * 60 * 24 * 365
+	maxJSONBodySize          = 4 * 1024 * 1024
+	// wsMaxClientMessageBytes 限制 WS 客户端上行消息；仪表盘客户端
+	// 不发送数据消息，仅保留控制帧空间。
+	wsMaxClientMessageBytes         = 4 * 1024
 	maxHTTPHeaderBytes              = 1 << 20
 	wsSendQueueSize                 = 8
 	wsWriteWait                     = 10 * time.Second
 	wsPongWait                      = 60 * time.Second
 	wsPingPeriod                    = (wsPongWait * 9) / 10
+	agentRateSweepInterval          = 5 * time.Minute
 	agentUpdateLeaseDelivery        = 2 * time.Minute
 	agentUpdateLeaseUpdating        = 10 * time.Minute
 	agentUpdateLeaseRestart         = 5 * time.Minute
@@ -231,7 +236,7 @@ type Store struct {
 	dataPath           string
 	lastPersist        time.Time
 	persistInterval    time.Duration
-	alerted            map[string]alertState
+	alerted            map[string]AlertedState
 	offlineSessions    map[string]OfflineSessionState
 	testHistory        map[string]map[string]*TestHistoryEntry
 	historyManager     *history.Manager
@@ -367,6 +372,9 @@ type Hub struct {
 type hubMessage struct {
 	messageType int
 	payload     []byte
+	// prepared 非空时走 WritePreparedMessage：同一快照广播给 N 个
+	// 客户端时帧化/压缩只执行一次（含压缩协商的连接取缓存压缩帧）。
+	prepared *websocket.PreparedMessage
 }
 
 type hubClient struct {
@@ -391,14 +399,17 @@ type agentRateWindow struct {
 	until time.Time
 }
 
-func (c *hubClient) writeMessage(messageType int, payload []byte) error {
+func (c *hubClient) writeMessage(msg hubMessage) error {
 	if c == nil || c.conn == nil {
 		return errors.New("websocket 连接不存在")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	return c.conn.WriteMessage(messageType, payload)
+	if msg.prepared != nil {
+		return c.conn.WritePreparedMessage(msg.prepared)
+	}
+	return c.conn.WriteMessage(msg.messageType, msg.payload)
 }
 
 func (c *hubClient) close() error {
@@ -416,11 +427,11 @@ func (c *hubClient) close() error {
 	return c.conn.Close()
 }
 
-func (c *hubClient) enqueue(messageType int, payload []byte) bool {
+func (c *hubClient) enqueue(messageType int, payload []byte, prepared *websocket.PreparedMessage) bool {
 	if c == nil {
 		return false
 	}
-	msg := hubMessage{messageType: messageType, payload: payload}
+	msg := hubMessage{messageType: messageType, payload: payload, prepared: prepared}
 	if messageType == websocket.TextMessage {
 		for {
 			select {
@@ -470,6 +481,7 @@ func Run(ctx context.Context, cfg Config) error {
 	profiles := make(map[string]*NodeProfile)
 	nodes := make(map[string]NodeState)
 	offlineSessions := make(map[string]OfflineSessionState)
+	alerted := make(map[string]AlertedState)
 	testHistory := make(map[string]map[string]*TestHistoryEntry)
 	if loaded {
 		settings, err = mergeSettings(persisted.Settings, defaultSettings)
@@ -483,6 +495,9 @@ func Run(ctx context.Context, cfg Config) error {
 		if persisted.OfflineSessions != nil {
 			offlineSessions = persisted.OfflineSessions
 		}
+		if persisted.Alerted != nil {
+			alerted = persisted.Alerted
+		}
 	}
 	if err := ensureServerIDsForProfiles(profiles, nodes); err != nil {
 		return err
@@ -495,6 +510,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Profiles:              profiles,
 		Nodes:                 nodes,
 		OfflineSessions:       offlineSessions,
+		Alerted:               alerted,
 		PendingHistoryClear:   persisted.PendingHistoryClear,
 		PendingHistoryDeletes: slices.Clone(persisted.PendingHistoryDeletes),
 	}
@@ -531,7 +547,7 @@ func Run(ctx context.Context, cfg Config) error {
 		buildCommit:       commit,
 		dataPath:          dataPath,
 		persistInterval:   defaultPersistInterval,
-		alerted:           make(map[string]alertState),
+		alerted:           alerted,
 		offlineSessions:   offlineSessions,
 		testHistory:       testHistory,
 		historyManager:    historyManager,
@@ -594,6 +610,11 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
+			// 用户名不匹配时也执行一次等价 bcrypt 比较，抹平响应时序差，
+			// 避免通过 401 延迟枚举有效管理员用户名。
+			if req.Username != creds.AdminUser {
+				verifyAdminPasswordDummy(req.Password)
+			}
 			if locked, retryAfter := store.recordLoginFailure(attemptKey, now); locked {
 				writeLoginRateLimit(w, retryAfter)
 				return
@@ -676,6 +697,9 @@ func Run(ctx context.Context, cfg Config) error {
 		adminMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
 	}
 
+	// 公开历史查询会触发整段 TSDB 扫描（1y 窗口最大），且端点免鉴权：
+	// 限制并发数并通过 r.Context() 在客户端断开时取消扫描。
+	publicHistorySem := make(chan struct{}, 4)
 	publicMux.HandleFunc("/api/v1/public/nodes/", withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
 		if !isPublicReadMethod(r) {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -710,7 +734,13 @@ func Run(ctx context.Context, cfg Config) error {
 			return
 		}
 
-		tests, err := store.QueryPublicNodeHistory(nodeID, from, to)
+		select {
+		case publicHistorySem <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
+		tests, err := store.QueryPublicNodeHistory(r.Context(), nodeID, from, to)
+		<-publicHistorySem
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query public node history failed"})
 			return
@@ -736,7 +766,7 @@ func Run(ctx context.Context, cfg Config) error {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		refreshConfig, err := agentAPI.ingest(r.RemoteAddr, payload, r.Header.Get("X-AGENT-TOKEN"))
+		refreshConfig, err := agentAPI.ingest(payload, r.Header.Get("X-AGENT-TOKEN"))
 		if err != nil {
 			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
 			return
@@ -827,7 +857,9 @@ func Run(ctx context.Context, cfg Config) error {
 	adminMux.HandleFunc("/api/v1/admin/system/update", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			writeJSON(w, http.StatusOK, systemUpdater.View(r.Context(), false))
+			viewCtx, cancelView := releaseCheckContext(r)
+			writeJSON(w, http.StatusOK, systemUpdater.View(viewCtx, false))
+			cancelView()
 		case http.MethodPost:
 			if !updater.CanCurrentDeployUpdate() {
 				message := updater.DefaultUnsupportedUpdateMessage()
@@ -846,19 +878,26 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
-			releaseInfo, err := systemUpdater.CheckLatest(r.Context())
+			// 任何未走到 reservation.Start 的退出路径都释放占位，避免
+			// panic 或遗漏分支把更新永久卡在 409。
+			started := false
+			defer func() {
+				if !started {
+					reservation.Cancel()
+				}
+			}()
+			checkCtx, cancelCheck := releaseCheckContext(r)
+			releaseInfo, err := systemUpdater.CheckLatest(checkCtx)
+			cancelCheck()
 			if err != nil {
-				reservation.Cancel()
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 				return
 			}
 			if err := validateReleaseTargetVersion(releaseInfo); err != nil {
-				reservation.Cancel()
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 				return
 			}
 			if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
-				reservation.Cancel()
 				writeJSON(w, http.StatusOK, map[string]string{
 					"status":         "up_to_date",
 					"target_version": releaseInfo.LatestVersion,
@@ -867,7 +906,6 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			dockerManaged := updater.CanDockerManagedUpdate()
 			if message := systemUpdateReleaseAssetError(releaseInfo, dockerManaged); message != "" {
-				reservation.Cancel()
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": message})
 				return
 			}
@@ -899,6 +937,7 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
+			started = true
 			writeJSON(w, http.StatusAccepted, map[string]string{
 				"status":         "started",
 				"target_version": releaseInfo.LatestVersion,
@@ -1149,6 +1188,11 @@ func Run(ctx context.Context, cfg Config) error {
 				adminTokenSalt = store.Credentials().TokenSalt
 			}
 			upgrader := websocket.Upgrader{
+				// permessage-deflate（gorilla 实现为双向 no_context_takeover，
+				// level 1）：快照广播对每个客户端省约 78% 流量；客户端未
+				// 提供扩展时自动回退明文。101 响应走 Hijack，不经过 HTTP
+				// gzip 中间件。
+				EnableCompression: true,
 				CheckOrigin: func(request *http.Request) bool {
 					// admin 连接保持严格的同源校验（连 token 都要求
 					// same-origin）。public 数据按设计免认证公开，允许
@@ -1176,7 +1220,7 @@ func Run(ctx context.Context, cfg Config) error {
 			// 首次连接立即推送快照
 			payload, _ := json.Marshal(snapshot)
 			if client != nil {
-				if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+				if ok := client.enqueue(websocket.TextMessage, payload, nil); !ok {
 					hub.Remove(conn)
 					return
 				}
@@ -1237,6 +1281,9 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// HTML 壳不缓存：中间缓存在无指令时可能缓存旧壳，引用已被
+		// 更新替换的资源路径导致页面空白。
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(htmlText))
 	}
@@ -1259,6 +1306,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(htmlText))
 	}
@@ -1342,12 +1390,17 @@ func Run(ctx context.Context, cfg Config) error {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		lastBalancedDigest := ""
+		lastRateSweep := time.Time{}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				now := time.Now()
+				if lastRateSweep.IsZero() || now.Sub(lastRateSweep) >= agentRateSweepInterval {
+					store.sweepExpiredAgentRateWindows(now)
+					lastRateSweep = now
+				}
 				hasBalanced := hub.HasVariant(publicVariantBalanced)
 				if hasBalanced {
 					snapshot := storeSnapshot(store, false)
@@ -1365,13 +1418,25 @@ func Run(ctx context.Context, cfg Config) error {
 				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
 				logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
-				if len(offlineEvents) > 0 {
-					go sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
-					go sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, offlineEvents)
-				}
-				if len(recoveredEvents) > 0 {
-					go sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, recoveredEvents)
-					go sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, recoveredEvents)
+				if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
+					go func() {
+						// 发送失败回滚告警状态，下个 tick 自动重试，
+						// 避免网络抖动导致该次离线/恢复通知永久丢失。
+						if len(offlineEvents) > 0 {
+							delivered := sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents) &&
+								sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, offlineEvents)
+							if !delivered {
+								store.RearmAlertDelivery(offlineEvents, true)
+							}
+						}
+						if len(recoveredEvents) > 0 {
+							delivered := sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, recoveredEvents) &&
+								sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, recoveredEvents)
+							if !delivered {
+								store.RearmAlertDelivery(recoveredEvents, false)
+							}
+						}
+					}()
 				}
 			}
 		}
@@ -1449,13 +1514,165 @@ func Run(ctx context.Context, cfg Config) error {
 func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           withGzip(handler),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    maxHTTPHeaderBytes,
 	}
+}
+
+// withGzip 对可压缩的 GET 响应做透明 gzip。公开资产全部 no-store，
+// 每次访问都会重新下载，monitor.js 131KB 压缩后约 37KB；snapshot JSON
+// 每次轮询同样受益。WebSocket 升级与 gRPC 流量在此层之外直通。
+func withGzip(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet ||
+			isAgentGRPCRequest(r) || !acceptsGzip(r) ||
+			strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") ||
+			r.Header.Get("Range") != "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Add("Vary", "Accept-Encoding")
+		gz := &gzipResponseWriter{ResponseWriter: w}
+		defer gz.finish()
+		next.ServeHTTP(gz, r)
+	})
+}
+
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		encoding := strings.TrimSpace(strings.ToLower(part))
+		if idx := strings.IndexByte(encoding, ';'); idx >= 0 {
+			encoding = strings.TrimSpace(encoding[:idx])
+			if strings.Contains(encoding, "q=0") {
+				continue
+			}
+		}
+		if encoding == "gzip" {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	gzipMinBodyBytes        = 1024
+	gzipDecisionBufferBytes = 4096
+)
+
+var gzipWriterPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	decided bool
+	on      bool
+	status  int
+	gz      *gzip.Writer
+	buf     []byte
+}
+
+// WriteHeader 仅记录状态码；压缩决策统一推迟到首块数据或 finish，
+// 因为流式 JSON 响应到达 WriteHeader 时没有 Content-Length 可判定大小。
+func (g *gzipResponseWriter) WriteHeader(status int) {
+	if g.decided {
+		return
+	}
+	g.status = status
+	if g.Header().Get("Content-Length") != "" {
+		g.decide()
+	}
+}
+
+// decide 依据已有信息（Content-Length 或已缓冲的首块）判定是否压缩。
+func (g *gzipResponseWriter) decide() {
+	if g.decided {
+		return
+	}
+	g.decided = true
+	if g.status == 0 {
+		g.status = http.StatusOK
+	}
+	header := g.Header()
+	sizeKnownSmall := false
+	if cl := header.Get("Content-Length"); cl != "" {
+		n, err := strconv.Atoi(cl)
+		sizeKnownSmall = err == nil && n < gzipMinBodyBytes
+	} else if len(g.buf) > 0 {
+		sizeKnownSmall = len(g.buf) < gzipMinBodyBytes
+	}
+	compressible := header.Get("Content-Encoding") == "" && !sizeKnownSmall &&
+		gzipAllowedContentType(header.Get("Content-Type"))
+	if !compressible {
+		g.passthrough()
+		return
+	}
+	g.gz = gzipWriterPool.Get().(*gzip.Writer)
+	g.gz.Reset(g.ResponseWriter)
+	header.Set("Content-Encoding", "gzip")
+	header.Del("Content-Length")
+	header.Del("Accept-Ranges")
+	g.on = true
+	if len(g.buf) > 0 {
+		g.gz.Write(g.buf)
+		g.buf = nil
+	}
+	g.ResponseWriter.WriteHeader(g.status)
+}
+
+func (g *gzipResponseWriter) Write(p []byte) (int, error) {
+	if g.on {
+		return g.gz.Write(p)
+	}
+	if g.decided {
+		return g.ResponseWriter.Write(p)
+	}
+	g.buf = append(g.buf, p...)
+	if len(g.buf) >= gzipDecisionBufferBytes {
+		g.decide()
+	}
+	return len(p), nil
+}
+
+// finish 在 handler 返回后收尾：压缩路径关闭 gzip 流；缓冲中的小
+// 响应或从未写 body 的响应在此完成最终决策并原样补写。
+func (g *gzipResponseWriter) finish() {
+	if g.on {
+		g.gz.Close()
+		gzipWriterPool.Put(g.gz)
+		g.gz = nil
+		return
+	}
+	g.decide()
+	if len(g.buf) > 0 {
+		g.passthrough()
+	}
+}
+
+// passthrough 把缓冲内容按原始状态码直传。仅在 decide 内调用一次，
+// 此刻底层 ResponseWriter 尚未写过任何字节。
+func (g *gzipResponseWriter) passthrough() {
+	g.ResponseWriter.WriteHeader(g.status)
+	if len(g.buf) > 0 {
+		g.ResponseWriter.Write(g.buf)
+		g.buf = nil
+	}
+}
+
+func gzipAllowedContentType(contentType string) bool {
+	base := contentType
+	if idx := strings.IndexByte(base, ';'); idx >= 0 {
+		base = base[:idx]
+	}
+	base = strings.ToLower(strings.TrimSpace(base))
+	switch base {
+	case "text/html", "text/css", "text/javascript",
+		"application/javascript", "application/json", "image/svg+xml":
+		return true
+	}
+	return false
 }
 
 func applyDefaults(cfg *Config) error {
@@ -1759,7 +1976,7 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 	nowSec := now.Unix()
 	changed := false
 	for _, test := range stats.NetworkTests {
-		key := buildTestHistoryKey(test)
+		key := history.BuildNetworkTestKey(test)
 		if key == "" {
 			continue
 		}
@@ -1800,28 +2017,6 @@ func (s *Store) updateTestHistoryLocked(stats metrics.NodeStats, now time.Time) 
 		changed = true
 	}
 	return changed
-}
-
-func buildTestHistoryKey(test metrics.NetworkTestResult) string {
-	kind := strings.ToLower(strings.TrimSpace(test.Type))
-	if kind == "" {
-		kind = "icmp"
-	}
-	host := strings.ToLower(strings.TrimSpace(test.Host))
-	name := strings.ToLower(strings.TrimSpace(test.Name))
-	if host == "" && name == "" {
-		return ""
-	}
-	var builder strings.Builder
-	builder.Grow(len(kind) + len(host) + len(name) + 16)
-	builder.WriteString(kind)
-	builder.WriteByte('|')
-	builder.WriteString(host)
-	builder.WriteByte('|')
-	builder.WriteString(strconv.Itoa(test.Port))
-	builder.WriteByte('|')
-	builder.WriteString(name)
-	return builder.String()
 }
 
 func normalizeHistoryEntry(entry *TestHistoryEntry) {
@@ -1966,10 +2161,6 @@ type AlertTargets struct {
 	SiteTitle       string
 }
 
-type alertState struct {
-	OfflineSince time.Time
-}
-
 type offlineRecoveryCandidate struct {
 	NodeID      string
 	StartedAt   int64
@@ -2108,7 +2299,6 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	targets := AlertTargets{
 		FeishuWebhook:   strings.TrimSpace(s.settings.AlertWebhook),
@@ -2121,16 +2311,21 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		targets.TelegramUserIDs = nil
 	}
 	if s.settings.AlertOfflineSec <= 0 {
+		s.mu.Unlock()
 		return AlertTargets{}, nil, nil
 	}
 	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
 	offlineEvents := make([]AlertEvent, 0)
 	recoveredEvents := make([]AlertEvent, 0)
+	needsPersist := false
 	for nodeID, node := range s.nodes {
 		state, wasAlerted := s.alerted[nodeID]
 		profile := s.ensureProfileLocked(nodeID)
 		if !isAlertEnabled(profile) {
-			delete(s.alerted, nodeID)
+			if wasAlerted {
+				delete(s.alerted, nodeID)
+				needsPersist = true
+			}
 			continue
 		}
 		offlineFor := now.Sub(node.LastSeen)
@@ -2150,6 +2345,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 					OfflineSec: offlineSec,
 				})
 				delete(s.alerted, nodeID)
+				needsPersist = true
 			}
 			continue
 		}
@@ -2165,16 +2361,53 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			LastSeen:   node.LastSeen.Unix(),
 			OfflineSec: int64(offlineFor.Seconds()),
 		})
-		s.alerted[nodeID] = alertState{OfflineSince: node.LastSeen}
+		s.alerted[nodeID] = AlertedState{OfflineSince: node.LastSeen}
+		needsPersist = true
 	}
 
 	for nodeID := range s.alerted {
 		if _, ok := s.nodes[nodeID]; !ok {
 			delete(s.alerted, nodeID)
+			needsPersist = true
 		}
 	}
 
+	s.mu.Unlock()
+	if needsPersist {
+		// 告警状态已持久化到 state.json，重启后不再对仍离线的节点重复告警。
+		s.persist()
+	}
 	return targets, offlineEvents, recoveredEvents
+}
+
+// RearmAlertDelivery 在告警/恢复通知发送失败时回滚 CollectAlertEvents 已翻转
+// 的状态，让下个 tick 重新产生并发送事件。offline=true 回滚离线告警，
+// false 回滚恢复通知（按事件携带的离线时长还原 OfflineSince）。
+func (s *Store) RearmAlertDelivery(events []AlertEvent, offline bool) {
+	needsPersist := false
+	s.mu.Lock()
+	now := time.Now()
+	for _, event := range events {
+		if offline {
+			// 必须删除而非重写：重写与 CollectAlertEvents 已写入的状态
+			// 相同，下个 tick wasAlerted 仍为 true 直接跳过，重试成为
+			// 空操作。删除后下个 tick 重新产生事件并从 node.LastSeen
+			// 重算 OfflineSince，重发内容与首次一致。
+			if _, ok := s.alerted[event.NodeID]; ok {
+				delete(s.alerted, event.NodeID)
+				needsPersist = true
+			}
+			continue
+		}
+		s.alerted[event.NodeID] = AlertedState{
+			OfflineSince: now.Add(-time.Duration(event.OfflineSec) * time.Second),
+		}
+		needsPersist = true
+	}
+	s.mu.Unlock()
+	if needsPersist {
+		s.persist()
+	}
 }
 
 func resolveAlertDisplay(profile *NodeProfile, stats metrics.NodeStats, nodeID string) string {
@@ -2188,22 +2421,26 @@ func resolveAlertDisplay(profile *NodeProfile, stats metrics.NodeStats, nodeID s
 	return display
 }
 
-func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) {
+func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) bool {
 	if webhook == "" || len(events) == 0 {
-		return
+		return true
 	}
 	if err := sendFeishuText(webhook, buildAlertMessage(siteTitle, events)); err != nil {
 		log.Printf("告警发送失败: %v", err)
+		return false
 	}
+	return true
 }
 
-func sendFeishuRecovery(webhook, siteTitle string, events []AlertEvent) {
+func sendFeishuRecovery(webhook, siteTitle string, events []AlertEvent) bool {
 	if webhook == "" || len(events) == 0 {
-		return
+		return true
 	}
 	if err := sendFeishuText(webhook, buildRecoveryMessage(siteTitle, events)); err != nil {
 		log.Printf("恢复通知发送失败: %v", err)
+		return false
 	}
+	return true
 }
 
 func sendFeishuTest(webhook, siteTitle string) error {
@@ -2779,14 +3016,15 @@ func convertNetworkHistoryToTestHistory(
 		if entry == nil {
 			continue
 		}
-		result[key] = cloneTestHistoryEntry(&TestHistoryEntry{
-			Latency:        entry.Latency,
-			Loss:           entry.Loss,
-			Times:          entry.Times,
+		// source 由查询新建、仅此处引用，克隆切片一次即可。
+		result[key] = &TestHistoryEntry{
+			Latency:        slices.Clone(entry.Latency),
+			Loss:           slices.Clone(entry.Loss),
+			Times:          slices.Clone(entry.Times),
 			LastAt:         entry.LastAt,
 			MinIntervalSec: entry.MinIntervalSec,
 			AvgIntervalSec: entry.AvgIntervalSec,
-		})
+		}
 	}
 	return result
 }
@@ -2808,7 +3046,7 @@ func (s *Store) HasNode(nodeID string) bool {
 	return exists
 }
 
-func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[string]*TestHistoryEntry, error) {
+func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from, to time.Time) (map[string]*TestHistoryEntry, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
 		return map[string]*TestHistoryEntry{}, nil
@@ -2816,7 +3054,7 @@ func (s *Store) QueryPublicNodeHistory(nodeID string, from, to time.Time) (map[s
 	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
 		return map[string]*TestHistoryEntry{}, nil
 	}
-	entries, err := s.historyManager.NetworkStore().QueryPublicRange(nodeID, from, to)
+	entries, err := s.historyManager.NetworkStore().QueryPublicRange(ctx, nodeID, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -3095,11 +3333,12 @@ func (h *Hub) CloseAdminClients() {
 // only reads it, so per-client bytes.Clone allocations are pure waste.
 func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 	clients := h.snapshotClients()
+	prepared := h.prepareBroadcast(payload)
 	for _, client := range clients {
 		if client == nil || client.variant != variant {
 			continue
 		}
-		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload, prepared); !ok {
 			h.removeClient(client)
 		}
 	}
@@ -3107,6 +3346,7 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 
 func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
 	clients := h.snapshotClients()
+	prepared := h.prepareBroadcast(payload)
 	currentSalt := strings.TrimSpace(tokenSalt)
 	for _, client := range clients {
 		if client == nil || client.variant != adminVariant {
@@ -3116,10 +3356,22 @@ func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
 			h.removeClient(client)
 			continue
 		}
-		if ok := client.enqueue(websocket.TextMessage, payload); !ok {
+		if ok := client.enqueue(websocket.TextMessage, payload, prepared); !ok {
 			h.removeClient(client)
 		}
 	}
+}
+
+// prepareBroadcast 把广播 payload 预帧化为 PreparedMessage：同一对象
+// 广播给全部连接，帧缓存按连接的压缩协商各构建一次（明文帧在构建时
+// 预生成，压缩帧由首个压缩连接的写入惰性生成并复用），之后每秒广播
+// 零重复帧化开销。
+func (h *Hub) prepareBroadcast(payload []byte) *websocket.PreparedMessage {
+	prepared, err := websocket.NewPreparedMessage(websocket.TextMessage, payload)
+	if err != nil {
+		return nil
+	}
+	return prepared
 }
 
 func (h *Hub) HasVariant(variant string) bool {
@@ -3159,7 +3411,10 @@ func configureWSConn(conn *websocket.Conn) {
 	if conn == nil {
 		return
 	}
-	conn.SetReadLimit(maxJSONBodySize)
+	// 客户端只需发 pong/close 控制帧（不受读上限约束）；启用
+	// permessage-deflate 后读路径多了解压环节，收紧上限封死
+	// 压缩炸弹面（小压缩帧解出超大消息）。
+	conn.SetReadLimit(wsMaxClientMessageBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
@@ -3178,7 +3433,7 @@ func heartbeatLoop(client *hubClient, hub *Hub) {
 			return
 		case <-ticker.C:
 		}
-		if ok := client.enqueue(websocket.PingMessage, nil); !ok {
+		if ok := client.enqueue(websocket.PingMessage, nil, nil); !ok {
 			hub.removeClient(client)
 			return
 		}
@@ -3194,7 +3449,7 @@ func writeLoop(client *hubClient, hub *Hub) {
 		case <-client.done:
 			return
 		case msg := <-client.send:
-			if err := client.writeMessage(msg.messageType, msg.payload); err != nil {
+			if err := client.writeMessage(msg); err != nil {
 				hub.removeClient(client)
 				return
 			}
@@ -3404,6 +3659,14 @@ func (s *Store) RotateAdminTokenSalt() error {
 	return nil
 }
 
+// dummyAdminBcryptHash 是一个预生成的合法 bcrypt 哈希（对应随机口令），
+// 仅用于登录时对无效用户名执行等价代价的比较运算。
+var dummyAdminBcryptHash = "$2a$10$N9qo8uLOickgx2ZMRZoMye.IjPeGqBQVLf1F5zq1CzU9xUvOzX8fO"
+
+func verifyAdminPasswordDummy(password string) {
+	_ = verifyPassword(password, dummyAdminBcryptHash)
+}
+
 func (s *Store) VerifyAdminPassword(password string) bool {
 	s.mu.RLock()
 	stored := s.settings.AdminPass
@@ -3572,13 +3835,14 @@ func (s *Store) allowAgentRateLocked(key string, window time.Duration, limit int
 			s.agentRegisterRate = rates
 		}
 	}
-	for rateKey, windowState := range rates {
-		if !windowState.until.IsZero() && !now.Before(windowState.until) {
-			delete(rates, rateKey)
-		}
+	// 每个 ingest 都在全局写锁内：只清理当前 key 的过期窗口，整体清扫
+	// 交给低频的 sweepExpiredAgentRateWindows，避免 O(N) 全表扫描。
+	state, exists := rates[key]
+	if exists && !state.until.IsZero() && !now.Before(state.until) {
+		delete(rates, key)
+		exists = false
 	}
-	state := rates[key]
-	if state.until.IsZero() || !now.Before(state.until) {
+	if !exists {
 		rates[key] = agentRateWindow{count: 1, until: now.Add(window)}
 		return true
 	}
@@ -3588,6 +3852,20 @@ func (s *Store) allowAgentRateLocked(key string, window time.Duration, limit int
 	state.count++
 	rates[key] = state
 	return true
+}
+
+// sweepExpiredAgentRateWindows 定期清理全部过期限流窗口。写入方在命中时
+// 已自清理当前 key，这里只兜底清理不再活跃的 key，防止长期缓慢增长。
+func (s *Store) sweepExpiredAgentRateWindows(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rates := range []map[string]agentRateWindow{s.agentIngestRate, s.agentRegisterRate} {
+		for rateKey, windowState := range rates {
+			if !windowState.until.IsZero() && !now.Before(windowState.until) {
+				delete(rates, rateKey)
+			}
+		}
+	}
 }
 
 func (s *Store) upgradeAdminPasswordHash(password, stored string) {
@@ -3838,6 +4116,40 @@ func (s *Store) SiteTitle() string {
 }
 
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
+	// bcrypt 校验/哈希单次约 60–100ms，必须在全局写锁外完成，
+	// 否则会阻塞所有 agent ingest 与快照广播。
+	var (
+		storedAdminPass  string
+		newAdminPassHash string
+		adminPassChanged bool
+	)
+	if update.AdminPass != nil {
+		pass := strings.TrimSpace(*update.AdminPass)
+		if pass == "" {
+			return SettingsView{}, errors.New("admin_pass invalid")
+		}
+		update.AdminPass = &pass
+		s.mu.RLock()
+		storedAdminPass = s.settings.AdminPass
+		s.mu.RUnlock()
+		if verifyPassword(pass, storedAdminPass) {
+			if !isBcryptHash(storedAdminPass) {
+				hash, err := hashPassword(pass)
+				if err != nil {
+					return SettingsView{}, errors.New("admin_pass hash failed")
+				}
+				newAdminPassHash = hash
+			}
+		} else {
+			hash, err := hashPassword(pass)
+			if err != nil {
+				return SettingsView{}, errors.New("admin_pass hash failed")
+			}
+			newAdminPassHash = hash
+			adminPassChanged = true
+		}
+	}
+
 	var view SettingsView
 	s.mu.Lock()
 	originalSettings := cloneSettings(s.settings)
@@ -3868,24 +4180,14 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 	}
 	if update.AdminPass != nil {
-		pass := strings.TrimSpace(*update.AdminPass)
-		if pass == "" {
-			return fail(errors.New("admin_pass invalid"))
+		// 锁外哈希期间密码可能已被并发修改：检测到即拒绝，避免覆盖。
+		if s.settings.AdminPass != storedAdminPass {
+			return fail(errors.New("admin_pass changed concurrently, please retry"))
 		}
-		if verifyPassword(pass, s.settings.AdminPass) {
-			if !isBcryptHash(s.settings.AdminPass) {
-				hash, err := hashPassword(pass)
-				if err != nil {
-					return fail(errors.New("admin_pass hash failed"))
-				}
-				s.settings.AdminPass = hash
-			}
-		} else {
-			hash, err := hashPassword(pass)
-			if err != nil {
-				return fail(errors.New("admin_pass hash failed"))
-			}
-			s.settings.AdminPass = hash
+		if newAdminPassHash != "" {
+			s.settings.AdminPass = newAdminPassHash
+		}
+		if adminPassChanged {
 			tokenSalt, err := randomToken(adminTokenLength)
 			if err != nil {
 				return fail(err)
@@ -4216,25 +4518,6 @@ func preserveRedactedString(imported, existing string) string {
 	return imported
 }
 
-func (s *Store) ReplaceProfiles(profiles map[string]*NodeProfile) error {
-	s.agentMutationMu.Lock()
-	defer s.agentMutationMu.Unlock()
-
-	s.mu.Lock()
-	normalized, err := s.normalizeProfilesForImportLocked(profiles)
-	if err != nil {
-		s.mu.Unlock()
-		return err
-	}
-	now := time.Now()
-	previousAgentConfigs := s.agentConfigProjectionsLocked(now)
-	s.profiles = normalized
-	s.reconcileAgentConfigRefreshLocked(previousAgentConfigs, now)
-	s.mu.Unlock()
-	s.persist()
-	return nil
-}
-
 func normalizePersistedProfiles(settings Settings, nodes map[string]NodeState, profiles map[string]*NodeProfile) (map[string]*NodeProfile, error) {
 	store := &Store{
 		settings: cloneSettings(settings),
@@ -4349,6 +4632,12 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	}
 	s.mu.Lock()
 	expectedBootstrapToken := strings.TrimSpace(s.settings.AgentToken)
+	// register 是未认证端点，全局限流必须先于 token 比对，
+	// 否则攻击者可不限速地暴力猜测共享 bootstrap token。
+	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
+		s.mu.Unlock()
+		return "", agentRateLimitError()
+	}
 	if expectedBootstrapToken != "" && !isBootstrapAgentToken(expectedBootstrapToken, bootstrapToken) {
 		s.mu.Unlock()
 		return "", invalidBootstrapTokenError()
@@ -4359,10 +4648,6 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 			s.mu.Unlock()
 			return token, nil
 		}
-	}
-	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
-		s.mu.Unlock()
-		return "", agentRateLimitError()
 	}
 	if !s.allowAgentRateLocked("register:"+nodeID, agentRegisterWindow, defaultAgentRegisterLimit, now, false) {
 		s.mu.Unlock()
@@ -4479,8 +4764,10 @@ func (s *Store) ensureServerIDLocked(nodeID string, profile *NodeProfile) (bool,
 	if profile == nil {
 		return false, nil
 	}
-	original := strings.TrimSpace(profile.ServerID)
-	if original == "" || s.isServerIDDuplicateLocked(nodeID, original) {
+	// 唯一性由生成路径（isServerIDUsedLocked）与导入规范化
+	// （ensureServerIDsForProfiles）保证；每个 ingest 都在全局写锁内
+	// 重新做 O(N) 全表扫描代价过高。
+	if strings.TrimSpace(profile.ServerID) == "" {
 		id, err := s.generateServerIDLocked()
 		if err != nil {
 			return false, err
@@ -4509,21 +4796,6 @@ func (s *Store) isServerIDUsedLocked(id string) bool {
 	}
 	for _, profile := range s.profiles {
 		if profile != nil && strings.TrimSpace(profile.ServerID) == id {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Store) isServerIDDuplicateLocked(nodeID, id string) bool {
-	if id == "" {
-		return false
-	}
-	for key, profile := range s.profiles {
-		if key == nodeID || profile == nil {
-			continue
-		}
-		if strings.TrimSpace(profile.ServerID) == id {
 			return true
 		}
 	}
@@ -5130,7 +5402,7 @@ func (s *Store) deleteNodeMemoryLocked(nodeID string) {
 func (s *Store) clearNodesMemoryLocked() {
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
-	s.alerted = make(map[string]alertState)
+	s.alerted = make(map[string]AlertedState)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.configRefresh = make(map[string]struct{})
 	s.testHistory = make(map[string]map[string]*TestHistoryEntry)
@@ -5347,18 +5619,16 @@ func (s *Store) buildAgentConfigLocked(nodeID string, remoteUpdateCapable bool) 
 func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time, remoteUpdateCapable bool) AgentConfig {
 	profile := s.profiles[nodeID]
 	if profile == nil {
+		// Tests 保持 nil（序列化为 null）：表示"服务端未配置"，agent 端
+		// 保留 -net-tests / CM_NET_TESTS 本地种子，而不是被静默清空。
 		return AgentConfig{
 			TestIntervalSec: defaultTestIntervalSec,
-			Tests:           []metrics.NetworkTestConfig{},
 		}
 	}
 	tests := s.resolveTestsLocked(profile)
 	group, _ := primaryGroupTagsFromSelections(profile.Groups)
 	if group == "" {
 		group = strings.TrimSpace(profile.Group)
-	}
-	if tests == nil {
-		tests = []metrics.NetworkTestConfig{}
 	}
 	var update *AgentUpdateInstruction
 	node, nodeExists := s.nodes[nodeID]
@@ -5447,6 +5717,7 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 		Profiles:        cloneProfiles(s.profiles),
 		Nodes:           cloneNodeStates(s.nodes),
 		OfflineSessions: cloneOfflineSessions(s.offlineSessions),
+		Alerted:         cloneAlertedStates(s.alerted),
 	}
 	applyPendingPersistIntentsToSnapshot(&snapshot, s.pendingClearNodes, s.pendingNodeDeletes)
 	return snapshot
@@ -5460,6 +5731,7 @@ func applyPendingPersistIntentsToSnapshot(snapshot *PersistedData, pendingClearN
 		snapshot.Profiles = map[string]*NodeProfile{}
 		snapshot.Nodes = map[string]NodeState{}
 		snapshot.OfflineSessions = map[string]OfflineSessionState{}
+		snapshot.Alerted = map[string]AlertedState{}
 		snapshot.PendingHistoryClear = true
 		snapshot.PendingHistoryDeletes = nil
 		return
@@ -5473,6 +5745,7 @@ func applyPendingPersistIntentsToSnapshot(snapshot *PersistedData, pendingClearN
 		delete(snapshot.Profiles, nodeID)
 		delete(snapshot.Nodes, nodeID)
 		delete(snapshot.OfflineSessions, nodeID)
+		delete(snapshot.Alerted, nodeID)
 		pendingDeletes = append(pendingDeletes, nodeID)
 	}
 	if len(pendingDeletes) > 0 {
@@ -6102,6 +6375,12 @@ func adminNodeIDFromPath(w http.ResponseWriter, rawPath string) (string, bool) {
 	return nodeID, true
 }
 
+// releaseCheckContext 限定 release 检查的执行时长：updater 默认 20s 超时
+// 高于管理端 10s WriteTimeout，慢网络下客户端只会看到连接被切断。
+func releaseCheckContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 8*time.Second)
+}
+
 func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (updater.ReleaseInfo, error) {
 	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, strings.TrimSpace(stats.AgentVersion))
 	return client.CheckLatest(ctx)
@@ -6143,7 +6422,9 @@ func handleAdminGetAgentUpdate(w http.ResponseWriter, r *http.Request, stats met
 		writeJSON(w, http.StatusOK, buildAgentUpdateView(stats, updater.ReleaseInfo{}, "当前节点还没有上报 Agent 版本"))
 		return
 	}
-	releaseInfo, err := checkRelease(r.Context(), stats)
+	checkCtx, cancelCheck := releaseCheckContext(r)
+	releaseInfo, err := checkRelease(checkCtx, stats)
+	cancelCheck()
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
@@ -6172,7 +6453,9 @@ func handleAdminPostAgentUpdate(
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "当前节点还没有上报 Agent 版本"})
 		return
 	}
-	releaseInfo, err := checkRelease(r.Context(), stats)
+	checkCtx, cancelCheck := releaseCheckContext(r)
+	releaseInfo, err := checkRelease(checkCtx, stats)
+	cancelCheck()
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return

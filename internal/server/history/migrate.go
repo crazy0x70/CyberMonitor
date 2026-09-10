@@ -2,6 +2,7 @@ package history
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,10 @@ type legacyHistoryPayload struct {
 
 type networkHistoryStore interface {
 	AppendBatch(nodeID string, tests []metrics.NetworkTestResult, now time.Time) error
-	QueryRange(nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
+	QueryRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
+	// QueryRangeRaw 返回原始采样时间戳：迁移去重需要精确时间匹配，
+	// 降采样查询输出的是桶起点时间，会造成漏判与幂等失效。
+	QueryRangeRaw(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
 }
 
 type LegacyMigrationResult struct {
@@ -188,7 +192,7 @@ func loadExistingNodeHistoryTimestamps(
 		return result, nil
 	}
 
-	seriesMap, err := store.QueryRange(nodeID, from, to)
+	seriesMap, err := store.QueryRangeRaw(context.Background(), nodeID, from, to)
 	if err != nil {
 		return nil, err
 	}

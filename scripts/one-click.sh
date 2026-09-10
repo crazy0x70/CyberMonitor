@@ -100,6 +100,20 @@ enable_service() {
     systemctl restart "${service}"
 }
 
+# 等待首次启动完成（state.json 持久化），最多 30 秒。
+wait_for_state_file() {
+  local data_dir="$1"
+  local state_file="${data_dir}/state.json"
+  for _ in {1..30}; do
+    if [[ -f "${state_file}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "警告：等待 ${state_file} 生成超时，继续执行后续步骤。" >&2
+  return 0
+}
+
 read_admin_settings() {
   local data_dir="$1"
   local state_file="${data_dir}/state.json"
@@ -235,13 +249,18 @@ install_server() {
     cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
     die "安装 ${service} 失败，已执行回滚流程"
   fi
-  if [[ -n "${admin_pass}" ]] && (! write_server_conf "${listen}" "${data_dir}" || ! systemctl restart "${service}"); then
-    if ! rollback_install_failure "server" "${service}" "" "" "${CONF_DIR}/server.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
+  if [[ -n "${admin_pass}" ]]; then
+    # 等首次启动把 state.json 落盘后再剥离密码重启；否则第二次启动可能在
+    # 初始化完成前进行，服务端会重新生成随机密码，而脚本打印的将是已失效的旧密码。
+    wait_for_state_file "${data_dir}"
+    if ! write_server_conf "${listen}" "${data_dir}" || ! systemctl restart "${service}"; then
+      if ! rollback_install_failure "server" "${service}" "" "" "${CONF_DIR}/server.conf" "${conf_backup}" "${service_file}" "${service_backup}" "${service_existed}" "${service_enabled}" "${service_active}"; then
+        cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
+        die "清理 ${service} 初始管理员密码失败；回滚后服务仍未运行"
+      fi
       cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
-      die "清理 ${service} 初始管理员密码失败；回滚后服务仍未运行"
+      die "安装 ${service} 失败，已执行回滚流程"
     fi
-    cleanup_created_data_dir "${data_dir}" "${data_dir_created}"
-    die "安装 ${service} 失败，已执行回滚流程"
   fi
   cleanup_file_backup "${conf_backup}"
   cleanup_file_backup "${service_backup}"

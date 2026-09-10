@@ -78,7 +78,6 @@ type networkTestIdentity struct {
 // （短窗口行为与降采样改造前完全一致）。
 type seriesAccumulator struct {
 	identity     networkTestIdentity
-	bucketMillis int64
 	latency      *metricSeries
 	loss         *metricSeries
 	availability *metricSeries
@@ -105,15 +104,16 @@ type bucketAggregate struct {
 }
 
 func newMetricSeries(bucketMillis int64) *metricSeries {
-	var bucketSeconds int64
+	// 只初始化活跃模式的 map；访问路径全部按 bucketSeconds 分支，
+	// 非活跃 map 恒为 nil（读安全），省去每序列一次无效分配。
 	if bucketMillis > 0 {
-		bucketSeconds = bucketMillis / 1000
+		return &metricSeries{bucketSeconds: bucketMillis / 1000, buckets: make(map[int64]*bucketAggregate)}
 	}
-	return &metricSeries{
-		bucketSeconds: bucketSeconds,
-		raw:           make(map[int64]*float64),
-		buckets:       make(map[int64]*bucketAggregate),
-	}
+	return &metricSeries{raw: make(map[int64]*float64)}
+}
+
+func (m *metricSeries) sizeHint() int {
+	return len(m.raw) + len(m.buckets)
 }
 
 // observe 折入一个原始采样。tsSeconds 为 Unix 秒；value 可能为非有限值。
@@ -225,7 +225,6 @@ func ensureSeriesAccumulator(
 	}
 	entry := &seriesAccumulator{
 		identity:     identity,
-		bucketMillis: bucketMillis,
 		latency:      newMetricSeries(bucketMillis),
 		loss:         newMetricSeries(bucketMillis),
 		availability: newMetricSeries(bucketMillis),
@@ -297,7 +296,7 @@ func cloneHistorySeriesValues(series *metricSeries, times []int64) []*float64 {
 }
 
 func collectNetworkHistoryTimes(acc *seriesAccumulator, cutoffSeconds int64) []int64 {
-	timeSet := make(map[int64]struct{}, len(acc.latency.raw)+len(acc.loss.raw)+len(acc.availability.raw))
+	timeSet := make(map[int64]struct{}, acc.latency.sizeHint()+acc.loss.sizeHint()+acc.availability.sizeHint())
 	for _, series := range [...]*metricSeries{acc.availability, acc.latency, acc.loss} {
 		series.eachTime(func(ts int64) {
 			if cutoffSeconds > 0 && ts < cutoffSeconds {

@@ -156,6 +156,7 @@ const (
 	netFilterRefreshInterval     = 10 * time.Second
 	netSpeedRefreshInterval      = 10 * time.Second
 	hostHostnameRefreshInterval  = 60 * time.Second
+	hostProcsRefreshInterval     = 30 * time.Second
 	hostMountsRefreshInterval    = 10 * time.Second
 
 	publicIPv4Family publicIPFamily = "ipv4"
@@ -208,20 +209,25 @@ type Collector struct {
 	// TTL caches for identity-like inputs that must not be re-derived on
 	// every ~1s tick. The Collector is used from a single goroutine, like
 	// the other sampler state above.
-	resolvedNetFilter   map[string]struct{}
-	resolvedNetFilterAt time.Time
-	netSpeedMbps        float64
-	netSpeedSampledAt   time.Time
-	hostHostname        string
-	hostHostnameAt      time.Time
-	hostMounts          []hostMount
-	hostMountsAt        time.Time
-	nvidiaSMIPath       string
-	nvidiaSMIPathAt     time.Time
-	gpuSample           []GPUInfo
-	gpuSampleStatic     bool
-	gpuSampleAt         time.Time
-	sourceWarningsShown map[string]struct{}
+	resolvedNetFilter    map[string]struct{}
+	resolvedNetFilterAt  time.Time
+	netSpeedMbps         float64
+	netSpeedSampledAt    time.Time
+	hostHostname         string
+	hostHostnameAt       time.Time
+	hostMounts           []hostMount
+	hostMountsAt         time.Time
+	nvidiaSMIPath        string
+	nvidiaSMIPathAt      time.Time
+	gpuSample            []GPUInfo
+	gpuSampleStatic      bool
+	gpuSampleAt          time.Time
+	bootTime             uint64
+	bootTimeOK           bool
+	hostProcs            int
+	hostHostnameFallback string
+	hostIdentityAt       time.Time
+	sourceWarningsShown  map[string]struct{}
 
 	publicIPs               publicIPInfo
 	publicIPRefreshInterval time.Duration
@@ -241,6 +247,13 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 			continue
 		}
 		filter[name] = struct{}{}
+	}
+	// hostRoot 仅在确实是聚合根（含 proc/ 或 sys/）时生效。原生部署的
+	// 默认值 /host 不存在，若照用会让分区识别、网速、磁盘类型等 sysfs
+	// 读取全部落空——磁盘 IO 计数退化为整盘+分区求和（虚高 2-3x）。
+	hostRoot = strings.TrimSpace(hostRoot)
+	if hostRoot != "" && !isDir(filepath.Join(hostRoot, "proc")) && !isDir(filepath.Join(hostRoot, "sys")) {
+		hostRoot = ""
 	}
 	return &Collector{
 		nodeID:                    nodeID,
@@ -274,31 +287,17 @@ func (c *Collector) Collect() (NodeStats, error) {
 
 	diskCounters, err := disk.IOCounters()
 	c.warnOnce("disk.IOCounters", err)
-	var diskRead, diskWrite uint64
-	for _, stat := range diskCounters {
-		diskRead += stat.ReadBytes
-		diskWrite += stat.WriteBytes
-	}
+	diskRead, diskWrite := sumDiskIOBytes(diskCounters, c.hostRoot)
 
 	netFilter := c.resolveNetFilterAt(now)
 	netCounters, err := gnet.IOCounters(true)
 	c.warnOnce("net.IOCounters", err)
 	netStat := sumNetCounters(netCounters, netFilter)
 
-	hostInfo, err := host.Info()
-	c.warnOnce("host.Info", err)
-	hostname := ""
-	uptime := uint64(0)
-	processCount := 0
-	if hostInfo != nil {
-		hostname = hostInfo.Hostname
-		uptime = hostInfo.Uptime
-		processCount = int(hostInfo.Procs)
-	}
+	hostname, uptime, processCount := c.sampleHostIdentityAt(now)
 	if hostName := c.readHostHostnameAt(now); hostName != "" {
 		hostname = hostName
 	}
-
 	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
 
 	netSpeedMbps := c.collectNetSpeedMbpsAt(now, netFilter)
@@ -312,7 +311,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 		Hostname:        hostname,
 		PublicIPv4:      publicIPs.IPv4,
 		PublicIPv6:      publicIPs.IPv6,
-		StaticInfo:      true,
+		StaticInfo:      staticInfoRefreshed,
 		StaticUpdatedAt: c.staticInfoUpdatedAt.Unix(),
 		UptimeSec:       uptime,
 		Timestamp:       now.Unix(),
@@ -423,6 +422,36 @@ func finiteNonNegative(value float64) float64 {
 	return value
 }
 
+// sampleHostIdentityAt 返回 hostname 兜底、uptime 与进程数。uptime 由
+// 一次性 BootTime 推算，进程数低频刷新——host.Info() 在 macOS/Linux 上
+// 每 tick fork 子进程并读多个文件，不能放进 ~1s 采集循环。
+func (c *Collector) sampleHostIdentityAt(now time.Time) (string, uint64, int) {
+	if !c.bootTimeOK {
+		if bt, err := host.BootTime(); err == nil && bt > 0 {
+			c.bootTime = bt
+			c.bootTimeOK = true
+		} else {
+			c.warnOnce("host.BootTime", err)
+		}
+	}
+	var uptime uint64
+	if c.bootTimeOK {
+		if secs := now.Unix() - int64(c.bootTime); secs > 0 {
+			uptime = uint64(secs)
+		}
+	}
+	if c.hostProcs <= 0 || now.Sub(c.hostIdentityAt) >= hostProcsRefreshInterval {
+		if hostInfo, err := host.Info(); err == nil && hostInfo != nil {
+			c.hostProcs = int(hostInfo.Procs)
+			c.hostHostnameFallback = hostInfo.Hostname
+			c.hostIdentityAt = now
+		} else {
+			c.warnOnce("host.Info", err)
+		}
+	}
+	return c.hostHostnameFallback, uptime, c.hostProcs
+}
+
 func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.PartitionStat) bool {
 	interval := c.staticInfoRefreshInterval
 	if interval <= 0 {
@@ -509,8 +538,10 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 	if !c.resolvedNetFilterAt.IsZero() && now.Sub(c.resolvedNetFilterAt) < netFilterRefreshInterval {
 		return c.resolvedNetFilter
 	}
-	if ifaces, err := gnet.Interfaces(); err == nil {
-		c.resolvedNetFilter = resolveInterfaceFilter(nil, ifaces)
+	// 过滤器必须与计数器同源：容器部署时 IOCounters 读宿主机 /proc/net/dev，
+	// 而 Interfaces() 只见容器自身网络命名空间，混用会把宿主机网卡全部过滤掉。
+	if counters, err := gnet.IOCounters(true); err == nil {
+		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName)
 		c.resolvedNetFilterAt = now
 	}
 	return c.resolvedNetFilter
@@ -522,7 +553,7 @@ func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struc
 	if !c.netSpeedSampledAt.IsZero() && now.Sub(c.netSpeedSampledAt) < netSpeedRefreshInterval {
 		return c.netSpeedMbps
 	}
-	c.netSpeedMbps = collectNetSpeedMbps(filter)
+	c.netSpeedMbps = collectNetSpeedMbps(c.hostRoot, filter)
 	c.netSpeedSampledAt = now
 	return c.netSpeedMbps
 }
@@ -788,26 +819,19 @@ func shouldCollectInterface(name string, filter map[string]struct{}) bool {
 	return !isVirtualInterface(normalized)
 }
 
-func resolveInterfaceFilter(filter map[string]struct{}, ifaces []gnet.InterfaceStat) map[string]struct{} {
-	if len(filter) > 0 {
-		return filter
-	}
-	return buildDefaultInterfaceFilter(ifaces, readInterfaceMasterName)
-}
-
 func buildDefaultInterfaceFilter(
-	ifaces []gnet.InterfaceStat,
+	stats []gnet.IOCountersStat,
 	readMaster func(string) string,
 ) map[string]struct{} {
-	if len(ifaces) == 0 {
+	if len(stats) == 0 {
 		return nil
 	}
-	resolved := make(map[string]struct{}, len(ifaces))
-	for _, iface := range ifaces {
-		if shouldIgnoreDefaultInterface(iface, readMaster) {
+	resolved := make(map[string]struct{}, len(stats))
+	for _, stat := range stats {
+		if shouldIgnoreDefaultInterface(stat.Name, readMaster) {
 			continue
 		}
-		name := normalizeInterfaceName(iface.Name)
+		name := normalizeInterfaceName(stat.Name)
 		if name == "" {
 			continue
 		}
@@ -820,18 +844,18 @@ func buildDefaultInterfaceFilter(
 }
 
 func shouldIgnoreDefaultInterface(
-	iface gnet.InterfaceStat,
+	name string,
 	readMaster func(string) string,
 ) bool {
-	name := normalizeInterfaceName(iface.Name)
-	if name == "" {
+	normalized := normalizeInterfaceName(name)
+	if normalized == "" {
 		return true
 	}
-	if isVirtualInterface(name) {
+	if isVirtualInterface(normalized) {
 		return true
 	}
 	if readMaster != nil {
-		if master := normalizeInterfaceName(readMaster(iface.Name)); isDockerBridgeMaster(master) {
+		if master := normalizeInterfaceName(readMaster(name)); isDockerBridgeMaster(master) {
 			return true
 		}
 	}
@@ -869,7 +893,19 @@ func isDockerBridgeMaster(name string) bool {
 	return lower == "docker0" || strings.HasPrefix(lower, "br-")
 }
 
-func readInterfaceMasterName(name string) string {
+// hostSysPath resolves a path under /sys, honouring -host-root in container
+// deployments so reads hit the host sysfs instead of the container's own.
+func hostSysPath(hostRoot string, rel ...string) string {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		root = "/"
+	}
+	return filepath.Join(append([]string{root, "sys"}, rel...)...)
+}
+
+// readInterfaceMasterName reports the bridge a Linux interface is enslaved to,
+// reading through the host sysfs when running inside a container.
+func (c *Collector) readInterfaceMasterName(name string) string {
 	if runtime.GOOS != "linux" {
 		return ""
 	}
@@ -877,39 +913,38 @@ func readInterfaceMasterName(name string) string {
 	if ifaceName == "" {
 		return ""
 	}
-	target, err := os.Readlink(filepath.Join("/sys/class/net", ifaceName, "master"))
+	target, err := os.Readlink(hostSysPath(c.hostRoot, "class", "net", ifaceName, "master"))
 	if err != nil {
 		return ""
 	}
 	return filepath.Base(target)
 }
 
-func collectNetSpeedMbps(filter map[string]struct{}) float64 {
+func collectNetSpeedMbps(hostRoot string, filter map[string]struct{}) float64 {
 	if runtime.GOOS != "linux" {
 		return 0
 	}
-	ifaces, err := gnet.Interfaces()
+	counters, err := gnet.IOCounters(true)
 	if err != nil {
 		return 0
 	}
 	maxSpeed := 0.0
-	for _, iface := range ifaces {
-		if !shouldCollectInterface(iface.Name, filter) {
+	for _, stat := range counters {
+		if !shouldCollectInterface(stat.Name, filter) {
 			continue
 		}
-		if speed := readInterfaceSpeedMbps(iface.Name); speed > maxSpeed {
+		if speed := readInterfaceSpeedMbps(hostRoot, stat.Name); speed > maxSpeed {
 			maxSpeed = speed
 		}
 	}
 	return maxSpeed
 }
 
-func readInterfaceSpeedMbps(name string) float64 {
+func readInterfaceSpeedMbps(hostRoot, name string) float64 {
 	if name == "" {
 		return 0
 	}
-	path := filepath.Join("/sys/class/net", canonicalInterfaceName(name), "speed")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(hostSysPath(hostRoot, "class", "net", canonicalInterfaceName(name), "speed"))
 	if err != nil {
 		return 0
 	}
@@ -943,6 +978,60 @@ func parseSpeedMbps(raw string) float64 {
 		return 0
 	}
 	return parsed * multiplier
+}
+
+// sumDiskIOBytes aggregates counters across whole disks only. /proc/diskstats
+// lists every device together with its partitions carrying identical counters,
+// so summing all rows would inflate the totals (loop/ram/zram mirror their
+// backing device or RAM, not a physical disk).
+func sumDiskIOBytes(counters map[string]disk.IOCountersStat, hostRoot string) (uint64, uint64) {
+	var read, write uint64
+	for name, stat := range counters {
+		if isVirtualBlockDevice(name, hostRoot) {
+			continue
+		}
+		if isPartitionOfCountedDisk(name, counters) {
+			continue
+		}
+		read += stat.ReadBytes
+		write += stat.WriteBytes
+	}
+	return read, write
+}
+
+// isPartitionOfCountedDisk 处理 BSD 的 GEOM/devstat 命名：ada0 与
+// ada0p1（GPT）、da0s1（MBR）计数器相同，分区后缀命中同集合中的整盘
+// 时剔除，避免整盘+分区求和导致 IO 虚高。legacy BSD disklabel 的双层
+// 嵌套（da0s1a）不覆盖，仍会多计一次（改动前全部求和更糟）。
+func isPartitionOfCountedDisk(name string, counters map[string]disk.IOCountersStat) bool {
+	i := len(name)
+	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+		i--
+	}
+	if i == 0 || i == len(name) {
+		return false
+	}
+	sep := name[i-1]
+	if sep != 'p' && sep != 's' {
+		return false
+	}
+	base := name[:i-1]
+	_, exists := counters[base]
+	return exists
+}
+
+func isVirtualBlockDevice(name, hostRoot string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	normalized := strings.TrimSpace(name)
+	if strings.HasPrefix(normalized, "loop") || strings.HasPrefix(normalized, "ram") || strings.HasPrefix(normalized, "zram") {
+		return true
+	}
+	// A "partition" attribute under /sys/class/block marks the entry as a
+	// partition of a parent disk whose counters are already counted.
+	_, err := os.Stat(hostSysPath(hostRoot, "class", "block", normalized, "partition"))
+	return err == nil
 }
 
 func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionStat) []DiskPartition {
@@ -1203,6 +1292,74 @@ func readBlockDeviceSizeBytes(name string) uint64 {
 	return sectors * 512
 }
 
+// 每 1s 采集一次都会遍历全部挂载点，前缀与文件系统黑名单保持包级只读，
+// 避免每次调用重建 map/slice。
+var skipMountPrefixes = []string{
+	"/proc",
+	"/sys",
+	"/dev",
+	"/run",
+	"/run/user",
+	"/run/credentials",
+	"/var/run",
+	"/etc",
+	"/snap",
+	"/var/snap",
+	"/var/lib/docker",
+	"/var/lib/containerd",
+	"/var/lib/containers",
+	"/var/lib/kubelet",
+	"/var/lib/flatpak",
+}
+
+var skipFilesystems = map[string]struct{}{
+	"proc":        {},
+	"sysfs":       {},
+	"tmpfs":       {},
+	"devtmpfs":    {},
+	"squashfs":    {},
+	"overlay":     {},
+	"aufs":        {},
+	"ramfs":       {},
+	"autofs":      {},
+	"securityfs":  {},
+	"pstore":      {},
+	"hugetlbfs":   {},
+	"configfs":    {},
+	"cgroup":      {},
+	"cgroup2":     {},
+	"devpts":      {},
+	"mqueue":      {},
+	"debugfs":     {},
+	"tracefs":     {},
+	"fusectl":     {},
+	"binfmt_misc": {},
+	"rpc_pipefs":  {},
+	"nsfs":        {},
+	"bpf":         {},
+	"lxcfs":       {},
+	// Network and cluster filesystems: their capacity is remote or
+	// shared, not local disk.
+	"nfs":       {},
+	"nfs4":      {},
+	"cifs":      {},
+	"smbfs":     {},
+	"smb2":      {},
+	"9p":        {},
+	"virtiofs":  {},
+	"afs":       {},
+	"ceph":      {},
+	"cephfs":    {},
+	"glusterfs": {},
+	"lustre":    {},
+	"gfs":       {},
+	"gfs2":      {},
+	"ocfs2":     {},
+	"beegfs":    {},
+	"sshfs":     {},
+	"fdescfs":   {},
+}
+
 func shouldSkipPartition(p disk.PartitionStat) bool {
 	if p.Mountpoint == "" || p.Mountpoint == "none" {
 		return true
@@ -1211,77 +1368,13 @@ func shouldSkipPartition(p disk.PartitionStat) bool {
 		return true
 	}
 	mountpoint := filepath.Clean(strings.TrimSpace(p.Mountpoint))
-	ignorePrefixes := []string{
-		"/proc",
-		"/sys",
-		"/dev",
-		"/run",
-		"/run/user",
-		"/run/credentials",
-		"/var/run",
-		"/etc",
-		"/snap",
-		"/var/snap",
-		"/var/lib/docker",
-		"/var/lib/containerd",
-		"/var/lib/containers",
-		"/var/lib/kubelet",
-		"/var/lib/flatpak",
-	}
-	for _, prefix := range ignorePrefixes {
+	for _, prefix := range skipMountPrefixes {
 		if mountpoint == prefix || strings.HasPrefix(mountpoint, prefix+"/") {
 			return true
 		}
 	}
-	ignoreFS := map[string]struct{}{
-		"proc":        {},
-		"sysfs":       {},
-		"tmpfs":       {},
-		"devtmpfs":    {},
-		"squashfs":    {},
-		"overlay":     {},
-		"aufs":        {},
-		"ramfs":       {},
-		"autofs":      {},
-		"securityfs":  {},
-		"pstore":      {},
-		"hugetlbfs":   {},
-		"configfs":    {},
-		"cgroup":      {},
-		"cgroup2":     {},
-		"devpts":      {},
-		"mqueue":      {},
-		"debugfs":     {},
-		"tracefs":     {},
-		"fusectl":     {},
-		"binfmt_misc": {},
-		"rpc_pipefs":  {},
-		"nsfs":        {},
-		"bpf":         {},
-		"lxcfs":       {},
-		// Network and cluster filesystems: their capacity is remote or
-		// shared, not local disk.
-		"nfs":       {},
-		"nfs4":      {},
-		"cifs":      {},
-		"smbfs":     {},
-		"smb2":      {},
-		"9p":        {},
-		"virtiofs":  {},
-		"afs":       {},
-		"ceph":      {},
-		"cephfs":    {},
-		"glusterfs": {},
-		"lustre":    {},
-		"gfs":       {},
-		"gfs2":      {},
-		"ocfs2":     {},
-		"beegfs":    {},
-		"sshfs":     {},
-		"fdescfs":   {},
-	}
 	fstype := strings.ToLower(p.Fstype)
-	if _, ok := ignoreFS[fstype]; ok && p.Mountpoint != "/" {
+	if _, ok := skipFilesystems[fstype]; ok && p.Mountpoint != "/" {
 		return true
 	}
 	// Any FUSE filesystem (rclone, alist, CloudDrive2, ...) is treated as a
@@ -1320,10 +1413,14 @@ func readHostVirtualMemory(hostRoot string) (*mem.VirtualMemoryStat, bool) {
 		available = total
 	}
 	used := total - available
+	free := kibToBytes(values["MemFree"])
+	if free > total {
+		free = total
+	}
 	return &mem.VirtualMemoryStat{
 		Total:       total,
 		Available:   available,
-		Free:        available,
+		Free:        free,
 		Used:        used,
 		UsedPercent: percentOf(used, total),
 	}, true

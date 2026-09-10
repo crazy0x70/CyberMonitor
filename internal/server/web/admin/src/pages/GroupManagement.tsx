@@ -289,6 +289,15 @@ function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
         target: { groupIndex },
       });
       groupErrors[String(groupIndex)] = message;
+    } else if (groupName.includes(":") || groupName.includes("/")) {
+      // 冒号与斜杠是 group:tag / group/tag 选择编码的分隔符，会让分组解析错乱。
+      const message = "一级分组名称不能包含“:”或“/”。";
+      validationIssues.push({
+        key: `group-separator-${groupIndex}`,
+        message,
+        target: { groupIndex },
+      });
+      groupErrors[String(groupIndex)] = message;
     } else if (seenGroups.has(groupName)) {
       const message = `一级分组“${groupName}”重复，请保留唯一名称。`;
       validationIssues.push({

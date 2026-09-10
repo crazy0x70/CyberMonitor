@@ -402,7 +402,12 @@ export interface AdminSocketConnection {
 interface AdminSocketOptions {
   reconnectDelayMs?: number;
   reconnectMaxDelayMs?: number;
+  staleTimeoutMs?: number;
 }
+
+// 半开连接（休眠/NAT 超时）不会触发 close 事件：超过 staleTimeoutMs 没有
+// 任何消息就主动断开，让既有 close 处理器走重连。
+const DEFAULT_STALE_TIMEOUT_MS = 15000;
 
 export function connectAdminSocket(
   onSnapshot: (snapshot: Snapshot) => void,
@@ -414,12 +419,42 @@ export function connectAdminSocket(
     reconnectDelayMs,
     Number(options.reconnectMaxDelayMs ?? 8000),
   );
+  const staleTimeoutMs = Math.max(
+    1000,
+    Number(options.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS),
+  );
   let nextReconnectDelayMs = reconnectDelayMs;
   let socket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let staleTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
 
+  const clearStaleTimer = () => {
+    if (staleTimer) {
+      clearTimeout(staleTimer);
+      staleTimer = null;
+    }
+  };
+
+  const armStaleTimer = () => {
+    clearStaleTimer();
+    if (closed || !socket) {
+      return;
+    }
+    staleTimer = setTimeout(() => {
+      staleTimer = null;
+      const activeSocket = socket;
+      socket = null;
+      try {
+        activeSocket?.close();
+      } catch {
+        // close 处理器负责重连
+      }
+    }, staleTimeoutMs);
+  };
+
   const handleMessage = (event: MessageEvent) => {
+    armStaleTimer();
     try {
       const payload = JSON.parse(event.data) as Snapshot | NodeDelta;
       if (isSnapshotPayload(payload)) {
@@ -446,9 +481,11 @@ export function connectAdminSocket(
     socket = new WebSocket(adminSocketURL());
     socket.addEventListener("open", () => {
       nextReconnectDelayMs = reconnectDelayMs;
+      armStaleTimer();
     });
     socket.addEventListener("message", handleMessage);
     socket.addEventListener("close", () => {
+      clearStaleTimer();
       socket = null;
       if (!closed && !reconnectTimer) {
         const delay = nextReconnectDelayMs;
@@ -469,6 +506,7 @@ export function connectAdminSocket(
     close() {
       closed = true;
       clearReconnectTimer();
+      clearStaleTimer();
       const activeSocket = socket;
       socket = null;
       activeSocket?.close();

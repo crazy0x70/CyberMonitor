@@ -20,22 +20,25 @@ import (
 )
 
 const (
-	aiProviderOpenAI            = "openai"
-	aiProviderGemini            = "gemini"
-	aiProviderVolcengine        = "volcengine"
-	aiProviderOpenAICompatible  = "openai_compatible"
-	defaultOpenAIBaseURL        = "https://api.openai.com/v1"
-	defaultOpenAIModel          = "gpt-5.2"
-	defaultGeminiBaseURL        = "https://generativelanguage.googleapis.com/v1beta"
-	defaultGeminiModel          = "gemini-2.5-flash"
-	defaultVolcengineBaseURL    = "https://ark.cn-beijing.volces.com/api/v3"
-	defaultVolcengineModel      = "doubao-seed-1-6-flash"
-	defaultAIMaxOutputTokens    = 512
-	defaultAITemperature        = 0.2
-	defaultAITestPrompt         = "请仅回复 ok"
-	maxTelegramMessageRunes     = 3500
-	maxAIPromptRunes            = 2000
-	maxHTTPErrorBodyBytes       = 4096
+	aiProviderOpenAI           = "openai"
+	aiProviderGemini           = "gemini"
+	aiProviderVolcengine       = "volcengine"
+	aiProviderOpenAICompatible = "openai_compatible"
+	defaultOpenAIBaseURL       = "https://api.openai.com/v1"
+	defaultOpenAIModel         = "gpt-5.2"
+	defaultGeminiBaseURL       = "https://generativelanguage.googleapis.com/v1beta"
+	defaultGeminiModel         = "gemini-2.5-flash"
+	defaultVolcengineBaseURL   = "https://ark.cn-beijing.volces.com/api/v3"
+	defaultVolcengineModel     = "doubao-seed-1-6-flash"
+	defaultAIMaxOutputTokens   = 512
+	defaultAITemperature       = 0.2
+	defaultAITestPrompt        = "请仅回复 ok"
+	maxTelegramMessageRunes    = 3500
+	maxAIPromptRunes           = 2000
+	maxHTTPErrorBodyBytes      = 4096
+	// maxAISuccessBodyBytes 覆盖完整 JSON 响应；思考型模型（如 doubao-seed）
+	// 会输出 reasoning_content，4KB 的错误体上限会截断正常回复导致解析失败。
+	maxAISuccessBodyBytes       = 1 << 20
 	aiOfflineRecentSessionLimit = 3
 	aiHTTPTimeout               = 18 * time.Second
 )
@@ -89,8 +92,11 @@ func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]s
 		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
-	raw, _ := readResponseBodyLimited(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxAISuccessBodyBytes))
 	if resp.StatusCode >= 300 {
+		if len(raw) > maxHTTPErrorBodyBytes {
+			raw = raw[:maxHTTPErrorBodyBytes]
+		}
 		return fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
@@ -635,7 +641,7 @@ func runAIQuery(ctx context.Context, store *Store, question string) (string, err
 		return "", err
 	}
 	systemPrompt := buildAISystemPrompt(settings.Prompt)
-	userPrompt, err := buildAIUserPrompt(store, question)
+	userPrompt, err := buildAIUserPrompt(ctx, store, question)
 	if err != nil {
 		return "", err
 	}
@@ -702,9 +708,10 @@ func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, e
 	if baseURL == "" {
 		return nil, errors.New("Base URL 不能为空")
 	}
-	endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, url.QueryEscape(config.APIKey))
+	endpoint := fmt.Sprintf("%s/models", baseURL)
+	headers := map[string]string{"x-goog-api-key": config.APIKey}
 	var parsed geminiModelsResponse
-	if err := aiDoJSON(ctx, http.MethodGet, endpoint, nil, nil, &parsed); err != nil {
+	if err := aiDoJSON(ctx, http.MethodGet, endpoint, headers, nil, &parsed); err != nil {
 		return nil, err
 	}
 	seen := make(map[string]struct{})
@@ -737,8 +744,8 @@ func buildAISystemPrompt(custom string) string {
 	return strings.Join(lines, "\n")
 }
 
-func buildAIUserPrompt(store *Store, question string) (string, error) {
-	snapshot := buildAISnapshot(store)
+func buildAIUserPrompt(ctx context.Context, store *Store, question string) (string, error) {
+	snapshot := buildAISnapshot(ctx, store)
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return "", err
@@ -746,13 +753,16 @@ func buildAIUserPrompt(store *Store, question string) (string, error) {
 	return fmt.Sprintf("问题: %s\n数据(JSON): %s", question, payload), nil
 }
 
-func buildAISnapshot(store *Store) aiSnapshot {
+func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 	snapshotTime := time.Now().UTC()
 	nodes := store.Snapshot()
 	offlineStore := resolveAIOfflineStore(store)
 	servers := make([]aiServerSummary, 0, len(nodes))
 	for _, node := range nodes {
-		servers = append(servers, buildAIServerSummary(node, offlineStore, store, snapshotTime))
+		if ctx.Err() != nil {
+			break
+		}
+		servers = append(servers, buildAIServerSummary(ctx, node, offlineStore, store, snapshotTime))
 	}
 	return aiSnapshot{
 		GeneratedAt: snapshotTime.Format("2006-01-02 15:04:05"),
@@ -760,17 +770,17 @@ func buildAISnapshot(store *Store) aiSnapshot {
 	}
 }
 
-func buildAIServerSummary(node NodeView, offlineStore *history.OfflineStore, store *Store, snapshotTime time.Time) aiServerSummary {
+func buildAIServerSummary(ctx context.Context, node NodeView, offlineStore *history.OfflineStore, store *Store, snapshotTime time.Time) aiServerSummary {
 	stats := node.Stats
 
 	diskUsed := calculateMaxDiskUsage(stats.Disk)
 	name := resolveNodeDisplayName(node)
-	offlineSummary, offlineHistoryUnavailable := buildAIOfflineSummary(offlineStore, stats.NodeID, snapshotTime)
+	offlineSummary, offlineHistoryUnavailable := buildAIOfflineSummary(ctx, offlineStore, stats.NodeID, snapshotTime)
 	hostName := resolveHostName(stats)
 	diskType := resolveDiskType(node, stats)
 	netSpeedMbps := resolveNetSpeed(node, stats)
 	testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
-	networkHistory, networkHistoryUnavailable := queryAINetworkHistory(store, stats.NodeID, snapshotTime)
+	networkHistory, networkHistoryUnavailable := queryAINetworkHistory(ctx, store, stats.NodeID, snapshotTime)
 	testTrends := buildAINetworkTrendSummaries(testsByKey, networkHistory)
 	diagnostics := make([]string, 0, 2)
 	if networkHistoryUnavailable {
@@ -851,7 +861,7 @@ func resolveNetSpeed(node NodeView, stats metrics.NodeStats) float64 {
 	return stats.NetSpeedMbps
 }
 
-func queryAINetworkHistory(store *Store, nodeID string, now time.Time) (map[string]*TestHistoryEntry, bool) {
+func queryAINetworkHistory(ctx context.Context, store *Store, nodeID string, now time.Time) (map[string]*TestHistoryEntry, bool) {
 	if store == nil {
 		return nil, false
 	}
@@ -865,7 +875,7 @@ func queryAINetworkHistory(store *Store, nodeID string, now time.Time) (map[stri
 		now = now.UTC()
 	}
 	from := now.Add(-24 * time.Hour)
-	entries, err := store.QueryPublicNodeHistory(nodeID, from, now)
+	entries, err := store.QueryPublicNodeHistory(ctx, nodeID, from, now)
 	if err != nil {
 		log.Printf("AI 网络历史查询失败 node=%s: %v", nodeID, err)
 		return nil, true
@@ -889,7 +899,7 @@ func resolveAIOfflineStore(store *Store) *history.OfflineStore {
 	return historyManager.OfflineStore()
 }
 
-func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, now time.Time) (*aiOfflineSummary, bool) {
+func buildAIOfflineSummary(ctx context.Context, offlineStore *history.OfflineStore, nodeID string, now time.Time) (*aiOfflineSummary, bool) {
 	if offlineStore == nil {
 		return nil, false
 	}
@@ -902,7 +912,7 @@ func buildAIOfflineSummary(offlineStore *history.OfflineStore, nodeID string, no
 	} else {
 		now = now.UTC()
 	}
-	insights, err := offlineStore.QueryInsights(nodeID, now, aiOfflineRecentSessionLimit)
+	insights, err := offlineStore.QueryInsights(ctx, nodeID, now, aiOfflineRecentSessionLimit)
 	if err != nil {
 		log.Printf("AI 离线历史查询失败 node=%s: %v", nodeID, err)
 		return nil, true
@@ -937,7 +947,7 @@ func buildAINetworkTestSummaries(tests []metrics.NetworkTestResult) ([]aiNetwork
 	testsByKey := make(map[string]metrics.NetworkTestResult)
 	keys := make([]string, 0, len(tests))
 	for _, test := range tests {
-		key := buildTestHistoryKey(test)
+		key := history.BuildNetworkTestKey(test)
 		if key == "" {
 			continue
 		}
@@ -1262,8 +1272,12 @@ func callGemini(ctx context.Context, config AIProviderConfig, systemPrompt, user
 	if err != nil {
 		return "", err
 	}
-	endpoint := fmt.Sprintf("%s/%s:generateContent?key=%s", baseURL, model, url.QueryEscape(config.APIKey))
-	headers := map[string]string{"Content-Type": "application/json"}
+	// API Key 走 header 而非 URL query，避免泄漏到出站代理与网关日志。
+	endpoint := fmt.Sprintf("%s/%s:generateContent", baseURL, model)
+	headers := map[string]string{
+		"Content-Type":   "application/json",
+		"x-goog-api-key": config.APIKey,
+	}
 	var parsed geminiResponse
 	if err := aiDoJSON(ctx, http.MethodPost, endpoint, headers, data, &parsed); err != nil {
 		return "", err

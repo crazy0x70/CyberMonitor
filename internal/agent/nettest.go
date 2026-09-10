@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"regexp"
@@ -37,6 +38,15 @@ var (
 	pingCountRegexes        = []*regexp.Regexp{pingTxRxRegex, pingWindowsCountRegex, pingChineseCountRegex}
 )
 
+// ParseNetTests 解析逗号分隔的网络测试目标列表。单项支持形式：
+//
+//	host[:port]                按端口推断 tcp / icmp
+//	icmp:host / tcp:host[:port]
+//	名称@host[:port] / 名称@icmp:host / 名称@tcp:host[:port]
+//	名称 icmp:host / 名称 tcp:host[:port]（名称与目标以空白分隔）
+//
+// IPv6 必须使用方括号：tcp:[2001:db8::1]:443、icmp:[2001:db8::1]。
+// 无法解析的单项记录日志并跳过，不影响其余目标。
 func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 	items := strings.Split(raw, ",")
 	results := make([]metrics.NetworkTestConfig, 0, len(items))
@@ -56,9 +66,21 @@ func parseNetTestItem(item string) (metrics.NetworkTestConfig, bool) {
 	}
 
 	name, target := splitNamedTarget(target)
+	// “名称 + 空白 + 目标”形式：主机名不含空白，首个空白前一定是名称。
+	if name == "" {
+		if idx := strings.IndexAny(target, " \t"); idx > 0 {
+			name = strings.TrimSpace(target[:idx])
+			target = strings.TrimSpace(target[idx+1:])
+		}
+	}
 	kind, target := splitNetTestType(target)
 	host, port := splitHostPort(target)
 	if host == "" {
+		log.Printf("忽略无法解析的网络测试目标 %q: host 为空（IPv6 请使用方括号，如 tcp:[::1]:443）", item)
+		return metrics.NetworkTestConfig{}, false
+	}
+	if err := validateProbeHost(host); err != nil {
+		log.Printf("忽略无法解析的网络测试目标 %q: %v", item, err)
 		return metrics.NetworkTestConfig{}, false
 	}
 
@@ -153,7 +175,7 @@ func runSingleNetworkTest(
 	ctx context.Context,
 	config metrics.NetworkTestConfig,
 	now func() time.Time,
-	tcpProbe func(string, int) (*float64, string, string),
+	tcpProbe func(context.Context, string, int) (*float64, string, string),
 	icmpProbe func(context.Context, string) (*float64, float64, string, string),
 ) metrics.NetworkTestResult {
 	result := metrics.NetworkTestResult{
@@ -173,7 +195,7 @@ func runSingleNetworkTest(
 
 	switch config.Type {
 	case "tcp":
-		latency, status, errText := tcpProbe(probeHost, config.Port)
+		latency, status, errText := tcpProbe(ctx, probeHost, config.Port)
 		result.LatencyMs = latency
 		result.Status = status
 		if status == "ok" {
@@ -205,10 +227,10 @@ func resolveNetworkTestProbeHost(ctx context.Context, config metrics.NetworkTest
 	return host, nil
 }
 
-func testTCP(host string, port int) (*float64, string, string) {
+func testTCP(ctx context.Context, host string, port int) (*float64, string, string) {
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", address, tcpTimeout)
+	conn, err := (&net.Dialer{Timeout: tcpTimeout}).DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, "error", err.Error()
 	}
@@ -508,6 +530,12 @@ func splitHostPort(value string) (string, int) {
 			return host, parsed
 		}
 		return strings.Trim(trimmed, "[]"), 0
+	}
+
+	// 无括号的裸 IPv6（如 ::1、2001:db8::1）不含端口：整体视为主机，
+	// 避免被"最后一个冒号后是端口"的启发式拆坏。
+	if strings.Count(trimmed, ":") > 1 {
+		return trimmed, 0
 	}
 
 	lastColon := strings.LastIndex(trimmed, ":")

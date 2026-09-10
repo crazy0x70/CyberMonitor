@@ -24,6 +24,11 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["打开监控页", "Open monitor page"],
   ["打开导航菜单", "Open navigation menu"],
   ["跳转到主要内容", "Skip to main content"],
+  ["多个用户 ID 请使用逗号分隔", "Separate multiple user IDs with commas"],
+  [
+    "服务端更新失败，当前登录态已失效，请重新登录。",
+    "Server update failed: your session has expired. Please sign in again.",
+  ],
   ["切换到浅色模式", "Switch to light mode"],
   ["切换到深色模式", "Switch to dark mode"],
   ["主题模式", "Theme mode"],

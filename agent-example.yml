@@ -17,6 +17,10 @@ services:
       CM_NODE_ID_FILE: "/state/.cybermonitor-node-id"
       CM_AGENT_TOKEN_FILE: "/state/.cybermonitor-agent-token"
       CM_INTERVAL: "5s"
+      # 可选：本地网络测试目标（服务端未为该节点配置探测项时生效）。逗号分隔，
+      # 形式：host[:port] | icmp:host | tcp:host[:port] | 名称@目标 | "名称 目标"；
+      # IPv6 需方括号，如 tcp:[2001:db8::1]:443。
+      # CM_NET_TESTS: "icmp:223.5.5.5,DNS@tcp:1.1.1.1:443,网关 192.168.1.1"
       # 默认拒绝服务端下发的远程更新任务；需要 Docker socket 更新能力时再改为 "0"。
       CM_DISABLE_UPDATE: "1"
       # 访问 Docker socket 需要显式 opt-in；挂载 docker.sock 并确认风险后再改为 "1"。

@@ -109,6 +109,7 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 			nodeID,
 			sample,
 			latestSeriesTimeUpdates,
+			now,
 		); err != nil {
 			return err
 		}
@@ -123,12 +124,18 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	return nil
 }
 
-func (s *NetworkStore) QueryRange(nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
-	return s.queryRange(nodeID, from, to, true)
+func (s *NetworkStore) QueryRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
+	return s.queryRange(ctx, nodeID, from, to, true)
 }
 
-func (s *NetworkStore) QueryPublicRange(nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
-	return s.queryRange(nodeID, from, to, false)
+func (s *NetworkStore) QueryPublicRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
+	return s.queryRange(ctx, nodeID, from, to, false)
+}
+
+// QueryRangeRaw 跳过桶降采样，返回原始采样时间戳。需要精确时间去重的
+// 场景（如 legacy 迁移去重）必须走此路径：降采样输出的是桶起点时间。
+func (s *NetworkStore) QueryRangeRaw(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
+	return s.queryRangeWithOptions(ctx, nodeID, from, to, true, 0)
 }
 
 func (s *NetworkStore) HasNodeHistory(nodeID string) (bool, error) {
@@ -152,6 +159,7 @@ func (s *NetworkStore) HasNodeHistory(nodeID string) (bool, error) {
 }
 
 func (s *NetworkStore) queryRange(
+	ctx context.Context,
 	nodeID string,
 	from, to time.Time,
 	includeAvailability bool,
@@ -167,11 +175,32 @@ func (s *NetworkStore) queryRange(
 		return map[string]*NetworkHistoryEntry{}, nil
 	}
 
-	mint := from.UnixMilli()
-	maxt := to.UnixMilli()
 	// 长窗口（如 1y）必须先定桶再采集：target ≤ ~1000 点/序列。
 	// 短窗口返回 0，走 raw 路径（与历史行为一致）。
-	bucketMillis := downsampleBucketMillis(mint, maxt)
+	bucketMillis := downsampleBucketMillis(from.UnixMilli(), to.UnixMilli())
+	return s.queryRangeWithOptions(ctx, nodeID, from, to, includeAvailability, bucketMillis)
+}
+
+func (s *NetworkStore) queryRangeWithOptions(
+	ctx context.Context,
+	nodeID string,
+	from, to time.Time,
+	includeAvailability bool,
+	bucketMillis int64,
+) (map[string]*NetworkHistoryEntry, error) {
+	if s == nil || s.db == nil {
+		return nil, errNilNetworkStore
+	}
+	nodeID = normalizeNodeID(nodeID)
+	if nodeID == "" {
+		return map[string]*NetworkHistoryEntry{}, nil
+	}
+	if to.Before(from) {
+		return map[string]*NetworkHistoryEntry{}, nil
+	}
+
+	mint := from.UnixMilli()
+	maxt := to.UnixMilli()
 	querier, err := s.db.Querier(mint, maxt)
 	if err != nil {
 		return nil, err
@@ -180,7 +209,7 @@ func (s *NetworkStore) queryRange(
 
 	accumulators := make(map[string]*seriesAccumulator)
 	if err := collectMetricSeriesBatch(
-		context.Background(),
+		ctx,
 		querier,
 		nodeID,
 		networkMetricNames(includeAvailability),
@@ -271,6 +300,7 @@ func (s *NetworkStore) appendPreparedMetricSamples(
 	nodeID string,
 	sample preparedNetworkSample,
 	latestSeriesTimeUpdates map[string]int64,
+	now time.Time,
 ) error {
 	for _, metric := range sample.metrics() {
 		if err := s.appendPreparedMetricSample(
@@ -278,6 +308,7 @@ func (s *NetworkStore) appendPreparedMetricSamples(
 			nodeID,
 			sample,
 			latestSeriesTimeUpdates,
+			now,
 			metric.name,
 			metric.value,
 		); err != nil {
@@ -292,10 +323,11 @@ func (s *NetworkStore) appendPreparedMetricSample(
 	nodeID string,
 	sample preparedNetworkSample,
 	latestSeriesTimeUpdates map[string]int64,
+	now time.Time,
 	metricName string,
 	value float64,
 ) error {
-	appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, metricName, value)
+	appended, err := s.appendMetricSampleIfFresh(appender, nodeID, sample, metricName, value, now)
 	if err != nil {
 		return err
 	}
@@ -311,8 +343,9 @@ func (s *NetworkStore) appendMetricSampleIfFresh(
 	sample preparedNetworkSample,
 	metricName string,
 	value float64,
+	now time.Time,
 ) (bool, error) {
-	latestMillis, known, err := s.latestTimestampMillis(metricName, nodeID, sample.seriesKey)
+	latestMillis, known, err := s.latestTimestampMillis(metricName, nodeID, sample.seriesKey, now)
 	if err != nil {
 		return false, err
 	}
@@ -320,13 +353,20 @@ func (s *NetworkStore) appendMetricSampleIfFresh(
 		return false, nil
 	}
 	if err := appendMetricSample(appender, nodeID, sample, metricName, value); err != nil {
+		// 首扫窗口外的陈旧样本（时钟回拨、久离线节点回连）会被 TSDB 以
+		// 越界/重复/乱序拒绝：跳过单个样本，不让它拖垮整批提交。
+		if errors.Is(err, storage.ErrOutOfBounds) ||
+			errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
+			errors.Is(err, storage.ErrOutOfOrderSample) {
+			return false, nil
+		}
 		return false, err
 	}
 	return true, nil
 }
 
-func (s *NetworkStore) latestTimestampMillis(metricName, nodeID, seriesKey string) (int64, bool, error) {
-	if err := s.ensureLatestSeriesTimeLoaded(); err != nil {
+func (s *NetworkStore) latestTimestampMillis(metricName, nodeID, seriesKey string, now time.Time) (int64, bool, error) {
+	if err := s.ensureLatestSeriesTimeLoaded(now); err != nil {
 		return 0, false, err
 	}
 
@@ -337,12 +377,12 @@ func (s *NetworkStore) latestTimestampMillis(metricName, nodeID, seriesKey strin
 	return 0, false, nil
 }
 
-func (s *NetworkStore) ensureLatestSeriesTimeLoaded() error {
+func (s *NetworkStore) ensureLatestSeriesTimeLoaded(now time.Time) error {
 	if s.latestLoaded {
 		return nil
 	}
 
-	latestSeriesTime, err := s.queryAllLatestTimestampMillis()
+	latestSeriesTime, err := s.queryRecentLatestTimestampMillis(now)
 	if err != nil {
 		return err
 	}
@@ -351,8 +391,12 @@ func (s *NetworkStore) ensureLatestSeriesTimeLoaded() error {
 	return nil
 }
 
-func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error) {
-	querier, err := s.db.Querier(math.MinInt64, math.MaxInt64)
+// queryRecentLatestTimestampMillis 只回扫乱序窗口内的样本建立去重基线：
+// 更老的样本本来就落在 TSDB 的 OutOfOrderTimeWindow 之外（写入时被拒），
+// 全量回扫在 366 天保留下会在重启后阻塞首个 ingest 数分钟。
+func (s *NetworkStore) queryRecentLatestTimestampMillis(now time.Time) (map[string]int64, error) {
+	mint := now.Add(-2 * networkOutOfOrderWindow).UnixMilli()
+	querier, err := s.db.Querier(mint, math.MaxInt64)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +408,7 @@ func (s *NetworkStore) queryAllLatestTimestampMillis() (map[string]int64, error)
 	}
 
 	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
-		Start: math.MinInt64,
+		Start: mint,
 		End:   math.MaxInt64,
 	}, nameMatcher)
 

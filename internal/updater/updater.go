@@ -144,23 +144,6 @@ func (c *Client) CheckLatest(ctx context.Context) (ReleaseInfo, error) {
 	return c.buildReleaseInfo(release), nil
 }
 
-func (c *Client) ApplyLatest(ctx context.Context) (ReleaseInfo, error) {
-	info, err := c.CheckLatest(ctx)
-	if err != nil {
-		return ReleaseInfo{}, err
-	}
-	if !ValidReleaseVersion(info.LatestVersion) {
-		return info, fmt.Errorf("更新目标版本无效: %s", info.LatestVersion)
-	}
-	if !info.HasUpdate && VersionCurrentOrNewer(info.CurrentVersion, info.LatestVersion) {
-		return info, fmt.Errorf("当前已是最新版本")
-	}
-	if err := c.ApplyReleaseAsset(ctx, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
-		return info, err
-	}
-	return info, nil
-}
-
 func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloadURL, checksumURL string) error {
 	if !CanSelfUpdate() {
 		return fmt.Errorf("当前平台暂不支持自更新")
@@ -465,18 +448,40 @@ func lookupChecksum(contents, filename string) (string, error) {
 }
 
 func replaceExecutable(targetPath, nextPath string) error {
+	// 先复制备份、再单次原子 rename：两个 rename 之间存在目标路径短暂
+	// 不存在的窗口，进程恰在此刻崩溃会留下无可执行文件且无法自愈。
+	// 复制式备份下，rename 失败时旧二进制原位未动，无需回滚。
 	backupPath := targetPath + ".backup"
-	_ = os.Remove(backupPath)
-	if err := os.Rename(targetPath, backupPath); err != nil {
+	if err := copyExecutableBackup(targetPath, backupPath); err != nil {
 		return fmt.Errorf("备份当前二进制失败: %w", err)
 	}
 	if err := os.Rename(nextPath, targetPath); err != nil {
-		if restoreErr := os.Rename(backupPath, targetPath); restoreErr != nil {
-			return fmt.Errorf("替换失败且回滚失败: %w", restoreErr)
-		}
 		return fmt.Errorf("替换当前二进制失败: %w", err)
 	}
 	return nil
+}
+
+func copyExecutableBackup(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(dst)
+	backup, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(backup, source); err != nil {
+		backup.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return backup.Close()
 }
 
 func resolveExecutablePath() (string, error) {
@@ -545,7 +550,9 @@ func HasVersionUpdate(current, latest string) bool {
 	}
 	currentVersion, currentOK := parseComparableVersion(current)
 	if !currentOK {
-		return current != ""
+		// dev/unknown 等无法解析的当前版本（多为源码构建）不做自动替换，
+		// 避免任意 release 都会覆盖非发布构建。
+		return false
 	}
 	return compareComparableVersions(currentVersion, latestVersion) < 0
 }

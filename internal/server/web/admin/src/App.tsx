@@ -563,19 +563,25 @@ export default function App() {
       return;
     }
 
-    let frame = 0;
-    const applyTranslations = () => {
-      frame = 0;
-      translateAdminDOM(root, locale);
-    };
+    // zh-CN 是源语言，翻译扫描是纯开销：只做一次初始归位，不再挂观察器。
+    // 其余语言用 150ms 尾随去抖，避免高频 WS 增量触发逐帧全树遍历。
+    translateAdminDOM(root, locale);
+    if (locale === "zh-CN") {
+      return;
+    }
 
-    applyTranslations();
-    const observer = new MutationObserver(() => {
-      if (frame) {
+    let timer = 0;
+    const scheduleTranslations = () => {
+      if (timer) {
         return;
       }
-      frame = window.requestAnimationFrame(applyTranslations);
-    });
+      timer = window.setTimeout(() => {
+        timer = 0;
+        translateAdminDOM(root, locale);
+      }, 150);
+    };
+
+    const observer = new MutationObserver(scheduleTranslations);
     observer.observe(root, {
       attributes: true,
       attributeFilter: ["aria-label", "placeholder", "title"],
@@ -586,8 +592,8 @@ export default function App() {
 
     return () => {
       observer.disconnect();
-      if (frame) {
-        window.cancelAnimationFrame(frame);
+      if (timer) {
+        clearTimeout(timer);
       }
     };
   }, [locale]);

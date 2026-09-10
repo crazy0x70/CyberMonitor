@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -167,6 +168,7 @@ type PersistedData struct {
 	Profiles              map[string]*NodeProfile        `json:"profiles"`
 	Nodes                 map[string]NodeState           `json:"nodes,omitempty"`
 	OfflineSessions       map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+	Alerted               map[string]AlertedState        `json:"alerted,omitempty"`
 	PendingHistoryClear   bool                           `json:"pending_history_clear,omitempty"`
 	PendingHistoryDeletes []string                       `json:"pending_history_deletes,omitempty"`
 }
@@ -177,6 +179,12 @@ type legacyPersistedProfile struct {
 
 type OfflineSessionState struct {
 	StartedAt int64 `json:"started_at"`
+}
+
+// AlertedState 记录已触发离线告警的节点，随 state.json 持久化，
+// 避免服务重启后对仍在离线的节点重复发送告警。
+type AlertedState struct {
+	OfflineSince time.Time `json:"offline_since"`
 }
 
 type TestHistoryEntry struct {
@@ -318,6 +326,7 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	}
 	payload.Nodes = nodes
 	payload.OfflineSessions = offlineSessions
+	payload.Alerted = normalizePersistedAlertedStates(payload.Alerted)
 	profiles, err := normalizePersistedProfiles(payload.Settings, payload.Nodes, payload.Profiles)
 	if err != nil {
 		return PersistedData{}, false, err
@@ -441,6 +450,9 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	if payload.OfflineSessions == nil {
 		payload.OfflineSessions = make(map[string]OfflineSessionState)
 	}
+	if payload.Alerted == nil {
+		payload.Alerted = make(map[string]AlertedState)
+	}
 	return payload
 }
 
@@ -485,6 +497,24 @@ func normalizePersistedOfflineSessions(sessions map[string]OfflineSessionState) 
 		normalized[nodeID] = session
 	}
 	return normalized, nil
+}
+
+// normalizePersistedAlertedStates 丢弃非法的节点 ID；告警状态属于可再生的
+// 瞬态数据，坏条目直接跳过，不让单个脏 key 阻塞启动。
+func normalizePersistedAlertedStates(alerted map[string]AlertedState) map[string]AlertedState {
+	if len(alerted) == 0 {
+		return map[string]AlertedState{}
+	}
+	normalized := make(map[string]AlertedState, len(alerted))
+	for rawNodeID, state := range alerted {
+		nodeID, err := history.NormalizeNodeID(rawNodeID)
+		if err != nil || nodeID == "" {
+			log.Printf("忽略 alerted 中非法的节点 ID: %q", rawNodeID)
+			continue
+		}
+		normalized[nodeID] = state
+	}
+	return normalized
 }
 
 func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []string, error) {
@@ -859,6 +889,17 @@ func cloneOfflineSessions(sessions map[string]OfflineSessionState) map[string]Of
 	cloned := make(map[string]OfflineSessionState, len(sessions))
 	for nodeID, session := range sessions {
 		cloned[nodeID] = session
+	}
+	return cloned
+}
+
+func cloneAlertedStates(alerted map[string]AlertedState) map[string]AlertedState {
+	if len(alerted) == 0 {
+		return map[string]AlertedState{}
+	}
+	cloned := make(map[string]AlertedState, len(alerted))
+	for nodeID, state := range alerted {
+		cloned[nodeID] = state
 	}
 	return cloned
 }
@@ -1332,12 +1373,17 @@ func primaryGroupTagsFromSelections(selections []string) (string, []string) {
 	return group, tags
 }
 
+// isValidGroupName 排除会破坏 "group:tag" / "group/tag" 选择编码的分隔符。
+func isValidGroupName(name string) bool {
+	return !strings.ContainsAny(name, ":/")
+}
+
 func normalizeGroupTree(nodes []GroupNode) []GroupNode {
 	seen := make(map[string]struct{})
 	normalized := make([]GroupNode, 0, len(nodes))
 	for _, node := range nodes {
 		name := normalizeGroupName(node.Name)
-		if name == "" {
+		if name == "" || !isValidGroupName(name) {
 			continue
 		}
 		if _, ok := seen[name]; ok {

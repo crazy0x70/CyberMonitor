@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -27,6 +28,15 @@ type agentRunner struct {
 	agentToken          string
 	agentTokenDurable   bool
 	nextRegisterAttempt time.Time
+	updates             remoteUpdateTracker
+}
+
+// remoteUpdateTracker 收拢远程更新的全部状态。更新应用在独立 goroutine
+// 中执行（docker 托管更新可阻塞 10 分钟、二进制自更新需下载完整发布包，
+// 同步执行会让上报停摆、节点被误判离线），因此读写都经锁串行。
+type remoteUpdateTracker struct {
+	mu                  sync.Mutex
+	running             bool
 	lastUpdateReportID  string
 	lastUpdateState     string
 	lastUpdateVersion   string
@@ -38,6 +48,61 @@ const (
 	remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
 	agentTokenRegisterRetryInterval     = 30 * time.Second
 )
+
+// beginApply 决定是否启动一次更新应用：抑制窗内的重复指令、以及尚在
+// 执行中的更新均返回 false；新签名时清空旧的报告去重状态。
+func (t *remoteUpdateTracker) beginApply(signature string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.running {
+		return false
+	}
+	if signature != "" && signature == t.lastUpdateSignature && !t.lastUpdateAppliedAt.IsZero() &&
+		now.Before(t.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow)) {
+		return false
+	}
+	if signature != t.lastUpdateSignature {
+		t.lastUpdateState = ""
+		t.lastUpdateVersion = ""
+		t.lastUpdateReportID = ""
+	}
+	t.running = true
+	return true
+}
+
+// endApply 在应用结束时记录签名与时间。成功与失败都进入抑制窗：失败
+// （坏下载 URL、只读文件系统等）不再陷入每 30s 一次的整包重下载循环。
+func (t *remoteUpdateTracker) endApply(signature string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastUpdateSignature = signature
+	t.lastUpdateAppliedAt = now
+	t.running = false
+}
+
+func (t *remoteUpdateTracker) reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastUpdateReportID = ""
+	t.lastUpdateState = ""
+	t.lastUpdateVersion = ""
+	t.lastUpdateSignature = ""
+	t.lastUpdateAppliedAt = time.Time{}
+}
+
+func (t *remoteUpdateTracker) skipDuplicateReport(updateID, state, version string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return updateID == t.lastUpdateReportID && state == t.lastUpdateState && version == t.lastUpdateVersion
+}
+
+func (t *remoteUpdateTracker) recordReport(updateID, state, version string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastUpdateReportID = updateID
+	t.lastUpdateState = state
+	t.lastUpdateVersion = version
+}
 
 var remoteUpdateNow = time.Now
 
@@ -129,11 +194,7 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 		log.Printf("持久化 Agent 专属凭据失败: %v", err)
 	}
 	if remote.Update == nil {
-		r.lastUpdateState = ""
-		r.lastUpdateVersion = ""
-		r.lastUpdateReportID = ""
-		r.lastUpdateSignature = ""
-		r.lastUpdateAppliedAt = time.Time{}
+		r.updates.reset()
 		return
 	}
 	if !r.agentTokenDurable {
@@ -141,28 +202,24 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 		return
 	}
 	signature := remoteUpdateInstructionSignature(remote.Update)
-	now := remoteUpdateNow()
-	if r.shouldSuppressRemoteUpdate(signature, now) {
+	if !r.updates.beginApply(signature, remoteUpdateNow()) {
 		return
 	}
-	if signature != r.lastUpdateSignature {
-		r.lastUpdateState = ""
-		r.lastUpdateVersion = ""
-		r.lastUpdateReportID = ""
-	}
-	if err := maybeApplyRemoteUpdate(ctx, r.reportRemoteUpdate, r.cfg, remote.Update); err != nil {
-		log.Printf("执行远程更新失败: %v", err)
-		return
-	}
-	r.lastUpdateSignature = signature
-	r.lastUpdateAppliedAt = now
-}
-
-func (r *agentRunner) shouldSuppressRemoteUpdate(signature string, now time.Time) bool {
-	if signature == "" || signature != r.lastUpdateSignature || r.lastUpdateAppliedAt.IsZero() {
-		return false
-	}
-	return now.Before(r.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow))
+	// 更新应用放到独立 goroutine：期间采集上报照常进行，节点不会因为
+	// 下载/拉镜像长时间无数据而被误判离线。报告使用 spawn 时的 token
+	// 快照且不触发重新注册——主循环可能并发轮换 token，后台路径不得
+	// 触碰 runner 的注册状态；token 失效则本次报告失败，抑制窗后重试。
+	update := *remote.Update
+	reportToken := r.agentToken
+	go func() {
+		err := maybeApplyRemoteUpdate(ctx, func(ctx context.Context, updateID, state, version, message string) error {
+			return r.reportUpdateWithToken(ctx, reportToken, updateID, state, version, message)
+		}, r.cfg, &update)
+		r.updates.endApply(signature, remoteUpdateNow())
+		if err != nil {
+			log.Printf("执行远程更新失败: %v", err)
+		}
+	}()
 }
 
 func remoteUpdateInstructionSignature(update *RemoteUpdateInstruction) string {
@@ -178,22 +235,24 @@ func remoteUpdateInstructionSignature(update *RemoteUpdateInstruction) string {
 	}, "\x00")
 }
 
-func (r *agentRunner) reportRemoteUpdate(ctx context.Context, updateID, state, version, message string) error {
+// reportUpdateWithToken 供后台更新 goroutine 上报更新状态：token 由
+// 调用方快照给定，401 时不重新注册，避免与主循环并发修改 runner 的
+// 注册状态；token 失效的报告随抑制窗重试自愈。
+func (r *agentRunner) reportUpdateWithToken(
+	ctx context.Context,
+	token, updateID, state, version, message string,
+) error {
 	updateID = strings.TrimSpace(updateID)
 	terminalState := isTerminalUpdateState(state)
-	if terminalState && r.lastUpdateReportID == updateID && r.lastUpdateState == state && r.lastUpdateVersion == version {
+	if terminalState && r.updates.skipDuplicateReport(updateID, state, version) {
 		return nil
 	}
-	_, err := callWithTokenRefresh(r, ctx, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, r.transport.ReportUpdate(ctx, r.cfg.NodeID, r.agentToken, updateID, state, version, message)
-	})
+	err := r.transport.ReportUpdate(ctx, r.cfg.NodeID, token, updateID, state, version, message)
 	if err != nil {
 		return err
 	}
 	if terminalState {
-		r.lastUpdateReportID = updateID
-		r.lastUpdateState = state
-		r.lastUpdateVersion = version
+		r.updates.recordReport(updateID, state, version)
 	}
 	return nil
 }
