@@ -27,6 +27,14 @@ die() {
 
 require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
+    # macOS 普通用户安装（用户级 LaunchAgent）允许非 root 卸载，
+    # 并把清理路径重定向到用户目录，与 agent.sh 安装侧保持一致。
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      INSTALL_DIR="${HOME}/CyberMonitor"
+      CONF_DIR="${HOME}/CyberMonitor/etc"
+      MACOS_LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
+      return 0
+    fi
     die "请使用 root 运行"
   fi
 }
@@ -145,18 +153,28 @@ EOF
 
 macos_uninstall() {
   local plist_path
+  local domain="system"
+  if [[ "$(id -u)" -ne 0 ]]; then
+    domain="gui/$(id -u)"
+  fi
 
   while IFS= read -r plist_path; do
     [[ -n "${plist_path}" ]] || continue
     if [[ -f "${plist_path}" ]]; then
       reject_unsafe_path "${plist_path}" || die "拒绝清理包含不安全路径的 launchd plist"
       if command -v launchctl >/dev/null 2>&1; then
-        launchctl bootout system "${plist_path}" >/dev/null 2>&1 || \
+        launchctl bootout "${domain}" "${plist_path}" >/dev/null 2>&1 || \
           launchctl unload -w "${plist_path}" >/dev/null 2>&1 || true
       fi
       rm -f "${plist_path}"
     fi
   done < <(macos_plist_candidates)
+
+  # 清理两种安装级别各自写出的日志文件（root: /var/log；用户: ~/Library/Logs）。
+  rm -f /var/log/cybermonitor-agent.log 2>/dev/null || true
+  if [[ -n "${HOME:-}" && "${HOME}" != "/" ]]; then
+    rm -f "${HOME}/Library/Logs/cybermonitor-agent.log" 2>/dev/null || true
+  fi
 
   cleanup_common_files
   echo "已卸载 ${SERVICE_NAME}（macOS / launchd）"

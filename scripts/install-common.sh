@@ -4,6 +4,7 @@ REPO="crazy0x70/CyberMonitor"
 INSTALL_DIR="${INSTALL_DIR:-/opt/CyberMonitor}"
 CONF_DIR="${CONF_DIR:-/etc/cybermonitor}"
 SYSTEMD_SERVICE_DIR="${SYSTEMD_SERVICE_DIR:-/etc/systemd/system}"
+MACOS_LAUNCHD_DIR="${MACOS_LAUNCHD_DIR:-/Library/LaunchDaemons}"
 LAST_BINARY_BACKUP=""
 LAST_BINARY_TARGET=""
 LAST_BINARY_INSTALLED="0"
@@ -21,6 +22,24 @@ require_root() {
 
 require_systemd() {
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd"
+}
+
+detect_os() {
+  case "$(uname -s)" in
+    Linux) echo "linux" ;;
+    Darwin) echo "macos" ;;
+    *) die "不支持的操作系统: $(uname -s)" ;;
+  esac
+}
+
+# macOS 普通用户安装时重定向到用户目录（系统目录不可写）：
+# 程序 ~/CyberMonitor、plist ~/Library/LaunchAgents（登录自启）。
+# root 安装保持 /opt/CyberMonitor + /Library/LaunchDaemons（开机自启）。
+normalize_macos_user_paths() {
+  [[ "$(uname -s)" == "Darwin" && "$(id -u)" -ne 0 ]] || return 0
+  INSTALL_DIR="${HOME}/CyberMonitor"
+  CONF_DIR="${HOME}/CyberMonitor/etc"
+  MACOS_LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
 }
 
 require_curl() {
@@ -71,7 +90,10 @@ normalize_release_version() {
     echo ""
     return 0
   fi
-  if [[ "${version,,}" == "latest" || "${version,,}" == "vlatest" ]]; then
+  # macOS 自带 bash 3.2 无 ${var,,} 展开，用 tr 兼容。
+  local version_lower
+  version_lower="$(printf '%s' "${version}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${version_lower}" == "latest" || "${version_lower}" == "vlatest" ]]; then
     echo ""
     return 0
   fi
@@ -277,7 +299,14 @@ download_binary() {
   local version="$2"
   local arch="$3"
   local output_var="$4"
-  local asset="cyber-monitor-${type}-linux-${arch}"
+  local os
+  os="$(detect_os)"
+  local asset_os="${os}"
+  # release 资产命名沿用 GOOS（darwin），detect_os 的 macos 需要映射。
+  if [[ "${os}" == "macos" ]]; then
+    asset_os="darwin"
+  fi
+  local asset="cyber-monitor-${type}-${asset_os}-${arch}"
   local url="https://github.com/${REPO}/releases/download/${version}/${asset}"
   local target="${INSTALL_DIR}/cyber-monitor-${type}"
   local backup=""

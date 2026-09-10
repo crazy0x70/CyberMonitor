@@ -102,6 +102,18 @@ sudo bash "$tmp/agent.sh" --server-url http://<主控IP>:25012 --agent-token <�
 rm -rf "$tmp"
 ```
 
+**macOS（launchd）**
+
+```bash
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
+bash "$tmp/agent.sh" --server-url http://<主控IP>:25012 --agent-token <你的Token>
+rm -rf "$tmp"
+```
+
+以 `sudo` 运行安装为系统级 LaunchDaemon（`/Library/LaunchDaemons`，开机自启）；普通用户运行则安装为用户级 LaunchAgent（`~/Library/LaunchAgents`，登录自启）。两种方式均自动保活。日志位于 `/var/log/cybermonitor-agent.log`（root）或 `~/Library/Logs/cybermonitor-agent.log`（用户）。
+
 **Windows**
 
 ```powershell
@@ -110,7 +122,7 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
 ```
 
-Linux 自定义参数使用 `--node-id`、`--disable-update` 等 shell 参数。Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
+Linux 与 macOS 自定义参数均使用 `--node-id`、`--disable-update` 等 shell 参数。Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
 
 ### 5. 卸载探针 (Agent)
 
@@ -119,6 +131,14 @@ Linux 自定义参数使用 `--node-id`、`--disable-update` 等 shell 参数。
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
 ```
+
+**macOS（launchd）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && bash /tmp/agent-uninstall.sh
+```
+
+系统级（sudo）安装的卸载同样需要加 `sudo`；用户级安装无需 root 直接卸载。
 
 **Windows**
 

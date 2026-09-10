@@ -107,6 +107,18 @@ sudo bash "$tmp/agent.sh" --server-url http://<server-ip>:25012 --agent-token <y
 rm -rf "$tmp"
 ```
 
+**macOS (launchd)**
+
+```bash
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/install-common.sh -o "$tmp/install-common.sh"
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent.sh -o "$tmp/agent.sh"
+bash "$tmp/agent.sh" --server-url http://<server-ip>:25012 --agent-token <your-token>
+rm -rf "$tmp"
+```
+
+With `sudo` the agent is installed as a system-level LaunchDaemon (`/Library/LaunchDaemons`, starts at boot); as a normal user it becomes a per-user LaunchAgent (`~/Library/LaunchAgents`, starts at login). Both keep the agent alive automatically. Logs go to `/var/log/cybermonitor-agent.log` (root) or `~/Library/Logs/cybermonitor-agent.log` (user).
+
 **Windows**
 
 ```powershell
@@ -115,7 +127,7 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script -ServerUrl 'http://<server-ip>:25012' -AgentToken '<your-token>'
 ```
 
-Linux custom parameters use shell flags such as `--node-id` and `--disable-update`. Windows custom parameters use PowerShell flags such as `-NodeId` and `-DisableUpdate`.
+Linux custom parameters use shell flags such as `--node-id` and `--disable-update` (macOS uses the same flags). Windows custom parameters use PowerShell flags such as `-NodeId` and `-DisableUpdate`.
 
 ### 5. Uninstalling the Agent
 
@@ -124,6 +136,14 @@ Linux custom parameters use shell flags such as `--node-id` and `--disable-updat
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && sudo bash /tmp/agent-uninstall.sh
 ```
+
+**macOS (launchd)**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/agent-uninstall.sh -o /tmp/agent-uninstall.sh && bash /tmp/agent-uninstall.sh
+```
+
+For a system-level (sudo) install, run the uninstall with `sudo` as well; a per-user install is removed without it.
 
 **Windows**
 
