@@ -2959,10 +2959,6 @@ func parsePublicHistoryRange(raw string, now time.Time) (string, time.Time, time
 		duration = 24 * time.Hour
 	case "7d":
 		duration = 7 * 24 * time.Hour
-	case "30d":
-		duration = 30 * 24 * time.Hour
-	case "1y":
-		duration = 366 * 24 * time.Hour
 	default:
 		return "", time.Time{}, time.Time{}, fmt.Errorf("invalid range")
 	}
@@ -4009,8 +4005,6 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 func redactAISettingsForExport(settings AISettings) AISettings {
 	settings = cloneAISettings(settings)
 	settings.OpenAI.APIKey = ""
-	settings.Gemini.APIKey = ""
-	settings.Volcengine.APIKey = ""
 	for i := range settings.OpenAICompatibles {
 		settings.OpenAICompatibles[i].APIKey = ""
 	}
@@ -4530,8 +4524,6 @@ func mergeRedactedAISettings(imported, existing AISettings) AISettings {
 	imported = cloneAISettings(imported)
 	existing = cloneAISettings(existing)
 	imported.OpenAI.APIKey = preserveRedactedString(imported.OpenAI.APIKey, existing.OpenAI.APIKey)
-	imported.Gemini.APIKey = preserveRedactedString(imported.Gemini.APIKey, existing.Gemini.APIKey)
-	imported.Volcengine.APIKey = preserveRedactedString(imported.Volcengine.APIKey, existing.Volcengine.APIKey)
 
 	existingCompatibles := make(map[string]AIProviderProfile, len(existing.OpenAICompatibles))
 	for _, item := range existing.OpenAICompatibles {

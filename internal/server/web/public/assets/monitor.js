@@ -79,6 +79,8 @@ const PUBLIC_I18N = {
     remainingPrefix: "剩余",
     unnamedNode: "未命名节点",
     totalSuffix: "total",
+    networkCardHide: "点击隐藏该探测曲线",
+    networkCardShow: "点击显示该探测曲线",
   },
   "en-US": {
     brandSubtitle: "Host monitoring",
@@ -143,6 +145,8 @@ const PUBLIC_I18N = {
     remainingPrefix: "Remaining",
     unnamedNode: "Unnamed node",
     totalSuffix: "total",
+    networkCardHide: "Click to hide this probe curve",
+    networkCardShow: "Click to show this probe curve",
   },
 };
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -203,6 +207,7 @@ const state = {
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
+  hiddenTests: new Map(),
   mergedProvenance: new Map(),
   renderedNode: new Map(),
   renderedHistorySig: new Map(),
@@ -1030,8 +1035,6 @@ const RANGE_OPTIONS = [
   { key: "1h", label: "1H", seconds: 60 * 60 },
   { key: "24h", label: "1D", seconds: 60 * 60 * 24 },
   { key: "7d", label: "1W", seconds: 60 * 60 * 24 * 7 },
-  { key: "30d", label: "1M", seconds: 60 * 60 * 24 * 30 },
-  { key: "1y", label: "1Y", seconds: 60 * 60 * 24 * 366 },
 ];
 
 function normalizePublicImageURL(value) {
@@ -1131,6 +1134,8 @@ function persistHistoryCache() {
     const serializedRanges = {};
     ranges.forEach((tests, rangeKey) => {
       if (!tests || tests.size === 0) return;
+      // 旧版本可能缓存过 30d/1y 数据，序列化时一并淘汰。
+      if (!RANGE_OPTIONS.some((item) => item.key === rangeKey)) return;
       const entries = {};
       tests.forEach((entry, key) => {
         if (!entry) return;
@@ -1526,6 +1531,8 @@ function applyTestHistory(history) {
       return;
     }
     Object.entries(rangeBuckets).forEach(([rangeKey, tests]) => {
+      // 只合并在当前 range 白名单内的数据（历史上曾有 30d/1y，服务端已不再提供）。
+      if (!RANGE_OPTIONS.some((item) => item.key === rangeKey)) return;
       if (mergeHistoryRangeByKey(cacheKey, rangeKey, tests)) {
         updated = true;
       }
@@ -2905,7 +2912,9 @@ function renderNetworkSection(fields, nodeId) {
   });
 
   const rangeEndSec = resolveRangeEndSec(now, latestHistoryAt, rangeSec);
+  const hiddenTests = state.hiddenTests.get(nodeId) || new Set();
   testEntries.forEach((entry) => {
+    entry.hidden = hiddenTests.has(entry.key);
     entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
   });
 
@@ -2933,7 +2942,7 @@ function renderNetworkSection(fields, nodeId) {
     const latencySeries = smoothEnabled
       ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
       : interpolatedLatency.slice();
-    if (hasSeriesData(latencySeries)) {
+    if (!entry.hidden && hasSeriesData(latencySeries)) {
       seriesList.push(latencySeries);
       colors.push(entry.color);
       labels.push(entry.label);
@@ -2941,6 +2950,18 @@ function renderNetworkSection(fields, nodeId) {
 
     const card = document.createElement("div");
     card.className = "network-card";
+    if (entry.hidden) {
+      card.classList.add("muted");
+    }
+    card.setAttribute("role", "button");
+    card.setAttribute("tabindex", "0");
+    card.title = entry.hidden
+      ? t("networkCardShow")
+      : t("networkCardHide");
+
+    const cardDot = document.createElement("span");
+    cardDot.className = "network-card-dot";
+    cardDot.style.background = entry.color;
 
     const cardName = document.createElement("div");
     cardName.className = "network-card-name";
@@ -2958,15 +2979,43 @@ function renderNetworkSection(fields, nodeId) {
     loss.className = "network-card-loss";
     loss.textContent = snapshot.loss;
 
+    card.appendChild(cardDot);
     card.appendChild(cardName);
     card.appendChild(cardStats);
     card.appendChild(loss);
+    card.addEventListener("click", () => {
+      toggleTestVisibility(fields, nodeId, entry.key);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleTestVisibility(fields, nodeId, entry.key);
+      }
+    });
     fields.testCards.appendChild(card);
   });
 
   const chart = buildLatencyChart(seriesList, colors, timeSeries, rangeSec);
   fields.testChart.innerHTML = chart.svg;
   setupLatencyHover(fields, chart.meta, labels);
+}
+
+// 点击探测卡片切换该曲线在延迟图中的显隐（会话级状态，随节点缓存键隔离）。
+function toggleTestVisibility(fields, nodeId, key) {
+  let hidden = state.hiddenTests.get(nodeId);
+  if (!hidden) {
+    hidden = new Set();
+    state.hiddenTests.set(nodeId, hidden);
+  }
+  if (hidden.has(key)) {
+    hidden.delete(key);
+    if (hidden.size === 0) {
+      state.hiddenTests.delete(nodeId);
+    }
+  } else {
+    hidden.add(key);
+  }
+  renderNetworkSection(fields, nodeId);
 }
 
 function buildRenderedTestGrid(rangeKey, rangeSec, rangeEndSec, testEntries) {

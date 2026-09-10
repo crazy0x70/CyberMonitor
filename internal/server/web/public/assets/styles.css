@@ -1092,6 +1092,40 @@ html[data-theme="dark"] .control-toggle:hover {
   border: 1px solid var(--panel-border);
   background: var(--card-bg);
   backdrop-filter: blur(14px);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s ease, opacity 0.15s ease, transform 0.15s ease;
+}
+
+.network-card:hover {
+  border-color: var(--accent, rgba(59, 130, 246, 0.55));
+  transform: translateY(-1px);
+}
+
+.network-card:focus-visible {
+  outline: 2px solid var(--accent, rgba(59, 130, 246, 0.55));
+  outline-offset: 2px;
+}
+
+.network-card.muted {
+  opacity: 0.45;
+}
+
+.network-card.muted:hover {
+  opacity: 0.7;
+}
+
+.network-card-dot {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin: 0 auto 8px;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.12) inset;
+}
+
+.network-card.muted .network-card-dot {
+  filter: grayscale(1);
 }
 
 .network-card-name {

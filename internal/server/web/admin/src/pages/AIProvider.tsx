@@ -64,7 +64,7 @@ type ProviderStatus = "unconfigured" | "unverified" | "verified";
 type ProviderDraft = {
   id: string;
   name: string;
-  provider: "openai" | "gemini" | "volcengine" | "openai_compatible";
+  provider: "openai" | "openai_compatible";
   apiKey: string;
   baseURL: string;
   model: string;
@@ -79,8 +79,6 @@ function resolveStatus(config: AIProviderConfig | undefined) {
 
 function providerLabel(provider: string, fallback = "") {
   if (provider === "openai") return "OpenAI";
-  if (provider === "gemini") return "Gemini";
-  if (provider === "volcengine") return "Volcengine";
   if (provider.startsWith("openai_compatible")) return fallback || "OpenAI 兼容";
   return provider;
 }
@@ -99,26 +97,6 @@ function makeProviderDrafts(settings: SettingsView | null): ProviderDraft[] {
       model: ai.openai?.model || "",
       models: [],
       status: resolveStatus(ai.openai),
-    },
-    {
-      id: "gemini",
-      name: "Gemini",
-      provider: "gemini",
-      apiKey: ai.gemini?.api_key || "",
-      baseURL: ai.gemini?.base_url || "",
-      model: ai.gemini?.model || "",
-      models: [],
-      status: resolveStatus(ai.gemini),
-    },
-    {
-      id: "volcengine",
-      name: "Volcengine",
-      provider: "volcengine",
-      apiKey: ai.volcengine?.api_key || "",
-      baseURL: ai.volcengine?.base_url || "",
-      model: ai.volcengine?.model || "",
-      models: [],
-      status: resolveStatus(ai.volcengine),
     },
   ];
 
@@ -438,8 +416,6 @@ export default function AIProvider({
       return;
     }
     const openai = providers.find((item) => item.provider === "openai");
-    const gemini = providers.find((item) => item.provider === "gemini");
-    const volcengine = providers.find((item) => item.provider === "volcengine");
     const compatibles = providers.filter((item) => item.provider === "openai_compatible");
 
     setIsSaving(true);
@@ -449,8 +425,6 @@ export default function AIProvider({
           command_provider: commandProvider,
           prompt,
           openai: openai ? toConfig(openai) : {},
-          gemini: gemini ? toConfig(gemini) : {},
-          volcengine: volcengine ? toConfig(volcengine) : {},
           openai_compatibles: compatibles.map((item) => ({
             id: item.id,
             name: item.name.trim(),

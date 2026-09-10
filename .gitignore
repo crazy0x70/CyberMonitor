@@ -47,3 +47,9 @@ output/
 internal/server/web/admin/node_modules/
 internal/server/web/admin/.DS_Store
 internal/server/web/dist/*
+
+# Local session / agent workspace and tool artifacts
+.zcode/
+.video_agent/
+.v2c/
+out/

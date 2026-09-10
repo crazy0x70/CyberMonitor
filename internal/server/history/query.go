@@ -16,15 +16,15 @@ const (
 	networkLossMetric         = "cm_network_test_packet_loss"
 	networkAvailabilityMetric = "cm_network_test_availability"
 
-	// 站长要求图表可回看 1 年（前端已提供 range=1y）。长范围查询由服务端
-	// 按窗口降采样（见 downsampleBucketMillis），单次查询的内存与 payload
-	// 始终有界（每序列 ≤ ~1000 点），因此 366 天保留本身不构成风险。
-	networkRetentionDays    = 366
+	// 数据只保留 7 天（前端 range 最大 1W）。长窗口查询仍由服务端
+	// 按窗口降采样（见 downsampleBucketMillis），单次查询的内存与
+	// payload 始终有界（每序列 ≤ ~1000 点）。
+	networkRetentionDays    = 7
 	networkRetention        = networkRetentionDays * 24 * time.Hour
 	networkOutOfOrderWindow = 24 * time.Hour
 
 	// TSDB 磁盘容量上限：超出后按保留策略删除最旧块，为页缓存设界。
-	// 该值是病态增长的保护上限，按中等规模节点群 ~1 年的体量估算。
+	// 该值是病态增长的保护上限（按 7 天保留已非常宽松）。
 	networkMaxBytes = 2 << 30
 	offlineMaxBytes = 256 << 20
 )

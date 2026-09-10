@@ -21,15 +21,9 @@ import (
 
 const (
 	aiProviderOpenAI           = "openai"
-	aiProviderGemini           = "gemini"
-	aiProviderVolcengine       = "volcengine"
 	aiProviderOpenAICompatible = "openai_compatible"
 	defaultOpenAIBaseURL       = "https://api.openai.com/v1"
 	defaultOpenAIModel         = "gpt-5.2"
-	defaultGeminiBaseURL       = "https://generativelanguage.googleapis.com/v1beta"
-	defaultGeminiModel         = "gemini-2.5-flash"
-	defaultVolcengineBaseURL   = "https://ark.cn-beijing.volces.com/api/v3"
-	defaultVolcengineModel     = "doubao-seed-1-6-flash"
 	defaultAIMaxOutputTokens   = 512
 	defaultAITemperature       = 0.2
 	defaultAITestPrompt        = "请仅回复 ok"
@@ -122,8 +116,6 @@ type AISettings struct {
 	CommandProvider   string              `json:"command_provider,omitempty"`
 	Prompt            string              `json:"prompt,omitempty"`
 	OpenAI            AIProviderConfig    `json:"openai,omitempty"`
-	Gemini            AIProviderConfig    `json:"gemini,omitempty"`
-	Volcengine        AIProviderConfig    `json:"volcengine,omitempty"`
 	OpenAICompatibles []AIProviderProfile `json:"openai_compatibles,omitempty"`
 }
 
@@ -234,26 +226,10 @@ type openAIChatResponse struct {
 	} `json:"choices"`
 }
 
-type geminiResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-}
-
 type openAIModelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
 	} `json:"data"`
-}
-
-type geminiModelsResponse struct {
-	Models []struct {
-		Name string `json:"name"`
-	} `json:"models"`
 }
 
 func defaultAISettings() AISettings {
@@ -263,14 +239,6 @@ func defaultAISettings() AISettings {
 		OpenAI: AIProviderConfig{
 			BaseURL: defaultOpenAIBaseURL,
 			Model:   defaultOpenAIModel,
-		},
-		Gemini: AIProviderConfig{
-			BaseURL: defaultGeminiBaseURL,
-			Model:   defaultGeminiModel,
-		},
-		Volcengine: AIProviderConfig{
-			BaseURL: defaultVolcengineBaseURL,
-			Model:   defaultVolcengineModel,
 		},
 		OpenAICompatibles: []AIProviderProfile{},
 	}
@@ -293,8 +261,6 @@ func mergeAISettings(existing, fallback AISettings) (AISettings, error) {
 		existing.Prompt = fallback.Prompt
 	}
 	existing.OpenAI = mergeAIProviderConfig(existing.OpenAI, fallback.OpenAI)
-	existing.Gemini = mergeAIProviderConfig(existing.Gemini, fallback.Gemini)
-	existing.Volcengine = mergeAIProviderConfig(existing.Volcengine, fallback.Volcengine)
 	if len(existing.OpenAICompatibles) == 0 {
 		existing.OpenAICompatibles = fallback.OpenAICompatibles
 	}
@@ -326,8 +292,6 @@ func normalizeAISettings(settings AISettings) (AISettings, error) {
 	settings.CommandProvider = commandProvider
 	settings.Prompt = normalizeAIPrompt(settings.Prompt)
 	settings.OpenAI = normalizeAIProviderConfig(settings.OpenAI)
-	settings.Gemini = normalizeAIProviderConfig(settings.Gemini)
-	settings.Volcengine = normalizeAIProviderConfig(settings.Volcengine)
 	compatibles, err := normalizeAICompatibles(settings.OpenAICompatibles)
 	if err != nil {
 		return AISettings{}, err
@@ -340,10 +304,6 @@ func normalizeAIProviderName(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case aiProviderOpenAI, "open_ai":
 		return aiProviderOpenAI
-	case aiProviderGemini:
-		return aiProviderGemini
-	case aiProviderVolcengine, "volc", "ark":
-		return aiProviderVolcengine
 	case aiProviderOpenAICompatible, "openai-compatible", "openai_compat":
 		return aiProviderOpenAICompatible
 	default:
@@ -415,8 +375,6 @@ func validateAISettings(settings AISettings) error {
 	}
 	configs := []AIProviderConfig{
 		settings.OpenAI,
-		settings.Gemini,
-		settings.Volcengine,
 	}
 	for _, cfg := range configs {
 		if err := validateAIBaseURL(cfg.BaseURL); err != nil {
@@ -435,7 +393,7 @@ func validateAISettings(settings AISettings) error {
 func validateAICommandProvider(settings AISettings) error {
 	provider, providerID := parseAIProviderSelector(settings.CommandProvider)
 	switch provider {
-	case aiProviderOpenAI, aiProviderGemini, aiProviderVolcengine:
+	case aiProviderOpenAI:
 		if providerID != "" {
 			return errors.New("AI 指令服务商无效")
 		}
@@ -494,20 +452,6 @@ func applyAIProviderDefaults(provider string, cfg AIProviderConfig) AIProviderCo
 		if cfg.Model == "" {
 			cfg.Model = defaultOpenAIModel
 		}
-	case aiProviderGemini:
-		if cfg.BaseURL == "" {
-			cfg.BaseURL = defaultGeminiBaseURL
-		}
-		if cfg.Model == "" {
-			cfg.Model = defaultGeminiModel
-		}
-	case aiProviderVolcengine:
-		if cfg.BaseURL == "" {
-			cfg.BaseURL = defaultVolcengineBaseURL
-		}
-		if cfg.Model == "" {
-			cfg.Model = defaultVolcengineModel
-		}
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	return cfg
@@ -518,10 +462,6 @@ func selectAIProviderConfig(settings AISettings, provider string) (aiProviderSel
 	switch normalized {
 	case aiProviderOpenAI:
 		return aiProviderSelection{Provider: normalized, Label: "OpenAI", Config: settings.OpenAI}, nil
-	case aiProviderGemini:
-		return aiProviderSelection{Provider: normalized, Label: "Gemini", Config: settings.Gemini}, nil
-	case aiProviderVolcengine:
-		return aiProviderSelection{Provider: normalized, Label: "Volcengine", Config: settings.Volcengine}, nil
 	case aiProviderOpenAICompatible:
 		return aiProviderSelection{Provider: normalized, Label: "OpenAI 兼容提供商", Config: AIProviderConfig{}}, nil
 	default:
@@ -661,9 +601,7 @@ func testAIProvider(ctx context.Context, provider string, config AIProviderConfi
 
 func listAIModels(ctx context.Context, provider string, config AIProviderConfig) ([]string, error) {
 	switch provider {
-	case aiProviderGemini:
-		return listGeminiModels(ctx, config)
-	case aiProviderOpenAI, aiProviderVolcengine, aiProviderOpenAICompatible:
+	case aiProviderOpenAI, aiProviderOpenAICompatible:
 		return listOpenAIModels(ctx, config)
 	default:
 		return nil, errors.New("AI 提供商无效")
@@ -696,37 +634,6 @@ func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, e
 		}
 		seen[id] = struct{}{}
 		models = append(models, id)
-	}
-	return models, nil
-}
-
-func listGeminiModels(ctx context.Context, config AIProviderConfig) ([]string, error) {
-	if config.APIKey == "" {
-		return nil, errors.New("API Key 不能为空")
-	}
-	baseURL := strings.TrimRight(config.BaseURL, "/")
-	if baseURL == "" {
-		return nil, errors.New("Base URL 不能为空")
-	}
-	endpoint := fmt.Sprintf("%s/models", baseURL)
-	headers := map[string]string{"x-goog-api-key": config.APIKey}
-	var parsed geminiModelsResponse
-	if err := aiDoJSON(ctx, http.MethodGet, endpoint, headers, nil, &parsed); err != nil {
-		return nil, err
-	}
-	seen := make(map[string]struct{})
-	models := make([]string, 0, len(parsed.Models))
-	for _, item := range parsed.Models {
-		name := strings.TrimSpace(item.Name)
-		if name == "" {
-			continue
-		}
-		name = strings.TrimPrefix(name, "models/")
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		models = append(models, name)
 	}
 	return models, nil
 }
@@ -1189,9 +1096,7 @@ func resolveNodeDisplayName(node NodeView) string {
 
 func callAIProvider(ctx context.Context, provider string, config AIProviderConfig, systemPrompt, userPrompt string) (string, error) {
 	switch provider {
-	case aiProviderGemini:
-		return callGemini(ctx, config, systemPrompt, userPrompt)
-	case aiProviderOpenAI, aiProviderVolcengine, aiProviderOpenAICompatible:
+	case aiProviderOpenAI, aiProviderOpenAICompatible:
 		return callOpenAICompatible(ctx, config, systemPrompt, userPrompt)
 	default:
 		return "", errors.New("AI 提供商无效")
@@ -1239,68 +1144,6 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 		return "", errors.New("AI 未返回有效内容")
 	}
 	return answer, nil
-}
-
-func callGemini(ctx context.Context, config AIProviderConfig, systemPrompt, userPrompt string) (string, error) {
-	if config.APIKey == "" {
-		return "", errors.New("API Key 不能为空")
-	}
-	if config.Model == "" {
-		return "", errors.New("模型不能为空")
-	}
-	baseURL := strings.TrimRight(config.BaseURL, "/")
-	if baseURL == "" {
-		return "", errors.New("Base URL 不能为空")
-	}
-	model := normalizeGeminiModel(config.Model)
-	prompt := fmt.Sprintf("%s\n\n%s", systemPrompt, userPrompt)
-	payload := map[string]any{
-		"contents": []map[string]any{
-			{
-				"role": "user",
-				"parts": []map[string]string{
-					{"text": prompt},
-				},
-			},
-		},
-		"generationConfig": map[string]any{
-			"temperature":     defaultAITemperature,
-			"maxOutputTokens": defaultAIMaxOutputTokens,
-		},
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	// API Key 走 header 而非 URL query，避免泄漏到出站代理与网关日志。
-	endpoint := fmt.Sprintf("%s/%s:generateContent", baseURL, model)
-	headers := map[string]string{
-		"Content-Type":   "application/json",
-		"x-goog-api-key": config.APIKey,
-	}
-	var parsed geminiResponse
-	if err := aiDoJSON(ctx, http.MethodPost, endpoint, headers, data, &parsed); err != nil {
-		return "", err
-	}
-	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
-		return "", errors.New("AI 未返回结果")
-	}
-	answer := strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text)
-	if answer == "" {
-		return "", errors.New("AI 未返回有效内容")
-	}
-	return answer, nil
-}
-
-func normalizeGeminiModel(model string) string {
-	value := strings.TrimSpace(model)
-	if value == "" {
-		return defaultGeminiModel
-	}
-	if strings.Contains(value, "/") {
-		return value
-	}
-	return "models/" + value
 }
 
 func trimTelegramMessage(text string) string {

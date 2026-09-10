@@ -82,8 +82,6 @@ function summarizeChannels(settings: SettingsView | null) {
 function readProviderLabel(settings: SettingsView | null, provider: string) {
   if (!provider) return "未配置";
   if (provider === "openai") return "OpenAI";
-  if (provider === "gemini") return "Gemini";
-  if (provider === "volcengine") return "Volcengine";
   if (provider.startsWith("openai_compatible:")) {
     const id = provider.split(":")[1] || "";
     const match = settings?.ai_settings?.openai_compatibles?.find((item) => item.id === id);

@@ -91,6 +91,10 @@ export default function AdminLogs() {
     return counts;
   }, [entries]);
 
+  // 最新日志置顶：轮询刷新后新条目立刻出现在视口顶部，无需自动滚动；
+  // 手动上滚回看历史时，底部内容变化也不会推动视口。
+  const orderedEntries = useMemo(() => [...entries].reverse(), [entries]);
+
   useEffect(() => {
     let active = true;
     let inFlight = false;
@@ -182,7 +186,7 @@ export default function AdminLogs() {
           ) : (
             <div className="max-h-[62vh] overflow-auto">
               <div className="min-w-[760px] divide-y divide-border">
-                {entries.map((entry) => (
+                {orderedEntries.map((entry) => (
                   <div key={entry.id} className="grid grid-cols-[180px_92px_110px_1fr] gap-4 px-6 py-4 text-sm">
                     <div className="font-mono text-xs text-muted-foreground">{formatLogTime(entry)}</div>
                     <div>

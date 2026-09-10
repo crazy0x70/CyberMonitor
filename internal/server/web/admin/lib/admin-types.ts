@@ -84,8 +84,6 @@ export interface AISettings {
   command_provider?: string;
   prompt?: string;
   openai?: AIProviderConfig;
-  gemini?: AIProviderConfig;
-  volcengine?: AIProviderConfig;
   openai_compatibles?: AIProviderProfile[];
 }
 
