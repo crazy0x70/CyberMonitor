@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -203,6 +204,32 @@ const (
 
 //go:embed web/public/* web/public/assets/* web/dist/admin/* web/dist/admin/assets/*
 var webFS embed.FS
+
+// webAssetRefPattern 匹配前端 index.html 中对 ./assets/ 资源的引用
+// （script src / link href）。
+var webAssetRefPattern = regexp.MustCompile(`(?i)(?:src|href)="\.?/?assets/([^"]+)"`)
+
+func verifyEmbeddedWebAssets() error {
+	pages := []struct {
+		page string
+		dir  string
+	}{
+		{"web/public/index.html", "web/public/assets"},
+		{"web/dist/admin/index.html", "web/dist/admin/assets"},
+	}
+	for _, item := range pages {
+		data, err := webFS.ReadFile(item.page)
+		if err != nil {
+			return fmt.Errorf("读取内嵌页面 %s 失败: %w", item.page, err)
+		}
+		for _, ref := range webAssetRefPattern.FindAllStringSubmatch(string(data), -1) {
+			if _, err := webFS.Open(filepath.Join(item.dir, ref[1])); err != nil {
+				return fmt.Errorf("内嵌前端资源缺失: %s 引用的 assets/%s 不存在，dist 构建不完整（重新执行 npm run build:admin 后再编译）", item.page, ref[1])
+			}
+		}
+	}
+	return nil
+}
 
 var newAgentUpdateID = func() (string, error) {
 	return randomToken(16)
@@ -465,6 +492,12 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	setupLogger(cfg.DataDir)
+
+	// 构建产物残缺（如源码包只带了部分 dist）时页面在浏览器端白屏，
+	// curl HTML 无法暴露——启动时直接失败，错误信息点名缺失文件。
+	if err := verifyEmbeddedWebAssets(); err != nil {
+		return err
+	}
 
 	dataPath := filepath.Join(cfg.DataDir, "state.json")
 	persisted, loaded, err := loadPersistedData(dataPath)

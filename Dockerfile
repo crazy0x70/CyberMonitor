@@ -37,7 +37,15 @@ RUN set -eu; \
     test -f internal/server/web/dist/admin/index.html || { \
       echo "Missing admin assets: run npm --prefix internal/server/web/admin run build:admin before local Docker builds." >&2; \
       exit 1; \
-    }
+    }; \
+    missing=0; \
+    for ref in $(grep -o 'assets/[A-Za-z0-9._-]*' internal/server/web/dist/admin/index.html | sort -u); do \
+      if [ ! -f "internal/server/web/dist/admin/$ref" ]; then \
+        echo "Missing admin asset: internal/server/web/dist/admin/$ref (dist build incomplete, re-run build:admin)" >&2; \
+        missing=1; \
+      fi; \
+    done; \
+    test "$missing" -eq 0
 RUN set -eux; \
   export GOOS=${TARGETOS}; \
   export GOARCH=${TARGETARCH}; \
