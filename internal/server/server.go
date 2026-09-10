@@ -1670,15 +1670,20 @@ func (g *gzipResponseWriter) Write(p []byte) (int, error) {
 }
 
 // finish 在 handler 返回后收尾：压缩路径关闭 gzip 流；缓冲中的小
-// 响应或从未写 body 的响应在此完成最终决策并原样补写。
+// 响应或从未写 body 的响应在此完成最终决策并原样补写。决策可能在
+// 本函数内部的 decide 才发生（响应体小于决策缓冲时），因此 Close
+// 的判定必须放在 decide 之后，否则小响应的 gzip 流永不收尾——
+// 只有 gzip 头 10 字节被写出，浏览器解压得到空文档（页面白屏）。
 func (g *gzipResponseWriter) finish() {
+	if !g.on {
+		g.decide()
+	}
 	if g.on {
 		g.gz.Close()
 		gzipWriterPool.Put(g.gz)
 		g.gz = nil
 		return
 	}
-	g.decide()
 	if len(g.buf) > 0 {
 		g.passthrough()
 	}
