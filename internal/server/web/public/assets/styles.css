@@ -1116,12 +1116,17 @@ html[data-theme="dark"] .control-toggle:hover {
 }
 
 .network-card-dot {
-  display: block;
+  flex: 0 0 auto;
+  display: inline-block;
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  margin: 0 auto 8px;
   box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.12) inset;
+}
+
+.network-card.selected {
+  border-color: var(--accent, rgba(59, 130, 246, 0.55));
+  box-shadow: 0 0 0 1px var(--accent, rgba(59, 130, 246, 0.35)) inset;
 }
 
 .network-card.muted .network-card-dot {
@@ -1133,7 +1138,17 @@ html[data-theme="dark"] .control-toggle:hover {
   font-size: 12px;
   color: var(--text);
   margin-bottom: 8px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.network-card-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .network-card-stats {

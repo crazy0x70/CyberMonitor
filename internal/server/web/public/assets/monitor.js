@@ -79,8 +79,8 @@ const PUBLIC_I18N = {
     remainingPrefix: "剩余",
     unnamedNode: "未命名节点",
     totalSuffix: "total",
-    networkCardHide: "点击隐藏该探测曲线",
-    networkCardShow: "点击显示该探测曲线",
+    networkCardFocus: "点击仅显示该探测曲线",
+    networkCardReset: "点击恢复全部曲线",
   },
   "en-US": {
     brandSubtitle: "Host monitoring",
@@ -145,8 +145,8 @@ const PUBLIC_I18N = {
     remainingPrefix: "Remaining",
     unnamedNode: "Unnamed node",
     totalSuffix: "total",
-    networkCardHide: "Click to hide this probe curve",
-    networkCardShow: "Click to show this probe curve",
+    networkCardFocus: "Click to show only this probe",
+    networkCardReset: "Click to show all curves",
   },
 };
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -207,7 +207,7 @@ const state = {
   metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
-  hiddenTests: new Map(),
+  selectedTests: new Map(),
   mergedProvenance: new Map(),
   renderedNode: new Map(),
   renderedHistorySig: new Map(),
@@ -2912,9 +2912,11 @@ function renderNetworkSection(fields, nodeId) {
   });
 
   const rangeEndSec = resolveRangeEndSec(now, latestHistoryAt, rangeSec);
-  const hiddenTests = state.hiddenTests.get(nodeId) || new Set();
+  const selectedTest = state.selectedTests.get(nodeId) || "";
+  const hasSelection = Boolean(selectedTest);
   testEntries.forEach((entry) => {
-    entry.hidden = hiddenTests.has(entry.key);
+    entry.focused = !hasSelection || entry.key === selectedTest;
+    entry.selected = entry.key === selectedTest;
     entry.filtered = filterHistoryByRange(entry.history, rangeSec, rangeEndSec);
   });
 
@@ -2942,7 +2944,7 @@ function renderNetworkSection(fields, nodeId) {
     const latencySeries = smoothEnabled
       ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
       : interpolatedLatency.slice();
-    if (!entry.hidden && hasSeriesData(latencySeries)) {
+    if (entry.focused && hasSeriesData(latencySeries)) {
       seriesList.push(latencySeries);
       colors.push(entry.color);
       labels.push(entry.label);
@@ -2950,22 +2952,30 @@ function renderNetworkSection(fields, nodeId) {
 
     const card = document.createElement("div");
     card.className = "network-card";
-    if (entry.hidden) {
+    if (!entry.focused) {
       card.classList.add("muted");
+    }
+    if (entry.selected) {
+      card.classList.add("selected");
     }
     card.setAttribute("role", "button");
     card.setAttribute("tabindex", "0");
-    card.title = entry.hidden
-      ? t("networkCardShow")
-      : t("networkCardHide");
+    card.title = entry.selected
+      ? t("networkCardReset")
+      : t("networkCardFocus");
+
+    const cardName = document.createElement("div");
+    cardName.className = "network-card-name";
 
     const cardDot = document.createElement("span");
     cardDot.className = "network-card-dot";
     cardDot.style.background = entry.color;
+    cardName.appendChild(cardDot);
 
-    const cardName = document.createElement("div");
-    cardName.className = "network-card-name";
-    cardName.textContent = entry.label;
+    const cardLabel = document.createElement("span");
+    cardLabel.className = "network-card-label";
+    cardLabel.textContent = entry.label;
+    cardName.appendChild(cardLabel);
 
     const cardStats = document.createElement("div");
     cardStats.className = "network-card-stats";
@@ -2979,17 +2989,16 @@ function renderNetworkSection(fields, nodeId) {
     loss.className = "network-card-loss";
     loss.textContent = snapshot.loss;
 
-    card.appendChild(cardDot);
     card.appendChild(cardName);
     card.appendChild(cardStats);
     card.appendChild(loss);
     card.addEventListener("click", () => {
-      toggleTestVisibility(fields, nodeId, entry.key);
+      toggleTestFocus(fields, nodeId, entry.key);
     });
     card.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        toggleTestVisibility(fields, nodeId, entry.key);
+        toggleTestFocus(fields, nodeId, entry.key);
       }
     });
     fields.testCards.appendChild(card);
@@ -3000,20 +3009,12 @@ function renderNetworkSection(fields, nodeId) {
   setupLatencyHover(fields, chart.meta, labels);
 }
 
-// 点击探测卡片切换该曲线在延迟图中的显隐（会话级状态，随节点缓存键隔离）。
-function toggleTestVisibility(fields, nodeId, key) {
-  let hidden = state.hiddenTests.get(nodeId);
-  if (!hidden) {
-    hidden = new Set();
-    state.hiddenTests.set(nodeId, hidden);
-  }
-  if (hidden.has(key)) {
-    hidden.delete(key);
-    if (hidden.size === 0) {
-      state.hiddenTests.delete(nodeId);
-    }
+// 点击探测卡片：选中后仅显示该曲线，再次点击恢复全部（会话级状态）。
+function toggleTestFocus(fields, nodeId, key) {
+  if (state.selectedTests.get(nodeId) === key) {
+    state.selectedTests.delete(nodeId);
   } else {
-    hidden.add(key);
+    state.selectedTests.set(nodeId, key);
   }
   renderNetworkSection(fields, nodeId);
 }
