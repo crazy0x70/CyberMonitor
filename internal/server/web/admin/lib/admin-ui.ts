@@ -160,8 +160,6 @@ export const adminDetailGroupClass =
 export const adminDetailHintPanelClass =
   "rounded-xl border border-slate-200/40 bg-slate-50/40 px-4 py-3 text-xs text-slate-500 dark:border-slate-800/40 dark:bg-slate-900/40 dark:text-slate-400";
 
-export const adminDetailWarningPanelClass =
-  "rounded-[1.25rem] border border-amber-200/60 bg-amber-50/60 px-4 py-3 text-[13px] text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/40 dark:text-amber-200";
 
 export const adminWorkspaceListClass = "space-y-4";
 

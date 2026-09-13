@@ -92,6 +92,8 @@ export interface LoginProps {
   homeTitle?: string;
   oauthProviders?: OAuthLoginProvider[];
   passwordLoginEnabled?: boolean;
+  /** 登录配置加载完成前为 false：不渲染"没有可用登录方式"终态告警。 */
+  loginConfigLoaded?: boolean;
   retryAfterSec?: number;
   theme: ThemeMode;
   topControls?: ReactNode;
@@ -107,6 +109,7 @@ export default function Login({
   homeTitle = "CyberMonitor",
   oauthProviders = [],
   passwordLoginEnabled = true,
+  loginConfigLoaded = true,
   retryAfterSec = 0,
   theme,
   topControls,
@@ -264,7 +267,7 @@ export default function Login({
                 </div>
               ) : null}
 
-              {!passwordLoginEnabled && oauthProviders.length === 0 ? (
+              {loginConfigLoaded && !passwordLoginEnabled && oauthProviders.length === 0 ? (
                 <Alert className="border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
                   <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-300" />
                   <AlertTitle className="text-amber-800 dark:text-amber-100">没有可用登录方式</AlertTitle>

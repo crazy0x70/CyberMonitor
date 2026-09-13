@@ -9,11 +9,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -25,19 +26,26 @@ const (
 
 var telegramSendFunc = sendTelegramMessage
 
+// telegramBackoffCap 限制 429 Retry-After 的生效上限，防止异常大值
+// 把轮询挂起过久。
+const telegramBackoffCap = time.Minute
+
+// telegramBackoffDelay 依据结构化 API 错误决定退避时长，不嗅探错误文本
+// （响应 body 或下游错误里出现 "401" 字样会误判档位）。
 func telegramBackoffDelay(err error) time.Duration {
-	if err == nil {
-		return telegramPollIdleDelay
+	var apiErr *telegramAPIError
+	if err != nil && errors.As(err, &apiErr) {
+		switch {
+		case apiErr.statusCode == 429:
+			if apiErr.retryAfter > 0 {
+				return min(apiErr.retryAfter, telegramBackoffCap)
+			}
+			return 8 * time.Second
+		case apiErr.permanent():
+			return 30 * time.Second
+		}
 	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	switch {
-	case strings.Contains(message, "429"):
-		return 8 * time.Second
-	case strings.Contains(message, "401"), strings.Contains(message, "403"), strings.Contains(message, "token"):
-		return 30 * time.Second
-	default:
-		return 2 * time.Second
-	}
+	return telegramPollIdleDelay
 }
 
 func telegramRequestErrorMessage(err error) string {
@@ -94,7 +102,6 @@ func startTelegramBot(ctx context.Context, store *Store) {
 		client := &http.Client{Timeout: 12 * time.Second}
 		var offset int64
 		var lastToken string
-		var lastUserKey string
 		// menuSetupPending 与 token 变更解耦：菜单设置失败只重试
 		// setTelegramCommands，不得触发 offset 重置（会把 Telegram
 		// 未确认 update 重新投递，造成命令重复执行）。
@@ -114,24 +121,20 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				}
 				continue
 			}
-			userKey := buildTelegramUserKey(userIDs)
 			if token != lastToken {
 				offset = 0
 				lastToken = token
-				lastUserKey = userKey
 				menuSetupPending = true
-			} else if userKey != lastUserKey {
-				lastUserKey = userKey
 			}
 			if menuSetupPending {
-				if err := setTelegramCommands(token); err != nil {
+				if err := setTelegramCommands(ctx, token); err != nil {
 					log.Printf("Telegram 菜单设置失败，将自动重试: %v", err)
 				} else {
 					menuSetupPending = false
 				}
 			}
 
-			updates, err := fetchTelegramUpdates(client, token, offset)
+			updates, err := fetchTelegramUpdates(ctx, client, token, offset)
 			if err != nil {
 				log.Printf("Telegram 轮询失败: %v", err)
 				if !waitTelegramPoll(ctx, telegramBackoffDelay(err)) {
@@ -160,11 +163,11 @@ func startTelegramBot(ctx context.Context, store *Store) {
 				if command == "" {
 					continue
 				}
-				reply := handleTelegramCommand(command, store, update.Message.From.ID, update.Message.Chat.ID)
+				reply := handleTelegramCommand(ctx, command, store, update.Message.From.ID, update.Message.Chat.ID)
 				if reply == "" {
 					continue
 				}
-				if err := sendTelegramMessage(token, update.Message.Chat.ID, reply); err != nil {
+				if err := sendTelegramMessage(ctx, token, update.Message.Chat.ID, reply); err != nil {
 					log.Printf("Telegram 回复失败: %v", err)
 				}
 			}
@@ -189,7 +192,7 @@ func waitTelegramPoll(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]telegramUpdate, error) {
+func fetchTelegramUpdates(ctx context.Context, client *http.Client, token string, offset int64) ([]telegramUpdate, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 12 * time.Second}
 	}
@@ -203,14 +206,25 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 		values.Set("offset", fmt.Sprintf("%d", offset))
 	}
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?%s", token, values.Encode())
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("请求更新失败: %s", telegramRequestErrorMessage(err))
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求更新失败: %s", telegramRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := readResponseBodyLimited(resp.Body)
-		return nil, fmt.Errorf("更新响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		apiErr := &telegramAPIError{
+			statusCode: resp.StatusCode,
+			err:        fmt.Errorf("更新响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body))),
+		}
+		if seconds, parseErr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); parseErr == nil && seconds > 0 {
+			apiErr.retryAfter = time.Duration(seconds) * time.Second
+		}
+		return nil, apiErr
 	}
 	var payload telegramUpdateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -223,25 +237,75 @@ func fetchTelegramUpdates(client *http.Client, token string, offset int64) ([]te
 }
 
 func sendTelegramAlert(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
-	if token == "" || len(userIDs) == 0 || len(events) == 0 {
-		return true
-	}
-	message := buildAlertMessage(siteTitle, events)
-	errs := sendTelegramMessageToUsers(token, userIDs, message)
-	for _, err := range errs {
-		log.Printf("Telegram 告警发送失败: %v", err)
-	}
-	return len(errs) == 0
+	return sendTelegramEventNotice(token, userIDs, siteTitle, events, buildAlertMessage, "告警")
 }
 
 func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
+	return sendTelegramEventNotice(token, userIDs, siteTitle, events, buildRecoveryMessage, "恢复通知")
+}
+
+// telegramMessageLimit 是 sendMessage 文本上限（4096，Telegram 按 UTF-16
+// 计）的字节口径余量：批量离线超限时 API 返回 400 属永久失败，告警会
+// 静默丢失，必须分片。
+const telegramMessageLimit = 4000
+
+// splitTelegramMessage 把消息按行分片到字节上限内，超长单行按 rune 边界
+// 硬切（字节数 ≤ UTF-16 单元数，口径保守安全）。
+func splitTelegramMessage(text string, limit int) []string {
+	if len(text) <= limit {
+		return []string{text}
+	}
+	var chunks []string
+	current := ""
+	flush := func() {
+		if current != "" {
+			chunks = append(chunks, current)
+			current = ""
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		candidate := line
+		if current != "" {
+			candidate = current + "\n" + line
+		}
+		switch {
+		case len(candidate) <= limit:
+			current = candidate
+		case len(line) > limit:
+			flush()
+			for len(line) > limit {
+				cut := limit
+				for cut > 0 && !utf8.RuneStart(line[cut]) {
+					cut--
+				}
+				if cut == 0 {
+					// 非法 UTF-8（无 RuneStart）兜底：按字节硬切，
+					// 保证循环必然推进。
+					cut = limit
+				}
+				chunks = append(chunks, line[:cut])
+				line = line[cut:]
+			}
+			current = line
+		default:
+			flush()
+			current = line
+		}
+	}
+	flush()
+	return chunks
+}
+
+func sendTelegramEventNotice(token string, userIDs []int64, siteTitle string, events []AlertEvent, build func(string, []AlertEvent) string, label string) bool {
 	if token == "" || len(userIDs) == 0 || len(events) == 0 {
 		return true
 	}
-	message := buildRecoveryMessage(siteTitle, events)
-	errs := sendTelegramMessageToUsers(token, userIDs, message)
+	var errs []string
+	for _, chunk := range splitTelegramMessage(build(siteTitle, events), telegramMessageLimit) {
+		errs = append(errs, sendTelegramMessageToUsers(token, userIDs, chunk)...)
+	}
 	for _, err := range errs {
-		log.Printf("Telegram 恢复通知发送失败: %v", err)
+		log.Printf("Telegram %s发送失败: %v", label, err)
 	}
 	return len(errs) == 0
 }
@@ -251,14 +315,21 @@ func sendTelegramTest(token string, userIDs []int64, siteTitle string) []string 
 	return sendTelegramMessageToUsers(token, userIDs, message)
 }
 
-// telegramPermanentError 标记不可通过重试解决的发送失败（无效 chat、
-// bot 被拉黑等），在告警投递中跳过重臂。
-type telegramPermanentError struct {
-	err error
+// telegramAPIError 携带 Bot API 的 HTTP 状态码与 429 Retry-After：退避
+// 决策与"配置类永久失败"判定都基于结构化字段。permanent 表示无效 token、
+// chat 不存在、bot 被拉黑等不可重试失败，告警投递中跳过重臂。
+type telegramAPIError struct {
+	statusCode int
+	retryAfter time.Duration
+	err        error
 }
 
-func (e *telegramPermanentError) Error() string { return e.err.Error() }
-func (e *telegramPermanentError) Unwrap() error { return e.err }
+func (e *telegramAPIError) Error() string { return e.err.Error() }
+func (e *telegramAPIError) Unwrap() error { return e.err }
+
+func (e *telegramAPIError) permanent() bool {
+	return e.statusCode == 400 || e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404
+}
 
 func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []string {
 	ids := normalizeTelegramUserIDs(userIDs)
@@ -275,9 +346,9 @@ func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []st
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := telegramSendFunc(token, id, text); err != nil {
-				var perm *telegramPermanentError
-				if errors.As(err, &perm) {
+			if err := telegramSendFunc(context.Background(), token, id, text); err != nil {
+				var apiErr *telegramAPIError
+				if errors.As(err, &apiErr) && apiErr.permanent() {
 					log.Printf("Telegram 收件人 %d 不可达，跳过该收件人: %v", id, err)
 					return
 				}
@@ -295,7 +366,7 @@ func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []st
 	return errs
 }
 
-func telegramBotAPICall(client *http.Client, token, method string, payload any, label string) (telegramSendResponse, error) {
+func telegramBotAPICall(ctx context.Context, client *http.Client, token, method string, payload any, label string) (telegramSendResponse, error) {
 	if err := validateTelegramToken(token); err != nil {
 		return telegramSendResponse{}, err
 	}
@@ -304,7 +375,7 @@ func telegramBotAPICall(client *http.Client, token, method string, payload any, 
 		return telegramSendResponse{}, fmt.Errorf("telegram %s编码失败: %w", label, err)
 	}
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return telegramSendResponse{}, fmt.Errorf("telegram %s请求创建失败: %s", label, telegramRequestErrorMessage(err))
 	}
@@ -319,14 +390,12 @@ func telegramBotAPICall(client *http.Client, token, method string, payload any, 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := readResponseBodyLimited(resp.Body)
-		err := fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
-		// 400/403/404/401 属配置类永久失败（token 无效、chat 不存在、
-		// bot 被拉黑等），重试无意义；豁免后不触发告警重臂，避免向
-		// 其余收件人重发风暴。
-		if resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
-			return telegramSendResponse{}, &telegramPermanentError{err: err}
+		// 4xx（permanent()）属配置类永久失败，重试无意义；豁免后不触发
+		// 告警重臂，避免向其余收件人重发风暴。
+		return telegramSendResponse{}, &telegramAPIError{
+			statusCode: resp.StatusCode,
+			err:        fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body))),
 		}
-		return telegramSendResponse{}, err
 	}
 	var result telegramSendResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -338,7 +407,7 @@ func telegramBotAPICall(client *http.Client, token, method string, payload any, 
 	return result, nil
 }
 
-func sendTelegramMessage(token string, userID int64, text string) error {
+func sendTelegramMessage(ctx context.Context, token string, userID int64, text string) error {
 	if userID <= 0 {
 		return errors.New("telegram 用户 ID 无效")
 	}
@@ -349,11 +418,11 @@ func sendTelegramMessage(token string, userID int64, text string) error {
 		"chat_id": userID,
 		"text":    text,
 	}
-	_, err := telegramBotAPICall(nil, token, "sendMessage", payload, "消息")
+	_, err := telegramBotAPICall(ctx, nil, token, "sendMessage", payload, "消息")
 	return err
 }
 
-func handleTelegramCommand(command string, store *Store, userID, chatID int64) string {
+func handleTelegramCommand(ctx context.Context, command string, store *Store, userID, chatID int64) string {
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
 		return ""
@@ -379,7 +448,7 @@ func handleTelegramCommand(command string, store *Store, userID, chatID int64) s
 	case "/alarmsoff":
 		return handleTelegramAlarmToggle(store, parts, false)
 	case "/ai":
-		return handleTelegramAICommand(command, store, userID, chatID)
+		return handleTelegramAICommand(ctx, command, store, userID, chatID)
 	default:
 		return buildTelegramHelp()
 	}
@@ -398,7 +467,7 @@ func buildTelegramHelp() string {
 	}, "\n")
 }
 
-func handleTelegramAICommand(command string, store *Store, userID, chatID int64) string {
+func handleTelegramAICommand(ctx context.Context, command string, store *Store, userID, chatID int64) string {
 	parts := strings.Fields(command)
 	if len(parts) < 2 {
 		return "用法: /ai 你的问题"
@@ -414,7 +483,7 @@ func handleTelegramAICommand(command string, store *Store, userID, chatID int64)
 	if !store.allowAgentRate(rateKey, telegramAIWindow, telegramAILimit, time.Now(), false) {
 		return "AI 查询过于频繁，请稍后再试"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 18*time.Second)
 	defer cancel()
 	answer, err := runAIQuery(ctx, store, query)
 	if err != nil {
@@ -643,7 +712,7 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 	return fmt.Sprintf("未找到服务器: %s", serverID)
 }
 
-func setTelegramCommands(token string) error {
+func setTelegramCommands(ctx context.Context, token string) error {
 	commands := []map[string]string{
 		{"command": "cmall", "description": "查看所有服务器统计"},
 		{"command": "server", "description": "查看服务器列表"},
@@ -654,21 +723,8 @@ func setTelegramCommands(token string) error {
 		{"command": "help", "description": "查看可用命令"},
 	}
 	payload := map[string]any{"commands": commands}
-	_, err := telegramBotAPICall(nil, token, "setMyCommands", payload, "菜单")
+	_, err := telegramBotAPICall(ctx, nil, token, "setMyCommands", payload, "菜单")
 	return err
-}
-
-func buildTelegramUserKey(ids []int64) string {
-	if len(ids) == 0 {
-		return ""
-	}
-	sorted := slices.Clone(ids)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	parts := make([]string, 0, len(sorted))
-	for _, id := range sorted {
-		parts = append(parts, fmt.Sprintf("%d", id))
-	}
-	return strings.Join(parts, ",")
 }
 
 func isAllowedTelegramUser(allowed map[int64]struct{}, fromID, chatID int64) bool {

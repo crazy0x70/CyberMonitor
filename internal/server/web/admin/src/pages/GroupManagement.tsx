@@ -77,6 +77,7 @@ import {
   adminWideInputClass,
   adminWorkspaceHeaderClass,
 } from "@/lib/admin-ui";
+import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import { getErrorMessage, resolveNodeSelections } from "@/lib/admin-format";
 import type { GroupNode, NodeView, SettingsView } from "@/lib/admin-types";
 
@@ -376,7 +377,6 @@ export default function GroupManagement({
   const incomingTree = useMemo(() => toEditableTree(groupTree), [groupTree]);
   const incomingSignature = useMemo(() => serializeEditableTree(incomingTree), [incomingTree]);
   const [draftTree, setDraftTree] = useState<EditableGroupNode[]>(incomingTree);
-  const [sourceSignature, setSourceSignature] = useState(incomingSignature);
   const [isSaving, setIsSaving] = useState(false);
   const isBusy = isSaving || saving;
   const sensors = useSensors(
@@ -388,38 +388,16 @@ export default function GroupManagement({
   );
 
   const draftSignature = useMemo(() => serializeEditableTree(draftTree), [draftTree]);
-  const isDirty = sourceSignature !== draftSignature;
-
-  useEffect(() => {
-    if (isBusy) {
-      return;
-    }
-    const currentDraftMatchesIncoming = draftSignature === incomingSignature;
-    if (isDirty && currentDraftMatchesIncoming) {
-      setSourceSignature(incomingSignature);
-      return;
-    }
-    if (incomingSignature === sourceSignature) {
-      return;
-    }
-    if (isDirty) {
-      setSourceSignature(incomingSignature);
-      toast.warning("服务端分组配置已更新，当前未保存修改已保留。");
-      return;
-    }
-    setDraftTree(incomingTree);
-    setSourceSignature(incomingSignature);
-  }, [draftSignature, incomingSignature, incomingTree, isBusy, isDirty, sourceSignature]);
-
-  useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
-
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+  // dirty 为派生值：由 hook 返回的已吸收 source 签名与草稿签名比较得出。
+  const [absorbedSignature, absorbSourceSignature] = useDraftReconcile({
+    draftSignature,
+    nextSourceSignature: incomingSignature,
+    isBusy,
+    resetDraft: () => setDraftTree(incomingTree),
+    warningText: "服务端分组配置已更新，当前未保存修改已保留。",
+  });
+  const isDirty = absorbedSignature !== draftSignature;
+  useDirtyNotification(onDirtyChange, isDirty);
 
   const draftTreeAnalysis = useMemo(() => analyzeDraftTree(draftTree), [draftTree]);
   const {
@@ -513,7 +491,7 @@ export default function GroupManagement({
     const canonicalTree = Array.isArray(next.group_tree) ? next.group_tree : fallbackTree;
     const nextDraftTree = toEditableTree(canonicalTree);
     setDraftTree(nextDraftTree);
-    setSourceSignature(serializeEditableTree(nextDraftTree));
+    absorbSourceSignature(serializeEditableTree(nextDraftTree));
     toast.success("分组配置已保存。");
   };
 
@@ -560,7 +538,9 @@ export default function GroupManagement({
     updateDraftTree((current) => reorderGroupsByID(current, String(active.id), String(over.id)));
   };
 
-  const handleSave = async () => {
+  const runAction = useAsyncAction();
+
+  const handleSave = () => {
     if (isBusy) {
       return;
     }
@@ -584,15 +564,12 @@ export default function GroupManagement({
       return;
     }
 
-    setIsSaving(true);
-    try {
-      const savedSettings = await onSave(nextTree);
-      finishSave(savedSettings, nextTree);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存分组失败。"));
-    } finally {
-      setIsSaving(false);
-    }
+    void runAction({
+      action: () => onSave(nextTree),
+      fallbackError: "保存分组失败。",
+      onSuccess: (savedSettings) => finishSave(savedSettings, nextTree),
+      setBusy: setIsSaving,
+    });
   };
 
   return (
@@ -728,7 +705,6 @@ function SortableGroupCard({
   onUpdateGroupName,
   onUpdateTagName,
 }: {
-  key?: string;
   group: EditableGroupNode;
   groupIndex: number;
   groupUsageCount: number;

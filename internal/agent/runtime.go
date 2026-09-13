@@ -29,6 +29,17 @@ type agentRunner struct {
 	agentTokenDurable   bool
 	nextRegisterAttempt time.Time
 	updates             remoteUpdateTracker
+	// updateWG 跟踪后台更新 goroutine：优雅退出时有限等待其收尾，
+	// 让最终状态上报完成，避免服务端更新记录停留在 updating。
+	updateWG sync.WaitGroup
+	// 控制面错误去重日志状态（logControlPlaneError 专用）。
+	errMu    sync.Mutex
+	errState map[string]errorLogState
+}
+
+type errorLogState struct {
+	key       string
+	lastLogAt time.Time
 }
 
 // remoteUpdateTracker 收拢远程更新的全部状态。更新应用在独立 goroutine
@@ -47,7 +58,32 @@ type remoteUpdateTracker struct {
 const (
 	remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
 	agentTokenRegisterRetryInterval     = 30 * time.Second
+	// 控制面持续失败时同类错误的重提周期：默认 1s 采样间隔下服务端
+	// 宕机/token 永久失效不再每秒刷屏（8 万+ 条/天）。
+	repeatedErrorLogInterval = 5 * time.Minute
 )
+
+// logControlPlaneError 对控制面失败做去重日志：同一错误按
+// repeatedErrorLogInterval 重提，错误变化立即打印，恢复成功打印一条
+// 恢复日志。err 为 nil 表示该来源恢复。
+func (r *agentRunner) logControlPlaneError(source, errKey string, err error) {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	state := r.errState[source]
+	if err == nil {
+		if state.key != "" {
+			log.Printf("%s已恢复", source)
+		}
+		delete(r.errState, source)
+		return
+	}
+	now := time.Now()
+	if state.key == errKey && now.Before(state.lastLogAt.Add(repeatedErrorLogInterval)) {
+		return
+	}
+	log.Printf("%s: %v", source, err)
+	r.errState[source] = errorLogState{key: errKey, lastLogAt: now}
+}
 
 // beginApply 决定是否启动一次更新应用：抑制窗内的重复指令、以及尚在
 // 执行中的更新均返回 false；新签名时清空旧的报告去重状态。
@@ -80,14 +116,20 @@ func (t *remoteUpdateTracker) endApply(signature string, now time.Time) {
 	t.running = false
 }
 
-func (t *remoteUpdateTracker) reset() {
+// reset 清理服务端撤回指令后的跟踪状态。抑制窗仍活跃时保留签名与
+// 时间戳：窗口内的同指令重推由 beginApply 拦截，endApply 的时间戳是
+// 唯一退避来源，清掉会把重推变成全新指令立即放行；窗口已过期则照常
+// 清理。
+func (t *remoteUpdateTracker) reset(now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.lastUpdateReportID = ""
 	t.lastUpdateState = ""
 	t.lastUpdateVersion = ""
-	t.lastUpdateSignature = ""
-	t.lastUpdateAppliedAt = time.Time{}
+	if t.lastUpdateAppliedAt.IsZero() || !now.Before(t.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow)) {
+		t.lastUpdateSignature = ""
+		t.lastUpdateAppliedAt = time.Time{}
+	}
 }
 
 func (t *remoteUpdateTracker) skipDuplicateReport(updateID, state, version string) bool {
@@ -114,6 +156,7 @@ func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.
 		runtimeCfg: newRuntimeConfig(cfg),
 		testCache:  make(map[string]cachedTest),
 		agentToken: strings.TrimSpace(cfg.AgentToken),
+		errState:   make(map[string]errorLogState),
 	}
 }
 
@@ -136,9 +179,10 @@ func (r *agentRunner) syncRemoteConfig(ctx context.Context) {
 		return r.transport.FetchConfig(ctx, r.cfg.NodeID, r.agentToken)
 	})
 	if err != nil {
-		log.Printf("拉取远程配置失败: %v", err)
+		r.logControlPlaneError("拉取远程配置失败", err.Error(), err)
 		return
 	}
+	r.logControlPlaneError("拉取远程配置失败", "", nil)
 
 	r.applyRemoteConfig(ctx, remote)
 }
@@ -194,13 +238,15 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 		log.Printf("持久化 Agent 专属凭据失败: %v", err)
 	}
 	if remote.Update == nil {
-		r.updates.reset()
+		r.updates.reset(remoteUpdateNow())
 		return
 	}
 	if !r.agentTokenDurable {
-		log.Printf("拒绝执行远程更新: Agent 专属凭据尚未可靠写入 %s", strings.TrimSpace(r.cfg.TokenFile))
+		r.logControlPlaneError("拒绝执行远程更新", "token-not-durable",
+			fmt.Errorf("Agent 专属凭据尚未可靠写入 %s", strings.TrimSpace(r.cfg.TokenFile)))
 		return
 	}
+	r.logControlPlaneError("拒绝执行远程更新", "", nil)
 	signature := remoteUpdateInstructionSignature(remote.Update)
 	if !r.updates.beginApply(signature, remoteUpdateNow()) {
 		return
@@ -211,12 +257,24 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 	// 触碰 runner 的注册状态；token 失效则本次报告失败，抑制窗后重试。
 	update := *remote.Update
 	reportToken := r.agentToken
+	r.updateWG.Add(1)
 	go func() {
-		err := maybeApplyRemoteUpdate(ctx, func(ctx context.Context, updateID, state, version, message string) error {
+		defer r.updateWG.Done()
+		// endApply 挂 defer：panic 等任何退出路径都必须释放 running，
+		// 否则后续更新指令被 beginApply 永久忽略且无诊断日志。闭包形式
+		// 让时间戳在调用时求值（抑制窗从更新结束起算，而非启动时刻）。
+		// 执行顺序（LIFO）：recover → endApply → Done。
+		defer func() { r.updates.endApply(signature, remoteUpdateNow()) }()
+		defer func() {
+			// 更新 goroutine 可能正处于二进制替换流程，panic 不得杀死
+			// 进程，记录后随 endApply 收尾。
+			if rec := recover(); rec != nil {
+				log.Printf("执行远程更新 panic 已恢复: %v", rec)
+			}
+		}()
+		if err := maybeApplyRemoteUpdate(ctx, func(ctx context.Context, updateID, state, version, message string) error {
 			return r.reportUpdateWithToken(ctx, reportToken, updateID, state, version, message)
-		}, r.cfg, &update)
-		r.updates.endApply(signature, remoteUpdateNow())
-		if err != nil {
+		}, r.cfg, &update); err != nil {
 			log.Printf("执行远程更新失败: %v", err)
 		}
 	}()
@@ -258,11 +316,7 @@ func (r *agentRunner) reportUpdateWithToken(
 }
 
 func (r *agentRunner) collectAndReport(ctx context.Context) {
-	sample, err := r.collector.Collect()
-	if err != nil {
-		log.Printf("采集失败: %v", err)
-		return
-	}
+	sample := r.collector.Collect()
 	if sample.NodeID == "" {
 		sample.NodeID = sample.Hostname
 	}
@@ -288,14 +342,16 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 		r.lastTestConfigSig = configSig
 		configChanged = true
 	}
-	if testsSnapshot, resultsChanged := runNetworkTestsWithCache(ctx, tests, interval, r.testCache); configChanged || resultsChanged {
+	if testsSnapshot, resultsChanged := runNetworkTestsWithCache(ctx, tests, interval, r.testCache, configChanged); configChanged || resultsChanged {
 		sample.NetworkTestsChanged = true
 		sample.NetworkTests = testsSnapshot
 	}
 
 	if err := r.reportStats(ctx, sample); err != nil {
-		log.Printf("上报失败: %v", err)
+		r.logControlPlaneError("上报失败", err.Error(), err)
+		return
 	}
+	r.logControlPlaneError("上报失败", "", nil)
 }
 
 func annotateAgentUpdateCapability(sample *metrics.NodeStats, cfg Config) {
@@ -330,7 +386,8 @@ func (r *agentRunner) restorePersistedAgentToken() error {
 		r.agentToken = persisted
 		r.agentTokenDurable = true
 		return nil
-	case err == nil, os.IsNotExist(err):
+	case os.IsNotExist(err), errors.Is(err, os.ErrInvalid):
+		// 空/全空白 token 文件与不存在同义：走重新注册路径。
 		r.agentTokenDurable = false
 		return nil
 	default:

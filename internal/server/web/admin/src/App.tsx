@@ -24,6 +24,7 @@ import {
   Sun,
   Server,
   Settings,
+  type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
@@ -75,7 +76,15 @@ import type {
   SettingsView,
   SystemUpdateInfo,
 } from "@/lib/admin-types";
-import { formatVersionLabel, getErrorMessage, upsertNodeView } from "@/lib/admin-format";
+import {
+  ADMIN_PAGE_QUERY_KEY,
+  adminPageHref,
+  formatVersionLabel,
+  getErrorMessage,
+  shouldHandleAdminNavigation,
+  upsertNodeView,
+  type AdminPage,
+} from "@/lib/admin-format";
 import {
   ADMIN_LOCALE_OPTIONS,
   adminBrowserTitleForLocale,
@@ -103,7 +112,7 @@ import {
   adminThemeToggleButtonClass,
 } from "@/lib/admin-ui";
 
-type Page = "dashboard" | "servers" | "groups" | "probes" | "settings" | "alerts" | "ai" | "logs";
+type Page = AdminPage;
 type LoginErrorType = "none" | "invalid" | "expired" | "locked";
 type ThemeMode = "auto" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
@@ -158,7 +167,7 @@ const ADMIN_THEME_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
   { value: "light", label: "浅色主题" },
   { value: "dark", label: "深色主题" },
 ];
-const PAGE_QUERY_KEY = "page";
+const PAGE_QUERY_KEY = ADMIN_PAGE_QUERY_KEY;
 const PAGE_VALUES = ["dashboard", "servers", "groups", "probes", "settings", "alerts", "ai", "logs"] as const;
 const LoginPage = lazy(() => import("./pages/Login"));
 const DashboardPage = lazy(() => import("./pages/Dashboard"));
@@ -225,18 +234,6 @@ function syncPageToURL(page: Page, replace = false) {
   }
 }
 
-function pageHref(page: Page) {
-  if (typeof window === "undefined") {
-    return page === "dashboard" ? "/" : `/?${PAGE_QUERY_KEY}=${page}`;
-  }
-  const nextURL = new URL(window.location.href);
-  if (page === "dashboard") {
-    nextURL.searchParams.delete(PAGE_QUERY_KEY);
-  } else {
-    nextURL.searchParams.set(PAGE_QUERY_KEY, page);
-  }
-  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
-}
 
 function resolveBrandTitle(settings: SettingsView | null, publicSettings: PublicSettings | null) {
   return (
@@ -318,18 +315,24 @@ function SectionLoader({
   );
 }
 
-function AdminLocaleSwitcher({
-  activeLocaleOption,
+function AdminDropdownSwitcher<T extends string>({
   className = "",
-  locale,
-  onLocaleChange,
-  t,
+  icon: Icon,
+  ariaLabel,
+  triggerTitle,
+  options,
+  activeValue,
+  optionLabel,
+  onSelect,
 }: {
-  activeLocaleOption: { value: AdminLocale; label: string; shortLabel: string };
   className?: string;
-  locale: AdminLocale;
-  onLocaleChange: (value: AdminLocale) => void;
-  t: (text: string) => string;
+  icon: LucideIcon;
+  ariaLabel: string;
+  triggerTitle: string;
+  options: ReadonlyArray<{ value: T; label: string }>;
+  activeValue: T;
+  optionLabel: (label: string) => string;
+  onSelect: (value: T) => void;
 }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -362,39 +365,64 @@ function AdminLocaleSwitcher({
       <Button
         aria-expanded={open}
         aria-haspopup="menu"
-        aria-label={t("界面语言")}
+        aria-label={ariaLabel}
         className={`${adminThemeToggleButtonClass} ${className}`}
         size="icon"
-        title={t("界面语言")}
+        title={triggerTitle}
         variant="outline"
         onClick={() => setOpen((current) => !current)}
       >
-        <Languages className="h-4 w-4" />
+        <Icon className="h-4 w-4" />
       </Button>
       {open ? (
         <div
           role="menu"
           className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1.5 text-popover-foreground shadow-xl"
         >
-          {ADMIN_LOCALE_OPTIONS.map((item) => (
+          {options.map((item) => (
             <button
               key={item.value}
-              aria-checked={item.value === locale}
+              aria-checked={item.value === activeValue}
               className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
               role="menuitemradio"
               type="button"
               onClick={() => {
                 setOpen(false);
-                onLocaleChange(item.value);
+                onSelect(item.value);
               }}
             >
-              <span>{item.label}</span>
-              {item.value === locale ? <Languages className="h-4 w-4 text-sky-500" /> : null}
+              <span>{optionLabel(item.label)}</span>
+              {item.value === activeValue ? <Icon className="h-4 w-4 text-sky-500" /> : null}
             </button>
           ))}
         </div>
       ) : null}
     </div>
+  );
+}
+
+function AdminLocaleSwitcher({
+  className = "",
+  locale,
+  onLocaleChange,
+  t,
+}: {
+  className?: string;
+  locale: AdminLocale;
+  onLocaleChange: (value: AdminLocale) => void;
+  t: (text: string) => string;
+}) {
+  return (
+    <AdminDropdownSwitcher
+      activeValue={locale}
+      ariaLabel={t("界面语言")}
+      className={className}
+      icon={Languages}
+      onSelect={onLocaleChange}
+      optionLabel={(label) => label}
+      options={ADMIN_LOCALE_OPTIONS}
+      triggerTitle={t("界面语言")}
+    />
   );
 }
 
@@ -413,83 +441,160 @@ function AdminThemeSwitcher({
   t: (text: string) => string;
   themeMode: ThemeMode;
 }) {
-  const [open, setOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
   const ThemeIcon = themeMode === "auto" ? Monitor : isDark ? Moon : Sun;
+  return (
+    <AdminDropdownSwitcher
+      activeValue={themeMode}
+      ariaLabel={t("主题模式")}
+      className={className}
+      icon={ThemeIcon}
+      onSelect={onThemeModeChange}
+      optionLabel={t}
+      options={ADMIN_THEME_OPTIONS}
+      triggerTitle={t(activeThemeOption.label)}
+    />
+  );
+}
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const handlePointerDown = (event: PointerEvent) => {
-      if (menuRef.current?.contains(event.target as Node)) {
-        return;
-      }
-      setOpen(false);
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
+const BOOT_PAYLOAD = readAdminBootPayload();
+
+type AdminNavItem = { id: Page; label: string; icon: LucideIcon };
+type AdminNavGroup = { title: string; items: AdminNavItem[] };
+
+function BrandIcon({
+  siteIcon,
+  siteTitle,
+  sizeClass = "h-5 w-5",
+}: {
+  siteIcon: string;
+  siteTitle: string;
+  sizeClass?: string;
+}) {
+  if (siteIcon) {
+    return (
+      <img
+        alt={siteTitle}
+        className={`h-full w-full object-cover ${sizeClass}`}
+        src={siteIcon}
+        width={40}
+        height={40}
+        referrerPolicy="no-referrer"
+      />
+    );
+  }
+  return <Activity className={sizeClass} />;
+}
+
+function NavContent({
+  currentPage,
+  deployedVersionLabel,
+  navigation,
+  onLogout,
+  onNavLinkClick,
+  siteIcon,
+  siteTitle,
+  t,
+}: {
+  currentPage: Page;
+  deployedVersionLabel: string;
+  navigation: AdminNavGroup[];
+  onLogout: () => void;
+  onNavLinkClick: (event: MouseEvent<HTMLAnchorElement>, page: Page) => void;
+  siteIcon: string;
+  siteTitle: string;
+  t: (text: string) => string;
+}) {
+  const monitorHref = publicMonitorPath();
 
   return (
-    <div ref={menuRef} className="relative">
-      <Button
-        aria-expanded={open}
-        aria-haspopup="menu"
-        aria-label={t("主题模式")}
-        className={`${adminThemeToggleButtonClass} ${className}`}
-        size="icon"
-        title={t(activeThemeOption.label)}
-        variant="outline"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <ThemeIcon className="h-4 w-4" />
-      </Button>
-      {open ? (
-        <div
-          role="menu"
-          className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1.5 text-popover-foreground shadow-xl"
+    <div className="m-4 flex h-[calc(100vh-2rem)] flex-col rounded-[2.5rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] text-sidebar-foreground shadow-[var(--cm-panel-shadow)] backdrop-blur-3xl">
+      <div className="border-b border-[var(--cm-sidebar-border)] px-6 py-8">
+        <a
+          aria-label={t("打开监控页")}
+          className="flex items-center gap-4 rounded-2xl text-[18px] font-black tracking-tighter text-sidebar-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+          href={monitorHref}
         >
-          {ADMIN_THEME_OPTIONS.map((item) => (
-            <button
-              key={item.value}
-              aria-checked={item.value === themeMode}
-              className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
-              role="menuitemradio"
-              type="button"
-              onClick={() => {
-                setOpen(false);
-                onThemeModeChange(item.value);
-              }}
-            >
-              <span>{t(item.label)}</span>
-              {item.value === themeMode ? <ThemeIcon className="h-4 w-4 text-sky-500" /> : null}
-            </button>
+          <div className={`${adminSidebarLogoChipClass} h-12 w-12 shrink-0 overflow-hidden shadow-lg`}>
+            <BrandIcon siteIcon={siteIcon} siteTitle={siteTitle} sizeClass="h-7 w-7" />
+          </div>
+          <div className="min-w-0 flex-1 leading-tight overflow-hidden">
+            <div className="truncate whitespace-nowrap bg-gradient-to-br from-slate-900 to-slate-500 bg-clip-text text-transparent dark:from-white dark:to-slate-400 italic">
+              {siteTitle}
+            </div>
+            <div className="mt-1">
+              <span className="inline-flex h-5 items-center rounded-full border border-slate-200 bg-slate-100/50 px-2.5 text-[8px] font-black tracking-[0.18em] text-slate-500 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-400">
+                {deployedVersionLabel}
+              </span>
+            </div>
+          </div>
+        </a>
+      </div>
+      <ScrollArea className="flex-1 px-5 py-8">
+        <div className="space-y-9 pb-8">
+          {navigation.map((group) => (
+            <div key={group.title}>
+              <h4 className="mb-4 px-4 text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-500">
+                {group.title}
+              </h4>
+              <div className="space-y-1.5">
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const active = currentPage === item.id;
+                  return (
+                    <a
+                      key={item.id}
+                      href={adminPageHref(item.id)}
+                      className={`${adminSidebarNavItemClass} relative overflow-hidden ${
+                        active
+                          ? "border-transparent bg-[#1f5dff] text-white shadow-[0_14px_32px_-14px_rgba(31,93,255,0.55)] dark:bg-[#2563eb] dark:text-white"
+                          : "border-transparent text-slate-500 hover:bg-[var(--cm-control-bg)] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-[var(--cm-control-bg)] dark:hover:text-slate-100"
+                      }`}
+                      onClick={(event) => {
+                        onNavLinkClick(event, item.id);
+                      }}
+                    >
+                      <span className={adminSidebarNavLabelClass}>
+                        <Icon
+                          className={`h-4 w-4 ${active ? "text-white" : "text-slate-400 group-hover:text-current"}`}
+                        />
+                        <span className="tracking-tight">{item.label}</span>
+                      </span>
+                      {active ? (
+                        <div className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />
+                      ) : null}
+                    </a>
+                  );
+                })}
+              </div>
+            </div>
           ))}
         </div>
-      ) : null}
+      </ScrollArea>
+      <div className="mt-auto border-t border-[var(--cm-sidebar-border)] p-5">
+        <Button
+          className={`${adminSidebarSecondaryButtonClass} group`}
+          variant="outline"
+          onClick={onLogout}
+        >
+          <LogOut className="mr-3 h-4 w-4" />
+          <span className="tracking-tight">{t("退出登录")}</span>
+        </Button>
+      </div>
     </div>
   );
 }
 
 export default function App() {
-  const bootPayload = readAdminBootPayload();
-  const [locale, setLocale] = useState<AdminLocale>(() => resolveInitialAdminLocale(bootPayload.settings || null));
+  const [locale, setLocale] = useState<AdminLocale>(() => resolveInitialAdminLocale(BOOT_PAYLOAD.settings || null));
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => resolveInitialThemeMode());
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() => resolveSystemTheme());
   const [token, setToken] = useState(() => getStoredAdminToken());
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [loginConfig, setLoginConfig] = useState<LoginConfigResponse | null>(null);
-  const [publicSettings, setPublicSettings] = useState<PublicSettings | null>(() => bootPayload.settings || null);
+  // 加载完成（含失败）前不下发 passwordLoginEnabled 判定：避免"密码登录
+  // 已禁用"的部署在配置到达前闪现密码表单。
+  const [loginConfigLoaded, setLoginConfigLoaded] = useState(false);
+  const [publicSettings, setPublicSettings] = useState<PublicSettings | null>(() => BOOT_PAYLOAD.settings || null);
   const [systemUpdateInfo, setSystemUpdateInfo] = useState<SystemUpdateInfo | null>(null);
   const [nodes, setNodes] = useState<NodeView[]>([]);
   const [currentPage, setCurrentPage] = useState<Page>(() => resolveInitialPage());
@@ -506,13 +611,21 @@ export default function App() {
   const socketRef = useRef<{ close: () => void } | null>(null);
   const systemUpdatePollRef = useRef<number | null>(null);
   const loadAllRequestRef = useRef(0);
+  const systemUpdatePollErrorToastAtRef = useRef(0);
+  const localeChangeSeqRef = useRef(0);
+  // 401 已由登出流程展示过期提示，其余错误才弹 toast。
+  const reportActionError = (error: unknown, fallback: string) => {
+    if (error instanceof AdminApiError && error.status === 401) {
+      return;
+    }
+    toast.error(getErrorMessage(error, fallback));
+  };
   const theme = themeMode === "auto" ? systemTheme : themeMode;
   const isDark = theme === "dark";
   const siteIcon = normalizePublicIconURL(settings?.site_icon || publicSettings?.site_icon || "");
   const siteTitle = resolveBrandTitle(settings, publicSettings);
   const deployedVersion = (settings?.version || publicSettings?.version || "").trim();
   const deployedVersionLabel = formatVersionLabel(deployedVersion);
-  const activeLocaleOption = ADMIN_LOCALE_OPTIONS.find((item) => item.value === locale) || ADMIN_LOCALE_OPTIONS[0];
   const activeThemeOption = ADMIN_THEME_OPTIONS.find((item) => item.value === themeMode) || ADMIN_THEME_OPTIONS[0];
   const t = (text: string) => adminText(locale, text);
 
@@ -647,8 +760,12 @@ export default function App() {
     if (!token) {
       return;
     }
+    const requestSeq = ++localeChangeSeqRef.current;
     try {
       const data = await saveSettings({ locale: nextLocale });
+      if (localeChangeSeqRef.current !== requestSeq) {
+        return;
+      }
       setSettings(data);
       setPublicSettings((current) => mergePublicSettings(data, current));
       toast.success(adminText(nextLocale, "界面语言已更新"));
@@ -687,19 +804,10 @@ export default function App() {
     proceedToPage(page);
   }
 
-  function shouldHandleClientNavigation(event: MouseEvent<HTMLAnchorElement>) {
-    return !(
-      event.defaultPrevented ||
-      event.button !== 0 ||
-      event.metaKey ||
-      event.ctrlKey ||
-      event.shiftKey ||
-      event.altKey
-    );
-  }
+
 
   function handleNavLinkClick(event: MouseEvent<HTMLAnchorElement>, page: Page) {
-    if (!shouldHandleClientNavigation(event)) {
+    if (!shouldHandleAdminNavigation(event)) {
       return;
     }
     event.preventDefault();
@@ -862,7 +970,7 @@ export default function App() {
       return;
     }
     refreshSystemUpdate().catch((error) => {
-      toast.error(getErrorMessage(error, "加载服务端更新状态失败"));
+      reportActionError(error, "加载服务端更新状态失败");
     });
   }, [currentPage, token]);
 
@@ -876,7 +984,13 @@ export default function App() {
     }
     systemUpdatePollRef.current = window.setInterval(() => {
       refreshSystemUpdate().catch((error) => {
-        toast.error(getErrorMessage(error, "刷新服务端更新状态失败"));
+        // 1.5s 轮询下网络抖动会连续失败，30s 节流避免连环弹窗。
+        const now = Date.now();
+        if (now - systemUpdatePollErrorToastAtRef.current < 30_000) {
+          return;
+        }
+        systemUpdatePollErrorToastAtRef.current = now;
+        reportActionError(error, "刷新服务端更新状态失败");
       });
     }, 1500);
     return () => {
@@ -908,11 +1022,13 @@ export default function App() {
       .then((config) => {
         if (!cancelled) {
           setLoginConfig(config);
+          setLoginConfigLoaded(true);
         }
       })
       .catch((error) => {
         if (!cancelled) {
           setLoginConfig(null);
+          setLoginConfigLoaded(true);
           toast.error(getErrorMessage(error, "加载登录配置失败"));
         }
       });
@@ -962,7 +1078,7 @@ export default function App() {
     };
   }, [token]);
 
-  const navigation = [
+  const navigation: AdminNavGroup[] = [
     {
       title: t("总览"),
       items: [{ id: "dashboard", label: t("首页"), icon: LayoutDashboard }],
@@ -984,29 +1100,20 @@ export default function App() {
         { id: "logs", label: t("日志查看"), icon: ScrollText },
       ],
     },
-  ] as const;
-
-  function BrandIcon({ sizeClass = "h-5 w-5" }: { sizeClass?: string }) {
-    if (siteIcon) {
-      return (
-        <img
-          alt={siteTitle}
-          className={`h-full w-full object-cover ${sizeClass}`}
-          src={siteIcon}
-          width={40}
-          height={40}
-          referrerPolicy="no-referrer"
-        />
-      );
-    }
-    return <Activity className={sizeClass} />;
-  }
+  ];
 
   async function refreshNodesAfterMutation(successLabel: string, successLocale: AdminLocale = locale) {
+    const requestID = loadAllRequestRef.current;
     try {
       const snapshot = await fetchNodes();
+      if (loadAllRequestRef.current !== requestID) {
+        return;
+      }
       setNodes(snapshot.nodes || []);
     } catch (error) {
+      if (loadAllRequestRef.current !== requestID) {
+        return;
+      }
       const message = getErrorMessage(error, adminText(successLocale, "节点列表刷新失败"));
       toast.warning(
         successLocale === "en-US"
@@ -1076,8 +1183,12 @@ export default function App() {
 
   async function handleRefreshNodes() {
     setRefreshingNodes(true);
+    const requestID = loadAllRequestRef.current;
     try {
       const snapshot = await fetchNodes();
+      if (loadAllRequestRef.current !== requestID) {
+        return;
+      }
       setNodes(snapshot.nodes || []);
     } catch (error) {
       if (error instanceof AdminApiError && error.status === 401) {
@@ -1116,7 +1227,6 @@ export default function App() {
           errorMessage: "服务端更新状态查询失败，当前登录态已失效，请重新登录。",
           errorType: "expired",
         });
-        return;
       }
       throw error;
     } finally {
@@ -1158,7 +1268,6 @@ export default function App() {
           errorMessage: "服务端更新失败，当前登录态已失效，请重新登录。",
           errorType: "expired",
         });
-        return;
       }
       throw error;
     } finally {
@@ -1202,89 +1311,6 @@ export default function App() {
       }
       throw error;
     }
-  }
-
-  function NavContent() {
-    const monitorHref = publicMonitorPath();
-
-    return (
-      <div className="m-4 flex h-[calc(100vh-2rem)] flex-col rounded-[2.5rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] text-sidebar-foreground shadow-[var(--cm-panel-shadow)] backdrop-blur-3xl">
-        <div className="border-b border-[var(--cm-sidebar-border)] px-6 py-8">
-          <a
-            aria-label={t("打开监控页")}
-            className="flex items-center gap-4 rounded-2xl text-[18px] font-black tracking-tighter text-sidebar-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
-            href={monitorHref}
-          >
-            <div className={`${adminSidebarLogoChipClass} h-12 w-12 shrink-0 overflow-hidden shadow-lg`}>
-              <BrandIcon sizeClass="h-7 w-7" />
-            </div>
-            <div className="min-w-0 flex-1 leading-tight overflow-hidden">
-              <div className="truncate whitespace-nowrap bg-gradient-to-br from-slate-900 to-slate-500 bg-clip-text text-transparent dark:from-white dark:to-slate-400 italic">
-                {siteTitle}
-              </div>
-              <div className="mt-1">
-                <span className="inline-flex h-5 items-center rounded-full border border-slate-200 bg-slate-100/50 px-2.5 text-[8px] font-black tracking-[0.18em] text-slate-500 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-400">
-                  {deployedVersionLabel}
-                </span>
-              </div>
-            </div>
-          </a>
-        </div>
-        <ScrollArea className="flex-1 px-5 py-8">
-          <div className="space-y-9 pb-8">
-            {navigation.map((group) => (
-              <div key={group.title}>
-                <h4 className="mb-4 px-4 text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-500">
-                  {group.title}
-                </h4>
-                <div className="space-y-1.5">
-                  {group.items.map((item) => {
-                    const Icon = item.icon;
-                    const active = currentPage === item.id;
-                    return (
-                      <a
-                        key={item.id}
-                        href={pageHref(item.id)}
-                        className={`${adminSidebarNavItemClass} relative overflow-hidden ${
-                          active
-                            ? "border-transparent bg-[#1f5dff] text-white shadow-[0_14px_32px_-14px_rgba(31,93,255,0.55)] dark:bg-[#2563eb] dark:text-white"
-                            : "border-transparent text-slate-500 hover:bg-[var(--cm-control-bg)] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-[var(--cm-control-bg)] dark:hover:text-slate-100"
-                        }`}
-                        onClick={(event) => {
-                          handleNavLinkClick(event, item.id);
-                        }}
-                      >
-                        <span className={adminSidebarNavLabelClass}>
-                          <Icon
-                            className={`h-4 w-4 ${active ? "text-white" : "text-slate-400 group-hover:text-current"}`}
-                          />
-            <span className="tracking-tight">{item.label}</span>
-                        </span>
-                        {active ? (
-                          <div className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />
-                        ) : null}
-                      </a>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-        </ScrollArea>
-        <div className="mt-auto border-t border-[var(--cm-sidebar-border)] p-5">
-          <Button
-            className={`${adminSidebarSecondaryButtonClass} group`}
-            variant="outline"
-            onClick={() => {
-              void handleUserLogout();
-            }}
-          >
-            <LogOut className="mr-3 h-4 w-4" />
-            <span className="tracking-tight">{t("退出登录")}</span>
-          </Button>
-        </div>
-      </div>
-    );
   }
 
   const pageContent = useMemo(() => {
@@ -1418,13 +1444,14 @@ export default function App() {
           onLogin={handleLogin}
           onOAuthLogin={handleOAuthLogin}
           oauthProviders={loginConfig?.oauth_providers || []}
-          passwordLoginEnabled={loginConfig?.password_login_enabled !== false}
+          passwordLoginEnabled={loginConfigLoaded ? loginConfig?.password_login_enabled !== false : false}
+          loginConfigLoaded={loginConfigLoaded}
           retryAfterSec={loginState.retryAfterSec}
           theme={theme}
             topControls={
               <>
                 <AdminLocaleSwitcher
-                  activeLocaleOption={activeLocaleOption}
+
                   locale={locale}
                   t={t}
                   onLocaleChange={(nextLocale) => {
@@ -1455,7 +1482,18 @@ export default function App() {
         {t("跳转到主要内容")}
       </a>
       <aside className="fixed inset-y-0 z-50 hidden w-72 flex-col md:flex">
-        <NavContent />
+        <NavContent
+          currentPage={currentPage}
+          deployedVersionLabel={deployedVersionLabel}
+          navigation={navigation}
+          onLogout={() => {
+            void handleUserLogout();
+          }}
+          onNavLinkClick={handleNavLinkClick}
+          siteIcon={siteIcon}
+          siteTitle={siteTitle}
+          t={t}
+        />
       </aside>
 
       <header className="fixed left-0 right-0 top-0 z-50 flex h-16 items-center border-b border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] px-6 backdrop-blur-3xl md:hidden">
@@ -1473,7 +1511,18 @@ export default function App() {
             )}
           />
           <SheetContent className="w-[310px] p-0 bg-transparent border-none shadow-none" side="left">
-            <NavContent />
+            <NavContent
+              currentPage={currentPage}
+              deployedVersionLabel={deployedVersionLabel}
+              navigation={navigation}
+              onLogout={() => {
+                void handleUserLogout();
+              }}
+              onNavLinkClick={handleNavLinkClick}
+              siteIcon={siteIcon}
+              siteTitle={siteTitle}
+              t={t}
+            />
           </SheetContent>
         </Sheet>
         <a
@@ -1482,7 +1531,7 @@ export default function App() {
           href={publicMonitorPath()}
         >
           <div className={`${adminSidebarLogoChipClass} h-10 w-10 rounded-xl overflow-hidden shadow-lg`}>
-            <BrandIcon sizeClass="h-5 w-5" />
+            <BrandIcon siteIcon={siteIcon} siteTitle={siteTitle} sizeClass="h-5 w-5" />
           </div>
           <div className="min-w-0 leading-tight">
             <div className="truncate text-[17px] italic">{siteTitle}</div>
@@ -1493,7 +1542,7 @@ export default function App() {
         </a>
         <div className="ml-auto flex items-center gap-2">
           <AdminLocaleSwitcher
-            activeLocaleOption={activeLocaleOption}
+
             locale={locale}
             t={t}
             onLocaleChange={(nextLocale) => {
@@ -1515,7 +1564,7 @@ export default function App() {
           <div className="w-full p-6 md:p-10 md:pt-10">
             <div className="mb-8 hidden justify-end gap-2 md:flex">
               <AdminLocaleSwitcher
-                activeLocaleOption={activeLocaleOption}
+
                 locale={locale}
                 t={t}
                 onLocaleChange={(nextLocale) => {

@@ -9,10 +9,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/distribution/reference"
@@ -48,6 +51,8 @@ const (
 	dockerReplacementReadyTimeout  = 120 * time.Second
 	dockerReplacementReadyInterval = 2 * time.Second
 	dockerCleanupTimeout           = 30 * time.Second
+	dockerRecreateOverallTimeout   = 20 * time.Minute
+	dockerPullTimeout              = 10 * time.Minute
 )
 
 var (
@@ -401,6 +406,10 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	if targetImage == "" {
 		return fmt.Errorf("缺少 helper 目标镜像")
 	}
+	// 停掉旧容器后的任何一步挂死都等于服务宕机：整体预算兜底，
+	// 回滚路径用 WithoutCancel 派生，不受本预算到期影响。
+	ctx, cancel := context.WithTimeout(ctx, dockerRecreateOverallTimeout)
+	defer cancel()
 	cli, err := newDockerClient(socketPath)
 	if err != nil {
 		return err
@@ -426,29 +435,80 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		return fmt.Errorf("创建替换容器失败: %w", err)
 	}
 	originalName := strings.TrimPrefix(inspect.Name, "/")
-	rollbackReplacement := true
+	var rollbackReplacement atomic.Bool
+	rollbackReplacement.Store(true)
 	oldStopped := false
 	oldRenamed := false
 	connectedExtraNetworks := []string{}
+	// 回滚状态快照：信号 goroutine 与主 goroutine 并发，用 atomic.Pointer
+	// 发布一致的 {oldStopped, oldRenamed, connectedNetworks} 视图。
+	type rollbackState struct {
+		oldStopped bool
+		oldRenamed bool
+		connected  []string
+	}
+	rollbackSnapshot := atomic.Pointer[rollbackState]{}
+	publishRollbackState := func() {
+		rollbackSnapshot.Store(&rollbackState{
+			oldStopped: oldStopped,
+			oldRenamed: oldRenamed,
+			connected:  append([]string{}, connectedExtraNetworks...),
+		})
+	}
+	publishRollbackState()
 	defer func() {
-		if !rollbackReplacement {
+		// CAS 防重入：信号 goroutine 与本 defer 并发时回滚全局只执行一次。
+		if !rollbackReplacement.CompareAndSwap(true, false) {
 			return
 		}
+		snapshot := rollbackSnapshot.Load()
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), dockerCleanupTimeout)
 		defer rollbackCancel()
-		rollbackErr := rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, oldStopped, oldRenamed, connectedExtraNetworks)
+		rollbackErr := rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
 		err = appendDockerRollbackError(err, rollbackErr)
+	}()
+	// helper 容器在"旧容器已停止、新容器未就绪"窗口内被 docker stop（SIGTERM）
+	// 杀死时 defer 不会执行，服务将保持宕机。安装信号处理器直接回滚。
+	stopSignals := make(chan os.Signal, 1)
+	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(stopSignals)
+	go func() {
+		sig, ok := <-stopSignals
+		if !ok {
+			return
+		}
+		log.Printf("Docker 更新 helper 收到 %s，执行回滚", sig)
+		if rollbackReplacement.CompareAndSwap(true, false) {
+			snapshot := rollbackSnapshot.Load()
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), dockerCleanupTimeout)
+			defer rollbackCancel()
+			_ = rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
+		}
+		os.Exit(1)
 	}()
 	if verifyErr := verifyReplacementContainerImage(ctx, cli, created.ID, targetImageID); verifyErr != nil {
 		err = verifyErr
 		return err
 	}
+	// 附加网络连接分两段：无静态 IP 的端点可在旧容器停止前预连接；带
+	// IPAMConfig（静态 IP）的端点必须等旧容器停止释放地址后再连接，否则
+	// NetworkConnect 报地址冲突，静态 IP 部署的一键更新永远失败。
+	preConnectNetworks := map[string]*network.EndpointSettings{}
+	postConnectNetworks := map[string]*network.EndpointSettings{}
 	for networkName, endpoint := range extraNetworks {
+		if endpoint != nil && endpoint.IPAMConfig != nil {
+			postConnectNetworks[networkName] = endpoint
+			continue
+		}
+		preConnectNetworks[networkName] = endpoint
+	}
+	for networkName, endpoint := range preConnectNetworks {
 		if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
 			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
 			return err
 		}
 		connectedExtraNetworks = append(connectedExtraNetworks, networkName)
+		publishRollbackState()
 	}
 	timeout := 20
 	if stopErr := cli.ContainerStop(ctx, inspect.ID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
@@ -456,12 +516,22 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		return err
 	}
 	oldStopped = true
+	publishRollbackState()
+	for networkName, endpoint := range postConnectNetworks {
+		if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
+			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
+			return err
+		}
+		connectedExtraNetworks = append(connectedExtraNetworks, networkName)
+		publishRollbackState()
+	}
 	backupName := fmt.Sprintf("%s-prev-%d", sanitizeContainerName(originalName), time.Now().Unix())
 	if renameErr := cli.ContainerRename(ctx, inspect.ID, backupName); renameErr != nil {
 		err = fmt.Errorf("备份旧容器名称失败: %w", renameErr)
 		return err
 	}
 	oldRenamed = true
+	publishRollbackState()
 	if renameErr := cli.ContainerRename(ctx, created.ID, originalName); renameErr != nil {
 		err = fmt.Errorf("恢复容器名称失败: %w", renameErr)
 		return err
@@ -474,7 +544,7 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		err = fmt.Errorf("替换容器未就绪: %w", readyErr)
 		return err
 	}
-	rollbackReplacement = false
+	rollbackReplacement.Store(false)
 	if cleanupErr := cleanupOldContainerAfterReplacement(ctx, cli, inspect.ID); cleanupErr != nil {
 		return cleanupErr
 	}
@@ -508,11 +578,13 @@ func rollbackCreatedContainer(ctx context.Context, cli dockerContainerRollbackCl
 		errs = append(errs, fmt.Errorf("删除替换容器失败: %w", removeErr))
 	}
 	if oldRenamed {
-		if renameErr := cli.ContainerRename(ctx, oldID, originalName); renameErr != nil {
-			errs = append(errs, fmt.Errorf("恢复旧容器名称失败: %w", renameErr))
-		}
+		// 先按 ID 启动再恢复名称：SIGKILL 落在两步之间时服务已在线，
+		// 最多短暂保留 -prev- 名称。
 		if startErr := cli.ContainerStart(ctx, oldID, container.StartOptions{}); startErr != nil {
 			errs = append(errs, fmt.Errorf("重启旧容器失败: %w", startErr))
+		}
+		if renameErr := cli.ContainerRename(ctx, oldID, originalName); renameErr != nil {
+			errs = append(errs, fmt.Errorf("恢复旧容器名称失败: %w", renameErr))
 		}
 		return errors.Join(errs...)
 	}
@@ -804,7 +876,10 @@ func newDockerClient(socketPath string) (*client.Client, error) {
 }
 
 func pullDockerImage(ctx context.Context, cli *client.Client, targetImage string) error {
-	reader, err := cli.ImagePull(ctx, targetImage, image.PullOptions{})
+	// 镜像拉取是 helper 内最容易无限挂起的一步，单独预算。
+	pullCtx, cancel := context.WithTimeout(ctx, dockerPullTimeout)
+	defer cancel()
+	reader, err := cli.ImagePull(pullCtx, targetImage, image.PullOptions{})
 	if err != nil {
 		return fmt.Errorf("拉取目标镜像失败: %w", err)
 	}

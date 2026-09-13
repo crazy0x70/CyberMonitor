@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -115,11 +114,10 @@ type grpcControlPlane struct {
 	capabilities []string
 	dialContext  func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
 
-	mu       sync.Mutex
-	conn     *grpc.ClientConn
-	client   agentrpc.AgentServiceClient
-	dialOnce sync.Once
-	dialErr  error
+	mu      sync.Mutex
+	conn    *grpc.ClientConn
+	client  agentrpc.AgentServiceClient
+	dialErr error
 }
 
 func newControlPlaneTransportWithOptions(cfg Config, client *http.Client, options grpcTransportOptions) agentControlPlane {
@@ -249,18 +247,23 @@ func (t *controlPlaneTransport) canUseGRPC() bool {
 
 func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	t.mu.Lock()
-	next := nextGRPCBackoff(t.opts.fallbackBackoff, t.grpcBackoffDuration)
-	t.grpcBackoffDuration = next
-	t.grpcBackoffUntil = time.Now().Add(next)
+	now := time.Now()
+	var next time.Duration
+	if now.Before(t.grpcBackoffUntil) {
+		// 并发失败（config ticker/上报/更新报告同时命中）：已在退避窗口内
+		// 只延长窗口、不推进档位，一次故障事件不重复计连续失败。
+		t.grpcBackoffUntil = now.Add(t.grpcBackoffDuration)
+		next = t.grpcBackoffDuration
+	} else {
+		next = nextGRPCBackoff(t.opts.fallbackBackoff, t.grpcBackoffDuration)
+		t.grpcBackoffDuration = next
+		t.grpcBackoffUntil = now.Add(next)
+	}
 	t.lastMode = "http"
 	t.mu.Unlock()
-	if t.grpc != nil {
-		target, state := t.grpc.connectionStatus()
-		log.Printf("gRPC 控制链路不可用，已回退 HTTP 并退避 %s: target=%s state=%s err=%v", next, target, state, err)
-		_ = t.grpc.Close()
-		return
-	}
-	log.Printf("gRPC 控制链路不可用，已回退 HTTP 并退避 %s: %v", next, err)
+	target, state := t.grpc.connectionStatus()
+	log.Printf("gRPC 控制链路不可用，已回退 HTTP 并退避 %s: target=%s state=%s err=%v", next, target, state, err)
+	_ = t.grpc.Close()
 }
 
 func callWithFallback[T any](
@@ -277,6 +280,12 @@ func callWithFallback[T any](
 			return result, nil
 		}
 		if !shouldFallbackToHTTP(err) {
+			return zero, err
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.DeadlineExceeded && t.grpc.connReady() {
+			// callTimeout 包住的是服务端处理全程：健康连接上的
+			// DeadlineExceeded 是应用层慢而非传输故障，透传错误给调用方，
+			// 不拆连接、不退避、不做 HTTP 重放（重放同样慢且放大负载）。
 			return zero, err
 		}
 		t.disableGRPCTemporarily(err)
@@ -316,10 +325,13 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 		return false, err
 	}
 	var result struct {
-		RefreshConfig bool `json:"refresh_config"`
+		// 服务端 ingest 响应为 {"status":"ok","refresh_config":...}；
+		// 字段名需与服务端 key 对齐才能取到 refresh_config。
+		Status        string `json:"status"`
+		RefreshConfig bool   `json:"refresh_config"`
 	}
 	if err := performAgentRequest(h.client, req, "ingest", func(body io.Reader) error {
-		return json.NewDecoder(body).Decode(&result)
+		return decodeAgentResponseJSON(body, &result, "ingest response has trailing data")
 	}); err != nil {
 		return false, err
 	}
@@ -331,6 +343,13 @@ func (h *httpControlPlane) ReportUpdate(ctx context.Context, nodeID, token, upda
 }
 
 func (g *grpcControlPlane) RegisterNodeToken(ctx context.Context, nodeID, bootstrapToken string) (string, error) {
+	// 与 HTTP 路径的 registerNodeToken 预检对齐：空 nodeID/token 不发请求。
+	if strings.TrimSpace(nodeID) == "" {
+		return "", fmt.Errorf("node id required")
+	}
+	if strings.TrimSpace(bootstrapToken) == "" {
+		return "", fmt.Errorf("bootstrap token required")
+	}
 	client, callCtx, cancel, err := g.prepareCall(ctx)
 	if err != nil {
 		return "", err
@@ -404,9 +423,6 @@ func (g *grpcControlPlane) ReportUpdate(ctx context.Context, nodeID, token, upda
 }
 
 func (g *grpcControlPlane) Close() error {
-	// Close rewrites dialOnce without holding a lock that clientConn's Do
-	// would honor; this is safe because the whole transport (Close included)
-	// is only ever used from the agent's single report loop goroutine.
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	var err error
@@ -415,19 +431,13 @@ func (g *grpcControlPlane) Close() error {
 		g.conn = nil
 		g.client = nil
 	}
-	// Re-arm the once-synchronized dial even when no connection was ever
-	// established: a transient dial failure must not permanently kill the
-	// gRPC transport, otherwise the HTTP-fallback backoff recovery can
-	// never retry the dial.
+	// 清除 dial 失败状态：瞬时失败不得永久杀死 gRPC 传输，
+	// HTTP 回退退避恢复后必须能够重拨。
 	g.dialErr = nil
-	g.dialOnce = sync.Once{}
 	return err
 }
 
 func (g *grpcControlPlane) connectionStatus() (string, string) {
-	if g == nil {
-		return "", "disabled"
-	}
 	g.mu.Lock()
 	conn := g.conn
 	target := g.target
@@ -436,6 +446,14 @@ func (g *grpcControlPlane) connectionStatus() (string, string) {
 		return target, "not_initialized"
 	}
 	return target, conn.GetState().String()
+}
+
+// connReady 报告底层连接是否处于 Ready（用于区分应用层慢与传输故障）。
+func (g *grpcControlPlane) connReady() bool {
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+	return conn != nil && conn.GetState() == connectivity.Ready
 }
 
 func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServiceClient, context.Context, context.CancelFunc, error) {
@@ -461,65 +479,61 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 	return client, callCtx, cancel, nil
 }
 
+// clientConn 在锁内完成 dial 与状态读写：远程更新 goroutine 与主上报循环
+// 会并发使用同一 transport，历史上依赖"单 goroutine"假设的 dialOnce 重置
+// 模式构成数据竞态。dial 失败记入 dialErr 并保持到 Close 清除（与原
+// dialOnce 语义一致：瞬时失败不会永久杀死 gRPC 传输，Close 后可重拨）。
 func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServiceClient, error) {
-	g.dialOnce.Do(func() {
-		dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
-		defer cancel()
-
-		opts := []grpc.DialOption{
-			grpc.WithDefaultCallOptions(
-				grpc.ForceCodec(agentrpc.GobCodec{}),
-				grpc.WaitForReady(true),
-			),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:                20 * time.Second,
-				Timeout:             10 * time.Second,
-				PermitWithoutStream: true,
-			}),
-			grpc.WithConnectParams(grpc.ConnectParams{
-				Backoff: backoff.Config{
-					BaseDelay:  1 * time.Second,
-					Multiplier: 1.6,
-					Jitter:     0.2,
-					MaxDelay:   10 * time.Second,
-				},
-				MinConnectTimeout: g.opts.dialTimeout,
-			}),
-		}
-		if g.secure {
-			opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-				MinVersion: tls.VersionTLS12,
-			})))
-		} else {
-			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		}
-
-		conn, err := g.dialContext(dialCtx, g.target, opts...)
-		if err != nil {
-			g.dialErr = err
-			return
-		}
-
-		g.mu.Lock()
-		g.conn = conn
-		g.client = agentrpc.NewAgentServiceClient(conn)
-		g.mu.Unlock()
-	})
-
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.client != nil {
+		return g.client, nil
+	}
 	if g.dialErr != nil {
 		// 包装成 Unavailable 让 shouldFallbackToHTTP 命中，否则裸 dial 错误
-		// 既不会回退 HTTP，也会因 dialOnce 已消耗而永久卡死该传输。
+		// 不会回退 HTTP。
 		return nil, status.Errorf(codes.Unavailable, "grpc dial failed: %v", g.dialErr)
 	}
 
-	g.mu.Lock()
-	client := g.client
-	g.mu.Unlock()
+	dialCtx, cancel := context.WithTimeout(ctx, g.opts.dialTimeout)
+	defer cancel()
 
-	if client == nil {
-		return nil, status.Error(codes.Unavailable, "grpc client not initialized")
+	opts := []grpc.DialOption{
+		grpc.WithDefaultCallOptions(
+			grpc.ForceCodec(agentrpc.GobCodec{}),
+			grpc.WaitForReady(true),
+		),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                20 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  1 * time.Second,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   10 * time.Second,
+			},
+			MinConnectTimeout: g.opts.dialTimeout,
+		}),
 	}
-	return client, nil
+	if g.secure {
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			MinVersion: tls.VersionTLS12,
+		})))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	conn, err := g.dialContext(dialCtx, g.target, opts...)
+	if err != nil {
+		g.dialErr = err
+		return nil, status.Errorf(codes.Unavailable, "grpc dial failed: %v", err)
+	}
+	g.conn = conn
+	g.client = agentrpc.NewAgentServiceClient(conn)
+	return g.client, nil
 }
 
 func fromRPCUpdateInstruction(update *agentrpc.UpdateInstruction) *RemoteUpdateInstruction {
@@ -540,16 +554,21 @@ func shouldFallbackToHTTP(err error) bool {
 		return false
 	}
 	if st, ok := status.FromError(err); ok {
+		// gRPC status 错误只按 code 判定。status 的 message 会携带服务端
+		// 透传的应用层错误文本（grpcStatusFromAPIError 原样保留），其中
+		// 常见 "connection refused"（下游 store/数据库）等字样，若落入下方
+		// 原始串扫描会误触发回退，复活"关健康连接 + HTTP 重放"的抖动。
 		switch st.Code() {
 		case codes.Unavailable, codes.Unimplemented, codes.DeadlineExceeded:
 			return true
 		case codes.Internal:
+			// grpc 框架自身的编解码/传输类 Internal 以 message 关键字识别。
 			msg := strings.ToLower(st.Message())
-			if strings.Contains(msg, "transport") || strings.Contains(msg, "content-type") || strings.Contains(msg, "http status") {
-				return true
-			}
+			return strings.Contains(msg, "transport") || strings.Contains(msg, "content-type") || strings.Contains(msg, "http status")
 		}
+		return false
 	}
+	// 非 status 错误是客户端本地/net 层错误，按 marker 启发式回退。
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
 		"unexpected eof",

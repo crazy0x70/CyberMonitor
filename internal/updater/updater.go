@@ -23,11 +23,11 @@ const (
 	DefaultRepo              = "crazy0x70/CyberMonitor"
 	defaultUserAgent         = "CyberMonitor-Updater"
 	maxDownloadBytes         = 512 * 1024 * 1024
+	maxReleaseJSONBytes      = 1 << 20
 	deployModeEnvKey         = "CM_DEPLOY_MODE"
 	checksumAssetName        = "SHA256SUMS"
 	maxUpdaterErrorBodyBytes = 4096
 	maxChecksumFileBytes     = 1024 * 1024
-	defaultHTTPTimeout       = 20 * time.Second
 )
 
 type Kind string
@@ -85,12 +85,23 @@ func NewClient(repo string, kind Kind, currentVersion string) *Client {
 	if strings.TrimSpace(repo) == "" {
 		repo = DefaultRepo
 	}
+	// 不设 Client.Timeout：512MB 上限的二进制下载在慢链路上远超任何整客户端
+	// 超时；API 类小请求由调用处的 ctx 超时约束，下载由 LimitReader+外层 ctx 兜底。
 	return &Client{
 		Repo:           repo,
 		Kind:           kind,
 		CurrentVersion: strings.TrimSpace(currentVersion),
 		HTTPClient: &http.Client{
-			Timeout: 45 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// GitHub release 下载正常会 302 到 *.githubusercontent.com；
+				// 其余主机一律拒绝，防止上游开放重定向把二进制/校验文件
+				// 导向第三方源。
+				host := req.URL.Hostname()
+				if host == "github.com" || strings.HasSuffix(host, ".githubusercontent.com") {
+					return nil
+				}
+				return fmt.Errorf("更新下载重定向到不受信主机: %s", host)
+			},
 		},
 		UserAgent: defaultUserAgent,
 	}
@@ -167,7 +178,21 @@ func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloa
 	if err != nil {
 		return err
 	}
+	exeInfo, err := os.Stat(exePath)
+	if err != nil {
+		return fmt.Errorf("读取当前二进制信息失败: %w", err)
+	}
 	exeDir := filepath.Dir(exePath)
+	// 清扫此前进程被强杀（SIGKILL/OOM）残留的更新临时目录——defer 清理在
+	// 那些场景不会执行。只清修改时间超过 1 小时的，避免误删并发进行中的更新。
+	if matches, globErr := filepath.Glob(filepath.Join(exeDir, ".cm-update-*")); globErr == nil {
+		staleCutoff := time.Now().Add(-time.Hour)
+		for _, match := range matches {
+			if info, statErr := os.Stat(match); statErr == nil && info.ModTime().Before(staleCutoff) {
+				_ = os.RemoveAll(match)
+			}
+		}
+	}
 	tmpDir, err := os.MkdirTemp(exeDir, ".cm-update-*")
 	if err != nil {
 		return fmt.Errorf("创建更新临时目录失败: %w", err)
@@ -183,7 +208,12 @@ func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloa
 	if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpBinary, 0o755); err != nil {
+	// 沿用现有权限位（至少保留属主可执行位），不把受限执行策略放宽为 0755。
+	newMode := exeInfo.Mode().Perm()
+	if newMode&0o100 == 0 {
+		newMode |= 0o100
+	}
+	if err := os.Chmod(tmpBinary, newMode); err != nil {
 		return fmt.Errorf("设置新二进制权限失败: %w", err)
 	}
 	if err := replaceExecutable(exePath, tmpBinary); err != nil {
@@ -306,20 +336,29 @@ func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
 }
 
 func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) {
-	resp, err := c.getOK(ctx, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", c.Repo), "application/vnd.github+json", "获取最新 Release 失败", "", "GitHub API 返回状态码 %d")
+	apiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	resp, err := c.getOK(apiCtx, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", c.Repo), "application/vnd.github+json", "获取最新 Release 失败", "", "GitHub API 返回状态码 %d")
 	if err != nil {
 		return githubRelease{}, err
 	}
 	defer resp.Body.Close()
 
 	var release githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	// 与其他读取路径（错误体 4KB、SHA256SUMS 1MB、下载 512MB）对齐：
+	// API 响应同样限长，截断会让 Decode 报错，fail-closed。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseJSONBytes)).Decode(&release); err != nil {
 		return githubRelease{}, fmt.Errorf("解析 Release 信息失败: %w", err)
 	}
 	return release, nil
 }
 
 func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) error {
+	// agent 自更新路径的外层 ctx 无 deadline（server 路径有 10 分钟）：
+	// 连接 stall 会让 io.Copy 无限期挂起并占死 remoteUpdateTracker，此处
+	// 统一加时间兜底（512MB @ ~0.3MB/s 慢链路）。
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
 	resp, err := c.getOK(ctx, downloadURL, "", "下载更新文件失败", "", "下载返回状态码 %d")
 	if err != nil {
 		return err
@@ -345,10 +384,17 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 	if written > maxDownloadBytes {
 		return fmt.Errorf("更新文件超过大小限制")
 	}
+	// 落盘后再 rename：掉电/崩溃不留截断的二进制。
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("同步更新文件失败: %w", err)
+	}
 	return nil
 }
 
 func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, downloadURL string) error {
+	// 校验文件是小请求：30s 足够，避免与二进制下载共用无超时客户端。
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	resp, err := c.getOK(ctx, checksumURL, "", "下载校验文件失败", "下载校验文件失败", "状态码 %d")
 	if err != nil {
 		return err
@@ -458,7 +504,22 @@ func replaceExecutable(targetPath, nextPath string) error {
 	if err := os.Rename(nextPath, targetPath); err != nil {
 		return fmt.Errorf("替换当前二进制失败: %w", err)
 	}
+	syncDirForUpdate(filepath.Dir(targetPath))
 	return nil
+}
+
+// syncDirForUpdate 对父目录做 fsync，确保 rename 的目录项在掉电后不回退。
+// Windows 不支持以文件语义打开目录，依赖 NTFS 元数据日志，跳过。
+func syncDirForUpdate(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = dirFile.Sync()
+	_ = dirFile.Close()
 }
 
 func copyExecutableBackup(src, dst string) error {
@@ -481,7 +542,16 @@ func copyExecutableBackup(src, dst string) error {
 		_ = os.Remove(dst)
 		return err
 	}
-	return backup.Close()
+	if err := backup.Sync(); err != nil {
+		backup.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := backup.Close(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 func resolveExecutablePath() (string, error) {
@@ -498,27 +568,14 @@ func resolveExecutablePath() (string, error) {
 
 func AssetName(kind Kind) string {
 	arch := runtime.GOARCH
-	switch arch {
-	case "arm":
+	if arch == "arm" {
 		arch = "armv7"
-	case "amd64", "arm64":
-	default:
-		arch = runtime.GOARCH
 	}
 	name := fmt.Sprintf("cyber-monitor-%s-%s-%s", kind, runtime.GOOS, arch)
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
 	return name
-}
-
-func CompareVersions(current, latest string) int {
-	currentVersion, currentOK := parseComparableVersion(current)
-	latestVersion, latestOK := parseComparableVersion(latest)
-	if !currentOK || !latestOK {
-		return 0
-	}
-	return compareComparableVersions(currentVersion, latestVersion)
 }
 
 func compareVersionParts(currentParts, latestParts [3]int) int {
@@ -620,10 +677,13 @@ func parseComparableVersion(value string) (comparableVersion, bool) {
 		return version, false
 	}
 	for idx := 0; idx < len(parts); idx++ {
-		if strings.TrimSpace(parts[idx]) == "" {
+		part := strings.TrimSpace(parts[idx])
+		// isDecimalIdentifier 同时拒绝空段、"+" 前缀（Atoi 接受 "+5"）
+		// 与非数字段，保证数字语义不被strconv的宽松解析绕过。
+		if !isDecimalIdentifier(part) {
 			return version, false
 		}
-		parsed, err := strconv.Atoi(parts[idx])
+		parsed, err := strconv.Atoi(part)
 		if err != nil || parsed < 0 {
 			return version, false
 		}
@@ -735,10 +795,7 @@ func isDecimalIdentifier(value string) bool {
 }
 
 func (c *Client) httpClient() *http.Client {
-	if c != nil && c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return &http.Client{Timeout: defaultHTTPTimeout}
+	return c.HTTPClient
 }
 
 func (c *Client) userAgent() string {

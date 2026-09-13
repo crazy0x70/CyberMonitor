@@ -21,6 +21,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Edit2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import type { SettingsView, TestCatalogItem } from "@/lib/admin-types";
 import { getErrorMessage } from "@/lib/admin-format";
 import {
@@ -267,7 +268,6 @@ export default function ProbeSettings({
   );
 
   const [drafts, setDrafts] = useState<TestCatalogItem[]>(normalizedCatalog);
-  const [sourceSignature, setSourceSignature] = useState(normalizedCatalogSignature);
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -278,45 +278,15 @@ export default function ProbeSettings({
   const draftSignature = useMemo(() => serializeCatalog(drafts), [drafts]);
   const isBusy = isSaving || saving;
 
-  useEffect(() => {
-    if (isBusy) {
-      return;
-    }
-    const currentDraftMatchesIncoming = draftSignature === normalizedCatalogSignature;
-    if (isDirty && currentDraftMatchesIncoming) {
-      setSourceSignature(normalizedCatalogSignature);
-      setIsDirty(false);
-      return;
-    }
-    if (normalizedCatalogSignature === sourceSignature) {
-      return;
-    }
-    if (isDirty) {
-      setSourceSignature(normalizedCatalogSignature);
-      toast.warning("服务端探测配置已更新，当前未保存修改已保留。");
-      return;
-    }
-    setDrafts(normalizedCatalog);
-    setSourceSignature(normalizedCatalogSignature);
-    setIsDirty(false);
-  }, [
+  const [, absorbSourceSignature] = useDraftReconcile({
     draftSignature,
+    nextSourceSignature: normalizedCatalogSignature,
     isBusy,
-    isDirty,
-    normalizedCatalog,
-    normalizedCatalogSignature,
-    sourceSignature,
-  ]);
-
-  useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
-
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+    resetDraft: () => setDrafts(normalizedCatalog),
+    warningText: "服务端探测配置已更新，当前未保存修改已保留。",
+    onCleaned: () => setIsDirty(false),
+  });
+  useDirtyNotification(onDirtyChange, isDirty);
 
   const openDialog = (item?: TestCatalogItem, index: number | null = null) => {
     if (isBusy) {
@@ -394,29 +364,28 @@ export default function ProbeSettings({
     toast.success("探测节点已移除");
   };
 
-  const handleSave = async () => {
+  const runAction = useAsyncAction();
+
+  const handleSave = () => {
     if (isBusy) {
       return;
     }
     const payload = normalizeCatalog(drafts);
-
-    setIsSaving(true);
-    try {
-      const savedSettings = await onSave(payload);
-      const canonicalCatalog = normalizeCatalog(savedSettings.test_catalog || payload);
-      const canonicalSignature = serializeCatalog(canonicalCatalog);
-      setDrafts(canonicalCatalog);
-      setSourceSignature(canonicalSignature);
-      setIsDirty(false);
-      toast.success("探测节点配置已保存");
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存探测节点配置失败"));
-    } finally {
-      setIsSaving(false);
-    }
+    void runAction({
+      action: () => onSave(payload),
+      fallbackError: "保存探测节点配置失败",
+      successToast: "探测节点配置已保存",
+      onSuccess: (savedSettings) => {
+        const canonicalCatalog = normalizeCatalog(savedSettings.test_catalog || payload);
+        setDrafts(canonicalCatalog);
+        absorbSourceSignature(serializeCatalog(canonicalCatalog));
+        setIsDirty(false);
+      },
+      setBusy: setIsSaving,
+    });
   };
 
-  const submitting = isBusy;
+  
 
   return (
     <div className={adminPageShellClass}>
@@ -440,9 +409,9 @@ export default function ProbeSettings({
           <Button
             className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
             onClick={handleSave}
-            disabled={!isDirty || submitting}
+            disabled={!isDirty || isBusy}
           >
-            {submitting ? "保存中…" : "保存更改"}
+            {isBusy ? "保存中…" : "保存更改"}
           </Button>
         </div>
       </div>

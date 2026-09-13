@@ -80,7 +80,26 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 采集/网络探测可能卡在不可中断的系统调用上，ctx 取消不被观察，
+	// 优雅退出链（含 updateWG 等待）无从进入：第二次信号直接强退
+	// （对齐 Windows 服务包装的放弃等待语义）。
+	forced := make(chan os.Signal, 2)
+	signal.Notify(forced, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(forced)
+	go func() {
+		signals := 0
+		for range forced {
+			signals++
+			if signals >= 2 {
+				log.Fatalf("再次收到退出信号，强制终止")
+			}
+		}
+	}()
 
+	parsedNetTests := agent.ParseNetTests(*netTestsRaw)
+	if strings.TrimSpace(*netTestsRaw) != "" && len(parsedNetTests) == 0 {
+		log.Fatalf("-net-tests 配置无效，未解析出任何测试项: %q", *netTestsRaw)
+	}
 	cfg := agent.Config{
 		ServerURL:               *serverURL,
 		Interval:                *interval,
@@ -91,7 +110,7 @@ func main() {
 		AgentToken:              *agentToken,
 		AgentVersion:            agentVersion,
 		HostRoot:                *hostRoot,
-		NetTests:                agent.ParseNetTests(*netTestsRaw),
+		NetTests:                parsedNetTests,
 		TestInterval:            *testInterval,
 		NetIfaces:               cmdutil.ParseCommaList(*netIface),
 		DisableUpdate:           *disableUpdate,

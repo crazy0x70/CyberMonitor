@@ -36,9 +36,8 @@ const maxPointsPerSeries = 1000
 // downsampleBucketMillis 计算某个 [mint, maxt] 查询窗口（Unix 毫秒）使用的
 // 聚合桶大小。返回 0 表示保留原始采样（短窗口走原有 raw 路径）。
 //
-// 目标：每序列最多输出 ~1000 个点。1 年窗口在 5s 采集间隔下约 630 万个
-// 原始样本/序列——不降采样就是内存炸弹与不可传输的 payload。向上取整
-// 保证桶数永远不超过 ~1000；桶再对齐到整秒（序列键以 Unix 秒存储，
+// 目标：每序列最多输出 ~1000 个点（公开历史窗口白名单上限 7d）。向上
+// 取整保证桶数永远不超过 ~1000；桶再对齐到整秒（序列键以 Unix 秒存储，
 // 桶起点需满足 ts - ts%bucketSeconds 的对齐语义）。
 func downsampleBucketMillis(mint, maxt int64) int64 {
 	windowMillis := maxt - mint
@@ -178,7 +177,9 @@ func buildNetworkSeriesKey(identity networkTestIdentity) string {
 	return key
 }
 
-func parseNetworkSeriesKey(key string) (networkTestIdentity, error) {
+// ParseNetworkSeriesKey 解析序列键（type|host|port|name），供包外消费者
+// （AI 趋势摘要）复用，避免同一格式出现两套解析器。
+func ParseNetworkSeriesKey(key string) (networkTestIdentity, error) {
 	parts := strings.Split(key, "|")
 	if len(parts) != 4 {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
@@ -210,6 +211,12 @@ func normalizeNetworkSeriesKey(identity networkTestIdentity) (networkTestIdentit
 	return identity, fmt.Sprintf("%s|%s|%d|%s", identity.Type, identity.Host, identity.Port, identity.Name)
 }
 
+// maxSeriesPerQuery 单次查询物化的序列数上限：series 身份由 agent 上报
+// 的 host/name 构成，基数在服务端无硬上限，公开免鉴权的历史查询一旦命中
+// 失控基数，序列数 × 3 指标 × ≤1000 桶的物化既是内存敞口也是响应体炸弹。
+// 超限序列丢弃不进结果。
+const maxSeriesPerQuery = 500
+
 func ensureSeriesAccumulator(
 	result map[string]*seriesAccumulator,
 	identity networkTestIdentity,
@@ -222,6 +229,9 @@ func ensureSeriesAccumulator(
 	existing := result[key]
 	if existing != nil {
 		return existing
+	}
+	if len(result) >= maxSeriesPerQuery {
+		return nil
 	}
 	entry := &seriesAccumulator{
 		identity:     identity,

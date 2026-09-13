@@ -25,8 +25,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Bot, CheckCircle2, FileText, HelpCircle, Layers3, Loader2, Plus, Trash2, XCircle } from "lucide-react";
-import { toast } from "sonner";
-import { getErrorMessage } from "@/lib/admin-format";
+import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import {
   adminActionButtonClass,
   adminDangerOutlineButtonClass,
@@ -70,10 +69,12 @@ type ProviderDraft = {
   model: string;
   models: string[];
   status: ProviderStatus;
+  keyConfigured: boolean;
 };
 
 function resolveStatus(config: AIProviderConfig | undefined) {
-  if (!config?.api_key) return "unconfigured" as const;
+  // api_key 已脱敏恒空，凭据事实看 api_key_set。
+  if (!config?.api_key_set) return "unconfigured" as const;
   return "unverified" as const;
 }
 
@@ -97,6 +98,7 @@ function makeProviderDrafts(settings: SettingsView | null): ProviderDraft[] {
       model: ai.openai?.model || "",
       models: [],
       status: resolveStatus(ai.openai),
+      keyConfigured: Boolean(ai.openai?.api_key_set),
     },
   ];
 
@@ -110,6 +112,7 @@ function makeProviderDrafts(settings: SettingsView | null): ProviderDraft[] {
       model: item.model || "",
       models: [],
       status: resolveStatus(item),
+        keyConfigured: Boolean(item.api_key_set),
     });
   });
 
@@ -216,48 +219,26 @@ export default function AIProvider({
   const [fetchingModelsId, setFetchingModelsId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const isBusy = isSaving || externalSaving || testingId !== null || fetchingModelsId !== null;
-  const [sourceSignature, setSourceSignature] = useState(() => aiSettingsSourceSignature(settings));
+
   const currentDraftSignature = useMemo(
     () => aiSettingsDraftSignature({ providers, commandProvider, prompt }),
     [commandProvider, prompt, providers],
   );
 
-  useEffect(() => {
-    if (isBusy) {
-      return;
-    }
-    const nextSourceSignature = aiSettingsSourceSignature(settings);
-    const currentDraftMatchesIncoming = currentDraftSignature === nextSourceSignature;
-    if (isDirty && currentDraftMatchesIncoming) {
-      setSourceSignature(nextSourceSignature);
-      setIsDirty(false);
-      return;
-    }
-    if (nextSourceSignature === sourceSignature) {
-      return;
-    }
-    if (isDirty) {
-      setSourceSignature(nextSourceSignature);
-      toast.warning("服务端 AI 配置已更新，当前未保存修改已保留。");
-      return;
-    }
-    const draft = makeAISettingsDraft(settings);
-    setProviders(draft.providers);
-    setCommandProvider(draft.commandProvider);
-    setPrompt(draft.prompt);
-    setSourceSignature(nextSourceSignature);
-    setIsDirty(false);
-  }, [currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
-
-  useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
-
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+  const [, absorbSourceSignature] = useDraftReconcile({
+    draftSignature: currentDraftSignature,
+    nextSourceSignature: aiSettingsSourceSignature(settings),
+    isBusy,
+    resetDraft: () => {
+      const draft = makeAISettingsDraft(settings);
+      setProviders(draft.providers);
+      setCommandProvider(draft.commandProvider);
+      setPrompt(draft.prompt);
+    },
+    warningText: "服务端 AI 配置已更新，当前未保存修改已保留。",
+    onCleaned: () => setIsDirty(false),
+  });
+  useDirtyNotification(onDirtyChange, isDirty);
 
   const providerOptions = useMemo(() => {
     return providers.map((item) => ({
@@ -274,8 +255,9 @@ export default function AIProvider({
     }
     const nextCommand = resolveProviderSelection(providerOptions, commandProvider);
     if (nextCommand !== commandProvider) {
+      // reconcile 类 effect 只修正选中项，不产生新的 dirty——
+      // 否则服务端规范化 compatible id 后用户刚保存就被标记未保存。
       setCommandProvider(nextCommand);
-      setIsDirty(true);
     }
   }, [commandProvider, isBusy, providerOptions]);
 
@@ -349,6 +331,7 @@ export default function AIProvider({
           baseURL: "",
           model: "",
           models: [],
+          keyConfigured: false,
           status: "unconfigured",
         },
       ],
@@ -361,89 +344,88 @@ export default function AIProvider({
       return;
     }
     const removingSelectedProvider = commandProvider === `openai_compatible:${id}`;
-    setProviderDrafts((current) => {
-      const next = current.filter((item) => item.id !== id);
-      if (removingSelectedProvider) {
-        setCommandProvider(resolveProviderSelection(next.map((item) => ({ value: toProviderValue(item) })), ""));
-      }
-      return next;
-    }, true);
-  };
-
-  const handleTest = async (item: ProviderDraft) => {
-    if (isBusy) {
-      return;
-    }
-    setTestingId(item.id);
-    try {
-      await onTestProvider(toProviderRequestKey(item), toConfig(item));
-      updateProviderDraft(item.id, (current) => ({ ...current, status: "verified" }));
-      toast.success(`${item.name} 验证成功`);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "验证失败"));
-    } finally {
-      setTestingId(null);
-    }
-  };
-
-  const handleFetchModels = async (item: ProviderDraft) => {
-    if (isBusy) {
-      return;
-    }
-    setFetchingModelsId(item.id);
-    try {
-      const models = await onFetchModels(toProviderRequestKey(item), toConfig(item));
-      const shouldFillModel = models.length > 0 && !item.model;
-      updateProviderDraft(
-        item.id,
-        (current) => ({
-          ...current,
-          models,
-          model: shouldFillModel ? models[0] : current.model,
-        }),
-        shouldFillModel,
+    // setter updater 必须保持纯函数（StrictMode 下会执行两次）：
+    // 先基于当前 state 计算新值，再分别调用两个 setter。
+    const nextDrafts = providers.filter((item) => item.id !== id);
+    if (removingSelectedProvider) {
+      setCommandProvider(
+        resolveProviderSelection(nextDrafts.map((item) => ({ value: toProviderValue(item) })), ""),
       );
-      toast.success(`${item.name} 模型列表已刷新`);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "获取模型列表失败"));
-    } finally {
-      setFetchingModelsId(null);
     }
+    setProviderDrafts(() => nextDrafts, true);
   };
 
-  const handleSave = async () => {
+  const runAction = useAsyncAction();
+
+  const handleTest = (item: ProviderDraft) => {
+    if (isBusy) {
+      return;
+    }
+    void runAction({
+      action: () => onTestProvider(toProviderRequestKey(item), toConfig(item)),
+      fallbackError: "验证失败",
+      successToast: `${item.name} 验证成功`,
+      onSuccess: () => updateProviderDraft(item.id, (current) => ({ ...current, status: "verified" })),
+      setBusy: (on) => setTestingId(on ? item.id : null),
+    });
+  };
+
+  const handleFetchModels = (item: ProviderDraft) => {
+    if (isBusy) {
+      return;
+    }
+    void runAction({
+      action: () => onFetchModels(toProviderRequestKey(item), toConfig(item)),
+      fallbackError: "获取模型列表失败",
+      successToast: `${item.name} 模型列表已刷新`,
+      onSuccess: (models) => {
+        const shouldFillModel = models.length > 0 && !item.model;
+        updateProviderDraft(
+          item.id,
+          (current) => ({
+            ...current,
+            models,
+            model: shouldFillModel ? models[0] : current.model,
+          }),
+          shouldFillModel,
+        );
+      },
+      setBusy: (on) => setFetchingModelsId(on ? item.id : null),
+    });
+  };
+
+  const handleSave = () => {
     if (isBusy) {
       return;
     }
     const openai = providers.find((item) => item.provider === "openai");
     const compatibles = providers.filter((item) => item.provider === "openai_compatible");
-
-    setIsSaving(true);
-    try {
-      const savedSettings = await onSave({
-        ai_settings: {
-          command_provider: commandProvider,
-          prompt,
-          openai: openai ? toConfig(openai) : {},
-          openai_compatibles: compatibles.map((item) => ({
-            id: item.id,
-            name: item.name.trim(),
-            ...toConfig(item),
-          })),
-        },
-      });
-      const canonicalDraft = makeAISettingsDraft(savedSettings);
-      setProviders(canonicalDraft.providers);
-      setCommandProvider(canonicalDraft.commandProvider);
-      setPrompt(canonicalDraft.prompt);
-      setSourceSignature(aiSettingsDraftSignature(canonicalDraft));
-      toast.success("AI 服务商配置已保存");
-      setIsDirty(false);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存 AI 配置失败"));
-    } finally {
-      setIsSaving(false);
-    }
+    void runAction({
+      action: () =>
+        onSave({
+          ai_settings: {
+            command_provider: commandProvider,
+            prompt,
+            openai: openai ? toConfig(openai) : {},
+            openai_compatibles: compatibles.map((item) => ({
+              id: item.id,
+              name: item.name.trim(),
+              ...toConfig(item),
+            })),
+          },
+        }),
+      fallbackError: "保存 AI 配置失败",
+      successToast: "AI 服务商配置已保存",
+      onSuccess: (savedSettings) => {
+        const canonicalDraft = makeAISettingsDraft(savedSettings);
+        setProviders(canonicalDraft.providers);
+        setCommandProvider(canonicalDraft.commandProvider);
+        setPrompt(canonicalDraft.prompt);
+        absorbSourceSignature(aiSettingsDraftSignature(canonicalDraft));
+        setIsDirty(false);
+      },
+      setBusy: setIsSaving,
+    });
   };
 
   return (
@@ -588,6 +570,7 @@ export default function AIProvider({
                         value={item.apiKey}
                         disabled={isBusy}
                         onChange={(event) => updateProviderInput(item.id, "apiKey", event.target.value)}
+                        placeholder={item.keyConfigured ? "已配置（留空保持不变）" : "sk-…"}
                       />
                     </div>
                     <div className="grid gap-2">

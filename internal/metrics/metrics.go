@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -18,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -158,6 +160,7 @@ const (
 	hostHostnameRefreshInterval  = 60 * time.Second
 	hostProcsRefreshInterval     = 30 * time.Second
 	hostMountsRefreshInterval    = 10 * time.Second
+	partitionsRefreshInterval    = 10 * time.Second
 
 	publicIPv4Family publicIPFamily = "ipv4"
 	publicIPv6Family publicIPFamily = "ipv6"
@@ -222,16 +225,32 @@ type Collector struct {
 	gpuSample            []GPUInfo
 	gpuSampleStatic      bool
 	gpuSampleAt          time.Time
+	gpuSampleOK          bool
 	bootTime             uint64
 	bootTimeOK           bool
 	hostProcs            int
 	hostHostnameFallback string
 	hostIdentityAt       time.Time
 	sourceWarningsShown  map[string]struct{}
+	sourceWarningsMu     sync.Mutex
+
+	// partitionsCache 缓存原生部署的挂载表（容器路径已有 hostMounts 缓存），
+	// 避免每个 tick 重新解析整张表。仅被 Collect 单线程访问。
+	partitionsCache    []disk.PartitionStat
+	partitionsCachedAt time.Time
 
 	publicIPs               publicIPInfo
 	publicIPRefreshInterval time.Duration
 	publicIPLookup          publicIPLookupFunc
+	publicIPsMu             sync.Mutex
+	publicIPRefreshRunning  bool
+
+	// 永不过期的设备/挂载点属性缓存：分区标记、设备容量、挂载点类型
+	// 在运行期视为不变（新增设备按 miss 现场查询后入缓存），避免每秒
+	// 采集 tick 对同一批路径重复 syscall。仅被 Collect 单线程访问。
+	blockPartitionAttr map[string]bool
+	blockDeviceTotal   map[string]uint64
+	mountpointIsDir    map[string]bool
 
 	staticInfo                collectorStaticInfo
 	staticInfoInitialized     bool
@@ -255,7 +274,7 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 	if hostRoot != "" && !isDir(filepath.Join(hostRoot, "proc")) && !isDir(filepath.Join(hostRoot, "sys")) {
 		hostRoot = ""
 	}
-	return &Collector{
+	collector := &Collector{
 		nodeID:                    nodeID,
 		nodeName:                  nodeName,
 		hostRoot:                  hostRoot,
@@ -263,10 +282,17 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		publicIPRefreshInterval:   defaultPublicIPRefreshInterval,
 		publicIPLookup:            newPublicIPLookup(defaultPublicIPLookupTimeout),
 		staticInfoRefreshInterval: defaultStaticInfoRefreshInterval,
+		blockPartitionAttr:        make(map[string]bool),
+		blockDeviceTotal:          make(map[string]uint64),
+		mountpointIsDir:           make(map[string]bool),
 	}
+	// gopsutil 的 cpu.Percent 首次调用因无基线样本返回错误，预热一次建立
+	// 基线，避免启动后第一个 tick CPU=0 且误报采集失败。
+	_, _ = cpu.Percent(0, false)
+	return collector
 }
 
-func (c *Collector) Collect() (NodeStats, error) {
+func (c *Collector) Collect() NodeStats {
 	now := time.Now()
 
 	cpuPercents, err := cpu.Percent(0, false)
@@ -279,15 +305,30 @@ func (c *Collector) Collect() (NodeStats, error) {
 	loadAvg, err := load.Avg()
 	c.warnOnce("load.Avg", err)
 	memStat := c.collectMemoryStat()
-	partitions, err := disk.Partitions(false)
-	c.warnOnce("disk.Partitions", err)
+	// 容器模式（hostRoot）下 collectDiskUsage 走 host 挂载缓存/host-root
+	// statfs，disk.Partitions 的结果只有 30 分钟一次的静态信息刷新消费——
+	// 到期时由 refreshStaticInfoAt 自行获取，避免每个 tick 解析整张挂载表。
+	// 原生路径同样做短 TTL 缓存，与容器路径口径一致。
+	var partitions []disk.PartitionStat
+	if strings.TrimSpace(c.hostRoot) == "" {
+		if c.partitionsCachedAt.IsZero() || now.Sub(c.partitionsCachedAt) >= partitionsRefreshInterval {
+			if list, err := disk.Partitions(false); err == nil {
+				c.partitionsCache = list
+				c.partitionsCachedAt = now
+			} else {
+				// 失败保留 last-good 且不推进时间戳，下个 tick 重试。
+				c.warnOnce("disk.Partitions", err)
+			}
+		}
+		partitions = c.partitionsCache
+	}
 	staticInfoRefreshed := c.refreshStaticInfoAt(now, partitions)
 
 	diskUsage := c.collectDiskUsage(now, partitions)
 
 	diskCounters, err := disk.IOCounters()
 	c.warnOnce("disk.IOCounters", err)
-	diskRead, diskWrite := sumDiskIOBytes(diskCounters, c.hostRoot)
+	diskRead, diskWrite := sumDiskIOBytesWithCache(diskCounters, c.hostRoot, c.blockPartitionAttr)
 
 	netFilter := c.resolveNetFilterAt(now)
 	netCounters, err := gnet.IOCounters(true)
@@ -300,9 +341,9 @@ func (c *Collector) Collect() (NodeStats, error) {
 	}
 	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
 
-	netSpeedMbps := c.collectNetSpeedMbpsAt(now, netFilter)
-	publicIPs := c.collectPublicIPsAt(now)
-	gpuStats := c.collectGPUStatsAt(now, staticInfoRefreshed, runNVIDIAGPUSample)
+	netSpeedMbps := c.collectNetSpeedMbpsAt(now, netFilter, netCounters)
+	publicIPs := c.currentPublicIPs(now)
+	gpuStats, gpuSampled := c.collectGPUStatsAt(now, staticInfoRefreshed, runNVIDIAGPUSample)
 	loadStat := valueOrZero(loadAvg)
 	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
@@ -341,7 +382,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 		TCPConns:     tcpConns,
 		UDPConns:     udpConns,
 		GPU:          gpuStats,
-		GPUCollected: true,
+		GPUCollected: gpuSampled,
 	}
 	stats.OS = c.staticInfo.OS
 	stats.Arch = c.staticInfo.Arch
@@ -369,7 +410,7 @@ func (c *Collector) Collect() (NodeStats, error) {
 	c.prevDisk = &disk.IOCountersStat{ReadBytes: diskRead, WriteBytes: diskWrite}
 	SanitizeNodeStats(&stats)
 
-	return stats, nil
+	return stats
 }
 
 // SanitizeNodeStats removes non-finite floating-point values before stats are
@@ -460,6 +501,11 @@ func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.Partiti
 	if c.staticInfoInitialized && now.Sub(c.staticInfoUpdatedAt) < interval {
 		return false
 	}
+	if partitions == nil {
+		var err error
+		partitions, err = disk.Partitions(false)
+		c.warnOnce("disk.Partitions", err)
+	}
 	next := collectorStaticInfo{
 		Arch:     detectArch(),
 		DiskType: detectDiskType(partitions, c.hostRoot),
@@ -511,12 +557,15 @@ func (c *Collector) sampleConnectionCountsAt(
 
 // warnOnce logs the first error seen from a metrics source so a broken input
 // (e.g. a wrong HOST_PROC) surfaces in logs instead of silently producing
-// all-zero telemetry. The Collector runs on a single goroutine, so no locking
-// is needed.
+// all-zero telemetry. Called from the sampler goroutine and the public-IP
+// lookup goroutines concurrently — sourceWarningsMu is mandatory（Go map
+// 并发写会直接 fatal）.
 func (c *Collector) warnOnce(source string, err error) {
 	if err == nil {
 		return
 	}
+	c.sourceWarningsMu.Lock()
+	defer c.sourceWarningsMu.Unlock()
 	if c.sourceWarningsShown == nil {
 		c.sourceWarningsShown = make(map[string]struct{})
 	}
@@ -541,7 +590,7 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 	// 过滤器必须与计数器同源：容器部署时 IOCounters 读宿主机 /proc/net/dev，
 	// 而 Interfaces() 只见容器自身网络命名空间，混用会把宿主机网卡全部过滤掉。
 	if counters, err := gnet.IOCounters(true); err == nil {
-		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName)
+		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName, c.isAggregatingMaster)
 		c.resolvedNetFilterAt = now
 	}
 	return c.resolvedNetFilter
@@ -549,11 +598,11 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 
 // collectNetSpeedMbpsAt caches the sampled link speed, which re-reads sysfs
 // per interface and changes at most when the interface set does.
-func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struct{}) float64 {
+func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struct{}, netCounters []gnet.IOCountersStat) float64 {
 	if !c.netSpeedSampledAt.IsZero() && now.Sub(c.netSpeedSampledAt) < netSpeedRefreshInterval {
 		return c.netSpeedMbps
 	}
-	c.netSpeedMbps = collectNetSpeedMbps(c.hostRoot, filter)
+	c.netSpeedMbps = collectNetSpeedMbps(c.hostRoot, filter, netCounters)
 	c.netSpeedSampledAt = now
 	return c.netSpeedMbps
 }
@@ -567,7 +616,12 @@ func (c *Collector) readHostHostnameAt(now time.Time) string {
 	return c.hostHostname
 }
 
-func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
+// currentPublicIPs 返回缓存的公网 IP；到期时触发后台刷新并立即返回旧值。
+// 查询（最长 2s，离线端点串行重试）不再阻塞 Collect 热路径——原先内联
+// 同步等待会让 agent 单循环在每轮重试间隔掉 1-2 个上报 tick。
+func (c *Collector) currentPublicIPs(now time.Time) publicIPInfo {
+	c.publicIPsMu.Lock()
+	defer c.publicIPsMu.Unlock()
 	refreshInterval := c.publicIPRefreshInterval
 	if refreshInterval <= 0 {
 		refreshInterval = defaultPublicIPRefreshInterval
@@ -583,11 +637,24 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 		c.publicIPs.checkedAt = now
 		return c.publicIPs
 	}
+	if c.publicIPRefreshRunning {
+		return c.publicIPs
+	}
+	c.publicIPRefreshRunning = true
+	go c.refreshPublicIPs()
+	return c.publicIPs
+}
 
-	next := c.publicIPs
-	next.checkedAt = now
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultPublicIPLookupTimeout)
+func (c *Collector) refreshPublicIPs() {
+	defer func() {
+		c.publicIPsMu.Lock()
+		c.publicIPRefreshRunning = false
+		c.publicIPsMu.Unlock()
+	}()
+	// 总预算 = 单端点超时 × 单 family 最多端点数：若用单端点超时作为总预算，
+	// 首个被防火墙 DROP 的端点会耗尽全部预算，后续端点随父 ctx 过期立即取消，
+	// 公网 IP 将永远解析失败。
+	ctx, cancel := context.WithTimeout(context.Background(), publicIPLookupTotalBudget(defaultPublicIPLookupTimeout))
 	defer cancel()
 	type lookupResult struct {
 		family publicIPFamily
@@ -595,11 +662,13 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 	}
 
 	familiesToCheck := []publicIPFamily{publicIPv4Family, publicIPv6Family}
-
 	results := make(chan lookupResult, len(familiesToCheck))
 	for _, family := range familiesToCheck {
 		go func(family publicIPFamily) {
 			normalized, err := c.lookupPublicIPAt(ctx, family)
+			if err != nil {
+				c.warnOnce("publicIP."+string(family), err)
+			}
 			if err != nil || normalized == "" {
 				results <- lookupResult{family: family}
 				return
@@ -608,21 +677,26 @@ func (c *Collector) collectPublicIPsAt(now time.Time) publicIPInfo {
 		}(family)
 	}
 
+	next := publicIPInfo{checkedAt: time.Now()}
 	for range len(familiesToCheck) {
 		result := <-results
 		switch result.family {
 		case publicIPv4Family:
-			if result.ip != "" {
-				next.IPv4 = result.ip
-			}
+			next.IPv4 = result.ip
 		case publicIPv6Family:
-			if result.ip != "" {
-				next.IPv6 = result.ip
-			}
+			next.IPv6 = result.ip
 		}
 	}
+	c.publicIPsMu.Lock()
+	defer c.publicIPsMu.Unlock()
+	// 保留旧值中非空的结果：本轮查询失败（空串）不清掉已知的 IP。
+	if next.IPv4 == "" {
+		next.IPv4 = c.publicIPs.IPv4
+	}
+	if next.IPv6 == "" {
+		next.IPv6 = c.publicIPs.IPv6
+	}
 	c.publicIPs = next
-	return c.publicIPs
 }
 
 func (c *Collector) lookupPublicIPAt(ctx context.Context, family publicIPFamily) (string, error) {
@@ -669,6 +743,15 @@ func defaultPublicIPEndpointsForFamily(family publicIPFamily) []string {
 	}
 }
 
+// publicIPLookupTotalBudget 是一次公网 IP 刷新的总预算上界（family 间并发）。
+func publicIPLookupTotalBudget(perEndpoint time.Duration) time.Duration {
+	maxEndpoints := len(defaultPublicIPv4Endpoints)
+	if n := len(defaultPublicIPv6Endpoints); n > maxEndpoints {
+		maxEndpoints = n
+	}
+	return perEndpoint * time.Duration(maxEndpoints)
+}
+
 func lookupPublicIPAddress(
 	ctx context.Context,
 	family publicIPFamily,
@@ -707,6 +790,7 @@ func lookupPublicIPAddress(
 		baseCtx = context.Background()
 	}
 
+	var lastErr error
 	for _, endpoint := range endpoints {
 		reqCtx, cancel := context.WithTimeout(baseCtx, timeout)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
@@ -718,20 +802,27 @@ func lookupPublicIPAddress(
 
 		resp, err := client.Do(req)
 		if err != nil {
+			lastErr = err
 			cancel()
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
 		resp.Body.Close()
 		cancel()
-		if err != nil || resp.StatusCode >= http.StatusMultipleChoices {
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= http.StatusMultipleChoices {
+			lastErr = fmt.Errorf("endpoint %s: HTTP %d", endpoint, resp.StatusCode)
 			continue
 		}
 		if normalized := extractPublicIPAddress(family, string(body)); normalized != "" {
 			return normalized, nil
 		}
+		lastErr = fmt.Errorf("endpoint %s: 响应无法解析为公网 IP", endpoint)
 	}
-	return "", nil
+	return "", lastErr
 }
 
 func extractPublicIPAddress(family publicIPFamily, raw string) string {
@@ -773,10 +864,11 @@ func normalizePublicIPAddress(family publicIPFamily, raw string) string {
 }
 
 func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {
-	if hostStat, ok := readHostVirtualMemory(c.hostRoot); ok {
-		return hostStat
-	}
-	memStat, _ := mem.VirtualMemory()
+	// 容器部署下 agent 已设置 HOST_PROC 指向 /host/proc，
+	// mem.VirtualMemory 读到的就是宿主 meminfo（Used = Total - Available
+	// 语义与原手写解析一致），无需重复实现。
+	memStat, err := mem.VirtualMemory()
+	c.warnOnce("mem.VirtualMemory", err)
 	return memStat
 }
 
@@ -822,13 +914,25 @@ func shouldCollectInterface(name string, filter map[string]struct{}) bool {
 func buildDefaultInterfaceFilter(
 	stats []gnet.IOCountersStat,
 	readMaster func(string) string,
+	isAggregatingMaster func(string) bool,
 ) map[string]struct{} {
 	if len(stats) == 0 {
 		return nil
 	}
+	// 计数器中出现过的接口名集合：master 关系的剔除依据。
+	// 仅当 master 是"流量聚合型"设备（Linux bridge / bonding）时才剔除
+	// 成员口——bridge/bond 的计数器包含成员口的同一份报文，双计会按
+	// 成员数成倍虚高。VRF/OVS 等非聚合 master 不在此列：成员口的真实
+	// 流量不经 master 设备计数，剔除成员口会让流量塌缩为 ~0。
+	known := make(map[string]struct{}, len(stats))
+	for _, stat := range stats {
+		if name := normalizeInterfaceName(stat.Name); name != "" {
+			known[name] = struct{}{}
+		}
+	}
 	resolved := make(map[string]struct{}, len(stats))
 	for _, stat := range stats {
-		if shouldIgnoreDefaultInterface(stat.Name, readMaster) {
+		if shouldIgnoreDefaultInterface(stat.Name, readMaster, isAggregatingMaster, known) {
 			continue
 		}
 		name := normalizeInterfaceName(stat.Name)
@@ -846,6 +950,8 @@ func buildDefaultInterfaceFilter(
 func shouldIgnoreDefaultInterface(
 	name string,
 	readMaster func(string) string,
+	isAggregatingMaster func(string) bool,
+	knownInterfaces map[string]struct{},
 ) bool {
 	normalized := normalizeInterfaceName(name)
 	if normalized == "" {
@@ -854,8 +960,25 @@ func shouldIgnoreDefaultInterface(
 	if isVirtualInterface(normalized) {
 		return true
 	}
-	if readMaster != nil {
-		if master := normalizeInterfaceName(readMaster(name)); isDockerBridgeMaster(master) {
+	if readMaster != nil && len(knownInterfaces) > 0 {
+		master := normalizeInterfaceName(readMaster(name))
+		if _, inCounters := knownInterfaces[master]; inCounters && isAggregatingMaster(master) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAggregatingMaster 判断 master 设备是否把成员口流量计入自身计数器：
+// Linux bridge 有 /sys/class/net/<dev>/bridge/，bonding 有 .../bonding/。
+// team（libteam）不暴露这两个标记目录，team 成员口维持双计的既有行为。
+func (c *Collector) isAggregatingMaster(master string) bool {
+	if runtime.GOOS != "linux" || master == "" {
+		return false
+	}
+	base := hostSysPath(c.hostRoot, "class", "net", canonicalInterfaceName(master))
+	for _, marker := range []string{"bridge", "bonding"} {
+		if info, err := os.Stat(filepath.Join(base, marker)); err == nil && info.IsDir() {
 			return true
 		}
 	}
@@ -867,6 +990,7 @@ func isVirtualInterface(name string) bool {
 	virtualPrefixes := []string{
 		"lo", "loopback", "docker", "veth", "br-", "virbr", "vmnet", "utun",
 		"tun", "tap", "wg", "tailscale", "zt", "vboxnet", "ham", "bridge",
+		"awdl", "llw",
 	}
 	for _, prefix := range virtualPrefixes {
 		if strings.HasPrefix(lower, prefix) {
@@ -886,11 +1010,6 @@ func canonicalInterfaceName(name string) string {
 		return trimmed[:idx]
 	}
 	return trimmed
-}
-
-func isDockerBridgeMaster(name string) bool {
-	lower := normalizeInterfaceName(name)
-	return lower == "docker0" || strings.HasPrefix(lower, "br-")
 }
 
 // hostSysPath resolves a path under /sys, honouring -host-root in container
@@ -920,16 +1039,12 @@ func (c *Collector) readInterfaceMasterName(name string) string {
 	return filepath.Base(target)
 }
 
-func collectNetSpeedMbps(hostRoot string, filter map[string]struct{}) float64 {
+func collectNetSpeedMbps(hostRoot string, filter map[string]struct{}, netCounters []gnet.IOCountersStat) float64 {
 	if runtime.GOOS != "linux" {
 		return 0
 	}
-	counters, err := gnet.IOCounters(true)
-	if err != nil {
-		return 0
-	}
 	maxSpeed := 0.0
-	for _, stat := range counters {
+	for _, stat := range netCounters {
 		if !shouldCollectInterface(stat.Name, filter) {
 			continue
 		}
@@ -957,12 +1072,6 @@ func parseSpeedMbps(raw string) float64 {
 		return 0
 	}
 	lower := strings.ToLower(value)
-	multiplier := 1.0
-	if strings.Contains(lower, "gb") {
-		multiplier = 1000
-	} else if strings.Contains(lower, "kb") {
-		multiplier = 0.001
-	}
 	var builder strings.Builder
 	for _, ch := range lower {
 		if (ch >= '0' && ch <= '9') || ch == '.' {
@@ -977,17 +1086,17 @@ func parseSpeedMbps(raw string) float64 {
 	if err != nil || parsed <= 0 {
 		return 0
 	}
-	return parsed * multiplier
+	return parsed
 }
 
 // sumDiskIOBytes aggregates counters across whole disks only. /proc/diskstats
 // lists every device together with its partitions carrying identical counters,
 // so summing all rows would inflate the totals (loop/ram/zram mirror their
 // backing device or RAM, not a physical disk).
-func sumDiskIOBytes(counters map[string]disk.IOCountersStat, hostRoot string) (uint64, uint64) {
+func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot string, partitionAttr map[string]bool) (uint64, uint64) {
 	var read, write uint64
 	for name, stat := range counters {
-		if isVirtualBlockDevice(name, hostRoot) {
+		if isVirtualBlockDevice(name, hostRoot, partitionAttr) {
 			continue
 		}
 		if isPartitionOfCountedDisk(name, counters) {
@@ -1020,7 +1129,7 @@ func isPartitionOfCountedDisk(name string, counters map[string]disk.IOCountersSt
 	return exists
 }
 
-func isVirtualBlockDevice(name, hostRoot string) bool {
+func isVirtualBlockDevice(name, hostRoot string, partitionAttr map[string]bool) bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
@@ -1030,8 +1139,14 @@ func isVirtualBlockDevice(name, hostRoot string) bool {
 	}
 	// A "partition" attribute under /sys/class/block marks the entry as a
 	// partition of a parent disk whose counters are already counted.
+	// 属性永不变：按设备名缓存，避免每个采集 tick 重复 stat。
+	if isPartition, ok := partitionAttr[normalized]; ok {
+		return isPartition
+	}
 	_, err := os.Stat(hostSysPath(hostRoot, "class", "block", normalized, "partition"))
-	return err == nil
+	isPartition := err == nil
+	partitionAttr[normalized] = isPartition
+	return isPartition
 }
 
 func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionStat) []DiskPartition {
@@ -1064,7 +1179,7 @@ func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionS
 			StatPath:   p.Mountpoint,
 		})
 	}
-	return collectPartitionUsage(candidates)
+	return collectPartitionUsageCached(candidates, c.mountpointIsDir, c.blockDeviceTotal)
 }
 
 type filesystemUsage struct {
@@ -1108,7 +1223,7 @@ func (c *Collector) collectHostDiskUsage(now time.Time) []DiskPartition {
 			StatPath:   resolveHostMountPath(hostRoot, mount.Mountpoint),
 		})
 	}
-	return collectPartitionUsage(candidates)
+	return collectPartitionUsageCached(candidates, c.mountpointIsDir, c.blockDeviceTotal)
 }
 
 // readHostMountsAt caches the parsed host mount list. Mounts can appear while
@@ -1144,14 +1259,16 @@ func apfsContainerDevice(fstype, device string) string {
 	return device
 }
 
-// collectPartitionUsage converts mounts into disk usage entries. It filters
+// collectPartitionUsageCached converts mounts into disk usage entries. It filters
 // virtual and network filesystems, dedupes repeated mountpoints and devices
 // (the same block device mounted at several mountpoints, e.g. btrfs
 // subvolumes or bind mounts, is only counted once; APFS volumes of one
 // container dedupe to the container, preferring the root mountpoint),
 // samples filesystem usage, and overrides the statfs total with the backing
 // block device capacity when sysfs reports one.
-func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
+// collectPartitionUsageCached 接收挂载点类型与设备容量缓存（nil 时退化为
+// 每次现场查询，语义不变）。
+func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache map[string]bool, blockTotalCache map[string]uint64) []DiskPartition {
 	seenMountpoints := make(map[string]struct{})
 	seenDevices := make(map[string]struct{})
 	apfsEntryIndex := make(map[string]int)
@@ -1165,7 +1282,7 @@ func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
 			Device:     device,
 			Mountpoint: candidate.Mountpoint,
 			Fstype:     candidate.Fstype,
-		}) {
+		}, mountpointDirCache) {
 			continue
 		}
 		if _, exists := seenMountpoints[candidate.Mountpoint]; exists {
@@ -1199,7 +1316,7 @@ func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
 		if candidate.Fstype != "" {
 			usageStat.Fstype = candidate.Fstype
 		}
-		total := resolvePartitionTotal(device, usageStat.Total)
+		total := resolvePartitionTotalCached(device, usageStat.Total, blockTotalCache)
 		if usageStat.Used > total {
 			// The device capacity cannot explain the statfs numbers;
 			// keep the filesystem-reported total instead.
@@ -1228,7 +1345,7 @@ func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
 	return diskUsage
 }
 
-// resolvePartitionTotal returns the total capacity for a mount's backing
+// resolvePartitionTotalCached returns the total capacity for a mount's backing
 // device. The statfs total (f_blocks * bsize) excludes filesystem metadata,
 // so a 40 GiB provisioned disk only reports ~39 GiB usable; sysfs exposes
 // the real device capacity and is preferred whenever available. statTotal is
@@ -1236,7 +1353,10 @@ func collectPartitionUsage(candidates []mountCandidate) []DiskPartition {
 // the expected behaviour outside Linux, where /sys/class/block does not
 // exist. When the collector runs in a container with a host root, sysfs
 // still exposes the host kernel's block devices, so the lookup stays valid.
-func resolvePartitionTotal(device string, statTotal uint64) uint64 {
+// resolvePartitionTotalCached 缓存设备容量（块设备容量运行期不变）：
+// sysfs size 读取与 /dev/mapper 符号链接解析不再每秒对每分区重复执行。
+// 三种结果（sysfs 命中 / 符号链接命中 / statfs 兜底）统一在出口回写缓存。
+func resolvePartitionTotalCached(device string, statTotal uint64, totalCache map[string]uint64) (total uint64) {
 	if sysfsBlockName(device) == "" {
 		// Devices outside /dev/ (Windows drive letters such as "C:" and
 		// volume mount folders, or synthetic host mounts) can never resolve
@@ -1247,6 +1367,16 @@ func resolvePartitionTotal(device string, statTotal uint64) uint64 {
 		// loop.
 		return statTotal
 	}
+	if totalCache != nil {
+		if cached, ok := totalCache[device]; ok {
+			return cached
+		}
+	}
+	defer func() {
+		if totalCache != nil {
+			totalCache[device] = total
+		}
+	}()
 	if size := readBlockDeviceSizeBytes(sysfsBlockName(device)); size > 0 {
 		return size
 	}
@@ -1360,12 +1490,21 @@ var skipFilesystems = map[string]struct{}{
 	"fdescfs":   {},
 }
 
-func shouldSkipPartition(p disk.PartitionStat) bool {
+// mountpointDirCache 缓存挂载点是否为目录（永不过期）：Windows 上对断连的
+// SMB/映射盘 mount folder 的 stat 可能卡顿数秒，不得在每个采集 tick 重复。
+func shouldSkipPartition(p disk.PartitionStat, mountpointDirCache map[string]bool) bool {
 	if p.Mountpoint == "" || p.Mountpoint == "none" {
 		return true
 	}
-	if info, err := os.Stat(p.Mountpoint); err == nil && !info.IsDir() {
+	if isDir, ok := mountpointDirCache[p.Mountpoint]; ok {
+		if !isDir {
+			return true
+		}
+	} else if info, err := os.Stat(p.Mountpoint); err == nil && !info.IsDir() {
+		mountpointDirCache[p.Mountpoint] = false
 		return true
+	} else if err == nil {
+		mountpointDirCache[p.Mountpoint] = true
 	}
 	mountpoint := filepath.Clean(strings.TrimSpace(p.Mountpoint))
 	for _, prefix := range skipMountPrefixes {
@@ -1389,91 +1528,6 @@ func shouldSkipPartition(p disk.PartitionStat) bool {
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
-}
-
-func readHostVirtualMemory(hostRoot string) (*mem.VirtualMemoryStat, bool) {
-	root := strings.TrimSpace(hostRoot)
-	if root == "" {
-		return nil, false
-	}
-	values, err := parseMemInfoFile(filepath.Join(root, "proc", "meminfo"))
-	if err != nil {
-		return nil, false
-	}
-
-	total := kibToBytes(values["MemTotal"])
-	if total == 0 {
-		return nil, false
-	}
-	available := kibToBytes(values["MemAvailable"])
-	if available == 0 {
-		available = kibToBytes(estimateMemAvailable(values))
-	}
-	if available > total {
-		available = total
-	}
-	used := total - available
-	free := kibToBytes(values["MemFree"])
-	if free > total {
-		free = total
-	}
-	return &mem.VirtualMemoryStat{
-		Total:       total,
-		Available:   available,
-		Free:        free,
-		Used:        used,
-		UsedPercent: percentOf(used, total),
-	}, true
-}
-
-func parseMemInfoFile(path string) (map[string]uint64, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	values := make(map[string]uint64)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		fields := strings.Fields(parts[1])
-		if len(fields) == 0 {
-			continue
-		}
-		value, err := strconv.ParseUint(fields[0], 10, 64)
-		if err != nil {
-			continue
-		}
-		values[strings.TrimSpace(parts[0])] = value
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return values, nil
-}
-
-func estimateMemAvailable(values map[string]uint64) uint64 {
-	free := values["MemFree"]
-	buffers := values["Buffers"]
-	cached := values["Cached"]
-	sreclaimable := values["SReclaimable"]
-	shmem := values["Shmem"]
-	if cached+sreclaimable > shmem {
-		return free + buffers + cached + sreclaimable - shmem
-	}
-	return free + buffers + cached
-}
-
-func kibToBytes(value uint64) uint64 {
-	return value * 1024
 }
 
 func percentOf(used, total uint64) float64 {
@@ -1911,11 +1965,13 @@ func defaultLookupNVIDIASMIPath() string {
 // is re-resolved at most once per nvidiaSMIPathRefreshInterval. When the
 // cached sample is fresh but was taken without static info and static info is
 // now requested, the sample is refreshed early.
+type gpuSampler func(path string, includeStatic bool) ([]GPUInfo, error)
+
 func (c *Collector) collectGPUStatsAt(
 	now time.Time,
 	includeStatic bool,
-	sampler func(path string, includeStatic bool) []GPUInfo,
-) []GPUInfo {
+	sampler gpuSampler,
+) ([]GPUInfo, bool) {
 	if sampler == nil {
 		sampler = runNVIDIAGPUSample
 	}
@@ -1924,20 +1980,35 @@ func (c *Collector) collectGPUStatsAt(
 		c.nvidiaSMIPathAt = now
 	}
 	if c.nvidiaSMIPath == "" {
-		return nil
+		// 机器上没有 nvidia-smi：确认性结果（无 GPU），server 端可安全
+		// 不保留 GPU 静态缓存。
+		return nil, true
 	}
 	fresh := !c.gpuSampleAt.IsZero() && now.Sub(c.gpuSampleAt) < gpuSampleRefreshInterval
 	if fresh && (!includeStatic || c.gpuSampleStatic) {
-		return c.gpuSample
+		// 失败后的缓存必须继续上报失败态：fresh 窗口内返回 (nil,false)，
+		// 否则 server 会把"采样失败"当成"确认无 GPU"清掉静态缓存。
+		return c.gpuSample, c.gpuSampleOK
 	}
-	gpus := sampler(c.nvidiaSMIPath, includeStatic)
+	gpus, err := sampler(c.nvidiaSMIPath, includeStatic)
+	if err != nil {
+		// 失败采样不得断言"确认无 GPU"（返回 false），否则 server 端
+		// mergeGPUStaticInfo 会清掉已缓存的 GPU 静态信息。
+		c.warnOnce("nvidia-smi", err)
+		c.gpuSample = nil
+		c.gpuSampleStatic = includeStatic
+		c.gpuSampleAt = now
+		c.gpuSampleOK = false
+		return nil, false
+	}
 	c.gpuSample = gpus
 	c.gpuSampleStatic = includeStatic
 	c.gpuSampleAt = now
-	return gpus
+	c.gpuSampleOK = true
+	return gpus, true
 }
 
-func runNVIDIAGPUSample(path string, includeStatic bool) []GPUInfo {
+func runNVIDIAGPUSample(path string, includeStatic bool) ([]GPUInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(
@@ -1947,17 +2018,21 @@ func runNVIDIAGPUSample(path string, includeStatic bool) []GPUInfo {
 		"--format=csv,noheader,nounits",
 	).Output()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("采样失败: %w", err)
 	}
-	return parseNVIDIAGPUStats(string(output), includeStatic)
+	gpus, err := parseNVIDIAGPUStats(string(output), includeStatic)
+	if err != nil {
+		return nil, fmt.Errorf("输出解析失败: %w", err)
+	}
+	return gpus, nil
 }
 
-func parseNVIDIAGPUStats(raw string, includeStatic bool) []GPUInfo {
+func parseNVIDIAGPUStats(raw string, includeStatic bool) ([]GPUInfo, error) {
 	reader := csv.NewReader(strings.NewReader(raw))
 	reader.TrimLeadingSpace = true
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	gpus := make([]GPUInfo, 0, len(records))
 	for _, record := range records {
@@ -1991,7 +2066,7 @@ func parseNVIDIAGPUStats(raw string, includeStatic bool) []GPUInfo {
 		}
 		gpus = append(gpus, gpu)
 	}
-	return gpus
+	return gpus, nil
 }
 
 func parseOptionalInt(raw string) (int, bool) {

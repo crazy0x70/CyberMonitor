@@ -29,8 +29,6 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
     "服务端更新失败，当前登录态已失效，请重新登录。",
     "Server update failed: your session has expired. Please sign in again.",
   ],
-  ["切换到浅色模式", "Switch to light mode"],
-  ["切换到深色模式", "Switch to dark mode"],
   ["主题模式", "Theme mode"],
   ["跟随系统", "Follow system"],
   ["浅色主题", "Light theme"],
@@ -52,7 +50,9 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["正在加载数据…", "Loading data..."],
   ["离开当前页面前先处理未保存内容？", "Handle unsaved changes before leaving this page?"],
   ["继续编辑", "Keep editing"],
+  ["Close", "关闭"],
   ["放弃未保存修改", "Discard changes"],
+  ["放弃修改", "Discard modifications"],
   ["有未保存的修改", "Unsaved changes"],
   ["保存中…", "Saving..."],
   ["保存更改", "Save changes"],
@@ -84,6 +84,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["没有可用登录方式", "No login method available"],
   ["请联系管理员启用密码登录或 OAuth / OIDC 登录。", "Contact an administrator to enable password login or OAuth / OIDC login."],
   ["总节点数", "Total nodes"],
+  ["节点总数", "Nodes tracked"],
   ["在线节点", "Online nodes"],
   ["离线节点", "Offline nodes"],
   ["未分组节点", "Ungrouped nodes"],
@@ -173,6 +174,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["节点配置已保存并下发", "Node configuration saved and dispatched"],
   ["节点已删除", "Node deleted"],
   ["节点列表刷新失败", "Failed to refresh node list"],
+  ["刷新节点列表失败", "Failed to refresh the node list"],
   ["路径:", "Path:"],
   ["全部", "All"],
   ["信息", "Info"],
@@ -221,7 +223,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["保存告警配置失败", "Failed to save alert configuration"],
   ["测试消息已发送", "Test message sent"],
   ["测试发送失败", "Failed to send test message"],
-  ["节点总数", "Total nodes"],
+
   ["已启用告警", "Alerts enabled"],
   ["已关闭告警", "Alerts disabled"],
   ["离线阈值", "Offline threshold"],
@@ -230,7 +232,6 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["当节点超过此时间未上报心跳时，将触发离线通知。", "An offline notification is triggered when a node stops reporting heartbeats longer than this time."],
   ["Telegram 告警", "Telegram alerts"],
   ["用户 ID", "User IDs"],
-  ["多个用户 ID 请使用逗号分隔。", "Separate multiple user IDs with commas."],
   ["正在发送…", "Sending..."],
   ["测试推送", "Test push"],
   ["飞书告警", "Feishu alerts"],
@@ -297,11 +298,13 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["当前 Agent 已禁用远程更新", "Remote Agent updates are disabled"],
   ["当前节点还没有上报 Agent 版本", "This node has not reported an Agent version"],
   ["当前 Agent 已是最新版", "Agent is already latest"],
+  // 历史变体：不同页面用过两种中文措辞，en→zh 回翻统一到前者。
+  ["当前 Agent 已是最新版本", "The agent is already up to date"],
   ["已禁用更新", "Updates disabled"],
   ["节点配置有未保存修改，请先保存或使用放弃修改。", "Node configuration has unsaved changes. Save or discard them first."],
   ["当前节点配置有未保存修改，请先保存或取消后再刷新。", "The current node has unsaved changes. Save or cancel before refreshing."],
   ["节点列表已刷新", "Node list refreshed"],
-  ["刷新节点列表失败", "Failed to refresh node list"],
+
   ["服务端节点配置已更新，请取消后重新打开再保存。", "Server-side node configuration changed. Cancel and reopen before saving."],
   ["保存节点配置失败", "Failed to save node configuration"],
   ["删除节点失败", "Failed to delete node"],
@@ -310,14 +313,13 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["当前节点平台暂不支持后台自更新", "This node platform does not support admin-side self-update"],
   ["已完成 Agent 版本检查", "Agent version check completed"],
   ["检查 Agent 更新失败", "Failed to check Agent updates"],
-  ["当前 Agent 已是最新版本", "Agent is already latest"],
+
   ["当前 Agent 已经是最新正式版", "Agent is already on the latest stable release"],
   ["下发 Agent 更新失败", "Failed to dispatch Agent update"],
   ["搜索节点", "Search nodes"],
   ["刷新节点", "Refresh nodes"],
   ["Agent 快速接入", "Quick Agent onboarding"],
   ["单击复制完整命令，拖拽可自由选择局部内容", "Click to copy the full command. Drag to select part of it."],
-  ["请先在基础设置的 Agent 配置中填写对接地址与 Agent Token。", "Fill the Agent endpoint and Agent token in Basic Settings first."],
   ["服务器管理", "Server management"],
   ["当前还没有节点接入。", "No nodes have connected yet."],
   ["没有匹配的节点，请调整搜索条件。", "No matching nodes. Adjust the search criteria."],
@@ -363,7 +365,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["点击一级分组或其下方标签即可选择；同一一级分组下会在分组与标签之间互斥。", "Click a top-level group or its tags to select. Groups and tags under the same top-level group are mutually exclusive."],
   ["删除节点", "Delete node"],
   ["确认删除节点？", "Delete this node?"],
-  ["放弃修改", "Discard changes"],
+
   ["保存配置", "Save configuration"],
   ["确认保存", "Confirm save"],
   ["后台路径已更新为", "Admin path updated to"],
@@ -391,7 +393,6 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["例如：cm-agent-token-abc123…", "Example: cm-agent-token-abc123..."],
   ["例如：搜索节点名、Node ID、主机名、地区…", "Example: search node name, Node ID, hostname, region..."],
   ["例如：123456789:ABC…", "Example: 123456789:ABC..."],
-  ["例如：123456789,987654321…", "Example: 123456789,987654321..."],
   ["例如：美国、香港、日本…", "Example: United States, Hong Kong, Japan..."],
   ["例如：CN2、BGP、GIA…", "Example: CN2, BGP, GIA..."],
   ["例如：主站 TCP 443…", "Example: main site TCP 443..."],
@@ -438,6 +439,12 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toEn: (match) => `Retry in ${match[1]} min ${match[2]} sec.`,
     en: /^Retry in\s+(\d+)\s+min\s+(\d+)\s+sec\.$/,
     toZh: (match) => `请在 ${match[1]} 分 ${match[2]} 秒后重试。`,
+  },
+  {
+    zh: /^尝试次数过多，请在\s+(\d+)\s+秒后重试$/,
+    toEn: (match) => `Too many attempts. Retry in ${match[1]} sec.`,
+    en: /^Too many attempts\. Retry in\s+(\d+)\s+sec\.$/,
+    toZh: (match) => `尝试次数过多，请在 ${match[1]} 秒后重试`,
   },
   {
     zh: /^使用\s+(.+)\s+登录$/,
@@ -683,6 +690,20 @@ function shouldSkipElement(element: Element | null) {
   return (
     tag === "SCRIPT" ||
     tag === "STYLE" ||
+    // INPUT/TEXTAREA 不在此跳过：属性翻译（placeholder 等）需要处理它们。
+    element.closest("[data-admin-i18n-skip]") != null
+  );
+}
+
+// 文本节点遍历专用的跳过判定：不进入表单控件与代码块。
+function shouldSkipTextNodeElement(element: HTMLElement | null): boolean {
+  if (!element) {
+    return false;
+  }
+  const tag = element.tagName;
+  return (
+    tag === "SCRIPT" ||
+    tag === "STYLE" ||
     tag === "TEXTAREA" ||
     tag === "INPUT" ||
     element.closest("[data-admin-i18n-skip]") != null
@@ -696,7 +717,7 @@ export function translateAdminDOM(root: ParentNode | null, locale: AdminLocale) 
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      return shouldSkipElement(node.parentElement)
+      return shouldSkipTextNodeElement(node.parentElement)
         ? NodeFilter.FILTER_REJECT
         : NodeFilter.FILTER_ACCEPT;
     },

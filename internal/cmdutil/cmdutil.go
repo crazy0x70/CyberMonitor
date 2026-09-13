@@ -1,6 +1,7 @@
 package cmdutil
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,10 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	}
 	duration, err := time.ParseDuration(value)
 	if err != nil {
+		if strings.TrimSpace(value) != "" {
+			// 空值（如 docker 中 CM_X=）视为未设置，静默回退。
+			log.Printf("环境变量 %s=%q 解析失败（%v），使用默认值 %s", key, value, err, def)
+		}
 		return def
 	}
 	return duration
@@ -33,6 +38,9 @@ func EnvBool(key string, def bool) bool {
 	}
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
+		if strings.TrimSpace(value) != "" {
+			log.Printf("环境变量 %s=%q 不是合法布尔值，使用默认值 %v", key, value, def)
+		}
 		return def
 	}
 	return parsed
@@ -76,7 +84,7 @@ func NormalizeListen(value string) string {
 	if trimmed == "" {
 		return trimmed
 	}
-	if strings.HasPrefix(trimmed, ":") || strings.Contains(trimmed, ":") {
+	if strings.Contains(trimmed, ":") {
 		return trimmed
 	}
 	return ":" + trimmed

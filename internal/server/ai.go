@@ -11,8 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -26,6 +27,7 @@ const (
 	defaultOpenAIModel         = "gpt-5.2"
 	defaultAIMaxOutputTokens   = 512
 	defaultAITemperature       = 0.2
+	aiSnapshotConcurrency      = 4
 	defaultAITestPrompt        = "请仅回复 ok"
 	maxTelegramMessageRunes    = 3500
 	maxAIPromptRunes           = 2000
@@ -86,30 +88,34 @@ func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]s
 		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxAISuccessBodyBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAISuccessBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("读取 AI 响应失败: %w", err)
+	}
 	if resp.StatusCode >= 300 {
 		if len(raw) > maxHTTPErrorBodyBytes {
 			raw = raw[:maxHTTPErrorBodyBytes]
 		}
 		return fmt.Errorf("AI 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
+	if int64(len(raw)) > maxAISuccessBodyBytes {
+		return fmt.Errorf("AI 响应超过 %d 字节上限，已截断", maxAISuccessBodyBytes)
+	}
 	if err := json.Unmarshal(raw, out); err != nil {
+		var envelope aiProviderErrorEnvelope
+		if json.Unmarshal(raw, &envelope) == nil && envelope.Error != nil && envelope.Error.Message != "" {
+			return errors.New(envelope.Error.Message)
+		}
 		return fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	var envelope aiProviderErrorEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return fmt.Errorf("AI 响应解析失败: %w", err)
-	}
-	if envelope.Error != nil {
-		return errors.New(envelope.Error.Message)
 	}
 	return nil
 }
 
 type AIProviderConfig struct {
-	APIKey  string `json:"api_key,omitempty"`
-	BaseURL string `json:"base_url,omitempty"`
-	Model   string `json:"model,omitempty"`
+	APIKey    string `json:"api_key,omitempty"`
+	APIKeySet bool   `json:"api_key_set,omitempty"`
+	BaseURL   string `json:"base_url,omitempty"`
+	Model     string `json:"model,omitempty"`
 }
 
 type AISettings struct {
@@ -134,6 +140,7 @@ type aiProviderSelection struct {
 type aiSnapshot struct {
 	GeneratedAt string            `json:"generated_at"`
 	Servers     []aiServerSummary `json:"servers"`
+	Diagnostics []string          `json:"diagnostics,omitempty"`
 }
 
 type aiServerSummary struct {
@@ -221,7 +228,8 @@ type aiNetworkTrend struct {
 type openAIChatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
 }
@@ -457,37 +465,51 @@ func applyAIProviderDefaults(provider string, cfg AIProviderConfig) AIProviderCo
 	return cfg
 }
 
-func selectAIProviderConfig(settings AISettings, provider string) (aiProviderSelection, error) {
-	normalized := normalizeAIProviderName(provider)
-	switch normalized {
-	case aiProviderOpenAI:
-		return aiProviderSelection{Provider: normalized, Label: "OpenAI", Config: settings.OpenAI}, nil
-	case aiProviderOpenAICompatible:
-		return aiProviderSelection{Provider: normalized, Label: "OpenAI 兼容提供商", Config: AIProviderConfig{}}, nil
-	default:
-		return aiProviderSelection{}, errors.New("AI 提供商无效")
-	}
-}
-
-func resolveAIProviderConfigBySelector(settings AISettings, selector string) (aiProviderSelection, error) {
+// resolveAIProviderSelection 把 provider 选择器（支持 "openai_compatible:<id>"）
+// 解析为最终配置；selector 为空时回退 CommandProvider；override 非 nil 时直接
+// 替换配置（用于保存前的连通性测试）。
+func resolveAIProviderSelection(settings AISettings, selector string, override *AIProviderConfig) (aiProviderSelection, error) {
 	selector = normalizeAIProviderSelector(selector)
 	if selector == "" {
 		selector = settings.CommandProvider
 	}
 	provider, providerID := parseAIProviderSelector(selector)
-	if provider == aiProviderOpenAICompatible {
-		if providerID != "" {
-			if selection, ok := findAICompatibleProvider(settings, providerID); ok {
-				return resolveAICompatibleSelection(selection)
+	var selection aiProviderSelection
+	switch provider {
+	case aiProviderOpenAICompatible:
+		switch {
+		case providerID != "":
+			item, ok := findAICompatibleProvider(settings, providerID)
+			if !ok {
+				return aiProviderSelection{}, errors.New("未找到指定的兼容服务商")
 			}
-			return aiProviderSelection{}, errors.New("未找到指定的兼容服务商")
+			selection = aiCompatibleSelection(item)
+		case len(settings.OpenAICompatibles) > 0:
+			selection = aiCompatibleSelection(settings.OpenAICompatibles[0])
+		default:
+			return aiProviderSelection{}, errors.New("未配置 OpenAI 兼容服务商")
 		}
-		if len(settings.OpenAICompatibles) > 0 {
-			return resolveAICompatibleSelection(settings.OpenAICompatibles[0])
-		}
-		return aiProviderSelection{}, errors.New("未配置 OpenAI 兼容服务商")
+	case aiProviderOpenAI:
+		selection = aiProviderSelection{Provider: provider, Label: "OpenAI", Config: settings.OpenAI}
+	default:
+		return aiProviderSelection{}, errors.New("AI 提供商无效")
 	}
-	return resolveAIProviderConfig(settings, provider)
+	if override != nil {
+		selection.Config = normalizeAIProviderConfig(*override)
+	}
+	return finalizeAIProviderSelection(selection)
+}
+
+func aiCompatibleSelection(provider AIProviderProfile) aiProviderSelection {
+	label := strings.TrimSpace(provider.Name)
+	if label == "" {
+		label = "OpenAI 兼容提供商"
+	}
+	return aiProviderSelection{
+		Provider: aiProviderOpenAICompatible,
+		Label:    label,
+		Config:   provider.AIProviderConfig,
+	}
 }
 
 func parseAIProviderSelector(selector string) (string, string) {
@@ -504,37 +526,6 @@ func findAICompatibleProvider(settings AISettings, providerID string) (AIProvide
 		}
 	}
 	return AIProviderProfile{}, false
-}
-
-func resolveAICompatibleSelection(provider AIProviderProfile) (aiProviderSelection, error) {
-	label := strings.TrimSpace(provider.Name)
-	if label == "" {
-		label = "OpenAI 兼容提供商"
-	}
-	return finalizeAIProviderSelection(aiProviderSelection{
-		Provider: aiProviderOpenAICompatible,
-		Label:    label,
-		Config:   provider.AIProviderConfig,
-	})
-}
-
-func resolveAIProviderConfig(settings AISettings, provider string) (aiProviderSelection, error) {
-	selection, err := selectAIProviderConfig(settings, provider)
-	if err != nil {
-		return aiProviderSelection{}, err
-	}
-	return finalizeAIProviderSelection(selection)
-}
-
-func resolveAIProviderConfigWithOverride(settings AISettings, provider string, override *AIProviderConfig) (aiProviderSelection, error) {
-	selection, err := selectAIProviderConfig(settings, provider)
-	if err != nil {
-		return aiProviderSelection{}, err
-	}
-	if override != nil {
-		selection.Config = normalizeAIProviderConfig(*override)
-	}
-	return finalizeAIProviderSelection(selection)
 }
 
 func finalizeAIProviderSelection(selection aiProviderSelection) (aiProviderSelection, error) {
@@ -576,7 +567,7 @@ func runAIQuery(ctx context.Context, store *Store, question string) (string, err
 		return "", err
 	}
 	provider := settings.CommandProvider
-	selection, err := resolveAIProviderConfigBySelector(settings, provider)
+	selection, err := resolveAIProviderSelection(settings, provider, nil)
 	if err != nil {
 		return "", err
 	}
@@ -664,16 +655,46 @@ func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 	snapshotTime := time.Now().UTC()
 	nodes := store.Snapshot()
 	offlineStore := resolveAIOfflineStore(store)
-	servers := make([]aiServerSummary, 0, len(nodes))
-	for _, node := range nodes {
+	// 每节点的 24h 历史查询串行会耗尽 18s 调用预算，有界并发后主预算留给 LLM。
+	servers := make([]aiServerSummary, len(nodes))
+	var (
+		wg        sync.WaitGroup
+		sem       = make(chan struct{}, aiSnapshotConcurrency)
+		completed atomic.Int32
+	)
+	for i := range nodes {
 		if ctx.Err() != nil {
 			break
 		}
-		servers = append(servers, buildAIServerSummary(ctx, node, offlineStore, store, snapshotTime))
+		wg.Add(1)
+		go func(i int, node NodeView) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			servers[i] = buildAIServerSummary(ctx, node, offlineStore, store, snapshotTime)
+			completed.Add(1)
+		}(i, nodes[i])
+	}
+	wg.Wait()
+	truncated := completed.Load() < int32(len(nodes))
+	filtered := servers[:0]
+	for _, server := range servers {
+		if server.ServerID != "" {
+			filtered = append(filtered, server)
+		}
+	}
+	var diagnostics []string
+	if truncated {
+		diagnostics = []string{"snapshot_truncated"}
 	}
 	return aiSnapshot{
 		GeneratedAt: snapshotTime.Format("2006-01-02 15:04:05"),
-		Servers:     servers,
+		Servers:     filtered,
+		Diagnostics: diagnostics,
 	}
 }
 
@@ -909,7 +930,12 @@ func buildAINetworkTrendSummaries(
 	trends := make([]aiNetworkTrend, 0, len(keys))
 	for _, key := range keys {
 		entry := nodeHistory[key]
-		kind, host, port, name := parseTestHistoryKey(key)
+		identity, err := history.ParseNetworkSeriesKey(key)
+		if err != nil {
+			log.Printf("AI 趋势跳过非法序列键 %q: %v", key, err)
+			continue
+		}
+		kind, host, port, name := identity.Type, identity.Host, identity.Port, identity.Name
 		var current *metrics.NetworkTestResult
 		if currentByKey != nil {
 			if test, ok := currentByKey[key]; ok {
@@ -989,26 +1015,11 @@ func summarizeAINetworkTrend(
 	}
 }
 
-func parseTestHistoryKey(key string) (kind string, host string, port int, name string) {
-	parts := strings.SplitN(key, "|", 4)
-	if len(parts) == 4 {
-		kind = strings.TrimSpace(parts[0])
-		host = strings.TrimSpace(parts[1])
-		if parsed, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && parsed > 0 {
-			port = parsed
-		}
-		name = strings.TrimSpace(parts[3])
-	}
-	if kind == "" {
-		kind = "icmp"
-	}
-	return kind, host, port, name
-}
-
 func latestNonNilFloat(values []*float64) *float64 {
 	for idx := len(values) - 1; idx >= 0; idx-- {
-		if value := history.CloneFloatPtr(values[idx]); value != nil {
-			return value
+		if value := values[idx]; value != nil {
+			cloned := *value
+			return &cloned
 		}
 	}
 	return nil
@@ -1018,11 +1029,10 @@ func averageNonNilFloat(values []*float64) *float64 {
 	total := 0.0
 	count := 0
 	for _, raw := range values {
-		value := history.CloneFloatPtr(raw)
-		if value == nil {
+		if raw == nil {
 			continue
 		}
-		total += *value
+		total += *raw
 		count++
 	}
 	if count == 0 {
@@ -1035,12 +1045,11 @@ func averageNonNilFloat(values []*float64) *float64 {
 func maxNonNilFloat(values []*float64) *float64 {
 	var maxValue *float64
 	for _, raw := range values {
-		value := history.CloneFloatPtr(raw)
-		if value == nil {
+		if raw == nil {
 			continue
 		}
-		if maxValue == nil || *value > *maxValue {
-			cloned := *value
+		if maxValue == nil || *raw > *maxValue {
+			cloned := *raw
 			maxValue = &cloned
 		}
 	}
@@ -1141,6 +1150,9 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 	}
 	answer := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if answer == "" {
+		if reasoning := strings.TrimSpace(parsed.Choices[0].Message.ReasoningContent); reasoning != "" {
+			return "", fmt.Errorf("模型仅返回推理内容未输出回答，推理消耗了全部 max_tokens=%d 预算", defaultAIMaxOutputTokens)
+		}
 		return "", errors.New("AI 未返回有效内容")
 	}
 	return answer, nil

@@ -3,12 +3,14 @@ package history
 import (
 	"context"
 	"errors"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -21,11 +23,31 @@ import (
 
 var errNilNetworkStore = errors.New("network history store is nil")
 
+// MigrationSample 是迁移专用的扁平样本（节点 ID + 原始探测结果）。
+type MigrationSample struct {
+	NodeID string
+	Test   metrics.NetworkTestResult
+}
+
 type NetworkStore struct {
 	db               *tsdb.DB
 	appendMu         sync.Mutex
 	latestSeriesTime map[string]int64
 	latestLoaded     bool
+	// capLogUntil 序列触顶日志的限频闸（UnixNano）：触顶节点可被公开
+	// 端点反复查询，逐条打印会成日志洪水。
+	capLogUntil atomic.Int64
+}
+
+// allowCapLog 触顶日志的限频闸：分钟级窗口至多放行一条，竞争下偶发
+// 多放一条无害。
+func (s *NetworkStore) allowCapLog(now time.Time) bool {
+	next := now.Add(time.Minute).UnixNano()
+	prev := s.capLogUntil.Load()
+	if prev >= now.UnixNano() {
+		return false
+	}
+	return s.capLogUntil.CompareAndSwap(prev, next)
 }
 
 type preparedNetworkSample struct {
@@ -80,8 +102,15 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	if s == nil || s.db == nil {
 		return errNilNetworkStore
 	}
-	nodeID = normalizeNodeID(nodeID)
-	if nodeID == "" || len(tests) == 0 {
+	normalizedID, err := NormalizeNodeID(nodeID)
+	if err != nil || normalizedID == "" {
+		// 迁移路径的 legacy 键未经上游校验：非法 nodeID 落库后 DeleteNode
+		// （同款严格校验）永远匹配不到，TSDB 序列残留。
+		log.Printf("history 拒绝非法节点 ID %q", strings.TrimSpace(nodeID))
+		return nil
+	}
+	nodeID = normalizedID
+	if len(tests) == 0 {
 		return nil
 	}
 
@@ -124,8 +153,46 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	return nil
 }
 
-func (s *NetworkStore) QueryRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
-	return s.queryRange(ctx, nodeID, from, to, true)
+// AppendMigrationSamples 以单一 appender、单次 Commit 提交全局升序样本：
+// TSDB head maxt 每次提交推进，按节点分批（各自 Commit）时，先落库批次
+// 的较新时间戳会让后续批次的更老样本命中 too-old 被静默丢弃。调用方须
+// 保证 samples 全局按 CheckedAt 升序。
+func (s *NetworkStore) AppendMigrationSamples(samples []MigrationSample) error {
+	if s == nil || s.db == nil {
+		return errNilNetworkStore
+	}
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	now := time.Now()
+	appender := s.db.Appender(context.Background())
+	committed := false
+	defer func() {
+		if !committed {
+			_ = appender.Rollback()
+		}
+	}()
+	latestSeriesTimeUpdates := make(map[string]int64)
+	for _, ms := range samples {
+		normalizedID, err := NormalizeNodeID(ms.NodeID)
+		if err != nil || normalizedID == "" {
+			log.Printf("history 拒绝非法节点 ID %q", strings.TrimSpace(ms.NodeID))
+			continue
+		}
+		sample, ok := prepareNetworkSample(ms.Test, now)
+		if !ok {
+			continue
+		}
+		if err := s.appendPreparedMetricSamples(appender, normalizedID, sample, latestSeriesTimeUpdates, now); err != nil {
+			return err
+		}
+	}
+	if err := appender.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	s.recordLatestSeriesTime(latestSeriesTimeUpdates)
+	return nil
 }
 
 func (s *NetworkStore) QueryPublicRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
@@ -208,7 +275,7 @@ func (s *NetworkStore) queryRangeWithOptions(
 	defer querier.Close()
 
 	accumulators := make(map[string]*seriesAccumulator)
-	if err := collectMetricSeriesBatch(
+	dropped, err := collectMetricSeriesBatch(
 		ctx,
 		querier,
 		nodeID,
@@ -217,12 +284,21 @@ func (s *NetworkStore) queryRangeWithOptions(
 		maxt,
 		bucketMillis,
 		accumulators,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
+	}
+	if dropped > 0 && s.allowCapLog(time.Now()) {
+		log.Printf("history 查询丢弃 %d 个超出基数上限（%d）的序列 node=%s", dropped, maxSeriesPerQuery, nodeID)
 	}
 
 	result := make(map[string]*NetworkHistoryEntry, len(accumulators))
 	cutoffSeconds := to.UTC().Add(-networkRetentionDays * 24 * time.Hour).Unix()
+	if bucketMillis == 0 {
+		// raw 路径供迁移去重基线使用：保留期截断会让超期 legacy 序列
+		// 整体缺席基线，产生无谓的重复 append（TSDB 重复容忍兜底）。
+		cutoffSeconds = 0
+	}
 	for key, acc := range accumulators {
 		entry := buildNetworkHistoryEntryWithCutoff(acc, cutoffSeconds)
 		if entry != nil {
@@ -270,11 +346,27 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	return nil
 }
 
+// networkMaxFutureSkew 容忍 agent 时钟适度超前。上限之外的未来时间戳
+// 会把 TSDB head maxt 抬到未来：此后所有节点的实时样本全部命中
+// too-old 被静默丢弃（全网 history 瘫痪且无日志），重启后基线回扫还会
+// 把未来值重新载入，跨重启持续。
+const networkMaxFutureSkew = 5 * time.Minute
+
 func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {
 	if checkedAt <= 0 {
 		return now.UTC().UnixMilli()
 	}
-	return checkedAt * 1000
+	if checkedAt > math.MaxInt64/1000 {
+		// 乘 1000 会溢出为负，按非法处理。
+		return now.UTC().UnixMilli()
+	}
+	millis := checkedAt * 1000
+	if millis > now.Add(networkMaxFutureSkew).UTC().UnixMilli() {
+		// 只钳上限：过老样本由 TSDB 拒收+容忍路径处理（迁移历史语义
+		// 依赖真实时间戳，不得向 now 收敛）。
+		return now.UTC().UnixMilli()
+	}
+	return millis
 }
 
 func appendMetricSample(
@@ -355,7 +447,12 @@ func (s *NetworkStore) appendMetricSampleIfFresh(
 	if err := appendMetricSample(appender, nodeID, sample, metricName, value); err != nil {
 		// 首扫窗口外的陈旧样本（时钟回拨、久离线节点回连）会被 TSDB 以
 		// 越界/重复/乱序拒绝：跳过单个样本，不让它拖垮整批提交。
+		// ErrTooOldSample：启用 OOO 窗口后，比 headMaxt-window 更老的样本
+		// 走该独立错误（而非 ErrOutOfBounds）。迁移场景下 map 随机序提交
+		// 多序列时，第二序列的老样本必然命中——不容忍会让 >24h 跨度的
+		// legacy 迁移永久失败（marker 不写、每次启动重试）。
 		if errors.Is(err, storage.ErrOutOfBounds) ||
+			errors.Is(err, storage.ErrTooOldSample) ||
 			errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
 			errors.Is(err, storage.ErrOutOfOrderSample) {
 			return false, nil
@@ -395,7 +492,9 @@ func (s *NetworkStore) ensureLatestSeriesTimeLoaded(now time.Time) error {
 // 更老的样本本来就落在 TSDB 的 OutOfOrderTimeWindow 之外（写入时被拒），
 // 全量回扫在 366 天保留下会在重启后阻塞首个 ingest 数分钟。
 func (s *NetworkStore) queryRecentLatestTimestampMillis(now time.Time) (map[string]int64, error) {
-	mint := now.Add(-2 * networkOutOfOrderWindow).UnixMilli()
+	// 1×乱序窗口即够：更老样本 TSDB 本就拒收（容忍路径），基线无需覆盖；
+	// 2× 会让重启后首次 ingest 在 appendMu 内全量迭代两天样本。
+	mint := now.Add(-networkOutOfOrderWindow).UnixMilli()
 	querier, err := s.db.Querier(mint, math.MaxInt64)
 	if err != nil {
 		return nil, err
@@ -450,8 +549,26 @@ func (s *NetworkStore) queryRecentLatestTimestampMillis(now time.Time) (map[stri
 	return latestSeriesTime, nil
 }
 
+// maxLatestSeriesTimeEntries 限制去重基线条目数：host/name 标签由 agent
+// 逐条可控，失控 agent 每次换标签即新增条目（数百字节/条），无上限会
+// 在进程生命周期内耗尽内存。超限先剪除陈旧条目（早于 2×乱序窗口的样本
+// 本就会被 TSDB 拒收，基线无需覆盖），仍超限则不记录新键——TSDB 侧由
+// head 截断与保留期自我限界，重复写入走容忍路径，仅损失去重效率。
+const maxLatestSeriesTimeEntries = 1 << 16
+
 func (s *NetworkStore) recordLatestSeriesTime(latestSeriesTimeUpdates map[string]int64) {
+	if len(s.latestSeriesTime)+len(latestSeriesTimeUpdates) > maxLatestSeriesTimeEntries {
+		cutoff := time.Now().Add(-2 * networkOutOfOrderWindow).UnixMilli()
+		for key, tsMillis := range s.latestSeriesTime {
+			if tsMillis < cutoff {
+				delete(s.latestSeriesTime, key)
+			}
+		}
+	}
 	for key, tsMillis := range latestSeriesTimeUpdates {
+		if _, exists := s.latestSeriesTime[key]; !exists && len(s.latestSeriesTime) >= maxLatestSeriesTimeEntries {
+			continue
+		}
 		s.latestSeriesTime[key] = tsMillis
 	}
 }
@@ -490,12 +607,25 @@ func (s *NetworkStore) deleteLatestSeriesTimeForNode(nodeID string) {
 	}
 }
 
+// escapeNodeIDKey 对去重基线复合键（metric|nodeID|seriesKey）中的 nodeID
+// 做 `|`/`%` 转义：ID 含 `|` 时切分错位会让按节点删除漏删，且不得为此
+// 拒绝存量持久化 ID（回溯会使升级后启动失败）。
+func escapeNodeIDKey(nodeID string) string {
+	nodeID = strings.ReplaceAll(nodeID, "%", "%25")
+	return strings.ReplaceAll(nodeID, "|", "%7C")
+}
+
+func unescapeNodeIDKey(nodeID string) string {
+	nodeID = strings.ReplaceAll(nodeID, "%7C", "|")
+	return strings.ReplaceAll(nodeID, "%25", "%")
+}
+
 func networkSeriesTimestampKey(metricName, nodeID, seriesKey string) string {
 	seriesKey = strings.TrimSpace(seriesKey)
 	if seriesKey == "" {
 		return ""
 	}
-	return metricName + "|" + normalizeNodeID(nodeID) + "|" + seriesKey
+	return metricName + "|" + escapeNodeIDKey(normalizeNodeID(nodeID)) + "|" + seriesKey
 }
 
 func networkSeriesTimestampNodeID(key string) string {
@@ -507,7 +637,7 @@ func networkSeriesTimestampNodeID(key string) string {
 	if !found {
 		return ""
 	}
-	return normalizeNodeID(nodeID)
+	return unescapeNodeIDKey(normalizeNodeID(nodeID))
 }
 
 func normalizeNodeID(nodeID string) string {
@@ -589,24 +719,25 @@ func collectMetricSeriesBatch(
 	maxt int64,
 	bucketMillis int64,
 	accumulators map[string]*seriesAccumulator,
-) error {
+) (int, error) {
 	if len(metricNames) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	nameMatcher, err := newMetricNameMatcher(metricNames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	seriesSet := querier.Select(ctx, false, &storage.SelectHints{
 		Start: mint,
 		End:   maxt,
 	}, nameMatcher, nodeMatcher)
+	dropped := 0
 	for seriesSet.Next() {
 		series := seriesSet.At()
 		seriesLabels := series.Labels()
@@ -614,6 +745,7 @@ func collectMetricSeriesBatch(
 		identity := networkIdentityFromLabels(seriesLabels)
 		acc := ensureSeriesAccumulator(accumulators, identity, bucketMillis)
 		if acc == nil {
+			dropped++
 			continue
 		}
 
@@ -634,10 +766,10 @@ func collectMetricSeriesBatch(
 			}
 		}
 		if err := iterator.Err(); err != nil {
-			return err
+			return dropped, err
 		}
 	}
-	return seriesSet.Err()
+	return dropped, seriesSet.Err()
 }
 
 func networkIdentityFromLabels(seriesLabels labels.Labels) networkTestIdentity {

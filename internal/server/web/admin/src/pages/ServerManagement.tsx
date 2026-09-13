@@ -25,6 +25,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -97,7 +98,6 @@ import {
   adminDetailGroupClass,
   adminDetailHeaderClass,
   adminDetailHintPanelClass,
-  adminDetailWarningPanelClass,
   adminDialogCancelClass,
   adminDialogContentClass,
   adminDangerBadgeClass,
@@ -646,7 +646,8 @@ export default function ServerManagement({
   const formSourceSignatureRef = useRef("");
   const agentUpdateRequestSeqRef = useRef(0);
   const lastOpenedNodeCardRef = useRef("");
-  const lastScrollYRef = useRef(0);
+  const restoreFocusTimerRef = useRef<number | null>(null);
+  const runAction = useAsyncAction();
 
   const testCatalog = settings?.test_catalog || [];
   const testCatalogSignature = useMemo(
@@ -773,15 +774,16 @@ export default function ServerManagement({
   const editorBusy = saving || deleting || refreshing || refreshingAgentUpdate || updatingAgent;
   const editorInputDisabled = editorBusy || sourceConflict;
 
-  useEffect(() => {
-    onDirtyChange?.(isEditingDraftDirty);
-  }, [isEditingDraftDirty, onDirtyChange]);
+  useDirtyNotification(onDirtyChange, isEditingDraftDirty);
 
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+  useEffect(
+    () => () => {
+      if (restoreFocusTimerRef.current !== null) {
+        window.clearTimeout(restoreFocusTimerRef.current);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!editingNode) {
@@ -881,8 +883,11 @@ export default function ServerManagement({
 
   const handleOpen = (node: NodeView) => {
     const nodeID = resolveNodeId(node);
+    if (restoreFocusTimerRef.current !== null) {
+      window.clearTimeout(restoreFocusTimerRef.current);
+      restoreFocusTimerRef.current = null;
+    }
     lastOpenedNodeCardRef.current = nodeID;
-    lastScrollYRef.current = window.scrollY;
     setEditingNodeId(nodeID);
   };
 
@@ -900,15 +905,22 @@ export default function ServerManagement({
     if (!restoreNodeID) {
       return;
     }
-    window.requestAnimationFrame(() => {
-      window.scrollTo({ top: lastScrollYRef.current, behavior: "auto" });
+    // Dialog 有 ~100ms 退出动画且期间保持滚动锁，单 rAF 内 scrollTo 会失效；
+    // 弹窗期间列表也可能因 WS 推送重排，旧 scrollY 已不对准原卡片。改为
+    // 等动画结束后直接滚回目标卡片本身。
+    restoreFocusTimerRef.current = window.setTimeout(() => {
+      restoreFocusTimerRef.current = null;
       const selector = `[data-node-card-id="${escapeSelectorValue(restoreNodeID)}"]`;
       const target = document.querySelector<HTMLElement>(selector);
-      target?.focus({ preventScroll: true });
-    });
+      if (!target) {
+        return;
+      }
+      target.scrollIntoView({ block: "center" });
+      target.focus({ preventScroll: true });
+    }, 150);
   };
 
-  const handleRefresh = async () => {
+  const handleRefresh = () => {
     if (editorBusy) {
       return;
     }
@@ -916,15 +928,12 @@ export default function ServerManagement({
       toast.warning("当前节点配置有未保存修改，请先保存或取消后再刷新。");
       return;
     }
-    setRefreshing(true);
-    try {
-      await onRefresh();
-      toast.success("节点列表已刷新");
-    } catch (error) {
-      toast.error(getErrorMessage(error, "刷新节点列表失败"));
-    } finally {
-      setRefreshing(false);
-    }
+    void runAction({
+      action: () => onRefresh(),
+      fallbackError: "刷新节点列表失败",
+      successToast: "节点列表已刷新",
+      setBusy: setRefreshing,
+    });
   };
 
   const handleToggleGroupSelection = (value: string) => {
@@ -975,7 +984,7 @@ export default function ServerManagement({
     }));
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     if (!editingNode || !form) {
       return;
     }
@@ -986,48 +995,41 @@ export default function ServerManagement({
     if (editorBusy) {
       return;
     }
-    setSaving(true);
-    try {
-      const payload = buildPayload(form, testCatalog);
-      await onSaveNode(resolveNodeId(editingNode), payload);
-      toast.success("节点配置已保存并下发");
-      closeEditor(true);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存节点配置失败"));
-    } finally {
-      setSaving(false);
-    }
+    void runAction({
+      action: () => onSaveNode(resolveNodeId(editingNode), buildPayload(form, testCatalog)),
+      fallbackError: "保存节点配置失败",
+      successToast: "节点配置已保存并下发",
+      onSuccess: () => closeEditor(true),
+      setBusy: setSaving,
+    });
   };
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     if (!editingNode || editorInputDisabled) {
       return;
     }
-    setDeleting(true);
-    try {
-      const deleteResult = await onDeleteNode(resolveNodeId(editingNode));
-      if (!deleteResult.history_error) {
-        toast.success("节点已删除");
-      }
-      setDeleteDialogOpen(false);
-      closeEditor(true);
-    } catch (error) {
-      toast.error(getErrorMessage(error, "删除节点失败"));
-    } finally {
-      setDeleting(false);
-    }
+    void runAction({
+      action: () => onDeleteNode(resolveNodeId(editingNode)),
+      fallbackError: "删除节点失败",
+      successToast: (deleteResult) => (deleteResult.history_error ? null : "节点已删除"),
+      onSuccess: () => {
+        setDeleteDialogOpen(false);
+        closeEditor(true);
+      },
+      setBusy: setDeleting,
+    });
   };
 
-  const copyInstallCommand = async (value: string) => {
+  const copyInstallCommand = (value: string) => {
     if (!value) {
       return;
     }
-    try {
-      await copyTextToClipboard(value);
-      toast.success("命令已复制");
-    } catch {
-      toast.error("复制失败，请手动选择命令后复制");
-    }
+    void runAction({
+      action: () => copyTextToClipboard(value),
+      fallbackError: "复制失败，请手动选择命令后复制",
+      fixedErrorText: true,
+      successToast: "命令已复制",
+    });
   };
 
   const handleCheckAgentUpdate = async () => {
@@ -1187,11 +1189,14 @@ export default function ServerManagement({
                     {activeInstallCommand}
                   </code>
                 </button>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Token 已隐藏：执行前请把命令中的 &lt;你的AgentToken&gt; 替换为基础设置中配置的 Agent Token。
+                </p>
               </div>
             </div>
           ) : (
             <div className={adminSectionIntroPanelClass}>
-              请先在基础设置的 Agent 配置中填写对接地址与 Agent Token。
+              请先在基础设置的 Agent 配置中填写 Agent 对接地址。
             </div>
           )}
         </CardContent>

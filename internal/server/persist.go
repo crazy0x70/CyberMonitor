@@ -31,10 +31,11 @@ const (
 	defaultLoginFailLimit  = 5
 	defaultLoginFailWindow = 15 * 60
 	defaultLoginLockSec    = 15 * 60
-	testHistoryVersion     = 1
-	testHistoryFileName    = "test_history.json"
-	configExportVersion    = 1
-	maxTestCatalogItems    = 512
+	// 时长类设置统一上限：int64 秒转 time.Duration 时超界会溢出为负数。
+	maxDurationSettingSec = 30 * 24 * 3600
+	testHistoryFileName   = "test_history.json"
+	configExportVersion   = 1
+	maxTestCatalogItems   = 512
 )
 
 var secureRandomReader io.Reader = rand.Reader
@@ -72,35 +73,36 @@ type Settings struct {
 }
 
 type SettingsView struct {
-	AdminPath            string            `json:"admin_path"`
-	AdminUser            string            `json:"admin_user"`
-	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
-	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
-	AgentToken           string            `json:"agent_token,omitempty"`
-	SiteTitle            string            `json:"site_title,omitempty"`
-	SiteIcon             string            `json:"site_icon,omitempty"`
-	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
-	HomeTitle            string            `json:"home_title,omitempty"`
-	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
-	Locale               string            `json:"locale,omitempty"`
-	AlertWebhook         string            `json:"alert_webhook,omitempty"`
-	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
-	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
-	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
-	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
-	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
-	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
-	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
-	AdminAuth            AdminAuthSettings `json:"admin_auth,omitempty"`
-	AISettings           AISettings        `json:"ai_settings,omitempty"`
-	Version              string            `json:"version,omitempty"`
-	Commit               string            `json:"commit,omitempty"`
-	Groups               []string          `json:"groups,omitempty"`
-	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
-	SessionToken         string            `json:"session_token,omitempty"`
-	SessionExpiresAt     int64             `json:"session_expires_at,omitempty"`
+	AdminPath             string            `json:"admin_path"`
+	AdminUser             string            `json:"admin_user"`
+	TurnstileSiteKey      string            `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey    string            `json:"turnstile_secret_key,omitempty"`
+	AgentEndpoint         string            `json:"agent_endpoint,omitempty"`
+	AgentToken            string            `json:"agent_token,omitempty"`
+	AgentTokenSet         bool              `json:"agent_token_set,omitempty"`
+	SiteTitle             string            `json:"site_title,omitempty"`
+	SiteIcon              string            `json:"site_icon,omitempty"`
+	SiteBackgroundImage   string            `json:"site_background_image,omitempty"`
+	HomeTitle             string            `json:"home_title,omitempty"`
+	HomeSubtitle          string            `json:"home_subtitle,omitempty"`
+	Locale                string            `json:"locale,omitempty"`
+	AlertWebhook          string            `json:"alert_webhook,omitempty"`
+	AlertWebhookSet       bool              `json:"alert_webhook_set,omitempty"`
+	AlertOfflineSec       int64             `json:"alert_offline_sec,omitempty"`
+	AlertTelegramToken    string            `json:"alert_telegram_token,omitempty"`
+	AlertTelegramTokenSet bool              `json:"alert_telegram_token_set,omitempty"`
+	AlertTelegramUserIDs  []int64           `json:"alert_telegram_user_ids,omitempty"`
+	AlertTelegramUserID   int64             `json:"alert_telegram_user_id,omitempty"`
+	LoginFailLimit        int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec    int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec          int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth             AdminAuthSettings `json:"admin_auth,omitempty"`
+	AISettings            AISettings        `json:"ai_settings,omitempty"`
+	Version               string            `json:"version,omitempty"`
+	Commit                string            `json:"commit,omitempty"`
+	Groups                []string          `json:"groups,omitempty"`
+	GroupTree             []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog           []TestCatalogItem `json:"test_catalog,omitempty"`
 }
 
 type SettingsUpdate struct {
@@ -185,6 +187,10 @@ type OfflineSessionState struct {
 // 避免服务重启后对仍在离线的节点重复发送告警。
 type AlertedState struct {
 	OfflineSince time.Time `json:"offline_since"`
+	// 投递失败的指数退避：NextRetryAt 为零值表示无待重试投递（首次
+	// 告警在途或已送达）。旧持久化文件缺字段按零值加载，行为不变。
+	NextRetryAt time.Time `json:"next_retry_at,omitempty"`
+	RetryCount  int       `json:"retry_count,omitempty"`
 }
 
 type TestHistoryEntry struct {
@@ -194,12 +200,6 @@ type TestHistoryEntry struct {
 	LastAt         int64      `json:"last_at"`
 	MinIntervalSec int64      `json:"min_interval_sec,omitempty"`
 	AvgIntervalSec float64    `json:"avg_interval_sec,omitempty"`
-}
-
-type TestHistoryData struct {
-	Version   int                                     `json:"version"`
-	UpdatedAt int64                                   `json:"updated_at,omitempty"`
-	Nodes     map[string]map[string]*TestHistoryEntry `json:"nodes,omitempty"`
 }
 
 type ConfigTransferData struct {
@@ -231,11 +231,20 @@ type ResetResult struct {
 	AdminPath string
 }
 
+// ErrDataDirLocked 表示数据目录已被其他进程独占（服务运行中或另一实例）。
+var ErrDataDirLocked = errors.New("数据目录正被其他进程使用（服务可能正在运行）")
+
 func ResetAdminPassword(dataDir string) (ResetResult, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return ResetResult{}, errors.New("data dir required")
 	}
 	dataPath := filepath.Join(dataDir, "state.json")
+	// 与运行中的服务实例互斥：无锁的重置会被实例下次持久化整体覆盖。
+	lockFile, err := tryLockFile(filepath.Join(dataDir, "server.lock"))
+	if err != nil {
+		return ResetResult{}, err
+	}
+	defer lockFile.Close()
 	payload, loaded, err := loadPersistedData(dataPath)
 	if err != nil {
 		return ResetResult{}, err
@@ -309,18 +318,27 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if err := strictUnmarshalJSON(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	if err := migrateLegacyProfileTests(data, &payload); err != nil {
+	// 迁移探测只提取所需的原始字段，避免对同一份 state.json 再做两次全量解码。
+	var probe struct {
+		Profiles map[string]json.RawMessage `json:"profiles"`
+		Settings struct {
+			AISettings json.RawMessage `json:"ai_settings"`
+		} `json:"settings"`
+	}
+	if err := strictUnmarshalJSON(data, &probe); err != nil {
 		return PersistedData{}, false, err
 	}
-	if err := migrateLegacyAISettings(data, &payload); err != nil {
+	if err := migrateLegacyProfileTests(probe.Profiles, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	payload = applyPersistedDataDefaults(payload)
+	if err := migrateLegacyAISettings(probe.Settings.AISettings, &payload); err != nil {
+		return PersistedData{}, false, err
+	}
 	nodes, err := normalizePersistedNodeStates(payload.Nodes)
 	if err != nil {
 		return PersistedData{}, false, err
 	}
-	offlineSessions, err := normalizePersistedOfflineSessions(payload.OfflineSessions)
+	offlineSessions, err := normalizeNodeIDMap("offline_sessions", payload.OfflineSessions)
 	if err != nil {
 		return PersistedData{}, false, err
 	}
@@ -345,101 +363,6 @@ func savePersistedData(path string, payload PersistedData) error {
 	return writeJSONFileAtomic(path, payload)
 }
 
-func loadTestHistoryData(path string) (TestHistoryData, bool, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return TestHistoryData{Nodes: make(map[string]map[string]*TestHistoryEntry)}, false, false, nil
-		}
-		return TestHistoryData{}, false, false, err
-	}
-
-	var payload TestHistoryData
-	trailing, err := history.DecodeFirstJSONValue(data, &payload)
-	if err == nil {
-		if payload.Version == 0 && payload.UpdatedAt == 0 && payload.Nodes == nil {
-			var legacy map[string]map[string]*TestHistoryEntry
-			legacyTrailing, legacyErr := history.DecodeFirstJSONValue(data, &legacy)
-			if legacyErr == nil {
-				payload = TestHistoryData{
-					Version:   testHistoryVersion,
-					UpdatedAt: time.Now().Unix(),
-					Nodes:     legacy,
-				}
-				trailing = trailing || legacyTrailing || legacy != nil
-			}
-		}
-	} else {
-		var legacy map[string]map[string]*TestHistoryEntry
-		legacyTrailing, legacyErr := history.DecodeFirstJSONValue(data, &legacy)
-		if legacyErr != nil {
-			return TestHistoryData{}, false, false, err
-		}
-		payload = TestHistoryData{
-			Version:   testHistoryVersion,
-			UpdatedAt: time.Now().Unix(),
-			Nodes:     legacy,
-		}
-		trailing = legacyTrailing || legacy != nil
-	}
-	if payload.Nodes == nil {
-		payload.Nodes = make(map[string]map[string]*TestHistoryEntry)
-	}
-	needsRewrite := trailing
-	nodes, nodeIDsChanged, err := normalizeTestHistoryNodes(payload.Nodes)
-	if err != nil {
-		return TestHistoryData{}, false, false, err
-	}
-	payload.Nodes = nodes
-	if nodeIDsChanged {
-		needsRewrite = true
-	}
-	if payload.Version != testHistoryVersion {
-		payload.Version = testHistoryVersion
-		needsRewrite = true
-	}
-	for _, tests := range payload.Nodes {
-		for _, entry := range tests {
-			if entry == nil {
-				continue
-			}
-			beforeLatency := len(entry.Latency)
-			beforeLoss := len(entry.Loss)
-			beforeTimes := len(entry.Times)
-			normalizeHistoryEntry(entry)
-			if len(entry.Latency) != beforeLatency || len(entry.Loss) != beforeLoss || len(entry.Times) != beforeTimes {
-				needsRewrite = true
-			}
-		}
-	}
-	return payload, true, needsRewrite, nil
-}
-
-func normalizeTestHistoryNodes(nodes map[string]map[string]*TestHistoryEntry) (map[string]map[string]*TestHistoryEntry, bool, error) {
-	if len(nodes) == 0 {
-		return map[string]map[string]*TestHistoryEntry{}, false, nil
-	}
-	normalized := make(map[string]map[string]*TestHistoryEntry, len(nodes))
-	changed := false
-	for rawNodeID, tests := range nodes {
-		nodeID, err := history.NormalizeNodeID(rawNodeID)
-		if err != nil {
-			return nil, false, fmt.Errorf("test_history 节点 ID invalid node id: %w", err)
-		}
-		if nodeID == "" {
-			return nil, false, errors.New("test_history 节点 ID 不能为空")
-		}
-		if _, exists := normalized[nodeID]; exists {
-			return nil, false, fmt.Errorf("test_history 节点 ID 重复: %s", nodeID)
-		}
-		if nodeID != rawNodeID {
-			changed = true
-		}
-		normalized[nodeID] = tests
-	}
-	return normalized, changed, nil
-}
-
 func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	if payload.Profiles == nil {
 		payload.Profiles = make(map[string]*NodeProfile)
@@ -456,45 +379,32 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	return payload
 }
 
-func normalizePersistedNodeStates(nodes map[string]NodeState) (map[string]NodeState, error) {
-	if len(nodes) == 0 {
-		return map[string]NodeState{}, nil
-	}
-	normalized := make(map[string]NodeState, len(nodes))
-	for rawNodeID, node := range nodes {
+func normalizeNodeIDMap[V any](prefix string, items map[string]V) (map[string]V, error) {
+	normalized := make(map[string]V, len(items))
+	for rawNodeID, item := range items {
 		nodeID, err := history.NormalizeNodeID(rawNodeID)
 		if err != nil {
-			return nil, fmt.Errorf("nodes 节点 ID invalid node id: %w", err)
+			return nil, fmt.Errorf("%s 节点 ID invalid node id: %w", prefix, err)
 		}
 		if nodeID == "" {
-			return nil, errors.New("nodes 节点 ID 不能为空")
+			return nil, fmt.Errorf("%s 节点 ID 不能为空", prefix)
 		}
 		if _, exists := normalized[nodeID]; exists {
-			return nil, fmt.Errorf("nodes 节点 ID 重复: %s", nodeID)
+			return nil, fmt.Errorf("%s 节点 ID 重复: %s", prefix, nodeID)
 		}
-		node.Stats.NodeID = nodeID
-		normalized[nodeID] = node
+		normalized[nodeID] = item
 	}
 	return normalized, nil
 }
 
-func normalizePersistedOfflineSessions(sessions map[string]OfflineSessionState) (map[string]OfflineSessionState, error) {
-	if len(sessions) == 0 {
-		return map[string]OfflineSessionState{}, nil
+func normalizePersistedNodeStates(nodes map[string]NodeState) (map[string]NodeState, error) {
+	normalized, err := normalizeNodeIDMap("nodes", nodes)
+	if err != nil {
+		return nil, err
 	}
-	normalized := make(map[string]OfflineSessionState, len(sessions))
-	for rawNodeID, session := range sessions {
-		nodeID, err := history.NormalizeNodeID(rawNodeID)
-		if err != nil {
-			return nil, fmt.Errorf("offline_sessions 节点 ID invalid node id: %w", err)
-		}
-		if nodeID == "" {
-			return nil, errors.New("offline_sessions 节点 ID 不能为空")
-		}
-		if _, exists := normalized[nodeID]; exists {
-			return nil, fmt.Errorf("offline_sessions 节点 ID 重复: %s", nodeID)
-		}
-		normalized[nodeID] = session
+	for nodeID, node := range normalized {
+		node.Stats.NodeID = nodeID
+		normalized[nodeID] = node
 	}
 	return normalized, nil
 }
@@ -544,12 +454,23 @@ func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []str
 	return false, normalized, nil
 }
 
-func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
+func migrateLegacyProfileTests(rawProfiles map[string]json.RawMessage, payload *PersistedData) error {
 	if payload == nil || len(payload.Profiles) == 0 {
 		return nil
 	}
 
-	legacyTests, err := readLegacyProfileTests(data)
+	// 目录钳制必须先于 legacy 短路：带毒持久化（历史迁移把目录撑到
+	// >512 后已落盘）在升级加载时 legacy tests 字段已被 JSON 往返丢弃，
+	// readLegacyProfileTests 返回空——若钳制放在短路之后则永不执行，
+	// 超限目录会让 UpdateSettings 永久报错，设置页卡死。
+	if payload.Settings.TestCatalog == nil {
+		payload.Settings.TestCatalog = []TestCatalogItem{}
+	}
+	if len(payload.Settings.TestCatalog) > maxTestCatalogItems {
+		payload.Settings.TestCatalog = payload.Settings.TestCatalog[:maxTestCatalogItems]
+	}
+
+	legacyTests, err := readLegacyProfileTests(rawProfiles)
 	if err != nil {
 		return err
 	}
@@ -557,9 +478,6 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 		return nil
 	}
 
-	if payload.Settings.TestCatalog == nil {
-		payload.Settings.TestCatalog = []TestCatalogItem{}
-	}
 	catalogIndex := legacyTestCatalogIndex(payload.Settings.TestCatalog)
 
 	for nodeID, tests := range legacyTests {
@@ -584,6 +502,11 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 				continue
 			}
 			if item.ID == "" {
+				// 迁移同样受目录上限约束：目录已满时跳过新增，仅保留
+				// 引用既有条目的选择，避免迁移产物超限卡死设置页。
+				if len(payload.Settings.TestCatalog) >= maxTestCatalogItems {
+					continue
+				}
 				id, err := randomToken(10)
 				if err != nil {
 					return err
@@ -602,26 +525,17 @@ func migrateLegacyProfileTests(data []byte, payload *PersistedData) error {
 			})
 		}
 		if len(selections) > 0 {
-			profile.TestSelections = selections
+			// selections 与下发链路同受 128 上限约束：超限时静默钳制
+			// （旧实现裸存，agent 端实际只收到前 128 条，管理端却全量
+			// 可见）。
+			profile.TestSelections = normalizeTestSelections(payload.Settings.TestCatalog, selections)
 		}
 	}
 	return nil
 }
 
-func migrateLegacyAISettings(data []byte, payload *PersistedData) error {
-	if payload == nil {
-		return nil
-	}
-
-	var raw struct {
-		Settings struct {
-			AISettings json.RawMessage `json:"ai_settings"`
-		} `json:"settings"`
-	}
-	if err := strictUnmarshalJSON(data, &raw); err != nil {
-		return err
-	}
-	if len(raw.Settings.AISettings) == 0 {
+func migrateLegacyAISettings(rawAISettings json.RawMessage, payload *PersistedData) error {
+	if payload == nil || len(rawAISettings) == 0 {
 		return nil
 	}
 
@@ -629,7 +543,7 @@ func migrateLegacyAISettings(data []byte, payload *PersistedData) error {
 		DefaultProvider  string           `json:"default_provider"`
 		OpenAICompatible AIProviderConfig `json:"openai_compatible"`
 	}
-	if err := strictUnmarshalJSON(raw.Settings.AISettings, &legacy); err != nil {
+	if err := strictUnmarshalJSON(rawAISettings, &legacy); err != nil {
 		return err
 	}
 
@@ -676,19 +590,13 @@ func aiCompatibleIDExists(items []AIProviderProfile, id string) bool {
 	return false
 }
 
-func readLegacyProfileTests(data []byte) (map[string][]metrics.NetworkTestConfig, error) {
-	var raw struct {
-		Profiles map[string]json.RawMessage `json:"profiles"`
-	}
-	if err := strictUnmarshalJSON(data, &raw); err != nil {
-		return nil, err
-	}
-	if len(raw.Profiles) == 0 {
+func readLegacyProfileTests(rawProfiles map[string]json.RawMessage) (map[string][]metrics.NetworkTestConfig, error) {
+	if len(rawProfiles) == 0 {
 		return nil, nil
 	}
 
 	result := make(map[string][]metrics.NetworkTestConfig)
-	for nodeID, rawProfile := range raw.Profiles {
+	for nodeID, rawProfile := range rawProfiles {
 		var profile legacyPersistedProfile
 		if err := strictUnmarshalJSON(rawProfile, &profile); err != nil {
 			return nil, err
@@ -974,21 +882,17 @@ func initSettings(cfg Config) (Settings, error) {
 
 func buildAdminPassword(input string) (string, string, error) {
 	pass := strings.TrimSpace(input)
-	generated := false
-	if pass == "" {
+	generated := pass == ""
+	if generated {
 		token, err := randomToken(adminTokenLength)
 		if err != nil {
 			return "", "", err
 		}
 		pass = token
-		generated = true
 	}
 	hash, err := hashPassword(pass)
 	if err != nil {
-		if generated {
-			return pass, pass, nil
-		}
-		return pass, "", nil
+		return "", "", fmt.Errorf("hash admin password: %w", err)
 	}
 	if generated {
 		return hash, pass, nil
@@ -1005,6 +909,10 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 	mergeInt64 := func(dst *int64, src int64) {
 		if *dst <= 0 {
 			*dst = src
+		}
+		if *dst > maxDurationSettingSec {
+			// 遗留/手工数据防溢出：int64 秒转 time.Duration 时超界会变负数。
+			*dst = maxDurationSettingSec
 		}
 	}
 	mergeInt := func(dst *int, src int) {

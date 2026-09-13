@@ -71,6 +71,7 @@ export interface TestCatalogItem {
 
 export interface AIProviderConfig {
   api_key?: string;
+  api_key_set?: boolean;
   base_url?: string;
   model?: string;
 }
@@ -91,18 +92,25 @@ export interface SettingsView {
   admin_path: string;
   admin_user: string;
   turnstile_site_key?: string;
+  /** 服务端恒脱敏回传空串，仅 turnstile_*_set 类布尔可信（下同）。 */
   turnstile_secret_key?: string;
   agent_endpoint?: string;
+  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
   agent_token?: string;
+  agent_token_set?: boolean;
   site_title?: string;
   site_icon?: string;
   site_background_image?: string;
   home_title?: string;
   home_subtitle?: string;
   locale?: string;
+  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
   alert_webhook?: string;
+  alert_webhook_set?: boolean;
   alert_offline_sec?: number;
+  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
   alert_telegram_token?: string;
+  alert_telegram_token_set?: boolean;
   alert_telegram_user_ids?: number[];
   alert_telegram_user_id?: number;
   login_fail_limit?: number;
@@ -115,8 +123,6 @@ export interface SettingsView {
   groups?: string[];
   group_tree?: GroupNode[];
   test_catalog?: TestCatalogItem[];
-  session_token?: string;
-  session_expires_at?: number;
 }
 
 export interface ConfigImportResponse {
@@ -321,7 +327,6 @@ export interface Snapshot {
   nodes: NodeView[];
   groups?: string[];
   settings?: PublicSettings;
-  test_history?: Record<string, unknown>;
 }
 
 export interface NodeDelta {

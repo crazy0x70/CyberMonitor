@@ -39,9 +39,15 @@ import {
   adminSummaryRowClass,
 } from "@/lib/admin-ui";
 import type { NodeView, SettingsView } from "@/lib/admin-types";
+import {
+  adminPageHref,
+  resolveNodeSelectionValues,
+  shouldHandleAdminNavigation,
+  type AdminPage,
+} from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
 
-type Page = "dashboard" | "servers" | "groups" | "probes" | "settings" | "alerts" | "ai";
+type Page = AdminPage;
 
 export interface DashboardProps {
   settings: SettingsView | null;
@@ -49,33 +55,11 @@ export interface DashboardProps {
   onNavigate: (page: Page) => void;
 }
 
-function dashboardPageHref(page: Page) {
-  if (typeof window === "undefined") {
-    return page === "dashboard" ? "/" : `/?page=${page}`;
-  }
-  const nextURL = new URL(window.location.href);
-  if (page === "dashboard") {
-    nextURL.searchParams.delete("page");
-  } else {
-    nextURL.searchParams.set("page", page);
-  }
-  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
-}
 
-function shouldHandleDashboardNavigation(event: MouseEvent<HTMLAnchorElement>) {
-  return !(
-    event.defaultPrevented ||
-    event.button !== 0 ||
-    event.metaKey ||
-    event.ctrlKey ||
-    event.shiftKey ||
-    event.altKey
-  );
-}
 
 function summarizeChannels(settings: SettingsView | null) {
-  const telegram = settings?.alert_telegram_token ? "TG 已配" : "TG 未配";
-  const webhook = settings?.alert_webhook ? "飞书已配" : "飞书未配";
+  const telegram = settings?.alert_telegram_token_set ? "TG 已配" : "TG 未配";
+  const webhook = settings?.alert_webhook_set ? "飞书已配" : "飞书未配";
   return `${telegram}，${webhook}`;
 }
 
@@ -97,7 +81,8 @@ function summarizeAI(settings: SettingsView | null) {
 }
 
 function countUngrouped(nodes: NodeView[]) {
-  return nodes.filter((node) => !(node.groups && node.groups.length > 0) && !node.group).length;
+  // 与分组管理页同口径：stats.node_group / tags 派生的归属也算已分组。
+  return nodes.filter((node) => resolveNodeSelectionValues(node).length === 0).length;
 }
 
 export default function Dashboard({ settings, nodes, onNavigate }: DashboardProps) {
@@ -153,7 +138,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
   ];
 
   const handleNavigateLink = (event: MouseEvent<HTMLAnchorElement>, page: Page) => {
-    if (!shouldHandleDashboardNavigation(event)) {
+    if (!shouldHandleAdminNavigation(event)) {
       return;
     }
     event.preventDefault();
@@ -221,7 +206,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
                     </div>
                   </div>
                   <a
-                    href={dashboardPageHref(item.page)}
+                    href={adminPageHref(item.page)}
                     className={cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")}
                     onClick={(event) => handleNavigateLink(event, item.page)}
                   >
@@ -247,7 +232,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
                 </div>
               </div>
               <a
-                href={dashboardPageHref("settings")}
+                href={adminPageHref("settings")}
                 className={cn(adminCompactActionButtonClass, "self-start sm:self-auto hover:bg-white dark:hover:bg-slate-950")}
                 onClick={(event) => handleNavigateLink(event, "settings")}
               >
@@ -269,7 +254,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
           </CardHeader>
           <CardContent className="space-y-4 p-6">
             <a
-              href={dashboardPageHref("probes")}
+              href={adminPageHref("probes")}
               className={`${adminQuickActionButtonClass} group`}
               onClick={(event) => handleNavigateLink(event, "probes")}
             >
@@ -277,7 +262,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
               探测设置
             </a>
             <a
-              href={dashboardPageHref("groups")}
+              href={adminPageHref("groups")}
               className={`${adminQuickActionButtonClass} group`}
               onClick={(event) => handleNavigateLink(event, "groups")}
             >
@@ -285,7 +270,7 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
               分组管理
             </a>
             <a
-              href={dashboardPageHref("alerts")}
+              href={adminPageHref("alerts")}
               className={`${adminQuickActionButtonClass} group`}
               onClick={(event) => handleNavigateLink(event, "alerts")}
             >

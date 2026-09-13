@@ -50,10 +50,8 @@ func verifyTurnstileToken(ctx context.Context, secretKey, token, remoteIP string
 		form.Set("remoteip", strings.TrimSpace(remoteIP))
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, turnstileVerifyURL, strings.NewReader(form.Encode()))
+	// 超时由 turnstileHTTPClient 的 8s Timeout 兜底，ctx 负责随请求取消。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, turnstileVerifyURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return errors.New("Turnstile 校验请求创建失败")
 	}

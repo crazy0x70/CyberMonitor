@@ -18,7 +18,7 @@ import type {
   SystemUpdateInfo,
 } from "@/lib/admin-types";
 
-export const ADMIN_TOKEN_KEY = "cm_admin_token";
+const ADMIN_TOKEN_KEY = "cm_admin_token";
 
 type AdminUnauthorizedListener = () => void;
 
@@ -153,7 +153,7 @@ function apiPath(path: string) {
   return basePath ? `${basePath}${path}` : path;
 }
 
-export function adminAppPath(adminPath: string) {
+function adminAppPath(adminPath: string) {
   const normalizedAdminPath = normalizeBasePath(adminPath);
   if (!normalizedAdminPath) {
     return "";
@@ -298,7 +298,7 @@ export async function logoutAdmin() {
 }
 
 export async function fetchNodes() {
-  const resp = await apiFetch("/api/v1/admin/nodes?history=0");
+  const resp = await apiFetch("/api/v1/admin/nodes");
   return unwrapResponse<Snapshot>(resp, "加载节点失败");
 }
 
@@ -395,7 +395,7 @@ export async function fetchAIModels(provider: string, config: AIProviderConfig) 
   return unwrapResponse<{ models: string[] }>(resp, "获取模型列表失败");
 }
 
-export interface AdminSocketConnection {
+interface AdminSocketConnection {
   close: () => void;
 }
 
@@ -406,8 +406,12 @@ interface AdminSocketOptions {
 }
 
 // 半开连接（休眠/NAT 超时）不会触发 close 事件：超过 staleTimeoutMs 没有
-// 任何消息就主动断开，让既有 close 处理器走重连。
-const DEFAULT_STALE_TIMEOUT_MS = 15000;
+// 任何消息就主动断开，让既有 close 处理器走重连。阈值须大于服务端 ping
+// 周期（54s，server.go wsPingPeriod）——浏览器 JS 层看不到 ping/pong 控制
+// 帧，全部 agent 静默时数据广播也停，此前 15s 阈值会每 ~16s 误判重连。
+// 注意阈值大于周期只是把保底重连拉长到 ~70s 一次（静默期无消息可重置
+// 计时器），并非消除；半开场景下服务端 60s 读超时先断，close 事件更早到达。
+const DEFAULT_STALE_TIMEOUT_MS = 70000;
 
 export function connectAdminSocket(
   onSnapshot: (snapshot: Snapshot) => void,

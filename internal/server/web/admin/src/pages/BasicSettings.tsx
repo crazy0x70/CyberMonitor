@@ -46,7 +46,8 @@ import type {
   SettingsView,
   SystemUpdateInfo,
 } from "@/lib/admin-types";
-import { adminAppLocation } from "@/lib/admin-api";
+import { useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
+import { AdminApiError, adminAppLocation } from "@/lib/admin-api";
 import {
   adminActionButtonClass,
   adminDirtyBadgeClass,
@@ -72,10 +73,6 @@ import {
   adminTabsTriggerClass,
   adminTextareaClass,
 } from "@/lib/admin-ui";
-import {
-  buildAgentInstallCommand,
-  buildAgentWindowsInstallCommand,
-} from "@/lib/agent-install";
 import { formatVersionLabel, getErrorMessage } from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
 
@@ -90,6 +87,14 @@ export interface BasicSettingsProps {
   startingSystemUpdate: boolean;
   onRefreshSystemUpdate: () => Promise<void>;
   onTriggerSystemUpdate: () => Promise<void>;
+}
+
+// 401 已由 App 层登出流程展示过期提示，系统更新按钮的内联 catch 不重复弹。
+function reportUpdateActionError(error: unknown, fallback: string) {
+  if (error instanceof AdminApiError && error.status === 401) {
+    return;
+  }
+  toast.error(getErrorMessage(error, fallback));
 }
 
 function parseJSONFile(file: File) {
@@ -319,6 +324,9 @@ export default function BasicSettings({
   });
 
   useEffect(() => {
+    if (isBusy) {
+      return;
+    }
     const nextSourceSignature = basicSettingsSourceSignature(settings);
     const currentDraftMatchesIncoming = !adminPass.trim() && currentDraftSignature === nextSourceSignature;
     if (isDirty && currentDraftMatchesIncoming) {
@@ -358,17 +366,9 @@ export default function BasicSettings({
     setSourceSignature(nextSourceSignature);
     setIsDirty(false);
     setIsConfirmOpen(false);
-  }, [adminPass, currentDraftSignature, isDirty, settings, sourceSignature]);
+  }, [adminPass, currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
 
-  useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
-
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+  useDirtyNotification(onDirtyChange, isDirty);
 
   const handleTextInputChange =
     (setter: (value: string) => void) =>
@@ -403,7 +403,6 @@ export default function BasicSettings({
 
   const buildPayload = () => {
     const payload: Record<string, unknown> = {
-      agent_token: agentToken.trim(),
       agent_endpoint: agentEndpoint.trim(),
       turnstile_site_key: turnstileSiteKey.trim(),
       site_title: siteTitle.trim(),
@@ -417,6 +416,10 @@ export default function BasicSettings({
 
     if (turnstileSecretKey.trim()) {
       payload.turnstile_secret_key = turnstileSecretKey.trim();
+    }
+    // 密钥已脱敏回传：留空表示保留现值，仅在用户输入新值时携带。
+    if (agentToken.trim()) {
+      payload.agent_token = agentToken.trim();
     }
     if (adminPath.trim() !== (settings?.admin_path || "")) payload.admin_path = adminPath.trim();
     if (adminUser.trim() && adminUser.trim() !== settings?.admin_user) payload.admin_user = adminUser.trim();
@@ -433,83 +436,90 @@ export default function BasicSettings({
     return payload;
   };
 
-  const persistSettings = async () => {
+  const runAction = useAsyncAction();
+
+  const persistSettings = () => {
     if (isBusy) {
       return;
     }
-    setIsSaving(true);
-    try {
-      const previousPath = settings?.admin_path || "";
-      const previousUser = settings?.admin_user || "";
-      const submittedAdminPass = adminPass.trim();
-      const next = await onSave(buildPayload());
-      const canonicalDraft = basicSettingsDraft(next);
-      applyBasicSettingsDraft(canonicalDraft, {
-        setAdminPath,
-        setAdminUser,
-        setAdminPass,
-        setTurnstileSiteKey,
-        setTurnstileSecretKey,
-        setAgentToken,
-        setAgentEndpoint,
-        setSiteTitle,
-        setSiteIcon,
-        setSiteBackgroundImage,
-        setHomeTitle,
-        setHomeSubtitle,
-        setLocale,
-        setLoginFailLimit,
-        setLoginFailWindow,
-        setLoginLockMinutes,
-        setAdminAuthDraft: setAdminAuthDraftValue,
-      });
-      setSourceSignature(basicSettingsDraftSignature(canonicalDraft));
-      resetDirtyState(true);
-      const messages = ["基础设置已保存"];
-      if (next.admin_path && next.admin_path !== previousPath) {
-        messages.push(`后台路径已更新为 ${next.admin_path}`);
-        const nextAdminPath = adminAppLocation(next.admin_path);
-        const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-        if (nextAdminPath && currentLocation !== nextAdminPath) {
-          window.history.replaceState({}, "", nextAdminPath);
+    const previousPath = settings?.admin_path || "";
+    const previousUser = settings?.admin_user || "";
+    const submittedAdminPass = adminPass.trim();
+    void runAction({
+      action: () => onSave(buildPayload()),
+      fallbackError: "保存基础设置失败",
+      successToast: (next) => {
+        const messages = ["基础设置已保存"];
+        if (next.admin_path && next.admin_path !== previousPath) {
+          messages.push(`后台路径已更新为 ${next.admin_path}`);
         }
-      }
-      if (next.admin_user && next.admin_user !== previousUser) {
-        messages.push("管理员账号已变更，登录态已自动刷新");
-      }
-      if (submittedAdminPass) {
-        messages.push("密码已更新，登录态已自动刷新");
-      }
-      toast.success(messages.join("；"));
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存基础设置失败"));
-    } finally {
-      setIsSaving(false);
-    }
+        if (next.admin_user && next.admin_user !== previousUser) {
+          messages.push("管理员账号已变更，登录态已自动刷新");
+        }
+        if (submittedAdminPass) {
+          messages.push("密码已更新，登录态已自动刷新");
+        }
+        return messages.join("；");
+      },
+      onSuccess: (next) => {
+        const canonicalDraft = basicSettingsDraft(next);
+        applyBasicSettingsDraft(canonicalDraft, {
+          setAdminPath,
+          setAdminUser,
+          setAdminPass,
+          setTurnstileSiteKey,
+          setTurnstileSecretKey,
+          setAgentToken,
+          setAgentEndpoint,
+          setSiteTitle,
+          setSiteIcon,
+          setSiteBackgroundImage,
+          setHomeTitle,
+          setHomeSubtitle,
+          setLocale,
+          setLoginFailLimit,
+          setLoginFailWindow,
+          setLoginLockMinutes,
+          setAdminAuthDraft: setAdminAuthDraftValue,
+        });
+        setSourceSignature(basicSettingsDraftSignature(canonicalDraft));
+        resetDirtyState(true);
+        if (next.admin_path && next.admin_path !== previousPath) {
+          const nextAdminPath = adminAppLocation(next.admin_path);
+          const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+          if (nextAdminPath && currentLocation !== nextAdminPath) {
+            window.history.replaceState({}, "", nextAdminPath);
+          }
+        }
+      },
+      setBusy: setIsSaving,
+    });
   };
 
-  const handleImport = async (file: File) => {
+  const handleImport = (file: File) => {
     if (isBusy) {
       return;
     }
-    setIsImporting(true);
-    try {
-      const payload = await parseJSONFile(file);
-      const response = await onImport(payload);
-      const messages = ["配置已导入"];
-      if (response.settings?.admin_path) {
-        messages.push(`后台路径已更新为 ${response.settings.admin_path}`);
-      }
-      toast.success(messages.join("；"));
-      resetDirtyState();
-    } catch (error) {
-      toast.error(getErrorMessage(error, "导入配置失败"));
-    } finally {
-      setIsImporting(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+    // File 引用已捕获，提前重置 input，同一文件可重复导入。
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
     }
+    void runAction({
+      action: async () => {
+        const payload = await parseJSONFile(file);
+        return onImport(payload);
+      },
+      fallbackError: "导入配置失败",
+      successToast: (response) => {
+        const messages = ["配置已导入"];
+        if (response.settings?.admin_path) {
+          messages.push(`后台路径已更新为 ${response.settings.admin_path}`);
+        }
+        return messages.join("；");
+      },
+      onSuccess: () => resetDirtyState(),
+      setBusy: setIsImporting,
+    });
   };
 
   const systemAlreadyLatest = Boolean(
@@ -1048,10 +1058,12 @@ export default function BasicSettings({
                     value={agentToken}
                     disabled={isBusy}
                     onChange={handleTextInputChange(setAgentToken)}
-                    placeholder="例如：cm-agent-token-abc123…"
+                    placeholder={settings?.agent_token_set ? "已配置（留空保持不变，输入新值可更换）" : "例如：cm-agent-token-abc123…"}
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    建议使用高强度随机 Token，修改后新接入 Agent 需使用新 Token。
+                    {settings?.agent_token_set
+                      ? "Token 已隐藏。留空保存即保留当前值；更换后新接入 Agent 需使用新 Token。"
+                      : "建议使用高强度随机 Token，修改后新接入 Agent 需使用新 Token。"}
                   </p>
                 </div>
               </CardContent>
@@ -1208,7 +1220,7 @@ export default function BasicSettings({
                     disabled={refreshingSystemUpdate || startingSystemUpdate}
                     onClick={() => {
                       onRefreshSystemUpdate().catch((error) => {
-                        toast.error(getErrorMessage(error, "刷新服务端更新状态失败"));
+                        reportUpdateActionError(error, "刷新服务端更新状态失败");
                       });
                     }}
                   >
@@ -1225,7 +1237,7 @@ export default function BasicSettings({
                     disabled={systemUpdateActionDisabled}
                     onClick={() => {
                       onTriggerSystemUpdate().catch((error) => {
-                        toast.error(getErrorMessage(error, "服务端更新操作失败"));
+                        reportUpdateActionError(error, "服务端更新操作失败");
                       });
                     }}
                   >

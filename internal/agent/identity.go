@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -103,7 +104,10 @@ func resolveNodeID(opts NodeIDOptions) (string, error) {
 		switch {
 		case err == nil:
 			return value, nil
-		case !errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, os.ErrNotExist), errors.Is(err, os.ErrInvalid):
+			// 文件不存在或为空：默认 home 路径继续走指纹派生/重建
+			// （显式 -node-id-file 的硬失败语义不受影响）。
+		default:
 			return "", err
 		}
 	}
@@ -169,7 +173,15 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 	for _, source := range sources {
 		value, err := readTrimmedFile(source.path)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+				continue
+			}
+			// 存在但读失败（EACCES 等）：以占位符参与指纹。保证两点：
+			// (a) 不可读期间每次启动派生同一 ID；(b) 全部源不可读时不再
+			// 退化为每启动一个随机 UUID。权限恢复后指纹仍会变化一次
+			// （一次性 ID 漂移，服务端多一条重复节点记录，可手工清理）。
+			log.Printf("读取机器指纹源 %s 失败: %v", source.path, err)
+			value = "<unreadable>"
 		}
 		part := source.label + "=" + value
 		if _, exists := seen[part]; exists {
@@ -212,19 +224,21 @@ func registerNodeToken(ctx context.Context, client *http.Client, endpoint, nodeI
 	if bootstrapToken == "" {
 		return "", fmt.Errorf("bootstrap token required")
 	}
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		strings.TrimRight(endpoint, "/")+"?node_id="+url.QueryEscape(nodeID),
-		nil,
-	)
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("register endpoint 无效: %w", err)
+	}
+	query := target.Query()
+	query.Set("node_id", nodeID)
+	target.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("X-AGENT-TOKEN", bootstrapToken)
 	var payload nodeRegisterResponse
 	if err := performAgentRequest(client, req, "register", func(body io.Reader) error {
-		return decodeStrictAgentJSON(body, &payload, "register response has trailing data")
+		return decodeAgentResponseJSON(body, &payload, "register response has trailing data")
 	}); err != nil {
 		return "", err
 	}
@@ -245,7 +259,9 @@ func readTrimmedFile(filePath string) (string, error) {
 	}
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
-		return "", os.ErrNotExist
+		// 文件存在但为空/全空白：与"不存在"区分开，调用方（显式
+		// node-id-file 场景）才不会静默落到其他来源并以别的 ID 上报。
+		return "", fmt.Errorf("文件 %s 内容为空: %w", trimmedPath, os.ErrInvalid)
 	}
 	return trimmed, nil
 }
@@ -260,11 +276,15 @@ func writeTrimmedFile(filePath, value string) error {
 		return fmt.Errorf("file value required")
 	}
 	dir := filepath.Dir(trimmedPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
+	// 目录已存在时不改权限：默认路径的 dir 可能是 $HOME，
+	// 无条件 chmod 会把用户主目录改成 0700。
+	if _, statErr := os.Stat(dir); statErr != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
 	}
 
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(trimmedPath)+".*.tmp")

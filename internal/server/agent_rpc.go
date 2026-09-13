@@ -21,8 +21,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const maxAgentNetworkTests = 128
-
 type agentAPIError struct {
 	statusCode int
 	message    string
@@ -64,14 +62,36 @@ func agentUpdateReportConflict() *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusConflict, message: "agent update report does not match pending instruction"}
 }
 
+// maxAgentNodeIDBytes 限制节点 ID 长度：该值流入持久化键、TSDB label、
+// 限流键与日志行，无上限时被控/异常 agent 可缓慢膨胀各存储。在 ingest
+// 收口处净化（截断+剔控制字符）而非 history.NormalizeNodeID 拒绝——
+// 后者被持久化加载链路复用，收紧会对存量脏 ID 回溯卡死启动。
+const maxAgentNodeIDBytes = 128
+
+func cleanAgentNodeID(nodeID string) string {
+	nodeID = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(nodeID))
+	if len(nodeID) > maxAgentNodeIDBytes {
+		nodeID = strings.ToValidUTF8(nodeID[:maxAgentNodeIDBytes], "")
+	}
+	return nodeID
+}
+
 func normalizeAgentNodeID(nodeID string) (string, *agentAPIError) {
 	var err error
 	nodeID, err = history.NormalizeNodeID(nodeID)
 	if err != nil {
 		return "", badAgentRequest("invalid node id")
 	}
-	if nodeID == "" {
-		return "", badAgentRequest("node_id required")
+	nodeID = cleanAgentNodeID(nodeID)
+	// 剔除控制字符可再造出 "." / ".."（如 "\x01..\x02"）——它们是
+	// NormalizeNodeID 显式拒绝的形态，净化后必须复查。
+	if nodeID == "" || nodeID == "." || nodeID == ".." {
+		return "", badAgentRequest("invalid node id")
 	}
 	return nodeID, nil
 }
@@ -89,8 +109,32 @@ func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agent
 		return metrics.NodeStats{}, apiErr
 	}
 	payload.NodeID = nodeID
+	// 身份类字符串经同一净化收口：它们播种 profile（Alias/Group）、进入
+	// 告警 webhook、WS 广播与日志，控制字符/超长文本不得原样入库。
+	payload.NodeName = cleanAgentText(payload.NodeName, 128)
+	payload.NodeAlias = cleanAgentText(payload.NodeAlias, 128)
+	payload.NodeGroup = cleanAgentText(payload.NodeGroup, 128)
+	payload.Hostname = cleanAgentText(payload.Hostname, 253)
+	payload.OS = cleanAgentText(payload.OS, 128)
+	payload.Arch = cleanAgentText(payload.Arch, 64)
+	payload.AgentVersion = cleanAgentText(payload.AgentVersion, 64)
+	payload.DeployMode = cleanAgentText(payload.DeployMode, 32)
+	payload.PublicIPv4 = cleanAgentText(payload.PublicIPv4, 64)
+	payload.PublicIPv6 = cleanAgentText(payload.PublicIPv6, 64)
+	payload.CPU.Model = cleanAgentText(payload.CPU.Model, 256)
+	for i := range payload.Disk {
+		payload.Disk[i].Device = cleanAgentText(payload.Disk[i].Device, 128)
+		payload.Disk[i].Mountpoint = cleanAgentText(payload.Disk[i].Mountpoint, 128)
+		payload.Disk[i].Fstype = cleanAgentText(payload.Disk[i].Fstype, 64)
+	}
+	for i := range payload.GPU {
+		payload.GPU[i].ID = cleanAgentText(payload.GPU[i].ID, 128)
+		payload.GPU[i].Name = cleanAgentText(payload.GPU[i].Name, 256)
+		payload.GPU[i].Vendor = cleanAgentText(payload.GPU[i].Vendor, 128)
+		payload.GPU[i].DriverVersion = cleanAgentText(payload.GPU[i].DriverVersion, 64)
+	}
 	if payload.NodeName == "" {
-		payload.NodeName = payload.NodeID
+		payload.NodeName = nodeID
 	}
 	metrics.SanitizeNodeStats(&payload)
 	payload.NetworkTests = normalizeAgentNetworkTestResults(payload.NetworkTests)
@@ -108,8 +152,9 @@ func normalizeAgentNetworkTestResults(items []metrics.NetworkTestResult) []metri
 	if len(items) == 0 {
 		return nil
 	}
-	if len(items) > maxAgentNetworkTests {
-		items = items[:maxAgentNetworkTests]
+	// 与下发侧 maxNetworkTestsPerNode（server.go）同一约束，共用常量。
+	if len(items) > maxNetworkTestsPerNode {
+		items = items[:maxNetworkTestsPerNode]
 	}
 	normalized := make([]metrics.NetworkTestResult, 0, len(items))
 	for _, item := range items {
@@ -197,6 +242,11 @@ func (a *agentAPI) broadcastNodeDelta(nodeID string) {
 	if a.hub == nil {
 		return
 	}
+	// 零观众早退：无人订阅时跳过 NodeView 深拷贝与序列化
+	//（无面板常驻部署下每条上报都在做全链路空转）。
+	if !a.hub.HasVariant(publicVariantBalanced) && !a.hub.HasVariant(adminVariant) {
+		return
+	}
 	delta, ok := a.store.PublicNodeDelta(nodeID)
 	if !ok {
 		return
@@ -205,12 +255,11 @@ func (a *agentAPI) broadcastNodeDelta(nodeID string) {
 	if err != nil {
 		return
 	}
-	a.hub.BroadcastVariant(data, publicVariantBalanced)
-	a.hub.BroadcastAdmin(data, a.store.Credentials().TokenSalt)
+	a.hub.BroadcastAllVariants(data, a.store.Credentials().TokenSalt)
 }
 
 func (a *agentAPI) broadcastSnapshot() {
-	broadcastStoreSnapshot(a.hub, a.store, false)
+	broadcastStoreSnapshot(a.hub, a.store)
 }
 
 func (a *agentAPI) ingest(payload metrics.NodeStats, token string) (bool, *agentAPIError) {
@@ -259,6 +308,11 @@ func (a *agentAPI) config(nodeID, token string, remoteUpdateCapable bool) (Agent
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
 			return AgentConfig{}, false, apiErr
 		}
+		// ingest 同款限流：GetConfig 持全局写锁且 lease 变更触发整库
+		// persist，异常 agent 循环拉取不得绕过节流。
+		if !a.store.allowAgentRate("config:"+nodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), false) {
+			return AgentConfig{}, false, agentRateLimitError()
+		}
 		config, leaseUpdated := a.store.DeliverAgentConfig(nodeID, remoteUpdateCapable)
 		return config, leaseUpdated, nil
 	}()
@@ -299,11 +353,12 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 	if apiErr != nil {
 		return apiErr
 	}
-	state, ok := normalizeAgentUpdateReportState(report.State)
-	if !ok {
+	if _, ok := normalizeAgentUpdateReportState(report.State); !ok {
 		return badAgentRequest("invalid agent update state")
 	}
-	report.State = state
+	// message 会随 NodeView 对全部 WS 订阅者放大重播并持久化，
+	// 与 network test 字段同策略截断，防单个 agent 写入 4MB 文本。
+	report.Message = cleanAgentText(report.Message, 240)
 	applied, apiErr := func() (bool, *agentAPIError) {
 		unlock := a.store.lockAgentNodeRead(nodeID)
 		defer unlock()
@@ -336,6 +391,13 @@ func newAgentRPCServer(api *agentAPI) *grpc.Server {
 			Time:    30 * time.Second,
 			Timeout: 10 * time.Second,
 		}),
+		// 对齐客户端 keepalive 20s（transport.go ClientParameters.Time）：
+		// 默认 EnforcementPolicy MinTime=5min 且禁无流 ping，上报间隔被调大
+		// 或休眠恢复时客户端 keepalive 会触发 GOAWAY too_many_pings 断连。
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	agentrpc.RegisterAgentServiceServer(server, &agentRPCServer{api: api})
 	return server
@@ -356,7 +418,13 @@ func isAgentGRPCRequest(r *http.Request) bool {
 	if r == nil || r.ProtoMajor != 2 {
 		return false
 	}
-	return strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), "application/grpc")
+	// 精确匹配 grpc 媒体类型族：Contains 会把 grpc-web 也路由进
+	// grpc.Server（其不支持 grpc-web，只能报错），而非落回 public handler。
+	mediaType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:i])
+	}
+	return mediaType == "application/grpc" || strings.HasPrefix(mediaType, "application/grpc+")
 }
 
 func (s *agentRPCServer) Register(ctx context.Context, req *agentrpc.RegisterRequest) (*agentrpc.RegisterResponse, error) {
@@ -447,7 +515,10 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 	case http.StatusTooManyRequests:
 		return status.Error(codes.ResourceExhausted, err.message)
 	case http.StatusServiceUnavailable:
-		return status.Error(codes.Unavailable, err.message)
+		// 应用层 503（如 store 写入失败）不能映射为 Unavailable：
+		// agent 端会把它当传输故障，关闭健康连接并整包改走 HTTP 重发，
+		// 在 store 故障期间引发连接抖动与重复提交。Internal 不触发回退。
+		return status.Error(codes.Internal, err.message)
 	default:
 		return status.Error(codes.Internal, err.message)
 	}

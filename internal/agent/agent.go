@@ -9,7 +9,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -31,10 +34,11 @@ var (
 	}
 	dockerManagedInitTimeout   = 10 * time.Second
 	dockerManagedLaunchTimeout = 10 * time.Minute
-	// updateReportTimeout 与控制面 http.Client 的 Timeout 保持一致，
-	// 避免更短的 per-request ctx 静默压过客户端超时。
-	updateReportTimeout = 10 * time.Second
 )
+
+// updateReportTimeout 与控制面 http.Client 的 Timeout 保持一致，避免更
+// 短的 per-request ctx 静默压过客户端超时。
+const updateReportTimeout = 10 * time.Second
 
 type Config struct {
 	ServerURL               string
@@ -68,9 +72,9 @@ func Run(ctx context.Context, cfg Config) error {
 	transport := newControlPlaneTransportWithOptions(cfg, client, grpcTransportOptions{})
 	defer transport.Close()
 	runner := newAgentRunner(cfg, transport, metrics.NewCollector(cfg.NodeID, cfg.NodeName, cfg.HostRoot, cfg.NetIfaces))
-	runner.bootstrapToken(ctx)
-	runner.syncRemoteConfig(ctx)
-	runner.collectAndReport(ctx)
+	runRecovered("节点注册", func() { runner.bootstrapToken(ctx) })
+	runRecovered("配置同步", func() { runner.syncRemoteConfig(ctx) })
+	runRecovered("采集上报", func() { runner.collectAndReport(ctx) })
 	ticker := time.NewTicker(cfg.Interval)
 	configTicker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -79,12 +83,46 @@ func Run(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// 有限等待覆盖"最终状态报告（10s Background 预算）"路径，
+			// 避免服务端更新记录停留在 updating，随后才经 defer
+			// transport.Close() 关闭控制面；超长更新（Docker 托管 10min
+			// 预算）不在等待范围，其后续上报落入 Close 后属既有限制。
+			waitForGoroutines(&runner.updateWG, agentShutdownWait)
 			return ctx.Err()
 		case <-ticker.C:
-			runner.collectAndReport(ctx)
+			runRecovered("采集上报", func() { runner.collectAndReport(ctx) })
 		case <-configTicker.C:
-			runner.syncRemoteConfig(ctx)
+			runRecovered("配置同步", func() { runner.syncRemoteConfig(ctx) })
 		}
+	}
+}
+
+// agentShutdownWait 覆盖二进制自更新的最终状态报告：报告全程由
+// updateReportTimeout 的 ctx 约束（gRPC 拨号/调用与 HTTP 回退均为其子
+// context），但报告可能吃满预算，等待在其之上留余量；仍小于 Windows
+// 服务包装的 gracefulStopTimeout=20s。
+const agentShutdownWait = updateReportTimeout + 5*time.Second
+
+// runRecovered 隔离单次 tick 的 panic：采集/注册路径任何未预期 panic 不
+// 得终止 agent 进程（崩溃即监控数据中断），记录堆栈后继续。
+func runRecovered(label string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("%s panic 已恢复: %v\n%s", label, rec, debug.Stack())
+		}
+	}()
+	fn()
+}
+
+func waitForGoroutines(wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
 	}
 }
 
@@ -296,8 +334,9 @@ func runNetworkTestsWithCache(
 	configs []metrics.NetworkTestConfig,
 	defaultInterval time.Duration,
 	cache map[string]cachedTest,
+	forceFullResult bool,
 ) ([]metrics.NetworkTestResult, bool) {
-	return runNetworkTestsWithCacheAt(ctx, configs, defaultInterval, cache, time.Now, RunNetworkTests)
+	return runNetworkTestsWithCacheAt(ctx, configs, defaultInterval, cache, time.Now, RunNetworkTests, forceFullResult)
 }
 
 func runNetworkTestsWithCacheAt(
@@ -307,6 +346,7 @@ func runNetworkTestsWithCacheAt(
 	cache map[string]cachedTest,
 	now func() time.Time,
 	runner func(context.Context, []metrics.NetworkTestConfig) []metrics.NetworkTestResult,
+	forceFullResult bool,
 ) ([]metrics.NetworkTestResult, bool) {
 	if len(configs) == 0 {
 		return handleEmptyConfigs(cache)
@@ -322,7 +362,39 @@ func runNetworkTestsWithCacheAt(
 	}
 
 	currentTime := now()
-	dueConfigs, dueKeys, validKeys := findDueTests(configs, cache, currentTime, defaultInterval)
+	// key 单遍预计算：findDue/buildOrdered/签名此前每 tick 各算一遍
+	//（Sprintf+ToLower ×3×测试数），配置只在远端下发时变化。
+	keys := make([]string, len(configs))
+	for i, cfg := range configs {
+		keys[i] = testKey(cfg)
+	}
+	dueConfigs, dueKeys, validKeys := findDueTests(configs, keys, cache, currentTime, defaultInterval)
+	// 单轮批量上限：探测同步阻塞上报主循环，批次过大会把上报停摆拉长到
+	// 分钟级（大目录全量到期时），节点可能被服务端判离线。截断前按
+	// "最久未运行优先"稳定排序（从未运行最优先），防止高频间隔项恒 due
+	// 垄断批次饿死后续项；未选中项顺延下一 tick，缓存零污染。
+	if len(dueConfigs) > maxNetTestWorkers {
+		order := make([]int, len(dueConfigs))
+		for i := range order {
+			order[i] = i
+		}
+		lastRunAt := func(i int) time.Time {
+			if cached, ok := cache[dueKeys[i]]; ok {
+				return cached.lastRun
+			}
+			return time.Time{}
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			return lastRunAt(order[a]).Before(lastRunAt(order[b]))
+		})
+		trimmedConfigs := make([]metrics.NetworkTestConfig, 0, maxNetTestWorkers)
+		trimmedKeys := make([]string, 0, maxNetTestWorkers)
+		for _, i := range order[:maxNetTestWorkers] {
+			trimmedConfigs = append(trimmedConfigs, dueConfigs[i])
+			trimmedKeys = append(trimmedKeys, dueKeys[i])
+		}
+		dueConfigs, dueKeys = trimmedConfigs, trimmedKeys
+	}
 
 	changed := false
 	if len(dueConfigs) > 0 {
@@ -334,7 +406,17 @@ func runNetworkTestsWithCacheAt(
 		changed = true
 	}
 
-	return buildOrderedResults(configs, cache), changed
+	if !changed {
+		if !forceFullResult {
+			// 常态 tick（无到期测试、无缓存清理）：结果与上一轮完全一致，
+			// 跳过全量结果切片的构建与拷贝。调用方声明配置已变化时除外
+			//（顺序变化的签名命中而缓存全未到期时 changed 仍为 false，
+			// 但消费方需要全量结果随 NetworkTestsChanged 一起上报）。
+			return nil, false
+		}
+		return buildOrderedResults(configs, keys, cache), false
+	}
+	return buildOrderedResults(configs, keys, cache), changed
 }
 
 func handleEmptyConfigs(cache map[string]cachedTest) ([]metrics.NetworkTestResult, bool) {
@@ -347,6 +429,7 @@ func handleEmptyConfigs(cache map[string]cachedTest) ([]metrics.NetworkTestResul
 
 func findDueTests(
 	configs []metrics.NetworkTestConfig,
+	keys []string,
 	cache map[string]cachedTest,
 	currentTime time.Time,
 	defaultInterval time.Duration,
@@ -356,8 +439,8 @@ func findDueTests(
 	validKeys := make(map[string]struct{}, len(configs))
 	queuedKeys := make(map[string]struct{}, len(configs))
 
-	for _, cfg := range configs {
-		key := testKey(cfg)
+	for i, cfg := range configs {
+		key := keys[i]
 		if key == "" {
 			continue
 		}
@@ -404,13 +487,20 @@ func cleanupStaleCache(cache map[string]cachedTest, validKeys map[string]struct{
 	return changed
 }
 
-func buildOrderedResults(configs []metrics.NetworkTestConfig, cache map[string]cachedTest) []metrics.NetworkTestResult {
+func buildOrderedResults(configs []metrics.NetworkTestConfig, keys []string, cache map[string]cachedTest) []metrics.NetworkTestResult {
 	ordered := make([]metrics.NetworkTestResult, 0, len(configs))
-	for _, cfg := range configs {
-		key := testKey(cfg)
+	seen := make(map[string]struct{}, len(configs))
+	for i := range configs {
+		key := keys[i]
 		if key == "" {
 			continue
 		}
+		// findDueTests 对重复 key 只探测一次，这里同样去重：服务端下发
+		// 重复项时上报结果不得出现双份。
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		if cached, ok := cache[key]; ok {
 			ordered = append(ordered, cached.result)
 		}

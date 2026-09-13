@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +35,10 @@ type legacyHistoryPayload struct {
 
 type networkHistoryStore interface {
 	AppendBatch(nodeID string, tests []metrics.NetworkTestResult, now time.Time) error
-	QueryRange(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
+	// AppendMigrationSamples 以单一事务提交全局按 CheckedAt 升序的迁移
+	// 样本（TSDB head maxt 全局单调且每次 Commit 推进，按节点分批提交
+	// 会让后处理批次的更老样本命中 too-old 被静默丢弃）。
+	AppendMigrationSamples(samples []MigrationSample) error
 	// QueryRangeRaw 返回原始采样时间戳：迁移去重需要精确时间匹配，
 	// 降采样查询输出的是桶起点时间，会造成漏判与幂等失效。
 	QueryRangeRaw(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
@@ -44,7 +49,6 @@ type LegacyMigrationResult struct {
 	SourcePath  string
 	BackupPath  string
 	MarkerPath  string
-	Migrated    bool
 }
 
 func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.Time) (LegacyMigrationResult, error) {
@@ -64,7 +68,7 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 		return LegacyMigrationResult{}, nil
 	}
 
-	payload, exists, err := loadLegacyHistoryPayload(sourcePath, now)
+	payload, data, exists, err := loadLegacyHistoryPayload(sourcePath, now)
 	if err != nil || !exists {
 		return LegacyMigrationResult{}, err
 	}
@@ -76,9 +80,18 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 		MarkerPath:  legacyMarkerPath(legacyPath),
 	}
 
-	result.Migrated, err = migrateLegacyNodes(store, payload.Nodes, now)
+	err = migrateLegacyNodes(store, payload.Nodes, now)
 	if err != nil {
 		return result, err
+	}
+
+	// 迁移成功即用已读入的原始字节写备份：同一文件不再二次 ReadFile
+	//（7d×多序列的大文件原先在内存中同时存在 2-3 份）。source 为 .bak
+	// 回退时（marker 丢失场景）不再造二级备份。
+	if sourcePath == legacyPath {
+		if err := WriteFileAtomic(legacyBackupPath(legacyPath), data); err != nil {
+			return result, fmt.Errorf("backup legacy history: %w", err)
+		}
 	}
 
 	return result, nil
@@ -88,69 +101,55 @@ func migrateLegacyNodes(
 	store networkHistoryStore,
 	nodes map[string]map[string]*legacyHistoryEntry,
 	now time.Time,
-) (bool, error) {
-	var migrated bool
+) error {
+	// 全部节点/序列的样本展平后按 CheckedAt 全局升序、单事务提交：
+	// TSDB head maxt 全局单调且每次 Commit 推进，任何"节点内有序/节点间
+	// 排序"的局部形态都无法约束跨批次的 maxt 重叠，后处理批次的更老样本
+	// 会命中 too-old 被"容忍"路径静默丢弃（不计数不打日志，源文件照删）。
+	maxCheckedAt := now.Add(networkMaxFutureSkew).Unix()
+	flat := make([]MigrationSample, 0)
 	for nodeID, tests := range nodes {
-		nodeMigrated, err := migrateLegacyNode(store, nodeID, tests, now)
-		if nodeMigrated {
-			migrated = true
-		}
-		if err != nil {
-			return migrated, err
-		}
-	}
-	return migrated, nil
-}
-
-func migrateLegacyNode(
-	store networkHistoryStore,
-	nodeID string,
-	tests map[string]*legacyHistoryEntry,
-	now time.Time,
-) (bool, error) {
-	existingTimesBySeries, err := loadExistingNodeHistoryTimestamps(store, nodeID, tests)
-	if err != nil {
-		return false, err
-	}
-
-	var migrated bool
-	for key, entry := range tests {
-		batch, err := buildLegacyMigrationBatch(key, entry, existingTimesBySeries)
-		if err != nil {
-			return migrated, err
-		}
-		if len(batch) == 0 {
+		if normalizedID, err := NormalizeNodeID(nodeID); err != nil || normalizedID == "" {
+			log.Printf("legacy 迁移跳过非法节点 ID %q", nodeID)
 			continue
 		}
-		if err := store.AppendBatch(nodeID, batch, now); err != nil {
-			return migrated, fmt.Errorf("append migrated history for %s/%s: %w", nodeID, key, err)
+		existingTimesBySeries, err := loadExistingNodeHistoryTimestamps(store, nodeID, tests)
+		if err != nil {
+			return err
 		}
-		migrated = true
-	}
-
-	return migrated, nil
-}
-
-func buildLegacyMigrationBatch(
-	key string,
-	entry *legacyHistoryEntry,
-	existingTimesBySeries map[string]map[int64]struct{},
-) ([]metrics.NetworkTestResult, error) {
-	identity, err := parseNetworkSeriesKey(key)
-	if err != nil {
-		return nil, err
-	}
-
-	normalizeLegacyHistoryEntry(entry)
-	existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
-	batch := make([]metrics.NetworkTestResult, 0, len(entry.Times))
-	for idx, checkedAt := range entry.Times {
-		if _, ok := existingTimes[checkedAt]; ok {
-			continue
+		for key, entry := range tests {
+			identity, err := ParseNetworkSeriesKey(key)
+			if err != nil {
+				// 单个畸形序列键只跳过自身：向上返回错误会中止全部节点的
+				// 迁移，marker 不写导致每次启动重试、legacy 永不清理。
+				log.Printf("legacy 探测序列键 %q（节点 %s）解析失败，已跳过: %v", key, nodeID, err)
+				continue
+			}
+			normalizeLegacyHistoryEntry(entry)
+			existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
+			for idx, checkedAt := range entry.Times {
+				if checkedAt <= 0 || checkedAt > maxCheckedAt {
+					// 与 <=0 同理：非法/未来时间戳会经
+					// resolveTimestampMillis 回落为迁移时刻落库，污染当天
+					// 曲线且破坏重迁移幂等（去重按原始时间戳匹配）。
+					continue
+				}
+				if _, ok := existingTimes[checkedAt]; ok {
+					continue
+				}
+				flat = append(flat, MigrationSample{
+					NodeID: nodeID,
+					Test:   buildLegacyNetworkTestResult(identity, entry, idx, checkedAt),
+				})
+			}
 		}
-		batch = append(batch, buildLegacyNetworkTestResult(identity, entry, idx, checkedAt))
 	}
-	return batch, nil
+	if len(flat) == 0 {
+		return nil
+	}
+	// CheckedAt 已在构建时原样携带，直接按其排序，无需旁路结构。
+	sort.Slice(flat, func(i, j int) bool { return flat[i].Test.CheckedAt < flat[j].Test.CheckedAt })
+	return store.AppendMigrationSamples(flat)
 }
 
 func buildLegacyNetworkTestResult(
@@ -255,25 +254,6 @@ func resolveLegacySourcePath(path string) (string, bool, error) {
 		return "", false, err
 	}
 	return "", false, nil
-}
-
-func EnsureLegacyMigrationBackup(path string) error {
-	legacyPath, err := normalizeLegacyHistoryPath(path)
-	if err != nil {
-		return err
-	}
-	backupPath := legacyBackupPath(legacyPath)
-	if _, err := os.Stat(backupPath); err == nil {
-		return nil
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	data, err := os.ReadFile(legacyPath)
-	if err != nil {
-		return err
-	}
-	return writeLegacyMigrationArtifact(legacyPath, legacyBackupPath, data)
 }
 
 func MarkLegacyMigrationComplete(path string, now time.Time) error {
@@ -404,13 +384,13 @@ func legacyEntryValues(entry *legacyHistoryEntry, idx int) (*float64, float64) {
 	return latency, *entry.Loss[idx]
 }
 
-func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload, bool, error) {
+func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload, []byte, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return legacyHistoryPayload{}, false, nil
+			return legacyHistoryPayload{}, nil, false, nil
 		}
-		return legacyHistoryPayload{}, false, err
+		return legacyHistoryPayload{}, nil, false, err
 	}
 
 	normalized := normalizeJSONBytes(data)
@@ -419,22 +399,22 @@ func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload,
 	if err == nil {
 		if payload.Nodes != nil || payload.Version != 0 || payload.UpdatedAt != 0 {
 			if trailing {
-				return legacyHistoryPayload{}, false, errors.New("extra content after JSON value")
+				return legacyHistoryPayload{}, nil, false, errors.New("extra content after JSON value")
 			}
 			if payload.Nodes == nil {
 				payload.Nodes = make(map[string]map[string]*legacyHistoryEntry)
 			}
-			return payload, true, nil
+			return payload, data, true, nil
 		}
 	}
 
 	var rawNodes map[string]map[string]*legacyHistoryEntry
 	trailing, err = DecodeFirstJSONValue(normalized, &rawNodes)
 	if err != nil {
-		return legacyHistoryPayload{}, false, err
+		return legacyHistoryPayload{}, nil, false, err
 	}
 	if trailing {
-		return legacyHistoryPayload{}, false, errors.New("extra content after JSON value")
+		return legacyHistoryPayload{}, nil, false, errors.New("extra content after JSON value")
 	}
 	if rawNodes == nil {
 		rawNodes = make(map[string]map[string]*legacyHistoryEntry)
@@ -443,7 +423,7 @@ func loadLegacyHistoryPayload(path string, now time.Time) (legacyHistoryPayload,
 		Version:   1,
 		UpdatedAt: now.Unix(),
 		Nodes:     rawNodes,
-	}, true, nil
+	}, data, true, nil
 }
 
 func normalizeJSONBytes(data []byte) []byte {

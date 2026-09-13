@@ -13,6 +13,10 @@ import (
 
 const systemUpdateRefreshWindow = 60 * time.Second
 
+// systemUpdateCheckTimeout 是单轮 release check 的独立上限：领跑者与请求
+// ctx 解耦后需要自己的超时兜底，不能依赖管理端请求超时。
+const systemUpdateCheckTimeout = 15 * time.Second
+
 var errSystemUpdateInProgress = errors.New("system update already in progress")
 
 type SystemUpdateView struct {
@@ -56,7 +60,7 @@ type systemUpdateManager struct {
 	updating       bool
 	refreshing     bool
 	refreshDone    chan struct{}
-	refreshErr     error
+	refreshResult  *systemUpdateRefreshResult
 	message        string
 }
 
@@ -191,21 +195,27 @@ func (m *systemUpdateManager) needsRefresh(force bool, now time.Time) bool {
 	return force || m.lastAttemptAt.IsZero() || now.Sub(m.lastAttemptAt) > systemUpdateRefreshWindow
 }
 
+// systemUpdateRefreshResult 是单轮 refresh 的结果快照，专供等待该轮的
+// 调用方读取，避免读到后续轮次重置后的共享状态。
+type systemUpdateRefreshResult struct {
+	info updater.ReleaseInfo
+	err  error
+}
+
 func (m *systemUpdateManager) refresh(ctx context.Context, force bool) (updater.ReleaseInfo, error) {
 	m.mu.Lock()
 	if m.refreshing {
+		// 等待者读取本轮 result 指针而非共享字段：若读 m.lastInfo/m.refreshErr，
+		// 新一轮 refresh 启动时会把 refreshErr 清为 nil，旧一轮的失败被吞。
+		result := m.refreshResult
 		done := m.refreshDone
 		m.mu.Unlock()
 		select {
 		case <-done:
-			m.mu.Lock()
-			info := m.lastInfo
-			err := m.refreshErr
-			m.mu.Unlock()
-			if err != nil {
-				return updater.ReleaseInfo{}, err
+			if result.err != nil {
+				return updater.ReleaseInfo{}, result.err
 			}
-			return info, nil
+			return result.info, nil
 		case <-ctx.Done():
 			return updater.ReleaseInfo{}, ctx.Err()
 		}
@@ -221,26 +231,32 @@ func (m *systemUpdateManager) refresh(ctx context.Context, force bool) (updater.
 		return info, nil
 	}
 	done := make(chan struct{})
+	result := &systemUpdateRefreshResult{}
 	m.refreshing = true
 	m.refreshDone = done
-	m.refreshErr = nil
+	m.refreshResult = result
 	m.mu.Unlock()
 
-	info, err := m.client.CheckLatest(ctx)
+	// 领跑者与请求 ctx 解耦：领跑者客户端断开不得取消整轮刷新，
+	// 否则所有等待者拿到 context.Canceled，活请求集体报错。
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), systemUpdateCheckTimeout)
+	defer cancel()
+	info, err := m.client.CheckLatest(checkCtx)
 	checkedAt := time.Now()
 	m.mu.Lock()
 	defer func() {
+		result.info = info
+		result.err = err
 		m.refreshing = false
 		if m.refreshDone == done {
 			m.refreshDone = nil
+			m.refreshResult = nil
 		}
 		close(done)
 		m.mu.Unlock()
 	}()
-	m.refreshErr = err
-	if isContextCancellationError(err) {
-		return updater.ReleaseInfo{}, err
-	}
+	// 超时/取消同样是真实发生的上游尝试，必须记录 lastAttemptAt，
+	// 否则节流窗口失效，慢上游期间每次请求都会重新发起刷新。
 	m.lastAttemptAt = checkedAt
 	if err != nil {
 		m.lastCheckError = err.Error()
@@ -256,10 +272,6 @@ func (m *systemUpdateManager) refresh(ctx context.Context, force bool) (updater.
 		m.message = ""
 	}
 	return info, nil
-}
-
-func isContextCancellationError(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func unixOrZero(value time.Time) int64 {

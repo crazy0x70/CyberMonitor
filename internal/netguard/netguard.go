@@ -7,7 +7,7 @@ import (
 
 func IsAllowedPublicIP(ip net.IP) bool {
 	addr, ok := AddrFromIP(ip)
-	return ok && addr.IsGlobalUnicast() && IsAllowedPublicAddr(addr)
+	return ok && addr.IsGlobalUnicast() && isAllowedPublicAddr(addr)
 }
 
 func AddrFromIP(ip net.IP) (netip.Addr, bool) {
@@ -24,7 +24,9 @@ func AddrFromIP(ip net.IP) (netip.Addr, bool) {
 	return addr, true
 }
 
-func IsAllowedPublicAddr(addr netip.Addr) bool {
+// isAllowedPublicAddr 仅接受经 AddrFromIP 归一化后的地址（4In6 已折叠
+// 为 v4），前缀表因此不含 ::ffff:0:0/96；255.255.255.255 被 /4 包含。
+func isAllowedPublicAddr(addr netip.Addr) bool {
 	for _, prefix := range blockedSpecialUsePrefixes {
 		if prefix.Contains(addr) {
 			return false
@@ -51,10 +53,8 @@ var blockedSpecialUsePrefixes = mustParsePrefixes([]string{
 	"203.0.113.0/24",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
-	"255.255.255.255/32",
 	"::/128",
 	"::1/128",
-	"::ffff:0:0/96",
 	"64:ff9b::/96",
 	"64:ff9b:1::/48",
 	"100::/64",

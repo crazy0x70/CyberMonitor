@@ -10,13 +10,29 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { AlertTriangle, Bell, Send, ShieldAlert } from "lucide-react";
-import { toast } from "sonner";
+import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import { cn } from "@/lib/utils";
-import { getErrorMessage, parseTelegramUserIds } from "@/lib/admin-format";
+import { parseTelegramUserIds } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
   adminDetailGroupClass,
+  adminDialogCancelClass,
+  adminDialogContentClass,
+  adminDialogDangerActionClass,
+  adminDialogFooterClass,
+  adminDialogHeaderClass,
   adminDirtyBadgeClass,
   adminInputClass,
   adminOverviewCardClass,
@@ -61,6 +77,13 @@ export interface NotificationAlertProps {
   onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
   onTest: (payload: AlertTestPayload) => Promise<void>;
 }
+
+type PendingConfirm = {
+  payload: Record<string, unknown>;
+  title: string;
+  description: string;
+  confirmLabel: string;
+};
 
 type AlertSettingsDraft = {
   webhook: string;
@@ -112,15 +135,16 @@ export default function NotificationAlert({
   onSave,
   onTest,
 }: NotificationAlertProps) {
-  const [webhook, setWebhook] = useState(() => makeAlertSettingsDraft(settings).webhook);
-  const [telegramToken, setTelegramToken] = useState(() => makeAlertSettingsDraft(settings).telegramToken);
-  const [telegramUserIds, setTelegramUserIds] = useState(() => makeAlertSettingsDraft(settings).telegramUserIds);
-  const [offlineMinutes, setOfflineMinutes] = useState(() => makeAlertSettingsDraft(settings).offlineMinutes);
+  const [initialDraft] = useState(() => makeAlertSettingsDraft(settings));
+  const [webhook, setWebhook] = useState(initialDraft.webhook);
+  const [telegramToken, setTelegramToken] = useState(initialDraft.telegramToken);
+  const [telegramUserIds, setTelegramUserIds] = useState(initialDraft.telegramUserIds);
+  const [offlineMinutes, setOfflineMinutes] = useState(initialDraft.offlineMinutes);
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [testingChannel, setTestingChannel] = useState<"telegram" | "feishu" | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<AlertField, string>>>({});
-  const [sourceSignature, setSourceSignature] = useState(() => alertSettingsSourceSignature(settings));
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const isBusy = isSaving || saving || testingChannel !== null;
   const currentDraftSignature = alertSettingsDraftSignature({
     webhook,
@@ -129,45 +153,24 @@ export default function NotificationAlert({
     offlineMinutes,
   });
 
-  useEffect(() => {
-    if (isBusy) {
-      return;
-    }
-    const nextSourceSignature = alertSettingsSourceSignature(settings);
-    const currentDraftMatchesIncoming = currentDraftSignature === nextSourceSignature;
-    if (isDirty && currentDraftMatchesIncoming) {
-      setSourceSignature(nextSourceSignature);
+  const [, absorbSourceSignature] = useDraftReconcile({
+    draftSignature: currentDraftSignature,
+    nextSourceSignature: alertSettingsSourceSignature(settings),
+    isBusy,
+    resetDraft: () => {
+      const draft = makeAlertSettingsDraft(settings);
+      setWebhook(draft.webhook);
+      setTelegramToken(draft.telegramToken);
+      setTelegramUserIds(draft.telegramUserIds);
+      setOfflineMinutes(draft.offlineMinutes);
+    },
+    warningText: "服务端告警配置已更新，当前未保存修改已保留。",
+    onCleaned: () => {
       setIsDirty(false);
       setFieldErrors({});
-      return;
-    }
-    if (nextSourceSignature === sourceSignature) {
-      return;
-    }
-    if (isDirty) {
-      setSourceSignature(nextSourceSignature);
-      toast.warning("服务端告警配置已更新，当前未保存修改已保留。");
-      return;
-    }
-    const draft = makeAlertSettingsDraft(settings);
-    setWebhook(draft.webhook);
-    setTelegramToken(draft.telegramToken);
-    setTelegramUserIds(draft.telegramUserIds);
-    setOfflineMinutes(draft.offlineMinutes);
-    setSourceSignature(nextSourceSignature);
-    setIsDirty(false);
-    setFieldErrors({});
-  }, [currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
-
-  useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
-
-  useEffect(() => {
-    return () => {
-      onDirtyChange?.(false);
-    };
-  }, [onDirtyChange]);
+    },
+  });
+  useDirtyNotification(onDirtyChange, isDirty);
 
   const counts = useMemo(() => {
     const total = nodes.length;
@@ -222,19 +225,30 @@ export default function NotificationAlert({
       nextErrors.webhook = "测试飞书告警前，请先填写 Webhook 地址。";
     }
 
-    if (requireTelegram || normalizedToken || normalizedUserIds) {
-      if (!normalizedToken) {
+    // token 已配置但脱敏回显为空（保留态）：user_ids 回显非空不构成
+    // "要求成对配置"的触发条件，留空保存表示保留现值。
+    const telegramConfigured = Boolean(settings?.alert_telegram_token_set);
+    // 已配置态下 token 与 ids 均清空 = 显式停用意图：保存时显式下发空值
+    // （服务端仅在收到显式空值时才清空，省略字段一律保留）。测试通道
+    // 仍要求有效配置，不构成停用意图。
+    const disableTelegram = telegramConfigured && !requireTelegram && !normalizedToken && !normalizedUserIds;
+    // ids 格式校验独立于成对分支：已配置态下输入了非法内容（如 "abc"）时
+    // 也必须报错，否则保存会静默回滚输入。
+    if (normalizedUserIds && ids.length === 0) {
+      nextErrors.telegramUserIds = "用户 ID 必须为正整数，多个 ID 请用逗号分隔。";
+    }
+    if (requireTelegram || normalizedToken || (normalizedUserIds && !telegramConfigured)) {
+      if (!normalizedToken && (requireTelegram || !telegramConfigured)) {
         nextErrors.telegramToken = "请输入 Telegram Bot Token。";
       }
       if (!normalizedUserIds) {
         nextErrors.telegramUserIds = "请输入至少一个 Telegram 用户 ID。";
-      } else if (ids.length === 0) {
-        nextErrors.telegramUserIds = "用户 ID 必须为正整数，多个 ID 请用逗号分隔。";
       }
     }
 
     const firstField = (Object.keys(alertFieldIDMap) as AlertField[]).find((field) => nextErrors[field]);
     return {
+      disableTelegram,
       errors: nextErrors,
       firstField,
       ids,
@@ -253,12 +267,29 @@ export default function NotificationAlert({
     return true;
   };
 
-  const buildSavePayload = (validation: ReturnType<typeof validateAlertForm>) => ({
-    alert_webhook: validation.normalizedWebhook,
-    alert_telegram_token: validation.normalizedToken,
-    alert_telegram_user_ids: validation.ids,
-    alert_offline_sec: validation.normalizedMinutes * 60,
-  });
+  const buildSavePayload = (validation: ReturnType<typeof validateAlertForm>) => {
+    const payload: Record<string, unknown> = {
+      alert_offline_sec: validation.normalizedMinutes * 60,
+    };
+    // 密钥已脱敏回传：留空表示保留现值（省略字段），仅在输入新值时携带。
+    if (validation.normalizedWebhook) {
+      payload.alert_webhook = validation.normalizedWebhook;
+    }
+    if (validation.disableTelegram) {
+      // 显式停用：省略字段在服务端语义是"保留"，必须显式下发空值。
+      payload.alert_telegram_token = "";
+      payload.alert_telegram_user_ids = [];
+    } else {
+      if (validation.normalizedToken) {
+        payload.alert_telegram_token = validation.normalizedToken;
+      }
+      // ids 与 token 解耦：token 已配置保留（留空）时也允许单独更新收件人。
+      if (validation.ids.length > 0) {
+        payload.alert_telegram_user_ids = validation.ids;
+      }
+    }
+    return payload;
+  };
 
   const buildTestPayload = (
     channel: "telegram" | "feishu",
@@ -273,7 +304,28 @@ export default function NotificationAlert({
           webhook: validation.normalizedWebhook,
         };
 
-  const handleSave = async () => {
+  const runAction = useAsyncAction();
+
+  const runSave = (payload: Record<string, unknown>) => {
+    void runAction({
+      action: () => onSave(payload),
+      fallbackError: "保存告警配置失败",
+      successToast: "告警配置已保存",
+      onSuccess: (savedSettings) => {
+        const canonicalDraft = makeAlertSettingsDraft(savedSettings);
+        setWebhook(canonicalDraft.webhook);
+        setTelegramToken(canonicalDraft.telegramToken);
+        setTelegramUserIds(canonicalDraft.telegramUserIds);
+        setOfflineMinutes(canonicalDraft.offlineMinutes);
+        absorbSourceSignature(alertSettingsDraftSignature(canonicalDraft));
+        setIsDirty(false);
+        setFieldErrors({});
+      },
+      setBusy: setIsSaving,
+    });
+  };
+
+  const handleSave = () => {
     if (isBusy) {
       return;
     }
@@ -281,27 +333,22 @@ export default function NotificationAlert({
     if (!applyValidationResult(validation)) {
       return;
     }
-
-    setIsSaving(true);
-    try {
-      const savedSettings = await onSave(buildSavePayload(validation));
-      const canonicalDraft = makeAlertSettingsDraft(savedSettings);
-      setWebhook(canonicalDraft.webhook);
-      setTelegramToken(canonicalDraft.telegramToken);
-      setTelegramUserIds(canonicalDraft.telegramUserIds);
-      setOfflineMinutes(canonicalDraft.offlineMinutes);
-      setSourceSignature(alertSettingsDraftSignature(canonicalDraft));
-      toast.success("告警配置已保存");
-      setIsDirty(false);
-      setFieldErrors({});
-    } catch (error) {
-      toast.error(getErrorMessage(error, "保存告警配置失败"));
-    } finally {
-      setIsSaving(false);
+    const payload = buildSavePayload(validation);
+    if (validation.disableTelegram) {
+      // "双空=停用"对用户不可见：清空收件人的本意可能只是改列表，弹窗
+      // 明示保存会连同样销已配置的 Bot Token（显式空值不可恢复）。
+      setPendingConfirm({
+        payload,
+        title: "确认停用 Telegram 通知？",
+        description: "保存将同时清除已配置的 Bot Token 与收件人列表，清除后需重新输入才能恢复；表单中其他未保存的修改将一并保存。",
+        confirmLabel: "停用并保存",
+      });
+      return;
     }
+    runSave(payload);
   };
 
-  const handleTest = async (channel: "telegram" | "feishu") => {
+  const handleTest = (channel: "telegram" | "feishu") => {
     if (isBusy) {
       return;
     }
@@ -313,15 +360,12 @@ export default function NotificationAlert({
       return;
     }
 
-    setTestingChannel(channel);
-    try {
-      await onTest(buildTestPayload(channel, validation));
-      toast.success("测试消息已发送");
-    } catch (error) {
-      toast.error(getErrorMessage(error, "测试发送失败"));
-    } finally {
-      setTestingChannel(null);
-    }
+    void runAction({
+      action: () => onTest(buildTestPayload(channel, validation)),
+      fallbackError: "测试发送失败",
+      successToast: "测试消息已发送",
+      setBusy: (on) => setTestingChannel(on ? channel : null),
+    });
   };
 
   const statCards = [
@@ -364,6 +408,15 @@ export default function NotificationAlert({
           </Button>
         </div>
       </div>
+
+      {!settings?.alert_webhook_set && !settings?.alert_telegram_token_set ? (
+        <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-5 py-4">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+          <p className="text-sm font-medium text-amber-600 dark:text-amber-400">
+            尚未配置任何通知渠道：节点离线时不会发送任何告警通知。请先配置飞书 Webhook 或 Telegram。
+          </p>
+        </div>
+      ) : null}
 
       <div className="grid auto-rows-fr gap-4 md:grid-cols-3">
         {statCards.map((item) => {
@@ -456,7 +509,7 @@ export default function NotificationAlert({
                     value={telegramToken}
                     disabled={isBusy}
                     onChange={createFieldChangeHandler("telegramToken", setTelegramToken)}
-                    placeholder="例如：123456789:ABC…"
+                    placeholder={settings?.alert_telegram_token_set ? "已配置（留空保持不变）" : "例如：123456789:ABC…"}
                   />
                   {fieldErrors.telegramToken ? (
                     <p id="telegram-token-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
@@ -528,12 +581,42 @@ export default function NotificationAlert({
                   value={webhook}
                   disabled={isBusy}
                   onChange={createFieldChangeHandler("webhook", setWebhook)}
-                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
+                  placeholder={settings?.alert_webhook_set ? "已配置（留空保持不变）" : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}
                 />
                 {fieldErrors.webhook ? (
                   <p id="feishu-webhook-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
                     {fieldErrors.webhook}
                   </p>
+                ) : null}
+                {settings?.alert_webhook_set ? (
+                  <AlertDialog>
+                    <AlertDialogTrigger
+                      type="button"
+                      className="h-8 w-fit px-2 text-xs font-bold text-rose-500 hover:text-rose-600"
+                      disabled={isBusy || isDirty}
+                      title={isDirty ? "请先保存或放弃当前修改" : undefined}
+                    >
+                      停用飞书 Webhook…
+                    </AlertDialogTrigger>
+                    <AlertDialogContent className={adminDialogContentClass}>
+                      <AlertDialogHeader className={adminDialogHeaderClass}>
+                        <AlertDialogTitle>确认停用飞书 Webhook？</AlertDialogTitle>
+                        <AlertDialogDescription>
+                          停用后节点离线将不再发送飞书通知，需重新填写 Webhook 才能恢复。
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter className={adminDialogFooterClass}>
+                        <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                        <AlertDialogAction
+                          className={adminDialogDangerActionClass}
+                          disabled={isBusy}
+                          onClick={() => runSave({ alert_webhook: "" })}
+                        >
+                          确认停用
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
                 ) : null}
               </div>
             </div>
@@ -551,6 +634,29 @@ export default function NotificationAlert({
           </CardFooter>
         </Card>
       </div>
+
+      <AlertDialog open={pendingConfirm !== null} onOpenChange={(open) => { if (!open) { setPendingConfirm(null); } }}>
+        <AlertDialogContent className={adminDialogContentClass}>
+          <AlertDialogHeader className={adminDialogHeaderClass}>
+            <AlertDialogTitle>{pendingConfirm?.title}</AlertDialogTitle>
+            <AlertDialogDescription>{pendingConfirm?.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className={adminDialogFooterClass}>
+            <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className={adminDialogDangerActionClass}
+              onClick={() => {
+                if (pendingConfirm) {
+                  runSave(pendingConfirm.payload);
+                }
+                setPendingConfirm(null);
+              }}
+            >
+              {pendingConfirm?.confirmLabel}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

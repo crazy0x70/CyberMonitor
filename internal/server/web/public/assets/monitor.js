@@ -204,10 +204,12 @@ const state = {
   testHistoryControllers: new Map(),
   testHistoryGeneration: new Map(),
   testHistoryRetryTimers: new Map(),
-  metricHistory: new Map(),
   testRange: new Map(),
   testSmooth: new Map(),
   selectedTests: new Map(),
+  historyMaxLastAt: new Map(),
+  publicSettingsSignature: "",
+  groupTabHrefSignature: "",
   mergedProvenance: new Map(),
   renderedNode: new Map(),
   renderedHistorySig: new Map(),
@@ -428,8 +430,8 @@ function refreshOpenNodeHistoryViews(nodeId, options = {}) {
   ) {
     return;
   }
-  if (options.force && card._detailSignature !== undefined) {
-    card._detailSignature = "";
+  if (options.force) {
+    card._historySignature = "";
   }
   updateNetworkTests(
     card._fields,
@@ -1085,8 +1087,20 @@ function applyPublicIdentitySettings(settings) {
 function applyPublicSettings(settings) {
   if (!settings) return;
   currentPublicSettings = settings || {};
-  const backgroundImage = normalizePublicImageURL(settings.site_background_image);
-  setPublicLocale(loadPublicLocalePreference(settings.locale), { persist: false });
+  // 每个 tick 的快照都会携带 settings，引用必变；按内容签名门控，
+  // 避免每 2s 重写站点标识 DOM。签名含 publicLocale：手动切换语言后仍会刷新。
+  const signature = [
+    currentPublicSettings.site_title || "",
+    currentPublicSettings.site_icon || "",
+    currentPublicSettings.home_title || "",
+    currentPublicSettings.home_subtitle || "",
+    publicLocale,
+    currentPublicSettings.site_background_image || "",
+  ].join("|");
+  if (state.publicSettingsSignature === signature) return;
+  state.publicSettingsSignature = signature;
+  const backgroundImage = normalizePublicImageURL(currentPublicSettings.site_background_image);
+  setPublicLocale(loadPublicLocalePreference(currentPublicSettings.locale), { persist: false });
   applyPublicIdentitySettings(currentPublicSettings);
   applySiteBackground(backgroundImage);
 }
@@ -1490,6 +1504,7 @@ function cleanupDetachedHistory(nodes) {
   for (const cacheKey of collectHistoryRequestCacheKeys()) {
     if (!activeHistoryKeys.has(cacheKey)) {
       state.testHistory.delete(cacheKey);
+      state.historyMaxLastAt.delete(cacheKey);
       trimHistoryRequestStateByKey(cacheKey);
       state.testHistoryGeneration.delete(cacheKey);
       changed = true;
@@ -1505,11 +1520,6 @@ function cleanupDetachedHistory(nodes) {
     if (!activeNodeIDs.has(id)) {
       state.testSmooth.delete(id);
       changed = true;
-    }
-  }
-  for (const id of state.metricHistory.keys()) {
-    if (!activeNodeIDs.has(id)) {
-      state.metricHistory.delete(id);
     }
   }
   if (changed) {
@@ -1564,10 +1574,32 @@ function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
   }
   const map = ensureHistoryRangeMapByKey(cacheKey, rangeKey);
   let updated = false;
-  Object.entries(tests).forEach(([key, entry]) => {
-    const normalized = normalizeTestHistoryEntry(entry);
-    if (!normalized) return;
+  Object.entries(tests).forEach(([key, raw]) => {
     const existing = map.get(key);
+    if (existing && existing.lastAt > 0) {
+      // 廉价预检：lastAt 未推进（含同刻且点数不增）的数据直接跳过，
+      // 避免每个广播 tick 对未变化序列做全量数组 normalize。
+      const rawTimes = Array.isArray(raw?.times) ? raw.times : null;
+      const rawLast = Number(
+        raw?.last_at ??
+          raw?.lastAt ??
+          (rawTimes && rawTimes.length ? rawTimes[rawTimes.length - 1] : 0)
+      );
+      if (Number.isFinite(rawLast) && rawLast > 0) {
+        const rawSize = rawTimes ? rawTimes.length : 0;
+        const existingSize = Array.isArray(existing.times)
+          ? existing.times.length
+          : 0;
+        if (
+          rawLast < existing.lastAt ||
+          (rawLast === existing.lastAt && rawSize <= existingSize)
+        ) {
+          return;
+        }
+      }
+    }
+    const normalized = normalizeTestHistoryEntry(raw);
+    if (!normalized) return;
     const incomingLast = normalized.lastAt || 0;
     const existingLast = existing && existing.lastAt ? existing.lastAt : 0;
     const incomingSize = normalized.times.length;
@@ -1581,6 +1613,10 @@ function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
       trimTestHistoryEntry(normalized);
       map.set(key, normalized);
       updated = true;
+      const cachedMax = state.historyMaxLastAt.get(cacheKey) || 0;
+      if (incomingLast > cachedMax) {
+        state.historyMaxLastAt.set(cacheKey, incomingLast);
+      }
     }
   });
   return updated;
@@ -1591,14 +1627,22 @@ function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
     return false;
   }
   const map = new Map();
+  let maxLastAt = 0;
   Object.entries(tests).forEach(([key, entry]) => {
     const normalized = normalizeTestHistoryEntry(entry);
     if (!normalized) return;
     trimTestHistoryEntry(normalized);
     map.set(key, normalized);
+    if (normalized.lastAt > maxLastAt) {
+      maxLastAt = normalized.lastAt;
+    }
   });
   const ranges = ensureNodeHistoryRangesByKey(cacheKey);
   ranges.set(normalizeHistoryRangeKey(rangeKey), map);
+  // 缓存语义是"该节点全部 range 的最大 lastAt"：replace 只覆盖单个 range，
+  // 取并集最大值避免把其他 range 的较新时间戳抹掉。
+  const cachedMax = state.historyMaxLastAt.get(cacheKey) || 0;
+  state.historyMaxLastAt.set(cacheKey, Math.max(cachedMax, maxLastAt));
   return true;
 }
 
@@ -2006,9 +2050,13 @@ function renderGroupTabs(groups) {
       groupTabs.appendChild(link);
     });
   }
+  const hrefChanged = state.groupTabHrefSignature !== state.statusFilter;
+  if (hrefChanged) {
+    state.groupTabHrefSignature = state.statusFilter;
+  }
   Array.from(groupTabs.querySelectorAll(".group-tab")).forEach((button) => {
     button.classList.toggle("active", button.dataset.group === state.selectedGroup);
-    if (button.tagName === "A") {
+    if (hrefChanged && button.tagName === "A") {
       button.setAttribute("href", buildViewURL(button.dataset.group || DEFAULT_GROUP, state.statusFilter));
     }
   });
@@ -2237,6 +2285,61 @@ function groupNodesByTag(nodes, group) {
   return sorted;
 }
 
+// ==== createCard 数据驱动模板：结构与字段一一对应，改动只需更新数据表 ====
+
+function summaryMetricsHTML() {
+  const items = [
+    { key: "cpu", label: "CPU", boxClass: " cpu" },
+    { key: "mem", label: t("memory"), boxClass: "" },
+    { key: "disk", label: t("disk"), boxClass: "" },
+    { key: "net", label: t("network"), boxClass: "" },
+  ];
+  return items
+    .map(
+      (item) => `
+        <div class="summary-metric${item.boxClass}">
+          <div class="summary-inline">
+            <span class="summary-label">${item.label}</span>
+            <span class="summary-text" data-field="${item.key}-meta">--</span>
+            <span class="summary-value" data-field="${item.key}-summary">--</span>
+          </div>
+          <div class="summary-bar-line">
+            <div class="summary-bar">
+              <span class="summary-fill ${item.key}" data-field="${item.key}-mini"></span>
+            </div>
+          </div>
+        </div>`
+    )
+    .join("");
+}
+
+function detailInfoRowsHTML() {
+  const rows = [
+    ["status", "detail-status"],
+    ["uptime", "detail-uptime"],
+    ["remaining", "detail-remaining"],
+    ["arch", "detail-arch"],
+    ["memory", "detail-mem"],
+    ["disk", "detail-disk"],
+    ["region", "detail-region"],
+    ["os", "detail-os"],
+    ["gpu", "detail-gpu"],
+    ["load", "detail-load"],
+    ["uploadTotal", "detail-upload"],
+    ["downloadTotal", "detail-download"],
+    ["firstReport", "detail-first"],
+    ["lastReport", "detail-last"],
+  ];
+  // CPU 行无翻译键（品牌缩写），插在 os 之后与历史布局一致。
+  rows.splice(8, 0, ["CPU", "detail-cpu", "raw"]);
+  return rows
+    .map(
+      ([labelKey, field, raw]) =>
+        `<div class="info-row"><span>${raw ? labelKey : t(labelKey)}</span><strong data-field="${field}">--</strong></div>`
+    )
+    .join("");
+}
+
 function createCard() {
   const card = document.createElement("details");
   card.className = "node-card";
@@ -2251,136 +2354,14 @@ function createCard() {
           <span class="node-meta-text" data-field="meta"></span>
         </div>
       </div>
-      <div class="node-summary-metrics">
-        <div class="summary-metric cpu">
-          <div class="summary-inline">
-            <span class="summary-label">CPU</span>
-            <span class="summary-text" data-field="cpu-meta">--</span>
-            <span class="summary-value" data-field="cpu-summary">--</span>
-          </div>
-          <div class="summary-bar-line">
-            <div class="summary-bar">
-              <span class="summary-fill cpu" data-field="cpu-mini"></span>
-            </div>
-          </div>
-        </div>
-        <div class="summary-metric">
-          <div class="summary-inline">
-            <span class="summary-label">${t("memory")}</span>
-            <span class="summary-text" data-field="mem-meta">--</span>
-            <span class="summary-value" data-field="mem-summary">--</span>
-          </div>
-          <div class="summary-bar-line">
-            <div class="summary-bar">
-              <span class="summary-fill mem" data-field="mem-mini"></span>
-            </div>
-          </div>
-        </div>
-        <div class="summary-metric">
-          <div class="summary-inline">
-            <span class="summary-label">${t("disk")}</span>
-            <span class="summary-text" data-field="disk-meta">--</span>
-            <span class="summary-value" data-field="disk-summary">--</span>
-          </div>
-          <div class="summary-bar-line">
-            <div class="summary-bar">
-              <span class="summary-fill disk" data-field="disk-mini"></span>
-            </div>
-          </div>
-        </div>
-        <div class="summary-metric">
-          <div class="summary-inline">
-            <span class="summary-label">${t("network")}</span>
-            <span class="summary-text" data-field="net-meta">--</span>
-            <span class="summary-value" data-field="net-summary">--</span>
-          </div>
-          <div class="summary-bar-line">
-            <div class="summary-bar">
-              <span class="summary-fill net" data-field="net-mini"></span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <div class="node-summary-metrics">${summaryMetricsHTML()}</div>
       <div class="node-summary-right">
         <div class="summary-right-line" data-field="summary-uptime"></div>
         <div class="summary-right-line" data-field="summary-tests"></div>
       </div>
     </summary>
     <div class="node-details">
-      <div class="detail-layout">
-        <div class="detail-info">
-          <div class="info-row"><span>${t("status")}</span><strong data-field="detail-status">--</strong></div>
-          <div class="info-row"><span>${t("uptime")}</span><strong data-field="detail-uptime">--</strong></div>
-          <div class="info-row"><span>${t("remaining")}</span><strong data-field="detail-remaining">--</strong></div>
-          <div class="info-row"><span>${t("arch")}</span><strong data-field="detail-arch">--</strong></div>
-          <div class="info-row"><span>${t("memory")}</span><strong data-field="detail-mem">--</strong></div>
-          <div class="info-row"><span>${t("disk")}</span><strong data-field="detail-disk">--</strong></div>
-          <div class="info-row"><span>${t("region")}</span><strong data-field="detail-region">--</strong></div>
-          <div class="info-row"><span>${t("os")}</span><strong data-field="detail-os">--</strong></div>
-          <div class="info-row"><span>CPU</span><strong data-field="detail-cpu">--</strong></div>
-          <div class="info-row"><span>${t("gpu")}</span><strong data-field="detail-gpu">--</strong></div>
-          <div class="info-row"><span>${t("load")}</span><strong data-field="detail-load">--</strong></div>
-          <div class="info-row"><span>${t("uploadTotal")}</span><strong data-field="detail-upload">--</strong></div>
-          <div class="info-row"><span>${t("downloadTotal")}</span><strong data-field="detail-download">--</strong></div>
-          <div class="info-row"><span>${t("firstReport")}</span><strong data-field="detail-first">--</strong></div>
-          <div class="info-row"><span>${t("lastReport")}</span><strong data-field="detail-last">--</strong></div>
-        </div>
-        <div class="detail-charts">
-          <div class="detail-grid">
-            <div class="metric">
-              <div class="metric-head">
-                <span>CPU</span>
-                <span data-field="cpu-value">--</span>
-              </div>
-              <div class="meter"><span class="fill" data-field="cpu-bar"></span></div>
-              <div class="metric-sub" data-field="cpu-load">Load --</div>
-              <div class="metric-chart" data-field="cpu-chart"></div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>${t("process")}</span>
-                <span data-field="proc-value">--</span>
-              </div>
-              <div class="metric-sub" data-field="proc-detail">--</div>
-              <div class="metric-chart" data-field="proc-chart"></div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>${t("memory")}</span>
-                <span data-field="mem-value">--</span>
-              </div>
-              <div class="meter"><span class="fill mem" data-field="mem-bar"></span></div>
-              <div class="metric-sub" data-field="mem-detail">--</div>
-              <div class="metric-chart" data-field="mem-chart"></div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>${t("disk")}</span>
-                <span data-field="disk-value">--</span>
-              </div>
-              <div class="meter"><span class="fill disk" data-field="disk-bar"></span></div>
-              <div class="metric-sub" data-field="disk-detail">--</div>
-              <div class="metric-chart" data-field="disk-chart"></div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>${t("network")}</span>
-                <span data-field="net-total">--</span>
-              </div>
-              <div class="metric-sub" data-field="net-detail">--</div>
-              <div class="metric-chart" data-field="net-chart"></div>
-            </div>
-            <div class="metric">
-              <div class="metric-head">
-                <span>${t("connection")}</span>
-                <span data-field="conn-value">--</span>
-              </div>
-              <div class="metric-sub" data-field="conn-detail">--</div>
-              <div class="metric-chart" data-field="conn-chart"></div>
-            </div>
-          </div>
-        </div>
-      </div>
+      <div class="detail-info">${detailInfoRowsHTML()}</div>
         <div class="network-section">
         <div class="network-chart">
           <div class="network-chart-toolbar">
@@ -2414,87 +2395,59 @@ function createCard() {
     </div>
   `;
 
-  const fields = {
-    name: card.querySelector('[data-field="name"]'),
-    meta: card.querySelector('[data-field="meta"]'),
-    statusDot: card.querySelector('[data-field="status-dot"]'),
-    summaryUptime: card.querySelector('[data-field="summary-uptime"]'),
-    summaryTests: card.querySelector('[data-field="summary-tests"]'),
-    cpuSummary: card.querySelector('[data-field="cpu-summary"]'),
-    memSummary: card.querySelector('[data-field="mem-summary"]'),
-    diskSummary: card.querySelector('[data-field="disk-summary"]'),
-    netSummary: card.querySelector('[data-field="net-summary"]'),
-    cpuMini: card.querySelector('[data-field="cpu-mini"]'),
-    memMini: card.querySelector('[data-field="mem-mini"]'),
-    diskMini: card.querySelector('[data-field="disk-mini"]'),
-    netMini: card.querySelector('[data-field="net-mini"]'),
-    cpuMeta: card.querySelector('[data-field="cpu-meta"]'),
-    memMeta: card.querySelector('[data-field="mem-meta"]'),
-    diskMeta: card.querySelector('[data-field="disk-meta"]'),
-    netMeta: card.querySelector('[data-field="net-meta"]'),
-    cpuValue: card.querySelector('[data-field="cpu-value"]'),
-    cpuBar: card.querySelector('[data-field="cpu-bar"]'),
-    cpuLoad: card.querySelector('[data-field="cpu-load"]'),
-    cpuChart: card.querySelector('[data-field="cpu-chart"]'),
-    memValue: card.querySelector('[data-field="mem-value"]'),
-    memBar: card.querySelector('[data-field="mem-bar"]'),
-    memDetail: card.querySelector('[data-field="mem-detail"]'),
-    memChart: card.querySelector('[data-field="mem-chart"]'),
-    diskValue: card.querySelector('[data-field="disk-value"]'),
-    diskBar: card.querySelector('[data-field="disk-bar"]'),
-    diskDetail: card.querySelector('[data-field="disk-detail"]'),
-    diskChart: card.querySelector('[data-field="disk-chart"]'),
-    netTotal: card.querySelector('[data-field="net-total"]'),
-    netDetail: card.querySelector('[data-field="net-detail"]'),
-    netChart: card.querySelector('[data-field="net-chart"]'),
-    procValue: card.querySelector('[data-field="proc-value"]'),
-    procDetail: card.querySelector('[data-field="proc-detail"]'),
-    procChart: card.querySelector('[data-field="proc-chart"]'),
-    connValue: card.querySelector('[data-field="conn-value"]'),
-    connDetail: card.querySelector('[data-field="conn-detail"]'),
-    connChart: card.querySelector('[data-field="conn-chart"]'),
-    networkSection: card.querySelector(".network-section"),
-    testSmooth: card.querySelector('[data-field="test-smooth"]'),
-    testRange: card.querySelector('[data-field="test-range"]'),
-    testChart: card.querySelector('[data-field="test-chart"]'),
-    testCrosshair: card.querySelector('[data-field="test-crosshair"]'),
-    testTooltip: card.querySelector('[data-field="test-tooltip"]'),
-    testCards: card.querySelector('[data-field="test-cards"]'),
-    uptime: card.querySelector('[data-field="uptime"]'),
-    lastSeen: card.querySelector('[data-field="last-seen"]'),
-    detailStatus: card.querySelector('[data-field="detail-status"]'),
-    detailUptime: card.querySelector('[data-field="detail-uptime"]'),
-    detailArch: card.querySelector('[data-field="detail-arch"]'),
-    detailOS: card.querySelector('[data-field="detail-os"]'),
-    detailCPU: card.querySelector('[data-field="detail-cpu"]'),
-    detailGPU: card.querySelector('[data-field="detail-gpu"]'),
-    detailLoad: card.querySelector('[data-field="detail-load"]'),
-    detailMem: card.querySelector('[data-field="detail-mem"]'),
-    detailDisk: card.querySelector('[data-field="detail-disk"]'),
-    detailRegion: card.querySelector('[data-field="detail-region"]'),
-    detailRemaining: card.querySelector('[data-field="detail-remaining"]'),
-    detailUpload: card.querySelector('[data-field="detail-upload"]'),
-    detailDownload: card.querySelector('[data-field="detail-download"]'),
-    detailFirst: card.querySelector('[data-field="detail-first"]'),
-    detailLast: card.querySelector('[data-field="detail-last"]'),
-  };
+  // data-field 自动收集：键名规则为 kebab→camel，os/cpu/gpu 缩写保持全大写。
+  // 模板与消费方（updateCard/renderCardDetails）都在本文件内，字段同步改。
+  const fields = {};
+  card.querySelectorAll("[data-field]").forEach((el) => {
+    fields[
+      el.dataset.field
+        .split("-")
+        .map((part, idx) =>
+          idx === 0
+            ? part
+            : part === "os" || part === "cpu" || part === "gpu"
+              ? part.toUpperCase()
+              : part.charAt(0).toUpperCase() + part.slice(1)
+        )
+        .join("")
+    ] = el;
+  });
+  fields.networkSection = card.querySelector(".network-section");
+
+  // range tabs 只构建一次（展开卡每 tick 重渲染时仅切 active class）。
+  fields.rangeButtons = new Map();
+  RANGE_OPTIONS.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "range-btn";
+    button.dataset.range = item.key;
+    button.textContent = item.label;
+    button.addEventListener("click", () => {
+      const current = state.testRange.get(card._nodeId) || DEFAULT_TEST_RANGE_KEY;
+      if (current === item.key) return;
+      state.testRange.set(card._nodeId, item.key);
+      renderNetworkSection(fields, card._nodeId);
+    });
+    fields.rangeButtons.set(item.key, button);
+    fields.testRange.appendChild(button);
+  });
 
   card._fields = fields;
-  card._detailSignature = "";
+  card._historySignature = "";
   card.addEventListener("toggle", () => {
     if (!card.open) {
-      card._detailSignature = "";
+      card._historySignature = "";
       return;
     }
     if (!card._lastNode || !card._nodeId) {
       return;
     }
-    const detailSignature = buildCardDetailSignature(card._lastNode, card._nodeId);
-    if (card._detailSignature === detailSignature) {
+    const historySignature = buildCardHistorySignature(card._lastNode, card._nodeId);
+    if (historySignature === card._historySignature) {
       return;
     }
     renderCardDetails(card, card._lastNode, card._nodeId);
-    card._detailSignature = detailSignature;
+    card._historySignature = historySignature;
   });
   return card;
 }
@@ -2530,24 +2483,12 @@ function updateCard(card, node, nodeId) {
   if (fields.cpuMini) {
     fields.cpuMini.style.width = `${cpuPercent}%`;
   }
-  fields.cpuValue.textContent = `${cpuPercent.toFixed(1)}%`;
-  fields.cpuBar.style.width = `${cpuPercent}%`;
-  fields.cpuLoad.textContent = `Load ${formatLoad(cpu)}`;
-
-  const processCount = stats.process_count || 0;
-  fields.procValue.textContent = `${processCount}`;
-  fields.procDetail.textContent = t("processCount");
 
   const memPercent = clamp(mem.used_percent || 0);
   fields.memSummary.textContent = `${memPercent.toFixed(0)}%`;
   if (fields.memMini) {
     fields.memMini.style.width = `${memPercent}%`;
   }
-  fields.memValue.textContent = `${memPercent.toFixed(1)}%`;
-  fields.memBar.style.width = `${memPercent}%`;
-  fields.memDetail.textContent = `${formatBytes(mem.used)} / ${formatBytes(
-    mem.total
-  )}`;
 
   const diskAgg = aggregateDisk(diskList);
   const diskPercent = clamp(diskAgg.percent);
@@ -2555,11 +2496,6 @@ function updateCard(card, node, nodeId) {
   if (fields.diskMini) {
     fields.diskMini.style.width = `${diskPercent}%`;
   }
-  fields.diskValue.textContent = `${diskPercent.toFixed(1)}%`;
-  fields.diskBar.style.width = `${diskPercent}%`;
-  fields.diskDetail.textContent = `${formatBytes(diskAgg.used)} / ${formatBytes(
-    diskAgg.total
-  )}`;
 
   const netSpeed =
     Number.isFinite(node.net_speed_mbps) && node.net_speed_mbps > 0
@@ -2577,29 +2513,10 @@ function updateCard(card, node, nodeId) {
   fields.netMeta.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
     net.rx_bytes_per_sec
   )}`;
-  fields.netTotal.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : "--";
-  fields.netDetail.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
-    net.rx_bytes_per_sec
-  )}`;
-
-  const tcpCount = stats.tcp_conns || 0;
-  const udpCount = stats.udp_conns || 0;
-  fields.connValue.textContent = `${tcpCount} / ${udpCount}`;
-  fields.connDetail.textContent = "TCP / UDP";
 
   card._nodeId = nodeId;
   card._lastNode = node;
 
-  updateMetricHistory(nodeId, stats, {
-    cpu: cpuPercent,
-    mem: mem.used || 0,
-    disk: diskAgg.used || 0,
-    netUp: net.tx_bytes_per_sec || 0,
-    netDown: net.rx_bytes_per_sec || 0,
-    process: stats.process_count || 0,
-    tcp: stats.tcp_conns || 0,
-    udp: stats.udp_conns || 0,
-  });
   fields.uptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
   fields.lastSeen.textContent = `${t("updatedPrefix")} ${formatTime(node.last_seen || 0)}`;
   fields.summaryUptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
@@ -2634,53 +2551,20 @@ function updateCard(card, node, nodeId) {
   fields.detailLast.textContent = formatTimeFull(node.last_seen || 0);
   updateTestHistory(nodeId, tests);
 
-  const detailSignature = buildCardDetailSignature(node, nodeId);
-  if (card.open && card._detailSignature !== detailSignature) {
+  const historySignature = buildCardHistorySignature(node, nodeId);
+  if (card.open && card._historySignature !== historySignature) {
     renderCardDetails(card, node, nodeId);
-    card._detailSignature = detailSignature;
+    card._historySignature = historySignature;
   }
 }
 
 function renderCardDetails(card, node, nodeId) {
-  const fields = card._fields;
-  const stats = node.stats || {};
-  const cpu = stats.cpu || {};
-  const mem = stats.memory || {};
-  const diskAgg = aggregateDisk(stats.disk || []);
-  const net = stats.network || {};
-  const history = state.metricHistory.get(nodeId) || updateMetricHistory(nodeId, stats, {
-    cpu: clamp(cpu.usage_percent || 0),
-    mem: mem.used || 0,
-    disk: diskAgg.used || 0,
-    netUp: net.tx_bytes_per_sec || 0,
-    netDown: net.rx_bytes_per_sec || 0,
-    process: stats.process_count || 0,
-    tcp: stats.tcp_conns || 0,
-    udp: stats.udp_conns || 0,
-  });
-
-  fields.cpuChart.innerHTML = renderSparklineMulti([history.cpu], ["#4f7cff"]);
-  fields.procChart.innerHTML = renderSparklineMulti([history.process], ["#f97316"]);
-  fields.memChart.innerHTML = renderSparklineMulti(
-    [history.mem],
-    ["#22c55e"],
-    mem.total || 0
+  updateNetworkTests(
+    card._fields,
+    node,
+    node.stats?.network_tests || [],
+    nodeId
   );
-  fields.diskChart.innerHTML = renderSparklineMulti(
-    [history.disk],
-    ["#f97316"],
-    diskAgg.total || 0
-  );
-  fields.netChart.innerHTML = renderSparklineMulti(
-    [history.netUp, history.netDown],
-    ["#38bdf8", "#a855f7"]
-  );
-  fields.connChart.innerHTML = renderSparklineMulti(
-    [history.tcp, history.udp],
-    ["#60a5fa", "#a855f7"]
-  );
-
-  updateNetworkTests(fields, node, stats.network_tests || [], nodeId);
 }
 
 function hasConfiguredNetworkTestPolicy(node) {
@@ -2696,7 +2580,9 @@ function hasConfiguredNetworkTestPolicy(node) {
 function clearNetworkSection(fields) {
   fields.testChart.innerHTML = "";
   fields.testCards.innerHTML = "";
-  if (fields.testRange) {
+  if (fields.rangeButtons) {
+    fields.rangeButtons.forEach((button) => button.classList.remove("active"));
+  } else if (fields.testRange) {
     fields.testRange.innerHTML = "";
   }
   if (fields.testSmooth) {
@@ -2713,9 +2599,6 @@ function clearNetworkSection(fields) {
 }
 
 function renderNetworkLoadingState(fields) {
-  if (fields.testRange) {
-    fields.testRange.innerHTML = "";
-  }
   resetNetworkChartInteractions(fields);
   fields.testChart.innerHTML = `
     <div class="network-loading-state">
@@ -2761,7 +2644,7 @@ function renderNetworkHistoryErrorChart(fields) {
 }
 
 function renderNetworkHistoryErrorState(fields, nodeId, activeRange) {
-  renderRangeTabs(fields, nodeId, activeRange);
+  renderRangeTabs(fields, activeRange);
   renderNetworkHistoryErrorChart(fields);
   fields.testCards.innerHTML = "";
 }
@@ -2825,18 +2708,7 @@ function resolveHistoryMapLastAt(historyMap) {
 }
 
 function latestHistoryAtForNode(nodeId) {
-  const ranges = state.testHistory.get(resolveHistoryNodeCacheKey(nodeId));
-  if (!ranges || ranges.size === 0) {
-    return 0;
-  }
-  let latest = 0;
-  ranges.forEach((historyMap) => {
-    const rangeLastAt = resolveHistoryMapLastAt(historyMap);
-    if (rangeLastAt > latest) {
-      latest = rangeLastAt;
-    }
-  });
-  return latest;
+  return state.historyMaxLastAt.get(resolveHistoryNodeCacheKey(nodeId)) || 0;
 }
 
 function resolveNetworkRenderContext(
@@ -2854,15 +2726,13 @@ function resolveNetworkRenderContext(
   };
 }
 
-function buildCardDetailSignature(node, nodeId) {
+// 历史签名：仅在网络历史变化时触发探测区整段重渲染。
+function buildCardHistorySignature(node, nodeId) {
   const stats = node?.stats || {};
   const { activeRange, latestHistoryAt } = resolveNetworkRenderContext(nodeId);
   return [
-    String(nodeId || ""),
-    Number(node?.last_seen || 0),
-    Number(stats?.uptime_sec || 0),
-    Number(stats?.process_count || 0),
     hasConfiguredNetworkTestPolicy(node) ? "1" : "0",
+    Array.isArray(stats?.network_tests) ? stats.network_tests.length : 0,
     activeRange,
     state.testSmooth.get(nodeId) ? "1" : "0",
     latestHistoryAt,
@@ -2885,7 +2755,7 @@ function renderNetworkSection(fields, nodeId) {
       ? baseTests
       : buildTestsFromHistory(renderHistoryMap);
   const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
-  renderRangeTabs(fields, nodeId, activeRange);
+  renderRangeTabs(fields, activeRange);
   renderSmoothToggle(fields, nodeId, smoothEnabled);
   fields.testCards.innerHTML = "";
 
@@ -3045,23 +2915,10 @@ function renderSmoothToggle(fields, nodeId, enabled) {
   };
 }
 
-function renderRangeTabs(fields, nodeId, active) {
-  if (!fields.testRange) return;
-  fields.testRange.innerHTML = "";
-  RANGE_OPTIONS.forEach((item) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "range-btn";
-    if (item.key === active) {
-      button.classList.add("active");
-    }
-    button.textContent = item.label;
-    button.addEventListener("click", () => {
-      if (item.key === active) return;
-      state.testRange.set(nodeId, item.key);
-      renderNetworkSection(fields, nodeId);
-    });
-    fields.testRange.appendChild(button);
+function renderRangeTabs(fields, active) {
+  if (!fields.rangeButtons) return;
+  fields.rangeButtons.forEach((button, key) => {
+    button.classList.toggle("active", key === active);
   });
 }
 
@@ -3118,12 +2975,20 @@ function filterHistoryByRange(history, rangeSec, nowSec) {
   }
   const filtered = { latency: [], loss: [], times: [] };
   const minTime = nowSec - rangeSec;
-  for (let i = 0; i < times.length; i += 1) {
-    const ts = times[i];
-    if (!ts || ts < minTime) {
-      continue;
+  // times 升序：二分定位首个 >= minTime 的下标，7d 大窗口避免全量线性扫。
+  let lo = 0;
+  let hi = times.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const t = Number(times[mid]);
+    if (Number.isFinite(t) && t < minTime) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
     }
-    filtered.times.push(ts);
+  }
+  for (let i = lo; i < times.length; i += 1) {
+    filtered.times.push(times[i]);
     filtered.latency.push(latency[i] ?? null);
     filtered.loss.push(loss[i] ?? null);
   }
@@ -3150,6 +3015,11 @@ function resolveObservedHistoryIntervalSec(testEntries) {
     const minInterval = Number(entry?.history?.minIntervalSec);
     if (Number.isFinite(minInterval) && minInterval > 0) {
       intervals.push(minInterval);
+      return;
+    }
+    const avgInterval = Number(entry?.history?.avgIntervalSec);
+    if (Number.isFinite(avgInterval) && avgInterval > 0) {
+      intervals.push(avgInterval);
       return;
     }
     const times = Array.isArray(entry?.filtered?.times) ? entry.filtered.times : [];
@@ -3290,44 +3160,6 @@ function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
   return result;
 }
 
-function updateMetricHistory(nodeId, stats, values) {
-  if (!state.metricHistory.has(nodeId)) {
-    state.metricHistory.set(nodeId, {
-      lastAt: 0,
-      cpu: [],
-      process: [],
-      mem: [],
-      disk: [],
-      netUp: [],
-      netDown: [],
-      tcp: [],
-      udp: [],
-    });
-  }
-  const entry = state.metricHistory.get(nodeId);
-  const timestamp = stats.timestamp || Math.floor(Date.now() / 1000);
-  if (timestamp > entry.lastAt) {
-    pushHistory(entry.cpu, values.cpu);
-    pushHistory(entry.process, values.process);
-    pushHistory(entry.mem, values.mem);
-    pushHistory(entry.disk, values.disk);
-    pushHistory(entry.netUp, values.netUp);
-    pushHistory(entry.netDown, values.netDown);
-    pushHistory(entry.tcp, values.tcp);
-    pushHistory(entry.udp, values.udp);
-    entry.lastAt = timestamp;
-  }
-  return entry;
-}
-
-function pushHistory(list, value) {
-  if (!Array.isArray(list)) return;
-  list.push(value);
-  if (list.length > 40) {
-    list.splice(0, list.length - 40);
-  }
-}
-
 function updateTestHistory(nodeId, tests) {
   if (!Array.isArray(tests) || tests.length === 0) {
     return;
@@ -3393,55 +3225,16 @@ function updateTestHistory(nodeId, tests) {
       entry.lastAt = checkedAt;
       trimTestHistoryEntry(entry);
       map.set(key, entry);
+      const cachedMax = state.historyMaxLastAt.get(cacheKey) || 0;
+      if (checkedAt > cachedMax) {
+        state.historyMaxLastAt.set(cacheKey, checkedAt);
+      }
       updated = true;
     });
   });
   if (updated) {
     scheduleHistoryCacheSave();
   }
-}
-
-function renderSparklineMulti(seriesList, colors, maxValueOverride) {
-  const width = 260;
-  const height = 70;
-  const normalized = seriesList
-    .map((series) => (Array.isArray(series) ? series : []))
-    .filter((series) => series.length > 0);
-  if (!normalized.length) {
-    return '<div class="sparkline-empty">--</div>';
-  }
-  const maxLen = Math.max(...normalized.map((series) => series.length));
-  const pointsList = normalized.map((series) =>
-    padSeries(series, maxLen).map((value) =>
-      value === null || value === undefined ? 0 : value
-    )
-  );
-  const flatValues = pointsList.flatMap((series) => series);
-  const computedMax = Math.max(1, ...flatValues);
-  const maxValue =
-    Number.isFinite(maxValueOverride) && maxValueOverride > 0
-      ? maxValueOverride
-      : computedMax;
-  const step = width / Math.max(maxLen - 1, 1);
-  const lines = pointsList
-    .map((series, seriesIndex) => {
-      const points = series
-        .map((value, index) => {
-          const safeValue = Math.min(value, maxValue);
-          const x = index * step;
-          const y = height - (safeValue / maxValue) * height;
-          return `${x.toFixed(1)},${y.toFixed(1)}`;
-        })
-        .join(" ");
-      const color = colors[seriesIndex] || "#4f7cff";
-      return `<polyline fill="none" stroke="${color}" stroke-width="2" points="${points}" />`;
-    })
-    .join("");
-  return `
-    <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-      ${lines}
-    </svg>
-  `;
 }
 
 function buildLatencyChart(seriesList, colors, times, rangeSec) {

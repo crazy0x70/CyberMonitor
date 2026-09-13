@@ -114,14 +114,19 @@ func (r *runtimeConfig) Snapshot() (string, string, []metrics.NetworkTestConfig,
 	return r.alias, r.group, copyTests, r.interval
 }
 
-func markRemoteNetworkTests(tests []metrics.NetworkTestConfig, publicOnly bool) []metrics.NetworkTestConfig {
+func markRemoteNetworkTests(tests []metrics.NetworkTestConfig, forcePublicOnly bool) []metrics.NetworkTestConfig {
 	if len(tests) == 0 {
 		return tests
 	}
 	marked := make([]metrics.NetworkTestConfig, len(tests))
 	copy(marked, tests)
 	for i := range marked {
-		marked[i].PublicOnly = publicOnly
+		// 默认拒绝私网时统一覆写；allow-private 节点原样信任服务端下发
+		// 的目标列表（当前服务端不做逐项 PublicOnly 标记，即允许私网），
+		// 不在此处整体抹平。
+		if forcePublicOnly {
+			marked[i].PublicOnly = true
+		}
 	}
 	return marked
 }
@@ -174,7 +179,7 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 
 	var payload RemoteConfig
 	if err := performAgentRequest(client, req, "config", func(body io.Reader) error {
-		return decodeStrictAgentJSON(body, &payload, "config response has trailing data")
+		return decodeAgentResponseJSON(body, &payload, "config response has trailing data")
 	}); err != nil {
 		return RemoteConfig{}, err
 	}
@@ -280,9 +285,11 @@ func readAgentAPIStatusError(resp *http.Response, operation string) error {
 	}
 }
 
-func decodeStrictAgentJSON(body io.Reader, target any, trailingMessage string) error {
+// decodeAgentResponseJSON 解码服务端响应：不做未知字段拒绝——server 先于
+// agent 滚动升级时，响应新增字段不得打挂存量 agent 的上报/配置同步；
+// trailing data 检查保留，足以发现协议错位。
+func decodeAgentResponseJSON(body io.Reader, target any, trailingMessage string) error {
 	decoder := json.NewDecoder(body)
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
 	}

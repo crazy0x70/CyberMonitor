@@ -19,8 +19,13 @@ import (
 )
 
 const (
-	defaultTCPPort           = 80
-	icmpTimeout              = 3 * time.Second
+	defaultTCPPort = 80
+	// icmpTimeout 必须覆盖 ping 完整运行时长（pingSampleCount 个包 ×
+	// 每包等待 2s + 发送间隔）：3s 预算会在命令打出汇总行前杀进程，
+	// 已成功的 reply 被错误改判为 100% 丢包——监控恰恰在丢包/高延迟
+	// 目标上触发此路径。代价：探测时长可能主导采集轮次，interval 小于
+	// 探测时长时实际采样周期取探测时长。
+	icmpTimeout              = 8 * time.Second
 	tcpTimeout               = 3 * time.Second
 	publicProbeLookupTimeout = 2 * time.Second
 	pingSampleCount          = 3
@@ -163,6 +168,22 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 				<-sem
 				wg.Done()
 			}()
+			defer func() {
+				// 探测路径 panic 不得杀死整个 agent：以 error 结果占位。
+				if rec := recover(); rec != nil {
+					log.Printf("网络测试 %s panic 已恢复: %v", config.Name, rec)
+					results[index] = metrics.NetworkTestResult{
+						Name:       config.Name,
+						Type:       config.Type,
+						Host:       config.Host,
+						Port:       config.Port,
+						PacketLoss: 100,
+						Status:     "error",
+						Error:      fmt.Sprintf("panic: %v", rec),
+						CheckedAt:  time.Now().Unix(),
+					}
+				}
+			}()
 			results[index] = runSingleNetworkTest(ctx, config, time.Now, testTCP, pingHost)
 		}(i, cfg)
 	}
@@ -186,16 +207,17 @@ func runSingleNetworkTest(
 		Status: "error",
 	}
 
-	probeHost, err := resolveNetworkTestProbeHost(ctx, config)
+	probeHosts, err := resolveNetworkTestProbeHost(ctx, config)
 	if err != nil {
 		result.Error = err.Error()
+		result.PacketLoss = 100
 		result.CheckedAt = now().Unix()
 		return result
 	}
 
 	switch config.Type {
 	case "tcp":
-		latency, status, errText := tcpProbe(ctx, probeHost, config.Port)
+		latency, status, errText := probeTCPCandidates(ctx, probeHosts, config.Port, tcpProbe)
 		result.LatencyMs = latency
 		result.Status = status
 		if status == "ok" {
@@ -205,7 +227,7 @@ func runSingleNetworkTest(
 		}
 		result.Error = errText
 	default:
-		latency, loss, status, errText := icmpProbe(ctx, probeHost)
+		latency, loss, status, errText := probeICMPCandidates(ctx, probeHosts, icmpProbe)
 		result.LatencyMs = latency
 		result.PacketLoss = loss
 		result.Status = status
@@ -216,15 +238,15 @@ func runSingleNetworkTest(
 	return result
 }
 
-func resolveNetworkTestProbeHost(ctx context.Context, config metrics.NetworkTestConfig) (string, error) {
+func resolveNetworkTestProbeHost(ctx context.Context, config metrics.NetworkTestConfig) ([]string, error) {
 	if config.PublicOnly {
 		return resolvePublicProbeHost(ctx, config.Host)
 	}
 	host := strings.TrimSpace(config.Host)
 	if err := validateProbeHost(host); err != nil {
-		return "", err
+		return nil, err
 	}
-	return host, nil
+	return []string{host}, nil
 }
 
 func testTCP(ctx context.Context, host string, port int) (*float64, string, string) {
@@ -232,6 +254,10 @@ func testTCP(ctx context.Context, host string, port int) (*float64, string, stri
 	start := time.Now()
 	conn, err := (&net.Dialer{Timeout: tcpTimeout}).DialContext(ctx, "tcp", address)
 	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return nil, "timeout", err.Error()
+		}
 		return nil, "error", err.Error()
 	}
 	_ = conn.Close()
@@ -283,10 +309,47 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	return latency, loss, status, parseErr
 }
 
+// probeICMPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
+// 失败时返回最后一次结果（与 probeTCPCandidates 对称，多 A 记录/双栈
+// 场景不再被首个地址单点拖死）。
+func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context.Context, string) (*float64, float64, string, string)) (*float64, float64, string, string) {
+	// 全部候选共享单项总预算：候选逐一尝试的最坏耗时不超过单地址路径，
+	// 排在前面的地址用不完的预算留给后续候选。
+	ctx, cancel := context.WithTimeout(ctx, icmpTimeout)
+	defer cancel()
+	var latency *float64
+	var loss float64
+	var status, errText string
+	for _, host := range hosts {
+		latency, loss, status, errText = probe(ctx, host)
+		if status == "ok" {
+			return latency, loss, status, ""
+		}
+	}
+	return latency, loss, status, errText
+}
+
+// probeTCPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
+// 失败时返回最后一次错误。
+func probeTCPCandidates(ctx context.Context, hosts []string, port int, probe func(context.Context, string, int) (*float64, string, string)) (*float64, string, string) {
+	var latency *float64
+	var status, errText string
+	for _, host := range hosts {
+		latency, status, errText = probe(ctx, host, port)
+		if status == "ok" {
+			return latency, status, ""
+		}
+	}
+	return latency, status, errText
+}
+
 func validateProbeHost(host string) error {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return errors.New("host 不能为空")
+	}
+	if len(host) > 253 {
+		return errors.New("host 超长（>253 字节）")
 	}
 	if net.ParseIP(host) != nil {
 		return nil
@@ -301,24 +364,26 @@ func validateProbeHost(host string) error {
 
 type probeLookupFunc func(context.Context, string) ([]net.IP, error)
 
-func resolvePublicProbeHost(ctx context.Context, host string) (string, error) {
+const maxProbeCandidates = 4
+
+func resolvePublicProbeHost(ctx context.Context, host string) ([]string, error) {
 	return resolvePublicProbeHostWithResolver(ctx, host, lookupProbeHostIPs)
 }
 
-func resolvePublicProbeHostWithResolver(ctx context.Context, host string, lookup probeLookupFunc) (string, error) {
+func resolvePublicProbeHostWithResolver(ctx context.Context, host string, lookup probeLookupFunc) ([]string, error) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		if err := validatePublicProbeIP(ip); err != nil {
-			return "", err
+			return nil, err
 		}
-		return canonicalProbeIP(ip), nil
+		return []string{canonicalProbeIP(ip)}, nil
 	}
 	name := normalizeProbeHostname(host)
 	if err := validateProbeHost(name); err != nil {
-		return "", err
+		return nil, err
 	}
 	if name == "localhost" || strings.HasSuffix(name, ".localhost") || !strings.Contains(name, ".") {
-		return "", errors.New("远程网络测试不允许使用本地或内网主机名")
+		return nil, errors.New("远程网络测试不允许使用本地或内网主机名")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -330,18 +395,29 @@ func resolvePublicProbeHostWithResolver(ctx context.Context, host string, lookup
 	defer cancel()
 	ips, err := lookup(lookupCtx, name)
 	if err != nil {
-		return "", fmt.Errorf("解析远程网络测试主机失败: %w", err)
+		return nil, fmt.Errorf("解析远程网络测试主机失败: %w", err)
 	}
 	if len(ips) == 0 {
-		return "", errors.New("解析远程网络测试主机失败: empty address set")
+		return nil, errors.New("解析远程网络测试主机失败: empty address set")
 	}
-	resolved := ""
+	// 任一被采纳的地址非法即整体失败（防 rebinding；封顶后未检查的
+	// 地址不会被探测）；返回全部已验证地址供 TCP 探测依次尝试（双栈
+	// 主机首个地址不可达不应整体失败），封顶 maxProbeCandidates 防超
+	// 大地址集拖死 worker。
+	seen := make(map[string]struct{}, len(ips))
+	resolved := make([]string, 0, len(ips))
 	for _, ip := range ips {
 		if err := validatePublicProbeIP(ip); err != nil {
-			return "", err
+			return nil, err
 		}
-		if resolved == "" {
-			resolved = canonicalProbeIP(ip)
+		literal := canonicalProbeIP(ip)
+		if _, dup := seen[literal]; dup {
+			continue
+		}
+		seen[literal] = struct{}{}
+		resolved = append(resolved, literal)
+		if len(resolved) == maxProbeCandidates {
+			break
 		}
 	}
 	return resolved, nil

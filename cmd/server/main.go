@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -66,8 +66,43 @@ func main() {
 
 	*listen = cmdutil.NormalizeListen(*listen)
 	*publicListen = cmdutil.NormalizeListen(*publicListen)
+	// 在任何 I/O 与凭据生成之前校验，失败时点名 flag，避免全量初始化
+	// 完成后才在 net.Listen 处报出不指明来源的错误。
+	for _, item := range []struct{ name, value string }{
+		{"listen", *listen},
+		{"public-listen", *publicListen},
+	} {
+		if item.value == "" {
+			continue
+		}
+		_, port, err := net.SplitHostPort(item.value)
+		if err != nil {
+			log.Fatalf("-%s 值 %q 不是合法监听地址: %v", item.name, item.value, err)
+		}
+		if port != "" {
+			// SplitHostPort 把端口当不透明字符串，服务名不可解析（如 ":abc"）
+			// 要靠 LookupPort 才能前置拦截。
+			if _, err := net.LookupPort("tcp", port); err != nil {
+				log.Fatalf("-%s 值 %q 端口 %q 不是合法端口: %v", item.name, item.value, port, err)
+			}
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 关闭链在途（HTTP drain、history Close 可达 30s）时第二次信号会被
+	// NotifyContext 忽略：对齐 agent 侧，二次信号直接强退。
+	forced := make(chan os.Signal, 2)
+	signal.Notify(forced, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(forced)
+	go func() {
+		signals := 0
+		for range forced {
+			signals++
+			if signals >= 2 {
+				log.Fatalf("再次收到退出信号，强制终止")
+			}
+		}
+	}()
 
 	cfg := server.Config{
 		Addr:                *listen,
@@ -82,7 +117,7 @@ func main() {
 		Commit:              resolvedCommit(),
 		TrustedProxyHeaders: *trustProxyHeaders,
 	}
-	if err := server.Run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+	if err := server.Run(ctx, cfg); err != nil {
 		log.Fatalf("服务启动失败: %v", err)
 	}
 }

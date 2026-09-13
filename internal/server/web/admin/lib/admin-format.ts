@@ -35,11 +35,6 @@ export function formatBytes(value?: number) {
   return `${current.toFixed(current >= 100 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-export function formatRate(value?: number) {
-  const bytes = formatBytes(value);
-  return bytes === "--" ? bytes : `${bytes}/s`;
-}
-
 export function formatMbps(value?: number) {
   const num = Number(value || 0);
   if (!Number.isFinite(num) || num <= 0) return "--";
@@ -269,4 +264,44 @@ export function resolveProbeLabel(item: TestCatalogItem) {
   const host = item.host || "--";
   const port = item.port ? `:${item.port}` : "";
   return `${type} ${host}${port}`;
+}
+
+// ==== 管理端页面导航（App 与 Dashboard 共用） ====
+
+export type AdminPage =
+  | "dashboard"
+  | "servers"
+  | "groups"
+  | "probes"
+  | "settings"
+  | "alerts"
+  | "ai"
+  | "logs";
+
+export const ADMIN_PAGE_QUERY_KEY = "page";
+
+export function adminPageHref(page: AdminPage) {
+  if (typeof window === "undefined") {
+    return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+  }
+  const nextURL = new URL(window.location.href);
+  if (page === "dashboard") {
+    nextURL.searchParams.delete(ADMIN_PAGE_QUERY_KEY);
+  } else {
+    nextURL.searchParams.set(ADMIN_PAGE_QUERY_KEY, page);
+  }
+  return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
+}
+
+export function shouldHandleAdminNavigation(
+  event: Pick<MouseEvent, "defaultPrevented" | "button" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">,
+) {
+  return !(
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  );
 }
