@@ -209,6 +209,7 @@ function basicSettingsDraft(settings: SettingsView | null) {
     homeTitle: settings?.home_title || "",
     homeSubtitle: settings?.home_subtitle || "",
     locale: normalizeLocaleValue(settings?.locale),
+    regionGroupEnabled: settings?.region_group_enabled !== false,
     loginFailLimit: String(settings?.login_fail_limit || 0),
     loginFailWindow: toMinuteFieldValue(settings?.login_fail_window_sec),
     loginLockMinutes: toMinuteFieldValue(settings?.login_lock_sec),
@@ -242,6 +243,7 @@ function applyBasicSettingsDraft(
     setHomeTitle: (value: string) => void;
     setHomeSubtitle: (value: string) => void;
     setLocale: (value: string) => void;
+    setRegionGroupEnabled: (value: boolean) => void;
     setLoginFailLimit: (value: string) => void;
     setLoginFailWindow: (value: string) => void;
     setLoginLockMinutes: (value: string) => void;
@@ -261,6 +263,7 @@ function applyBasicSettingsDraft(
   setters.setHomeTitle(draft.homeTitle);
   setters.setHomeSubtitle(draft.homeSubtitle);
   setters.setLocale(draft.locale);
+  setters.setRegionGroupEnabled(draft.regionGroupEnabled);
   setters.setLoginFailLimit(draft.loginFailLimit);
   setters.setLoginFailWindow(draft.loginFailWindow);
   setters.setLoginLockMinutes(draft.loginLockMinutes);
@@ -292,6 +295,7 @@ export default function BasicSettings({
   const [homeTitle, setHomeTitle] = useState("");
   const [homeSubtitle, setHomeSubtitle] = useState("");
   const [locale, setLocale] = useState("zh-CN");
+  const [regionGroupEnabled, setRegionGroupEnabled] = useState(true);
   const [loginFailLimit, setLoginFailLimit] = useState("0");
   const [loginFailWindow, setLoginFailWindow] = useState("");
   const [loginLockMinutes, setLoginLockMinutes] = useState("");
@@ -317,6 +321,7 @@ export default function BasicSettings({
     homeTitle,
     homeSubtitle,
     locale,
+    regionGroupEnabled,
     loginFailLimit,
     loginFailWindow,
     loginLockMinutes,
@@ -358,6 +363,7 @@ export default function BasicSettings({
       setHomeTitle,
       setHomeSubtitle,
       setLocale,
+      setRegionGroupEnabled,
       setLoginFailLimit,
       setLoginFailWindow,
       setLoginLockMinutes,
@@ -411,6 +417,7 @@ export default function BasicSettings({
       home_title: homeTitle.trim(),
       home_subtitle: homeSubtitle.trim(),
       locale: normalizeLocaleValue(locale),
+      region_group_enabled: regionGroupEnabled,
       admin_auth: adminAuthPayload(adminAuthDraftValue),
     };
 
@@ -477,6 +484,7 @@ export default function BasicSettings({
           setHomeTitle,
           setHomeSubtitle,
           setLocale,
+          setRegionGroupEnabled,
           setLoginFailLimit,
           setLoginFailWindow,
           setLoginLockMinutes,
@@ -1175,6 +1183,28 @@ export default function BasicSettings({
                       ))}
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <Label htmlFor="region-group-enabled" className="text-sm font-semibold">
+                      国家地区分组导航
+                    </Label>
+                    <p className={`mt-1 text-xs ${adminMutedTextClass}`}>
+                      展示页按节点地区代码（C&amp;R）二级分组。
+                    </p>
+                  </div>
+                  <Switch
+                    id="region-group-enabled"
+                    checked={regionGroupEnabled}
+                    disabled={isBusy}
+                    onCheckedChange={(checked) => {
+                      if (isBusy) {
+                        return;
+                      }
+                      setRegionGroupEnabled(Boolean(checked));
+                      setIsDirty(true);
+                    }}
+                  />
                 </div>
               </CardContent>
             </Card>

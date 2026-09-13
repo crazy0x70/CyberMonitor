@@ -168,32 +168,35 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 		{label: "hostname", path: filepath.Join(root, "etc", "hostname")},
 	}
 
-	parts := make([]string, 0, len(sources))
-	seen := make(map[string]struct{}, len(sources))
+	// 存在但不可读（sysfs product_uuid 等为 0400，非特权容器 EACCES）的
+	// 源不参与指纹：与占位符方案相比，指纹值与旧版本（同样跳过）一致，
+	// 版本升级不产生节点 ID 漂移；代价是权限状态变化（如改用
+	// --privileged）会漂移一次，两方案在此等价。日志点名该源，避免静默。
+	var readable, placeholders []string
 	for _, source := range sources {
 		value, err := readTrimmedFile(source.path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
 				continue
 			}
-			// 存在但读失败（EACCES 等）：以占位符参与指纹。保证两点：
-			// (a) 不可读期间每次启动派生同一 ID；(b) 全部源不可读时不再
-			// 退化为每启动一个随机 UUID。权限恢复后指纹仍会变化一次
-			// （一次性 ID 漂移，服务端多一条重复节点记录，可手工清理）。
-			log.Printf("读取机器指纹源 %s 失败: %v", source.path, err)
-			value = "<unreadable>"
-		}
-		part := source.label + "=" + value
-		if _, exists := seen[part]; exists {
+			log.Printf("机器指纹源 %s 不可读，指纹跳过该源: %v", source.path, err)
+			placeholders = append(placeholders, source.label+"=<unreadable>")
 			continue
 		}
-		seen[part] = struct{}{}
-		parts = append(parts, part)
+		readable = append(readable, source.label+"="+value)
 	}
-	if len(parts) == 0 {
-		return "", os.ErrNotExist
+	if len(readable) > 0 {
+		return strings.Join(readable, "\n"), nil
 	}
-	return strings.Join(parts, "\n"), nil
+	if len(placeholders) > 0 {
+		// 全部源存在但均不可读：以占位符参与指纹，保证每次启动派生
+		// 同一 ID，不退化为每启动一个随机 UUID。
+		return strings.Join(placeholders, "\n"), nil
+	}
+	// 全部源不存在：hostRoot 未挂载或配置错误的典型症状。此时上层会
+	// 生成随机 node ID（容器重建即换新 ID），点名日志让这一后果可见。
+	log.Printf("机器指纹源目录 %s 下无可读指纹源，将退回随机 node id（请检查宿主机目录挂载）", root)
+	return "", os.ErrNotExist
 }
 
 func deriveStableNodeIDFromFingerprint(fingerprint string) string {

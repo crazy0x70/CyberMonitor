@@ -104,6 +104,7 @@ export interface SettingsView {
   home_title?: string;
   home_subtitle?: string;
   locale?: string;
+  region_group_enabled?: boolean;
   /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
   alert_webhook?: string;
   alert_webhook_set?: boolean;

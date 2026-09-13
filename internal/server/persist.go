@@ -41,22 +41,25 @@ const (
 var secureRandomReader io.Reader = rand.Reader
 
 type Settings struct {
-	AdminPath            string            `json:"admin_path"`
-	AdminUser            string            `json:"admin_user"`
-	AdminPass            string            `json:"admin_pass"`
-	AdminPassPlain       string            `json:"-"`
-	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
-	TokenSalt            string            `json:"token_salt,omitempty"`
-	AuthToken            string            `json:"auth_token,omitempty"`
-	AgentToken           string            `json:"agent_token,omitempty"`
-	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
-	SiteTitle            string            `json:"site_title,omitempty"`
-	SiteIcon             string            `json:"site_icon,omitempty"`
-	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
-	HomeTitle            string            `json:"home_title,omitempty"`
-	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
-	Locale               string            `json:"locale,omitempty"`
+	AdminPath           string `json:"admin_path"`
+	AdminUser           string `json:"admin_user"`
+	AdminPass           string `json:"admin_pass"`
+	AdminPassPlain      string `json:"-"`
+	TurnstileSiteKey    string `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey  string `json:"turnstile_secret_key,omitempty"`
+	TokenSalt           string `json:"token_salt,omitempty"`
+	AuthToken           string `json:"auth_token,omitempty"`
+	AgentToken          string `json:"agent_token,omitempty"`
+	AgentEndpoint       string `json:"agent_endpoint,omitempty"`
+	SiteTitle           string `json:"site_title,omitempty"`
+	SiteIcon            string `json:"site_icon,omitempty"`
+	SiteBackgroundImage string `json:"site_background_image,omitempty"`
+	HomeTitle           string `json:"home_title,omitempty"`
+	HomeSubtitle        string `json:"home_subtitle,omitempty"`
+	Locale              string `json:"locale,omitempty"`
+	// 展示页"国家地区(C&R)分组导航"开关：反向存储使存量数据（字段缺省）
+	// 语义为启用，无需迁移。
+	RegionGroupDisabled  bool              `json:"region_group_disabled,omitempty"`
 	AlertWebhook         string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
 	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
@@ -73,19 +76,22 @@ type Settings struct {
 }
 
 type SettingsView struct {
-	AdminPath             string            `json:"admin_path"`
-	AdminUser             string            `json:"admin_user"`
-	TurnstileSiteKey      string            `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey    string            `json:"turnstile_secret_key,omitempty"`
-	AgentEndpoint         string            `json:"agent_endpoint,omitempty"`
-	AgentToken            string            `json:"agent_token,omitempty"`
-	AgentTokenSet         bool              `json:"agent_token_set,omitempty"`
-	SiteTitle             string            `json:"site_title,omitempty"`
-	SiteIcon              string            `json:"site_icon,omitempty"`
-	SiteBackgroundImage   string            `json:"site_background_image,omitempty"`
-	HomeTitle             string            `json:"home_title,omitempty"`
-	HomeSubtitle          string            `json:"home_subtitle,omitempty"`
-	Locale                string            `json:"locale,omitempty"`
+	AdminPath           string `json:"admin_path"`
+	AdminUser           string `json:"admin_user"`
+	TurnstileSiteKey    string `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey  string `json:"turnstile_secret_key,omitempty"`
+	AgentEndpoint       string `json:"agent_endpoint,omitempty"`
+	AgentToken          string `json:"agent_token,omitempty"`
+	AgentTokenSet       bool   `json:"agent_token_set,omitempty"`
+	SiteTitle           string `json:"site_title,omitempty"`
+	SiteIcon            string `json:"site_icon,omitempty"`
+	SiteBackgroundImage string `json:"site_background_image,omitempty"`
+	HomeTitle           string `json:"home_title,omitempty"`
+	HomeSubtitle        string `json:"home_subtitle,omitempty"`
+	Locale              string `json:"locale,omitempty"`
+	// 指针语义：解码时 nil=字段缺失（legacy 导出文件），只接受显式
+	// true/false——否则 pre-r54 导入会把缺省解码成"关闭"。
+	RegionGroupEnabled    *bool             `json:"region_group_enabled,omitempty"`
 	AlertWebhook          string            `json:"alert_webhook,omitempty"`
 	AlertWebhookSet       bool              `json:"alert_webhook_set,omitempty"`
 	AlertOfflineSec       int64             `json:"alert_offline_sec,omitempty"`
@@ -119,6 +125,7 @@ type SettingsUpdate struct {
 	HomeTitle            *string            `json:"home_title"`
 	HomeSubtitle         *string            `json:"home_subtitle"`
 	Locale               *string            `json:"locale"`
+	RegionGroupEnabled   *bool              `json:"region_group_enabled"`
 	AlertWebhook         *string            `json:"alert_webhook"`
 	AlertOfflineSec      *int64             `json:"alert_offline_sec"`
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`

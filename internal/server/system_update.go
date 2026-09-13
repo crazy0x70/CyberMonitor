@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -143,7 +144,16 @@ func (m *systemUpdateManager) startLocked(info updater.ReleaseInfo, dockerManage
 
 func (m *systemUpdateManager) runApply(dockerManaged bool, apply func() error) {
 	go func() {
-		err := apply()
+		// apply 在独立 goroutine 执行，顶层 panic 不得杀死进程；转为
+		// 错误后走既有失败收尾（updating=false + message）。
+		err := func() (applyErr error) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					applyErr = fmt.Errorf("更新执行 panic 已恢复: %v", rec)
+				}
+			}()
+			return apply()
+		}()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		if err != nil {

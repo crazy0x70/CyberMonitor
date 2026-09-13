@@ -363,6 +363,7 @@ type PublicSettings struct {
 	HomeTitle           string `json:"home_title,omitempty"`
 	HomeSubtitle        string `json:"home_subtitle,omitempty"`
 	Locale              string `json:"locale,omitempty"`
+	RegionGroupEnabled  bool   `json:"region_group_enabled"`
 }
 
 type Snapshot struct {
@@ -4015,6 +4016,7 @@ func (s *Store) PublicSettings() PublicSettings {
 		HomeTitle:           s.settings.HomeTitle,
 		HomeSubtitle:        s.settings.HomeSubtitle,
 		Locale:              normalizeLocale(s.settings.Locale),
+		RegionGroupEnabled:  !s.settings.RegionGroupDisabled,
 	}
 }
 
@@ -4044,6 +4046,7 @@ func (s *Store) settingsViewLocked() SettingsView {
 		HomeTitle:             s.settings.HomeTitle,
 		HomeSubtitle:          s.settings.HomeSubtitle,
 		Locale:                normalizeLocale(s.settings.Locale),
+		RegionGroupEnabled:    boolPointer(!s.settings.RegionGroupDisabled),
 		AlertOfflineSec:       s.settings.AlertOfflineSec,
 		AlertTelegramUserIDs:  cloneInt64Slice(s.settings.AlertTelegramUserIDs),
 		AlertTelegramUserID:   firstTelegramUserID(s.settings.AlertTelegramUserIDs),
@@ -4198,16 +4201,18 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	testCatalog := cloneTestCatalogItems(view.TestCatalog)
 
 	update := SettingsUpdate{
-		AdminPath:            stringPointer(adminPath),
-		AdminUser:            stringPointer(adminUser),
-		TurnstileSiteKey:     stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
-		AgentEndpoint:        stringPointer(agentEndpoint),
-		SiteTitle:            stringPointer(siteTitle),
-		SiteIcon:             stringPointer(siteIcon),
-		SiteBackgroundImage:  stringPointer(siteBackgroundImage),
-		HomeTitle:            stringPointer(homeTitle),
-		HomeSubtitle:         stringPointer(homeSubtitle),
-		Locale:               stringPointer(locale),
+		AdminPath:           stringPointer(adminPath),
+		AdminUser:           stringPointer(adminUser),
+		TurnstileSiteKey:    stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
+		AgentEndpoint:       stringPointer(agentEndpoint),
+		SiteTitle:           stringPointer(siteTitle),
+		SiteIcon:            stringPointer(siteIcon),
+		SiteBackgroundImage: stringPointer(siteBackgroundImage),
+		HomeTitle:           stringPointer(homeTitle),
+		HomeSubtitle:        stringPointer(homeSubtitle),
+		Locale:              stringPointer(locale),
+		// 指针直传：nil（legacy 导出文件缺省）表示不触碰现值。
+		RegionGroupEnabled:   view.RegionGroupEnabled,
 		AlertWebhook:         stringPointer(alertWebhook),
 		AlertOfflineSec:      int64Pointer(view.AlertOfflineSec),
 		AlertTelegramToken:   stringPointer(alertTelegramToken),
@@ -4396,6 +4401,9 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.Locale != nil {
 		s.settings.Locale = normalizeLocale(*update.Locale)
+	}
+	if update.RegionGroupEnabled != nil {
+		s.settings.RegionGroupDisabled = !*update.RegionGroupEnabled
 	}
 	if update.AlertWebhook != nil {
 		value := strings.TrimSpace(*update.AlertWebhook)

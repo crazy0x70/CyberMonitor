@@ -31,7 +31,7 @@ const PUBLIC_I18N = {
     emptyGroupTitle: "当前分组暂无节点",
     emptyGroupBody: "请选择其他分组或返回全部查看。",
     poweredBy: "Powered by",
-    all: "全部",
+    all: "ALL",
     traffic: "流量",
     bandwidth: "带宽",
     unconfigured: "未配置",
@@ -97,7 +97,7 @@ const PUBLIC_I18N = {
     emptyGroupTitle: "No nodes in this group",
     emptyGroupBody: "Choose another group or return to All.",
     poweredBy: "Powered by",
-    all: "All",
+    all: "ALL",
     traffic: "Traffic",
     bandwidth: "Bandwidth",
     unconfigured: "Unconfigured",
@@ -154,10 +154,20 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
   minute: "2-digit",
   second: "2-digit",
 });
-const regionDisplayNames =
-  typeof Intl !== "undefined" && Intl.DisplayNames
-    ? new Intl.DisplayNames(["en"], { type: "region" })
-    : null;
+const regionDisplayNamesCache = new Map();
+function regionDisplayNamesFor(locale) {
+  if (typeof Intl === "undefined" || !Intl.DisplayNames) return null;
+  if (!regionDisplayNamesCache.has(locale)) {
+    let instance = null;
+    try {
+      instance = new Intl.DisplayNames([locale], { type: "region" });
+    } catch {
+      instance = null;
+    }
+    regionDisplayNamesCache.set(locale, instance);
+  }
+  return regionDisplayNamesCache.get(locale);
+}
 const fallbackRegionNames = {
   CA: "Canada",
   CN: "China",
@@ -172,7 +182,10 @@ const fallbackRegionNames = {
   US: "United States",
 };
 
-const DEFAULT_GROUP = "全部";
+const DEFAULT_GROUP = "ALL";
+// 国家地区虚拟分组：tag 存地区代码（ISO 两位码），显示层经 formatRegion
+// 按 locale 出名（zh: 新加坡 / en: Singapore）。
+const REGION_GROUP = "C&R";
 const DEFAULT_STATUS_FILTER = "all";
 const DEFAULT_TEST_RANGE_KEY = "1h";
 const STATUS_FILTERS = new Set(["all", "online", "offline"]);
@@ -209,6 +222,7 @@ const state = {
   selectedTests: new Map(),
   historyMaxLastAt: new Map(),
   publicSettingsSignature: "",
+  regionGroupEnabled: true,
   groupTabHrefSignature: "",
   mergedProvenance: new Map(),
   renderedNode: new Map(),
@@ -1096,9 +1110,11 @@ function applyPublicSettings(settings) {
     currentPublicSettings.home_subtitle || "",
     publicLocale,
     currentPublicSettings.site_background_image || "",
+    currentPublicSettings.region_group_enabled !== false ? "1" : "0",
   ].join("|");
   if (state.publicSettingsSignature === signature) return;
   state.publicSettingsSignature = signature;
+  state.regionGroupEnabled = currentPublicSettings.region_group_enabled !== false;
   const backgroundImage = normalizePublicImageURL(currentPublicSettings.site_background_image);
   setPublicLocale(loadPublicLocalePreference(currentPublicSettings.locale), { persist: false });
   applyPublicIdentitySettings(currentPublicSettings);
@@ -1905,7 +1921,8 @@ function collectGroupNames(nodes, settingsGroups) {
   (settingsGroups || []).forEach((group) => set.add(group));
   nodes.forEach((node) => {
     getGroupSelections(node).forEach((item) => {
-      if (item.group) {
+      // C&R 是固定 tab（受公开设置门控），不作为普通分组名参与收集。
+      if (item.group && item.group !== REGION_GROUP) {
         set.add(item.group);
       }
     });
@@ -1928,7 +1945,8 @@ function buildGroupSelectionSignature(node) {
   const groups = Array.isArray(node.groups) ? node.groups.join("\n") : "";
   const group = String(resolveFallbackGroup(node) || "").trim();
   const tags = Array.isArray(node.tags) ? node.tags.join("\n") : "";
-  return `${groups}||${group}||${tags}`;
+  const region = String(node?.region || "").trim().toUpperCase();
+  return `${groups}||${group}||${tags}||${region}`;
 }
 
 function extractGroupSelections(node) {
@@ -1943,6 +1961,12 @@ function extractGroupSelections(node) {
   }
   const selections = [];
   const seen = new Set();
+  // 地区代码作为 C&R 虚拟分组的 tag（存 code，显示层 formatRegion）。
+  const regionCode = String(node?.region || "").trim().toUpperCase();
+  if (/^[A-Z]{2}$/.test(regionCode)) {
+    selections.push({ group: REGION_GROUP, tag: regionCode });
+    seen.add(`${REGION_GROUP}:${regionCode}`);
+  }
   const raw = Array.isArray(node.groups) ? node.groups : [];
   if (raw.length > 0) {
     raw.forEach((value) => {
@@ -2023,7 +2047,11 @@ function resetRenderMode(mode) {
 
 function renderGroupTabs(groups) {
   if (!groupTabs) return;
-  const allGroups = [DEFAULT_GROUP, ...groups];
+  const allGroups = [
+    DEFAULT_GROUP,
+    ...(state.regionGroupEnabled ? [REGION_GROUP] : []),
+    ...groups,
+  ];
   const signature = allGroups.join("\n");
   if (!allGroups.includes(state.selectedGroup)) {
     applyViewState(
@@ -2064,6 +2092,7 @@ function renderGroupTabs(groups) {
 
 function filterNodesByGroup(nodes, group) {
   if (!group || group === DEFAULT_GROUP) return nodes;
+  if (group === REGION_GROUP) return nodes;
   return nodes.filter((node) => getGroupSelections(node, group).length > 0);
 }
 
@@ -2177,7 +2206,7 @@ function renderTagSections(nodes, group) {
   const sections = groupNodesByTag(nodes, group);
 
   sections.forEach((section, sectionIndex) => {
-    const entry = ensureTagSection(section.tag, sectionIndex);
+    const entry = ensureTagSection(section.tag, sectionIndex, group);
     entry.count.textContent = `(${section.nodes.length})`;
     activeTags.add(section.tag);
     section.nodes.forEach((node, index) => {
@@ -2197,7 +2226,7 @@ function renderTagSections(nodes, group) {
   cleanupTagSections(activeTags);
 }
 
-function ensureTagSection(tag, index) {
+function ensureTagSection(tag, index, group = "") {
   let entry = state.tagSections.get(tag);
   if (!entry) {
     const wrapper = document.createElement("div");
@@ -2230,7 +2259,8 @@ function ensureTagSection(tag, index) {
     state.tagSections.set(tag, entry);
   }
   entry.dot.style.background = tagColor(tag, index);
-  entry.name.textContent = tag;
+  entry.name.textContent =
+    group === REGION_GROUP && tag !== t("unconfigured") ? regionDisplayName(tag) : tag;
   return entry;
 }
 
@@ -3856,12 +3886,26 @@ function flagEmoji(code) {
   return String.fromCodePoint(first, second) + " ";
 }
 
+function regionDisplayName(code) {
+  const normalized = (code || "").trim().toUpperCase();
+  if (!normalized) return normalized;
+  const displayNames = regionDisplayNamesFor(publicLocale);
+  return (
+    (displayNames && typeof displayNames.of === "function"
+      ? displayNames.of(normalized)
+      : "") ||
+    fallbackRegionNames[normalized] ||
+    normalized
+  );
+}
+
 function formatRegion(code) {
   const normalized = (code || "").trim().toUpperCase();
   if (!normalized) return "--";
+  const displayNames = regionDisplayNamesFor(publicLocale);
   const resolved =
-    (regionDisplayNames && typeof regionDisplayNames.of === "function"
-      ? regionDisplayNames.of(normalized)
+    (displayNames && typeof displayNames.of === "function"
+      ? displayNames.of(normalized)
       : "") ||
     fallbackRegionNames[normalized] ||
     normalized;
