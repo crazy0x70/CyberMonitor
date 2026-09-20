@@ -556,7 +556,9 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 	if !recognized {
 		return false, "", false
 	}
-	nodes := store.Snapshot()
+	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
+	// 查询与开关告警——"隐藏"只裁剪公开展示面。
+	nodes := store.AdminSnapshot()
 	matched := 0
 	serverID := ""
 	for _, node := range nodes {
@@ -584,48 +586,73 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 }
 
 func buildTelegramAllStats(store *Store) string {
-	nodes := store.Snapshot()
+	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
+	// 查询与开关告警——"隐藏"只裁剪公开展示面。
+	nodes := store.AdminSnapshot()
 	total := len(nodes)
 	if total == 0 {
 		return "暂无服务器数据"
 	}
 	online := 0
 	offline := 0
+	waiting := 0
 	cpuSum := 0.0
 	memSum := 0.0
+	sampled := 0
 	for _, node := range nodes {
-		if node.Status == "offline" {
+		switch node.Status {
+		case "offline":
 			offline++
-		} else {
+		case nodeStatusWaitingRegistration:
+			// profile-only 节点无指标，剔除出在线与均值分母。
+			waiting++
+			continue
+		default:
 			online++
 		}
 		cpuSum += node.Stats.CPU.UsagePercent
 		memSum += node.Stats.Memory.UsedPercent
+		sampled++
 	}
-	avgCPU := cpuSum / float64(total)
-	avgMem := memSum / float64(total)
-	return fmt.Sprintf(
-		"服务器统计\n总数: %d\n在线: %d\n离线: %d\n平均CPU: %.1f%%\n平均内存: %.1f%%\n统计时间: %s",
-		total,
-		online,
-		offline,
+	avgCPU := 0.0
+	avgMem := 0.0
+	if sampled > 0 {
+		avgCPU = cpuSum / float64(sampled)
+		avgMem = memSum / float64(sampled)
+	}
+	statsText := fmt.Sprintf(
+		"服务器统计\n总数: %d\n在线: %d\n离线: %d",
+		total, online, offline,
+	)
+	if waiting > 0 {
+		statsText += fmt.Sprintf("\n待接入: %d", waiting)
+	}
+	statsText += fmt.Sprintf(
+		"\n平均CPU: %.1f%%\n平均内存: %.1f%%\n统计时间: %s",
 		avgCPU,
 		avgMem,
 		time.Now().Format("2006-01-02 15:04:05"),
 	)
+	return statsText
 }
 
 func buildTelegramServerList(store *Store) string {
-	nodes := store.Snapshot()
+	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
+	// 查询与开关告警——"隐藏"只裁剪公开展示面。
+	nodes := store.AdminSnapshot()
 	if len(nodes) == 0 {
 		return "暂无服务器数据"
 	}
 	online := make([]NodeView, 0)
 	offline := make([]NodeView, 0)
+	waiting := make([]NodeView, 0)
 	for _, node := range nodes {
-		if node.Status == "offline" {
+		switch node.Status {
+		case "offline":
 			offline = append(offline, node)
-		} else {
+		case nodeStatusWaitingRegistration:
+			waiting = append(waiting, node)
+		default:
 			online = append(online, node)
 		}
 	}
@@ -653,6 +680,13 @@ func buildTelegramServerList(store *Store) string {
 			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
 		}
 	}
+	if len(waiting) > 0 {
+		lines = append(lines, "", "待接入（已配置未上报）：")
+		for _, node := range waiting {
+			display := resolveNodeDisplayName(node)
+			lines = append(lines, fmt.Sprintf("• %s （%s）", display, node.ServerID))
+		}
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -661,14 +695,19 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 	if serverID == "" {
 		return "用法: /status 服务器ID"
 	}
-	nodes := store.Snapshot()
+	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
+	// 查询与开关告警——"隐藏"只裁剪公开展示面。
+	nodes := store.AdminSnapshot()
 	for _, node := range nodes {
 		if node.ServerID != serverID {
 			continue
 		}
 		statusLabel := "在线"
-		if node.Status == "offline" {
+		switch node.Status {
+		case "offline":
 			statusLabel = "离线"
+		case nodeStatusWaitingRegistration:
+			statusLabel = "待接入"
 		}
 		display := resolveNodeDisplayName(node)
 		lastSeen := formatTelegramTime(node.LastSeen)

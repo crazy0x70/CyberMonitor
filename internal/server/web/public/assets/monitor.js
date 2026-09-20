@@ -1922,11 +1922,14 @@ function buildTestGrid(rangeKey, rangeSec, nowSec, observedIntervalSec) {
 
 function collectGroupNames(nodes, settingsGroups) {
   const set = new Set();
-  (settingsGroups || []).forEach((group) => set.add(group));
+  const known = new Set(settingsGroups || []);
+  known.forEach((group) => set.add(group));
   nodes.forEach((node) => {
     getGroupSelections(node).forEach((item) => {
-      // C&R 是固定 tab（受公开设置门控），不作为普通分组名参与收集。
-      if (item.group && item.group !== REGION_GROUP) {
+      // C&R 是固定 tab（受公开设置门控），不作为普通分组名参与收集；
+      // 节点上指向已删除分组的悬空选择同样不收集（纵深防御：后端级联
+      // 清理之外的旧缓存/旧版本快照兜底）。
+      if (item.group && item.group !== REGION_GROUP && known.has(item.group)) {
         set.add(item.group);
       }
     });
@@ -3798,7 +3801,8 @@ function formatGPUDetails(gpus) {
           ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
           : "";
       const driver = String(gpu.driver_version || "").trim();
-      return [name, usage, memory, driver ? `${t("gpuDriver")} ${driver}` : ""]
+      // 顺序：显卡类型 · 驱动 · 占用率 · 显存详情。
+      return [name, driver ? `${t("gpuDriver")} ${driver}` : "", usage, memory]
         .filter(Boolean)
         .join(" · ");
     })

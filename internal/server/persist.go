@@ -1198,6 +1198,45 @@ func parseGroupSelection(value string) (string, string) {
 	return group, tag
 }
 
+// groupSelectionSets 汇总 settings 中当前有效的分组名与 (分组\x00标签)
+// 集合；treeMode 表示分组树存在（标签维度可判定）。
+func groupSelectionSets(settings Settings) (map[string]struct{}, map[string]struct{}, bool) {
+	groupNames := make(map[string]struct{})
+	tagKeys := make(map[string]struct{})
+	for _, node := range settings.GroupTree {
+		groupNames[node.Name] = struct{}{}
+		for _, tag := range node.Children {
+			tagKeys[node.Name+"\x00"+tag.Name] = struct{}{}
+		}
+	}
+	for _, name := range settings.Groups {
+		groupNames[name] = struct{}{}
+	}
+	return groupNames, tagKeys, len(settings.GroupTree) > 0
+}
+
+// filterGroupSelections 剔除指向未配置分组/标签的选择：分组被删除、或
+// 树模式下标签不再存在的条目不保留（悬空引用会在展示页复活分组）。
+func filterGroupSelections(selections []string, groupNames, tagKeys map[string]struct{}, treeMode bool) []string {
+	kept := make([]string, 0, len(selections))
+	for _, selection := range selections {
+		group, tag := parseGroupSelection(selection)
+		if group == "" {
+			continue
+		}
+		if _, ok := groupNames[group]; !ok {
+			continue
+		}
+		if tag != "" && treeMode {
+			if _, tagOK := tagKeys[group+"\x00"+tag]; !tagOK {
+				continue
+			}
+		}
+		kept = append(kept, selection)
+	}
+	return kept
+}
+
 func normalizeGroupSelections(selections []string) []string {
 	if len(selections) == 0 {
 		return nil

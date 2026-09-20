@@ -14,6 +14,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 import {
   AlertDialog,
@@ -213,6 +214,7 @@ type FormState = {
   diskType: string;
   netSpeedMbps: string;
   alertEnabled: boolean;
+  hiddenFromDisplay: boolean;
   expireAt: string;
   renewPlan: RenewPlan;
   groups: string[];
@@ -431,6 +433,7 @@ function buildFormState(node: NodeView, catalog: TestCatalogItem[]): FormState {
   return {
     alias: node.alias || node.stats.node_alias || "",
     region: node.region || "",
+    hiddenFromDisplay: node.hidden_from_display === true,
     diskType: node.disk_type || "",
     netSpeedMbps: node.net_speed_mbps ? String(node.net_speed_mbps) : "",
     alertEnabled: node.alert_enabled !== false,
@@ -445,6 +448,7 @@ function formDraftSignature(form: FormState) {
   return JSON.stringify({
     alias: form.alias,
     alertEnabled: form.alertEnabled,
+    hiddenFromDisplay: form.hiddenFromDisplay,
     diskType: form.diskType,
     expireAt: form.expireAt,
     groups: normalizeSelectionValues(form.groups),
@@ -488,6 +492,7 @@ function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfileP
   const payload: NodeProfilePayload = {
     alias: form.alias.trim(),
     alert_enabled: form.alertEnabled,
+    hide_from_display: form.hiddenFromDisplay,
     auto_renew: autoRenew,
     disk_type: form.diskType.trim(),
     groups: normalizeSelectionValues(form.groups),
@@ -1498,6 +1503,27 @@ export default function ServerManagement({
                                 )
                               }
                               placeholder="两位代码，如 SG / JP / HK"
+                            />
+                          </div>
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <Label htmlFor="node-hidden" className="text-sm font-semibold">
+                                在展示页隐藏
+                              </Label>
+                              <p className={`mt-1 text-xs text-slate-500 dark:text-slate-400`}>
+                                隐藏后节点不出现在公开展示页与历史查询；告警照常推送，Telegram 与管理端不受影响。
+                              </p>
+                            </div>
+                            <Switch
+                              id="node-hidden"
+                              checked={form.hiddenFromDisplay}
+                              disabled={editorBusy || sourceConflict}
+                              onCheckedChange={(checked: boolean) => {
+                                if (editorBusy || sourceConflict) {
+                                  return;
+                                }
+                                updateFormField("hiddenFromDisplay", Boolean(checked));
+                              }}
                             />
                           </div>
                         </div>

@@ -284,14 +284,17 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID                 string                  `json:"server_id,omitempty"`
-	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
-	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
-	Alias                    string                  `json:"alias,omitempty"`
-	Group                    string                  `json:"group,omitempty"`
-	Tags                     []string                `json:"tags,omitempty"`
-	Groups                   []string                `json:"groups,omitempty"`
-	Region                   string                  `json:"region,omitempty"`
+	ServerID       string   `json:"server_id,omitempty"`
+	AgentAuthToken string   `json:"agent_auth_token,omitempty"`
+	AlertEnabled   *bool    `json:"alert_enabled,omitempty"`
+	Alias          string   `json:"alias,omitempty"`
+	Group          string   `json:"group,omitempty"`
+	Tags           []string `json:"tags,omitempty"`
+	Groups         []string `json:"groups,omitempty"`
+	Region         string   `json:"region,omitempty"`
+	// 在公开展示页隐藏本节点（管理端仍可见可管理）；零值=显示，存量
+	// 数据无需迁移。
+	HideFromDisplay          bool                    `json:"hide_from_display,omitempty"`
 	DiskType                 string                  `json:"disk_type,omitempty"`
 	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
 	ExpireAt                 int64                   `json:"expire_at,omitempty"`
@@ -342,6 +345,7 @@ type NodeView struct {
 	Tags                     []string          `json:"tags,omitempty"`
 	Groups                   []string          `json:"groups,omitempty"`
 	Region                   string            `json:"region,omitempty"`
+	HiddenFromDisplay        bool              `json:"hidden_from_display,omitempty"`
 	DiskType                 string            `json:"disk_type,omitempty"`
 	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
 	ExpireAt                 int64             `json:"expire_at,omitempty"`
@@ -3148,6 +3152,10 @@ func (s *Store) HasNode(nodeID string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// 隐藏节点对公开历史端点视为不存在（管理端不受影响）。
+	if profile := s.profiles[nodeID]; profile != nil && profile.HideFromDisplay {
+		return false
+	}
 	_, exists := s.nodes[nodeID]
 	return exists
 }
@@ -3167,8 +3175,18 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 	return convertNetworkHistoryToTestHistory(entries), nil
 }
 
+// Snapshot 返回公开展示视图：hide_from_display 节点不出现（管理端
+// AdminSnapshot 不过滤）。
 func (s *Store) Snapshot() []NodeView {
-	return s.snapshot(false)
+	all := s.snapshot(false)
+	visible := all[:0]
+	for _, view := range all {
+		if view.HiddenFromDisplay {
+			continue
+		}
+		visible = append(visible, view)
+	}
+	return visible
 }
 
 func (s *Store) AdminSnapshot() []NodeView {
@@ -3269,6 +3287,7 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		Status:                   nodeStatusWaitingRegistration,
 		ServerID:                 profile.ServerID,
 		AlertEnabled:             isAlertEnabled(profile),
+		HiddenFromDisplay:        profile.HideFromDisplay,
 		Alias:                    alias,
 		Group:                    group,
 		Tags:                     cloneStringSlice(tags),
@@ -3294,7 +3313,7 @@ func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 
 	now := time.Now()
 	node, ok := s.nodeViewLocked(nodeID, now)
-	if !ok {
+	if !ok || node.HiddenFromDisplay {
 		return NodeDelta{}, false
 	}
 	return NodeDelta{
@@ -3340,6 +3359,7 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		Status:                   status,
 		ServerID:                 profile.ServerID,
 		AlertEnabled:             isAlertEnabled(profile),
+		HiddenFromDisplay:        profile.HideFromDisplay,
 		Alias:                    profile.Alias,
 		Group:                    group,
 		Tags:                     cloneStringSlice(tags),
@@ -3762,6 +3782,7 @@ type NodeProfileUpdate struct {
 	NetSpeedMbps     *int             `json:"net_speed_mbps"`
 	ExpireAt         *int64           `json:"expire_at"`
 	AutoRenew        *bool            `json:"auto_renew"`
+	HideFromDisplay  *bool            `json:"hide_from_display"`
 	RenewIntervalSec *int64           `json:"renew_interval_sec"`
 	TestIntervalSec  *int             `json:"test_interval_sec"`
 	TestSelections   *[]TestSelection `json:"test_selections"`
@@ -4570,6 +4591,12 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.markAgentConfigRefreshForCatalogChangeLocked(previousCatalog, catalog)
 		s.pruneProfileTestSelectionsLocked()
 	}
+	if update.Groups != nil || update.GroupTree != nil {
+		// 分组/标签被删除时，节点档案上的对应选择同步剔除——否则悬空
+		// 选择会把已删除的分组在展示页"复活"。置于全部校验之后：fail
+		// 回滚只恢复 settings，不能让 prune 的档案变异先于校验发生。
+		s.pruneProfileGroupSelectionsLocked()
+	}
 	view = s.settingsViewLocked()
 	s.mu.Unlock()
 
@@ -4715,6 +4742,7 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 	}
 
 	now := time.Now().Unix()
+	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
 	normalized := make(map[string]*NodeProfile, len(profiles))
 	for rawNodeID, rawProfile := range profiles {
 		nodeID, err := history.NormalizeNodeID(rawNodeID)
@@ -4739,10 +4767,17 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if len(profile.Groups) == 0 && (profile.Group != "" || len(profile.Tags) > 0) {
 			profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
 		}
+		// legacy Group/Tags 重建的选择同样可能指向已删除的分组/标签，
+		// 按当前 settings 分组集剔除（覆盖启动加载与导入两个入口）。
+		profile.Groups = filterGroupSelections(profile.Groups, groupNames, tagKeys, treeMode)
 		if len(profile.Groups) > 0 {
 			group, tags := primaryGroupTagsFromSelections(profile.Groups)
 			profile.Group = group
 			profile.Tags = tags
+		} else {
+			// 剔除清空时同步清 legacy 字段，避免悬空组名残留持久化数据。
+			profile.Group = ""
+			profile.Tags = nil
 		}
 		profile.Region = strings.ToUpper(strings.TrimSpace(profile.Region))
 		profile.DiskType = strings.TrimSpace(profile.DiskType)
@@ -5091,6 +5126,9 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 			value = 0
 		}
 		profile.NetSpeedMbps = value
+	}
+	if update.HideFromDisplay != nil {
+		profile.HideFromDisplay = *update.HideFromDisplay
 	}
 	if update.AutoRenew != nil {
 		profile.AutoRenew = *update.AutoRenew
@@ -6082,6 +6120,24 @@ func (s *Store) pruneProfileTestSelectionsLocked() {
 			continue
 		}
 		profile.TestSelections = s.normalizeSelectionsLocked(profile.TestSelections)
+	}
+}
+
+// pruneProfileGroupSelectionsLocked 剔除节点档案上指向已删除分组/标签
+// 的选择。要求持 s.mu 写锁；调用时机为 settings 中分组集合发生变化后。
+func (s *Store) pruneProfileGroupSelectionsLocked() {
+	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
+	for _, profile := range s.profiles {
+		if profile == nil || len(profile.Groups) == 0 {
+			continue
+		}
+		kept := filterGroupSelections(profile.Groups, groupNames, tagKeys, treeMode)
+		if len(kept) != len(profile.Groups) {
+			profile.Groups = kept
+			group, tags := primaryGroupTagsFromSelections(profile.Groups)
+			profile.Group = group
+			profile.Tags = tags
+		}
 	}
 }
 
