@@ -52,7 +52,7 @@ import {
   adminStatValueToneClassByTone,
   adminSurfaceCardClass,
 } from "@/lib/admin-ui";
-import type { AlertTestPayload, NodeView, SettingsView } from "@/lib/admin-types";
+import type { AlertTestPayload, NodeView, SettingsUpdate, SettingsView } from "@/lib/admin-types";
 
 const panelCardClass = `flex h-full flex-col overflow-hidden ${adminSurfaceCardClass}`;
 
@@ -74,12 +74,12 @@ export interface NotificationAlertProps {
   nodes: NodeView[];
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
-  onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
+  onSave: (payload: SettingsUpdate) => Promise<SettingsView>;
   onTest: (payload: AlertTestPayload) => Promise<void>;
 }
 
 type PendingConfirm = {
-  payload: Record<string, unknown>;
+  payload: SettingsUpdate;
   title: string;
   description: string;
   confirmLabel: string;
@@ -267,8 +267,8 @@ export default function NotificationAlert({
     return true;
   };
 
-  const buildSavePayload = (validation: ReturnType<typeof validateAlertForm>) => {
-    const payload: Record<string, unknown> = {
+  const buildSavePayload = (validation: ReturnType<typeof validateAlertForm>): SettingsUpdate => {
+    const payload: SettingsUpdate = {
       alert_offline_sec: validation.normalizedMinutes * 60,
     };
     // 密钥已脱敏回传：留空表示保留现值（省略字段），仅在输入新值时携带。
@@ -306,7 +306,7 @@ export default function NotificationAlert({
 
   const runAction = useAsyncAction();
 
-  const runSave = (payload: Record<string, unknown>) => {
+  const runSave = (payload: SettingsUpdate) => {
     void runAction({
       action: () => onSave(payload),
       fallbackError: "保存告警配置失败",

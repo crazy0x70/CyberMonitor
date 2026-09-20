@@ -99,7 +99,7 @@ type telegramChat struct {
 
 func startTelegramBot(ctx context.Context, store *Store) {
 	go func() {
-		client := &http.Client{Timeout: 12 * time.Second}
+		client := noRedirectHTTPClient(12 * time.Second)
 		var offset int64
 		var lastToken string
 		// menuSetupPending 与 token 变更解耦：菜单设置失败只重试
@@ -194,7 +194,7 @@ func waitTelegramPoll(ctx context.Context, delay time.Duration) bool {
 
 func fetchTelegramUpdates(ctx context.Context, client *http.Client, token string, offset int64) ([]telegramUpdate, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 12 * time.Second}
+		client = noRedirectHTTPClient(12 * time.Second)
 	}
 	if err := validateTelegramToken(token); err != nil {
 		return nil, err
@@ -381,7 +381,7 @@ func telegramBotAPICall(ctx context.Context, client *http.Client, token, method 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if client == nil {
-		client = &http.Client{Timeout: 8 * time.Second}
+		client = noRedirectHTTPClient(8 * time.Second)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

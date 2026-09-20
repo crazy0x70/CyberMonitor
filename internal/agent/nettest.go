@@ -310,8 +310,8 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 }
 
 // probeICMPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
-// 失败时返回最后一次结果（与 probeTCPCandidates 对称，多 A 记录/双栈
-// 场景不再被首个地址单点拖死）。
+// 失败时返回最后一次结果（多 A 记录/双栈场景不再被首个地址单点拖死；
+// TCP 侧全败时聚合各候选原因，此处保持末次结果）。
 func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context.Context, string) (*float64, float64, string, string)) (*float64, float64, string, string) {
 	// 全部候选共享单项总预算：候选逐一尝试的最坏耗时不超过单地址路径，
 	// 排在前面的地址用不完的预算留给后续候选。
@@ -330,15 +330,34 @@ func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context
 }
 
 // probeTCPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
-// 失败时返回最后一次错误。
+// 失败时聚合各候选失败原因（probeICMPCandidates 全败时保持末次结果，
+// 不聚合）。
 func probeTCPCandidates(ctx context.Context, hosts []string, port int, probe func(context.Context, string, int) (*float64, string, string)) (*float64, string, string) {
+	// 全部候选共享单项总预算：候选逐一尝试的最坏耗时不超过单地址路径
+	// （与 ICMP 同构），排在前面的地址用不完的预算留给后续候选。
+	ctx, cancel := context.WithTimeout(ctx, tcpTimeout)
+	defer cancel()
 	var latency *float64
 	var status, errText string
+	var failures []string
 	for _, host := range hosts {
 		latency, status, errText = probe(ctx, host, port)
 		if status == "ok" {
 			return latency, status, ""
 		}
+		failures = append(failures, host+": "+errText)
+	}
+	// 单失败保持裸错误文案（与既有行为一致）；多失败才聚合，避免噪声。
+	if len(failures) > 1 {
+		shown := failures
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		aggregated := strings.Join(shown, "; ")
+		if len(failures) > len(shown) {
+			aggregated += fmt.Sprintf("（另有 %d 个地址失败）", len(failures)-len(shown))
+		}
+		return latency, status, aggregated
 	}
 	return latency, status, errText
 }

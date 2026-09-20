@@ -169,13 +169,17 @@ function regionDisplayNamesFor(locale) {
   return regionDisplayNamesCache.get(locale);
 }
 const fallbackRegionNames = {
+  AU: "Australia",
   CA: "Canada",
   CN: "China",
   DE: "Germany",
   FR: "France",
   HK: "Hong Kong",
   JP: "Japan",
+  KR: "South Korea",
+  MO: "Macao",
   NL: "Netherlands",
+  RU: "Russia",
   SG: "Singapore",
   TW: "Taiwan",
   UK: "United Kingdom",

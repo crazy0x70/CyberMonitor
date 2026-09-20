@@ -13,6 +13,7 @@ import type {
   NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
+  SettingsUpdate,
   SettingsView,
   Snapshot,
   SystemUpdateInfo,
@@ -249,7 +250,7 @@ export async function fetchSettings() {
   return unwrapResponse<SettingsView>(resp, "加载设置失败");
 }
 
-export async function saveSettings(payload: Record<string, unknown>) {
+export async function saveSettings(payload: SettingsUpdate) {
   const resp = await apiFetch(
     "/api/v1/admin/settings",
     {
@@ -371,7 +372,7 @@ export async function testAlertChannels(payload: AlertTestPayload) {
   return unwrapResponse<{ status: string }>(resp, "测试告警失败");
 }
 
-export async function testAIProvider(provider: string, config: AIProviderConfig) {
+export async function testAIProvider(provider: string, config: AIProviderConfig | null) {
   const resp = await apiFetch(
     "/api/v1/admin/ai/test",
     {
@@ -383,7 +384,7 @@ export async function testAIProvider(provider: string, config: AIProviderConfig)
   return unwrapResponse<{ status: string }>(resp, "测试 Provider 失败");
 }
 
-export async function fetchAIModels(provider: string, config: AIProviderConfig) {
+export async function fetchAIModels(provider: string, config: AIProviderConfig | null) {
   const resp = await apiFetch(
     "/api/v1/admin/ai/models",
     {

@@ -14,7 +14,7 @@ import (
 
 const turnstileVerifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
-var turnstileHTTPClient = &http.Client{Timeout: 8 * time.Second}
+var turnstileHTTPClient = noRedirectHTTPClient(8 * time.Second)
 
 type turnstileVerifyResponse struct {
 	Success    bool     `json:"success"`

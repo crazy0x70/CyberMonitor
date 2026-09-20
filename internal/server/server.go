@@ -480,6 +480,9 @@ func (c *hubClient) enqueue(payload []byte, prepared *websocket.PreparedMessage)
 
 const shutdownGraceTimeout = 5 * time.Second
 
+// Run 完成服务端全部启动序：数据目录锁 → 持久化加载与归一 → 历史
+// 存储打开 → HTTP/gRPC 路由装配 → 监听服务，阻塞至 ctx 取消或监听
+// 失败。返回值经 log.Fatalf 上报（cmd/server/main.go）。
 func Run(ctx context.Context, cfg Config) error {
 	if err := applyDefaults(&cfg); err != nil {
 		return err
@@ -1596,8 +1599,9 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 				if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
 					go func() {
 						// 投递 goroutine 顶层 panic 同样不得杀死进程；网络栈
-						// 调用链未来演化时的未预期崩溃只损失本轮投递，重臂
-						// 机制会在后续 tick 补投。
+						// 调用链未来演化时的未预期崩溃只损失本轮投递（panic 路径
+						// 不重臂：已发射事件保持“在途”，待节点恢复由恢复分支收尾；
+						// 仅 send 返回失败才经 Rearm 补投）。
 						defer func() {
 							if rec := recover(); rec != nil {
 								log.Printf("告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
@@ -1605,8 +1609,8 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 						}()
 						// 双通道均未配置时"投递成功"是假成功：对离线告警保持
 						// 重臂循环（退避封顶 5min），管理员补配 webhook/token
-						// 后自动补投。恢复通知不重臂——重建条目 RetryCount=0
-						// 会退化为 2s 周期的无限 persist 循环。
+						// 后自动补投。恢复通知不重臂——恢复通知时效敏感，空通道
+						// 期重臂没有投递目标，只产生无意义的退避 persist 循环。
 						if targets.FeishuWebhook == "" && targets.TelegramToken == "" {
 							store.RearmAlertDelivery(offlineEvents, true)
 							return
@@ -2079,6 +2083,11 @@ type AlertEvent struct {
 	OS         string
 	LastSeen   int64
 	OfflineSec int64
+	// RetryCount 携带发射时 AlertedState 的投递重试计数：恢复事件发射即
+	// 删除条目，重臂重建时以此为基递增——否则重建条目零值归零，退避退化
+	// 为 2s 恒定循环。仅在恢复路径使用（离线事件发射不删条目，重臂直接
+	// 读存置状态递增）。
+	RetryCount int
 }
 
 type AlertTargets struct {
@@ -2091,6 +2100,17 @@ type AlertTargets struct {
 // offlineSessionDefaultThreshold：告警阈值关闭（<=0）时，离线轨迹仍按此默认阈值记录，
 // 否则 offline TSDB 时长与恢复事件随告警停用整体失活。
 const offlineSessionDefaultThreshold = 5 * time.Minute
+
+// offlineAlertThreshold 把秒设置转换为告警/离线轨迹共用的时长阈值；非法
+// 或溢出值（写入端已钳制，此处为防御性回退）回退默认阈值。调用方须持
+// s.mu（读或写）。
+func (s *Store) offlineAlertThreshold() time.Duration {
+	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
+	if threshold <= 0 {
+		return offlineSessionDefaultThreshold
+	}
+	return threshold
+}
 
 type offlineRecoveryCandidate struct {
 	NodeID      string
@@ -2109,10 +2129,7 @@ func (s *Store) ReconcileOfflineTracker(now time.Time) {
 		s.offlineSessions = make(map[string]OfflineSessionState)
 	}
 
-	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
-	if threshold <= 0 {
-		threshold = offlineSessionDefaultThreshold
-	}
+	threshold := s.offlineAlertThreshold()
 	for nodeID, node := range s.nodes {
 		offlineFor := now.Sub(node.LastSeen)
 		session, hasSession := s.offlineSessions[nodeID]
@@ -2235,6 +2252,9 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 	}
 }
 
+// CollectAlertEvents 巡检全部节点的离线/恢复状态，产出待投递事件并
+// 维护 alerted 状态机（重臂/退避/失效清理）。调用方须持无锁（内部自
+// 取 s.mu）；投递失败由 RearmAlertDelivery 在后续 tick 重试。
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
 
@@ -2251,11 +2271,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	// 阈值非法时视为全局禁用，但仍需走清理循环：禁用前产生的 alerted
 	// 残留会抑制重新启用后的下一次离线告警。
 	alertDisabled := s.settings.AlertOfflineSec <= 0
-	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
-	if threshold <= 0 {
-		// 与 ReconcileOfflineTracker 同参回退，两处转换行为保持一致。
-		threshold = offlineSessionDefaultThreshold
-	}
+	threshold := s.offlineAlertThreshold()
 	offlineEvents := make([]AlertEvent, 0)
 	recoveredEvents := make([]AlertEvent, 0)
 	needsPersist := false
@@ -2280,7 +2296,10 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		if offlineFor < threshold {
 			if wasAlerted {
 				// NextRetryAt 非零且未到期：上次投递失败，退避等待中。
-				if !state.NextRetryAt.IsZero() && now.Before(state.NextRetryAt) {
+				// 剩余等待超出退避封顶视为已到期（时钟回拨护栏，与离线分支
+				// 同参：合法 NextRetryAt 距今恒 ≤ maxAlertRetryBackoff）。
+				if !state.NextRetryAt.IsZero() && now.Before(state.NextRetryAt) &&
+					state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff {
 					continue
 				}
 				stats := node.Stats
@@ -2295,6 +2314,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 					OS:         stats.OS,
 					LastSeen:   node.LastSeen.Unix(),
 					OfflineSec: offlineSec,
+					RetryCount: state.RetryCount,
 				})
 				delete(s.alerted, nodeID)
 				needsPersist = true
@@ -2305,7 +2325,8 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			// 已告警节点仅在退避到期时重发（投递失败的补投），重发沿用
 			// OfflineSince 口径并清空 NextRetryAt（本轮投递在途，再次
 			// 失败由 Rearm 重新设置退避）。RetryCount 不在此处清零：同
-			// 一离线周期内持续失败应继续放大退避。
+			// 一离线周期内持续失败应继续放大退避；跨周期继承——经恢复重建
+			// 进入的新离线周期沿用累计计数（偏少通知方向，可接受）。
 			// 时钟回拨会把 NextRetryAt 推到未来超过任何合法退避值，
 			// 剩余等待超出上限时视为已到期。
 			if state.NextRetryAt.IsZero() || (now.Before(state.NextRetryAt) && state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff) {
@@ -2398,8 +2419,11 @@ func (s *Store) RearmAlertDelivery(events []AlertEvent, offline bool) {
 				if _, alive := s.nodes[event.NodeID]; !alive {
 					continue
 				}
+				// 重建以事件携带的 RetryCount 为基递增：发射时条目已删，
+				// 零值重建会把退避钉死在 backoff(1)=2s 的恒定循环。
 				state = AlertedState{
 					OfflineSince: now.Add(-time.Duration(event.OfflineSec) * time.Second),
+					RetryCount:   event.RetryCount + 1,
 				}
 			} else {
 				state.RetryCount++
@@ -4253,6 +4277,10 @@ func (s *Store) SiteTitle() string {
 	return normalizeSiteTitle(s.settings.SiteTitle)
 }
 
+// UpdateSettings 应用设置增量：指针字段 nil=不变，非 nil=显式写入
+// （含清零）。bcrypt 等慢操作在全局锁外完成；成功路径由本方法在锁外
+// 触发 persist（导入暂存 Store 的 dataPath 为空时 persist 为 no-op，
+// 由 ImportConfig 统一落盘）。返回保存后的脱敏视图。
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	// bcrypt 校验/哈希单次约 60–100ms，必须在全局写锁外完成，
 	// 否则会阻塞所有 agent ingest 与快照广播。
@@ -5003,6 +5031,11 @@ func containsKey(seen map[string]struct{}, key string) bool {
 	return ok
 }
 
+// UpdateProfile 应用节点档案增量（指针契约：nil=不变，非 nil 空串=
+// 清除；renew_interval_sec 例外，仅 >0 生效）。region 经别名映射归一
+// 为两位码，非法输入经 handler 400 拒绝、其它调用面静默归一为清除；
+// test_interval_sec 仅 >0 生效且 UI 未暴露（仅 API 可写）。第二个返
+// 回值 false 表示节点不存在。
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProfile, bool) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
@@ -5046,7 +5079,8 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		profile.Groups = normalizeGroupSelections(profile.Groups)
 	}
 	if update.Region != nil {
-		profile.Region = strings.ToUpper(strings.TrimSpace(*update.Region))
+		// handler 已前置校验；此处归一（别名映射/大写）兜底其它调用面。
+		profile.Region, _ = normalizeRegionCode(*update.Region)
 	}
 	if update.DiskType != nil {
 		profile.DiskType = strings.TrimSpace(*update.DiskType)
@@ -6344,14 +6378,35 @@ var sharedWebhookClient = sync.OnceValue(func() *http.Client {
 			ExpectContinueTimeout: time.Second,
 			IdleConnTimeout:       60 * time.Second,
 		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return errors.New("webhook redirect limit exceeded")
-			}
-			return validateWebhookURL(req.URL.String())
-		},
+		CheckRedirect: webhookRedirectPolicy,
 	}
 })
+
+// webhookRedirectPolicy：跟随语义保留（r50 逐跳 SSRF 校验设计）；Referer
+// 必须摘除——Go 在调用 CheckRedirect 前会把上一跳完整 URL 写入新请求的
+// Referer（net/http client.go 官方指定的覆盖位置就是回调内），而 webhook
+// secret 在 URL path 中，不摘除即随 Referer 泄漏给重定向目标。
+func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("webhook redirect limit exceeded")
+	}
+	req.Header.Del("Referer")
+	return validateWebhookURL(req.URL.String())
+}
+
+// noRedirectHTTPClient 构造凭据类出站请求的 http.Client：3xx 一律原样
+// 返回调用方，防止 Authorization/Bearer、form body 中的 secret 或 URL
+// path 中的 token 被转发到重定向目标（默认策略下同 host 不同端口也会
+// 保留 Authorization，307/308 还会原样重放 body）。Telegram/OAuth/
+// Turnstile/AI 端点固定，正常路径不返回 3xx。
+func noRedirectHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
 
 func restrictedCallbackDialContext(resolver callbackResolver, dialContext callbackDialContext) callbackDialContext {
 	return func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -6453,6 +6508,13 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 	if err := decodeJSON(w, r, &update); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
+	}
+	if update.Region != nil && strings.TrimSpace(*update.Region) != "" {
+		// 空串放行：与 alias/group 同契约，非 nil 空串 = 清除 region。
+		if _, ok := normalizeRegionCode(*update.Region); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "region 必须是两位地区代码（如 SG/JP/HK）"})
+			return
+		}
 	}
 	if _, ok := store.UpdateProfile(nodeID, update); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
@@ -6754,6 +6816,42 @@ func agentUpdateReportHTTPHandler(agentAPI *agentAPI) http.HandlerFunc {
 
 // cleanAdminProfileText 收敛 admin 侧 profile 文本字段：去首尾空白并按
 // rune 截断（与 agent 侧上报字段的既定 cap 策略一致）。
+// regionAliases 把常见地区中英文名映射为两位码；键一律小写。
+var regionAliases = map[string]string{
+	"新加坡": "SG", "japan": "JP", "日本": "JP",
+	"香港": "HK", "中国香港": "HK", "hong kong": "HK", "hongkong": "HK",
+	"台湾": "TW", "中国台湾": "TW", "taiwan": "TW",
+	"美国": "US", "united states": "US", "usa": "US",
+	"英国": "UK", "united kingdom": "UK", "uk": "UK",
+	"加拿大": "CA", "canada": "CA",
+	"德国": "DE", "germany": "DE",
+	"法国": "FR", "france": "FR",
+	"荷兰": "NL", "netherlands": "NL",
+	"中国": "CN", "中国大陆": "CN", "china": "CN",
+	"韩国": "KR", "korea": "KR",
+	"澳门": "MO", "macau": "MO", "macao": "MO",
+	"澳大利亚": "AU", "australia": "AU",
+	"俄罗斯": "RU", "russia": "RU",
+	"singapore": "SG",
+}
+
+// normalizeRegionCode 把用户输入归一为两位地区码（别名映射 + 大写）。
+// ok=false 表示输入既非别名也非两位码。
+func normalizeRegionCode(value string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(value))
+	if key == "" {
+		return "", false
+	}
+	if code, ok := regionAliases[key]; ok {
+		return code, true
+	}
+	upper := strings.ToUpper(key)
+	if len(upper) == 2 && upper[0] >= 'A' && upper[0] <= 'Z' && upper[1] >= 'A' && upper[1] <= 'Z' {
+		return upper, true
+	}
+	return "", false
+}
+
 func cleanAdminProfileText(value string, maxLen int) string {
 	value = strings.TrimSpace(value)
 	if maxLen <= 0 || len([]rune(value)) <= maxLen {

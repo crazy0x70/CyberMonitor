@@ -58,15 +58,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import type {
-  AgentUpdateInfo,
+import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type AgentUpdateInfo,
   NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
   SettingsView,
   TestCatalogItem,
-  TestSelection,
-} from "@/lib/admin-types";
+  TestSelection, } from "@/lib/admin-types";
 import {
   flattenGroupTree,
   formatBytes,
@@ -137,7 +135,29 @@ import {
   adminWorkspaceMetaLabelClass,
 } from "@/lib/admin-ui";
 
-const DEFAULT_TCP_INTERVAL = 5;
+// 与后端 maxNetworkTestsPerNode 对齐（超限静默截断）。
+const maxTestsPerNode = 128;
+// 常见地区名→两位码映射（与后端 regionAliases 同内容，键小写）。
+const REGION_ALIASES: Record<string, string> = {
+  新加坡: "SG", 日本: "JP", 香港: "HK", 中国香港: "HK", 台湾: "TW",
+  中国台湾: "TW", 美国: "US", 英国: "UK", 加拿大: "CA", 德国: "DE",
+  法国: "FR", 荷兰: "NL", 中国: "CN", 中国大陆: "CN", 韩国: "KR",
+  澳门: "MO", 澳大利亚: "AU", 俄罗斯: "RU",
+  singapore: "SG", japan: "JP", "hong kong": "HK", hongkong: "HK",
+  taiwan: "TW", "united states": "US", usa: "US", "united kingdom": "UK",
+  uk: "UK", canada: "CA", germany: "DE", france: "FR", netherlands: "NL",
+  china: "CN", korea: "KR", macau: "MO", macao: "MO", australia: "AU",
+  russia: "RU",
+};
+
+function normalizeRegionInput(value: string): string {
+  const key = value.trim().toLowerCase();
+  if (!key) return "";
+  const mapped = REGION_ALIASES[key];
+  if (mapped) return mapped;
+  const upper = key.toUpperCase();
+  return /^[A-Z]{2}$/.test(upper) ? upper : "";
+}
 
 const statCardLabelClass = adminStatEyebrowClass;
 
@@ -302,7 +322,7 @@ function defaultInterval(item?: TestCatalogItem) {
   if (!Number.isFinite(raw) || raw <= 0) {
     return DEFAULT_TCP_INTERVAL;
   }
-  return Math.min(Math.trunc(raw), 3600);
+  return Math.min(Math.trunc(raw), MAX_TCP_INTERVAL);
 }
 
 function isTCPTest(test?: Partial<TestCatalogItem>) {
@@ -320,7 +340,7 @@ function buildTestSelectionValue(item?: TestCatalogItem, intervalSec?: number) {
   const rawInterval = Math.trunc(Number(intervalSec) || 0);
   return String(
     Number.isFinite(rawInterval) && rawInterval > 0
-      ? Math.min(rawInterval, 3600)
+      ? Math.min(rawInterval, MAX_TCP_INTERVAL)
       : defaultInterval(item),
   );
 }
@@ -331,7 +351,7 @@ function parseTestSelectionInterval(item: TestCatalogItem, rawValue: string) {
   }
   const parsedInterval = Number.parseInt(rawValue, 10);
   return Number.isFinite(parsedInterval) && parsedInterval >= 0
-    ? Math.min(parsedInterval, 3600)
+    ? Math.min(parsedInterval, MAX_TCP_INTERVAL)
     : defaultInterval(item);
 }
 
@@ -460,6 +480,11 @@ function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfileP
       interval_sec: parseTestSelectionInterval(item, intervalValue),
     }));
 
+  const region = normalizeRegionInput(form.region);
+  if (form.region.trim() && !region) {
+    throw new Error("地区代码无效：请输入两位字母代码（如 SG / JP / HK）。");
+  }
+
   const payload: NodeProfilePayload = {
     alias: form.alias.trim(),
     alert_enabled: form.alertEnabled,
@@ -468,15 +493,14 @@ function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfileP
     groups: normalizeSelectionValues(form.groups),
     net_speed_mbps:
       Number.isFinite(normalizedSpeed) && normalizedSpeed >= 0 ? normalizedSpeed : 0,
-    region: form.region.trim().toUpperCase(),
+    region,
     test_selections: selections,
   };
 
-  if (expireAt > 0) {
-    payload.expire_at = expireAt;
-    if (renewIntervalSec > 0) {
-      payload.renew_interval_sec = renewIntervalSec;
-    }
+  // 始终携带：后端是指针契约，缺省=不变；清空输入框时传 0 才能真正清除。
+  payload.expire_at = expireAt;
+  if (renewIntervalSec > 0) {
+    payload.renew_interval_sec = renewIntervalSec;
   }
 
   return payload;
@@ -957,7 +981,14 @@ export default function ServerManagement({
   };
 
   const handleToggleTest = ({ item, itemId, active }: TestDraftEntry) => {
-    if (!itemId) {
+    if (!itemId || !form) {
+      return;
+    }
+    // 后端 normalizeTestSelections 超出 128 静默截断：在 UI 层拦下，避
+    // 免保存成功提示后重开只剩前 128 项勾选。判定放在 updater 外
+    // （updater 必须是纯函数，StrictMode 下副作用会双触发）。
+    if (!active && Object.keys(form.testSelections).length >= maxTestsPerNode) {
+      toast.warning(`单个节点最多选择 ${maxTestsPerNode} 个探测项。`);
       return;
     }
     patchForm((current) => {
@@ -1442,6 +1473,7 @@ export default function ServerManagement({
                               id="node-alias"
                               name="node-alias"
                               autoComplete="off"
+                              maxLength={120}
                               className={formInputClass}
                               value={form.alias}
                               disabled={editorInputDisabled}
@@ -1455,13 +1487,17 @@ export default function ServerManagement({
                               id="node-region"
                               name="node-region"
                               autoComplete="off"
+                              maxLength={2}
                               className={formInputClass}
                               value={form.region}
                               disabled={editorInputDisabled}
                               onChange={(event) =>
-                                updateFormField("region", event.target.value.toUpperCase())
+                                updateFormField(
+                                  "region",
+                                  event.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase()
+                                )
                               }
-                              placeholder="例如：US"
+                              placeholder="两位代码，如 SG / JP / HK"
                             />
                           </div>
                         </div>
@@ -1590,7 +1626,7 @@ export default function ServerManagement({
                                           className="h-10 w-[148px] rounded-xl border-slate-300 bg-white text-sm dark:border-slate-700 dark:bg-slate-950"
                                           type="number"
                                           min={0}
-                                          max={3600}
+                                          max={MAX_TCP_INTERVAL}
                                           autoComplete="off"
                                           disabled={!active || !itemId || editorInputDisabled}
                                           value={intervalValue}

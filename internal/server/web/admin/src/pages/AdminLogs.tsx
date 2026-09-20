@@ -32,7 +32,6 @@ const levelOptions: Array<{ value: AdminLogLevel; label: string }> = [
   { value: "warning", label: "警告" },
   { value: "error", label: "错误" },
   { value: "debug", label: "调试" },
-  { value: "silent", label: "静默" },
 ];
 
 const levelLabels: Record<Exclude<AdminLogLevel, "all">, string> = {
@@ -179,9 +178,13 @@ export default function AdminLogs() {
             ))}
           </div>
 
+          <p className="border-b px-6 py-2 text-xs text-muted-foreground">
+            仅展示最近 {LOG_LIMIT} 条日志；计数为当前过滤窗口内的分布。
+          </p>
+
           {entries.length === 0 ? (
             <div className="flex min-h-[280px] items-center justify-center px-6 py-12 text-sm text-muted-foreground">
-              {level === "silent" ? "静默" : "暂无日志"}
+              暂无日志
             </div>
           ) : (
             <div className="max-h-[62vh] overflow-auto">

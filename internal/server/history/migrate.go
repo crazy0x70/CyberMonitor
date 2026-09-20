@@ -118,6 +118,9 @@ func migrateLegacyNodes(
 			return err
 		}
 		for key, entry := range tests {
+			if entry == nil {
+				continue
+			}
 			identity, err := ParseNetworkSeriesKey(key)
 			if err != nil {
 				// 单个畸形序列键只跳过自身：向上返回错误会中止全部节点的

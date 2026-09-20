@@ -609,7 +609,7 @@ func sanitizeAdminReturnTo(raw string, adminPath string) string {
 }
 
 func adminOAuthContext(ctx context.Context) context.Context {
-	client := &http.Client{Timeout: adminOAuthHTTPTimeout}
+	client := noRedirectHTTPClient(adminOAuthHTTPTimeout)
 	return context.WithValue(ctx, oauth2.HTTPClient, client)
 }
 

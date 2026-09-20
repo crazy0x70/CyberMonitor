@@ -93,10 +93,17 @@ func NewClient(repo string, kind Kind, currentVersion string) *Client {
 		CurrentVersion: strings.TrimSpace(currentVersion),
 		HTTPClient: &http.Client{
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("更新下载重定向次数超过限制")
+				}
+				if req.URL.Scheme != "https" || req.URL.User != nil ||
+					(req.URL.Port() != "" && req.URL.Port() != "443") {
+					return fmt.Errorf("更新下载重定向必须使用无用户信息的标准 HTTPS 地址")
+				}
 				// GitHub release 下载正常会 302 到 *.githubusercontent.com；
 				// 其余主机一律拒绝，防止上游开放重定向把二进制/校验文件
 				// 导向第三方源。
-				host := req.URL.Hostname()
+				host := strings.ToLower(req.URL.Hostname())
 				if host == "github.com" || strings.HasSuffix(host, ".githubusercontent.com") {
 					return nil
 				}
@@ -254,7 +261,7 @@ func (c *Client) parseGitHubReleaseAssetURL(rawURL, expectedAsset string) (relea
 	if err != nil {
 		return releaseAssetRef{}, err
 	}
-	if parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") {
+	if parsed.Scheme != "https" || parsed.User != nil || !strings.EqualFold(parsed.Host, "github.com") {
 		return releaseAssetRef{}, fmt.Errorf("必须使用 github.com 的 HTTPS release 地址")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {

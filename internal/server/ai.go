@@ -82,7 +82,7 @@ func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]s
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	client := &http.Client{Timeout: aiHTTPTimeout}
+	client := noRedirectHTTPClient(aiHTTPTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
@@ -484,6 +484,8 @@ func resolveAIProviderSelection(settings AISettings, selector string, override *
 				return aiProviderSelection{}, errors.New("未找到指定的兼容服务商")
 			}
 			selection = aiCompatibleSelection(item)
+		case override != nil:
+			selection = aiCompatibleSelection(AIProviderProfile{})
 		case len(settings.OpenAICompatibles) > 0:
 			selection = aiCompatibleSelection(settings.OpenAICompatibles[0])
 		default:

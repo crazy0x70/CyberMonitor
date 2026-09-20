@@ -26,6 +26,7 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Bot, CheckCircle2, FileText, HelpCircle, Layers3, Loader2, Plus, Trash2, XCircle } from "lucide-react";
 import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
+import { toast } from "sonner";
 import {
   adminActionButtonClass,
   adminDangerOutlineButtonClass,
@@ -47,15 +48,15 @@ import {
   adminTextareaClass,
   adminWarningBadgeClass,
 } from "@/lib/admin-ui";
-import type { AIProviderConfig, SettingsView } from "@/lib/admin-types";
+import type { AIProviderConfig, SettingsUpdate, SettingsView } from "@/lib/admin-types";
 
 export interface AIProviderProps {
   settings: SettingsView | null;
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
-  onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
-  onTestProvider: (provider: string, config: AIProviderConfig) => Promise<void>;
-  onFetchModels: (provider: string, config: AIProviderConfig) => Promise<string[]>;
+  onSave: (payload: SettingsUpdate) => Promise<SettingsView>;
+  onTestProvider: (provider: string, config: AIProviderConfig | null) => Promise<void>;
+  onFetchModels: (provider: string, config: AIProviderConfig | null) => Promise<string[]>;
 }
 
 type ProviderStatus = "unconfigured" | "unverified" | "verified";
@@ -127,12 +128,17 @@ function toConfig(item: ProviderDraft): AIProviderConfig {
   };
 }
 
-function toProviderValue(item: ProviderDraft) {
-  return item.provider === "openai_compatible" ? `openai_compatible:${item.id}` : item.provider;
+// 验证/取模型路径：本会话未重输 key 时传 null，后端 override=nil 走
+// 存储配置——占位符"已配置（留空保持不变）"的承诺在验证路径同样成立。
+function toTestConfig(item: ProviderDraft): AIProviderConfig | null {
+  if (!item.apiKey.trim() && item.keyConfigured) {
+    return null;
+  }
+  return toConfig(item);
 }
 
-function toProviderRequestKey(item: ProviderDraft) {
-  return item.provider === "openai_compatible" ? "openai_compatible" : item.provider;
+function toProviderValue(item: ProviderDraft) {
+  return item.provider === "openai_compatible" ? `openai_compatible:${item.id}` : item.provider;
 }
 
 function resolveProviderSelection(options: Array<{ value: string }>, currentValue: string) {
@@ -214,7 +220,6 @@ export default function AIProvider({
   const [providers, setProviders] = useState<ProviderDraft[]>(() => makeAISettingsDraft(settings).providers);
   const [commandProvider, setCommandProvider] = useState(() => makeAISettingsDraft(settings).commandProvider);
   const [prompt, setPrompt] = useState(() => makeAISettingsDraft(settings).prompt);
-  const [isDirty, setIsDirty] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [fetchingModelsId, setFetchingModelsId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -225,7 +230,7 @@ export default function AIProvider({
     [commandProvider, prompt, providers],
   );
 
-  const [, absorbSourceSignature] = useDraftReconcile({
+  const [sourceSignature, absorbSourceSignature] = useDraftReconcile({
     draftSignature: currentDraftSignature,
     nextSourceSignature: aiSettingsSourceSignature(settings),
     isBusy,
@@ -236,15 +241,51 @@ export default function AIProvider({
       setPrompt(draft.prompt);
     },
     warningText: "服务端 AI 配置已更新，当前未保存修改已保留。",
-    onCleaned: () => setIsDirty(false),
   });
+  // dirty 从签名派生（对齐 hook 惯例）：手工撤销回原值时徽标同步熄灭，
+  // 不会像本地布尔那样卡在"有未保存的修改"。
+  const isDirty = currentDraftSignature !== sourceSignature;
   useDirtyNotification(onDirtyChange, isDirty);
+
+  const savedCompatibleIDs = useMemo(
+    () => new Set((settings?.ai_settings?.openai_compatibles || []).map((item) => item.id)),
+    [settings],
+  );
+  // 请求选择器：已保存的 compatible 必须带 id——config=null（存量 key）
+  // 时后端按选择器取存储配置，裸 key 会命中列表第一个服务商。未保存的
+  // 新增条目 id 不在存储中，走 override 全量替换，保留裸 key。
+  const toProviderRequestKey = (item: ProviderDraft) => {
+    if (item.provider !== "openai_compatible") {
+      return item.provider;
+    }
+    return savedCompatibleIDs.has(item.id) ? `openai_compatible:${item.id}` : "openai_compatible";
+  };
+
+  // key 走存储配置（输入留空）但端点/模型已改动：测试的是存储旧值，
+  // 结果会误导归因——要求先保存。
+  const endpointEditNeedsSave = (item: ProviderDraft) => {
+    if (!item.keyConfigured || item.apiKey.trim()) {
+      return false;
+    }
+    const source =
+      item.provider === "openai"
+        ? settings?.ai_settings?.openai
+        : settings?.ai_settings?.openai_compatibles?.find((entry) => entry.id === item.id);
+    if (!source) {
+      return false;
+    }
+    return (
+      item.baseURL.trim() !== (source.base_url || "").trim() ||
+      item.model.trim() !== (source.model || "").trim()
+    );
+  };
 
   const providerOptions = useMemo(() => {
     return providers.map((item) => ({
       value: toProviderValue(item),
       label: providerLabel(item.provider, item.name),
-      configured: Boolean(item.apiKey),
+      // 脱敏视图下 apiKey 恒空：已配置与否要看 keyConfigured。
+      configured: Boolean(item.apiKey) || item.keyConfigured,
       status: item.status,
     }));
   }, [providers]);
@@ -261,29 +302,15 @@ export default function AIProvider({
     }
   }, [commandProvider, isBusy, providerOptions]);
 
-  const markDirty = () => {
-    setIsDirty(true);
-  };
-
-  const setProviderDrafts = (
-    updater: (current: ProviderDraft[]) => ProviderDraft[],
-    dirty = false,
-  ) => {
+  const setProviderDrafts = (updater: (current: ProviderDraft[]) => ProviderDraft[]) => {
     setProviders(updater);
-    if (dirty) {
-      markDirty();
-    }
   };
 
   const updateProviderDraft = (
     id: string,
     updater: (current: ProviderDraft) => ProviderDraft,
-    dirty = false,
   ) => {
-    setProviderDrafts(
-      (current) => current.map((item) => (item.id === id ? updater(item) : item)),
-      dirty,
-    );
+    setProviderDrafts((current) => current.map((item) => (item.id === id ? updater(item) : item)));
   };
 
   const updateProviderInput = (
@@ -302,17 +329,22 @@ export default function AIProvider({
         return {
           ...current,
           apiKey: value,
-          status: value ? "unverified" : "unconfigured",
+          // 清空输入=保存时保留服务端现 key，状态跟随现状不降级。
+          status: value ? "unverified" : current.keyConfigured ? current.status : "unconfigured",
         };
       }
+      // 端点/模型变更即降级：已验证状态只对当时保存的端点成立；key 走
+      // 存储（输入为空、keyConfigured=true）是脱敏视图下的主路径，同样
+      // 必须降级——否则徽标对新端点虚报已验证。
+      const configured = Boolean(current.apiKey.trim()) || current.keyConfigured;
       const next = {
         ...current,
-        status: current.apiKey ? "unverified" : current.status,
+        status: configured ? "unverified" : current.status,
       };
       return field === "baseURL"
         ? { ...next, baseURL: value }
         : { ...next, model: value };
-    }, true);
+    });
   };
 
   const addCompatible = () => {
@@ -334,8 +366,7 @@ export default function AIProvider({
           keyConfigured: false,
           status: "unconfigured",
         },
-      ],
-      true,
+      ]
     );
   };
 
@@ -352,7 +383,7 @@ export default function AIProvider({
         resolveProviderSelection(nextDrafts.map((item) => ({ value: toProviderValue(item) })), ""),
       );
     }
-    setProviderDrafts(() => nextDrafts, true);
+    setProviderDrafts(() => nextDrafts);
   };
 
   const runAction = useAsyncAction();
@@ -361,8 +392,12 @@ export default function AIProvider({
     if (isBusy) {
       return;
     }
+    if (endpointEditNeedsSave(item)) {
+      toast.warning("端点或模型有未保存修改，请先保存后再测试。");
+      return;
+    }
     void runAction({
-      action: () => onTestProvider(toProviderRequestKey(item), toConfig(item)),
+      action: () => onTestProvider(toProviderRequestKey(item), toTestConfig(item)),
       fallbackError: "验证失败",
       successToast: `${item.name} 验证成功`,
       onSuccess: () => updateProviderDraft(item.id, (current) => ({ ...current, status: "verified" })),
@@ -374,8 +409,12 @@ export default function AIProvider({
     if (isBusy) {
       return;
     }
+    if (endpointEditNeedsSave(item)) {
+      toast.warning("端点或模型有未保存修改，请先保存后再获取模型。");
+      return;
+    }
     void runAction({
-      action: () => onFetchModels(toProviderRequestKey(item), toConfig(item)),
+      action: () => onFetchModels(toProviderRequestKey(item), toTestConfig(item)),
       fallbackError: "获取模型列表失败",
       successToast: `${item.name} 模型列表已刷新`,
       onSuccess: (models) => {
@@ -386,8 +425,7 @@ export default function AIProvider({
             ...current,
             models,
             model: shouldFillModel ? models[0] : current.model,
-          }),
-          shouldFillModel,
+          })
         );
       },
       setBusy: (on) => setFetchingModelsId(on ? item.id : null),
@@ -422,7 +460,6 @@ export default function AIProvider({
         setCommandProvider(canonicalDraft.commandProvider);
         setPrompt(canonicalDraft.prompt);
         absorbSourceSignature(aiSettingsDraftSignature(canonicalDraft));
-        setIsDirty(false);
       },
       setBusy: setIsSaving,
     });
@@ -468,7 +505,6 @@ export default function AIProvider({
                   return;
                 }
                 setCommandProvider(value);
-                markDirty();
               }}
             >
               <SelectTrigger id="ai-command-provider" className={`w-full ${adminSelectTriggerClass}`}>
@@ -506,7 +542,6 @@ export default function AIProvider({
                 return;
               }
               setPrompt(event.target.value);
-              markDirty();
             }}
             disabled={isBusy}
             placeholder="例如：请重点关注网络流量、下载量与离线情况…"

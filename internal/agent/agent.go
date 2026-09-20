@@ -336,32 +336,16 @@ func runNetworkTestsWithCache(
 	cache map[string]cachedTest,
 	forceFullResult bool,
 ) ([]metrics.NetworkTestResult, bool) {
-	return runNetworkTestsWithCacheAt(ctx, configs, defaultInterval, cache, time.Now, RunNetworkTests, forceFullResult)
-}
-
-func runNetworkTestsWithCacheAt(
-	ctx context.Context,
-	configs []metrics.NetworkTestConfig,
-	defaultInterval time.Duration,
-	cache map[string]cachedTest,
-	now func() time.Time,
-	runner func(context.Context, []metrics.NetworkTestConfig) []metrics.NetworkTestResult,
-	forceFullResult bool,
-) ([]metrics.NetworkTestResult, bool) {
 	if len(configs) == 0 {
 		return handleEmptyConfigs(cache)
 	}
 	if defaultInterval <= 0 {
 		defaultInterval = DefaultTestInterval
 	}
-	if now == nil {
-		now = time.Now
-	}
-	if runner == nil {
-		runner = RunNetworkTests
-	}
 
-	currentTime := now()
+	// 调度时钟恒为真实 time.Now()（携带单调读数，与 lastRun 同轨）；
+	// 不提供可注入时钟：假时钟无单调读数，会静默退化 Sub 为墙钟比较。
+	currentTime := time.Now()
 	// key 单遍预计算：findDue/buildOrdered/签名此前每 tick 各算一遍
 	//（Sprintf+ToLower ×3×测试数），配置只在远端下发时变化。
 	keys := make([]string, len(configs))
@@ -398,7 +382,7 @@ func runNetworkTestsWithCacheAt(
 
 	changed := false
 	if len(dueConfigs) > 0 {
-		updateCacheWithResults(cache, dueKeys, runner(ctx, dueConfigs))
+		updateCacheWithResults(cache, dueKeys, RunNetworkTests(ctx, dueConfigs))
 		changed = true
 	}
 
@@ -470,7 +454,11 @@ func updateCacheWithResults(cache map[string]cachedTest, keys []string, results 
 			break
 		}
 		cache[keys[i]] = cachedTest{
-			lastRun: time.Unix(result.CheckedAt, 0),
+			// lastRun 必须携带单调时钟（time.Now()）：findDueTests 的
+			// currentTime 同样来自 time.Now()，单侧缺失单调读数会把 Sub
+			// 退化为墙钟比较——NTP 回拨后 Sub 为负，全部缓存探测停摆到
+			// 墙钟追回为止。CheckedAt 墙钟仅用于上报/展示。
+			lastRun: time.Now(),
 			result:  result,
 		}
 	}

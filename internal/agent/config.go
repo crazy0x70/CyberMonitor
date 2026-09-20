@@ -189,6 +189,8 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 // performAgentRequest issues an agent API request and turns >=300 responses
 // into agentAPIStatusError. A non-nil decode callback receives the response
 // body (e.g. the strict-JSON decoder); nil means the body is ignored.
+// Redirects are returned as status errors, so agent credentials and request
+// bodies never follow a Location header, even within the same origin.
 func performAgentRequest(
 	client *http.Client,
 	req *http.Request,
@@ -201,7 +203,13 @@ func performAgentRequest(
 	if req == nil {
 		return fmt.Errorf("http request required")
 	}
-	resp, err := client.Do(req)
+	// Copy rather than mutate the shared client: other users keep their redirect
+	// policy, while Transport, Jar and Timeout remain in effect for this request.
+	requestClient := *client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return err
 	}

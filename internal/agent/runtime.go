@@ -53,15 +53,35 @@ type remoteUpdateTracker struct {
 	lastUpdateVersion   string
 	lastUpdateSignature string
 	lastUpdateAppliedAt time.Time
+	// 连续失败计数与上次结果：失败重投按指数退避（2min→1h 封顶），
+	// 防止坏下载 URL 等永久性故障以 2min 节奏无限敲打更新源（r45）。
+	consecutiveFailures int
+	lastRunFailed       bool
 }
 
 const (
 	remoteUpdateDuplicateSuppressWindow = 2 * time.Minute
-	agentTokenRegisterRetryInterval     = 30 * time.Second
+	// 单次失败仍用平坦 2min（与旧行为一致，容忍网络抖动）；从第二次
+	// 连续失败起指数增长，封顶 1h。
+	remoteUpdateFailureMaxBackoff   = time.Hour
+	agentTokenRegisterRetryInterval = 30 * time.Second
 	// 控制面持续失败时同类错误的重提周期：默认 1s 采样间隔下服务端
 	// 宕机/token 永久失效不再每秒刷屏（8 万+ 条/天）。
 	repeatedErrorLogInterval = 5 * time.Minute
 )
+
+// updateFailureBackoff 第 n 次连续失败后的重投退避：2min * 2^(n-1)，
+// 封顶 remoteUpdateFailureMaxBackoff。
+func updateFailureBackoff(consecutiveFailures int) time.Duration {
+	backoff := remoteUpdateDuplicateSuppressWindow
+	for i := 1; i < consecutiveFailures && backoff < remoteUpdateFailureMaxBackoff; i++ {
+		backoff *= 2
+	}
+	if backoff > remoteUpdateFailureMaxBackoff {
+		backoff = remoteUpdateFailureMaxBackoff
+	}
+	return backoff
+}
 
 // logControlPlaneError 对控制面失败做去重日志：同一错误按
 // repeatedErrorLogInterval 重提，错误变化立即打印，恢复成功打印一条
@@ -86,7 +106,7 @@ func (r *agentRunner) logControlPlaneError(source, errKey string, err error) {
 }
 
 // beginApply 决定是否启动一次更新应用：抑制窗内的重复指令、以及尚在
-// 执行中的更新均返回 false；新签名时清空旧的报告去重状态。
+// 执行中的更新均返回 false；新签名时清空旧的报告去重与失败退避状态。
 func (t *remoteUpdateTracker) beginApply(signature string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -94,41 +114,60 @@ func (t *remoteUpdateTracker) beginApply(signature string, now time.Time) bool {
 		return false
 	}
 	if signature != "" && signature == t.lastUpdateSignature && !t.lastUpdateAppliedAt.IsZero() &&
-		now.Before(t.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow)) {
+		now.Before(t.lastUpdateAppliedAt.Add(t.effectiveSuppressWindowLocked())) {
 		return false
 	}
 	if signature != t.lastUpdateSignature {
 		t.lastUpdateState = ""
 		t.lastUpdateVersion = ""
 		t.lastUpdateReportID = ""
+		t.consecutiveFailures = 0
+		t.lastRunFailed = false
 	}
 	t.running = true
 	return true
 }
 
+// effectiveSuppressWindowLocked 上次运行失败时按连续失败次数取退避窗，
+// 否则用平坦重复抑制窗（成功后的同指令重推仍按 2min 去重）。
+func (t *remoteUpdateTracker) effectiveSuppressWindowLocked() time.Duration {
+	if t.lastRunFailed {
+		return updateFailureBackoff(t.consecutiveFailures)
+	}
+	return remoteUpdateDuplicateSuppressWindow
+}
+
 // endApply 在应用结束时记录签名与时间。成功与失败都进入抑制窗：失败
 // （坏下载 URL、只读文件系统等）不再陷入每 30s 一次的整包重下载循环。
-func (t *remoteUpdateTracker) endApply(signature string, now time.Time) {
+func (t *remoteUpdateTracker) endApply(signature string, now time.Time, failed bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.lastUpdateSignature = signature
 	t.lastUpdateAppliedAt = now
 	t.running = false
+	if failed {
+		t.consecutiveFailures++
+	} else {
+		t.consecutiveFailures = 0
+	}
+	t.lastRunFailed = failed
 }
 
-// reset 清理服务端撤回指令后的跟踪状态。抑制窗仍活跃时保留签名与
-// 时间戳：窗口内的同指令重推由 beginApply 拦截，endApply 的时间戳是
-// 唯一退避来源，清掉会把重推变成全新指令立即放行；窗口已过期则照常
-// 清理。
+// reset 清理服务端撤回指令后的跟踪状态。抑制窗（含失败退避窗）仍活跃
+// 时保留签名与时间戳：窗口内的同指令重推由 beginApply 拦截，endApply
+// 的时间戳是唯一退避来源，清掉会把重推变成全新指令立即放行；窗口已
+// 过期则照常清理（含失败计数——退避已服完刑，重推按新指令处理）。
 func (t *remoteUpdateTracker) reset(now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.lastUpdateReportID = ""
 	t.lastUpdateState = ""
 	t.lastUpdateVersion = ""
-	if t.lastUpdateAppliedAt.IsZero() || !now.Before(t.lastUpdateAppliedAt.Add(remoteUpdateDuplicateSuppressWindow)) {
+	if t.lastUpdateAppliedAt.IsZero() || !now.Before(t.lastUpdateAppliedAt.Add(t.effectiveSuppressWindowLocked())) {
 		t.lastUpdateSignature = ""
 		t.lastUpdateAppliedAt = time.Time{}
+		t.consecutiveFailures = 0
+		t.lastRunFailed = false
 	}
 }
 
@@ -259,22 +298,32 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 	reportToken := r.agentToken
 	r.updateWG.Add(1)
 	go func() {
+		// failed 捕获三类失败：更新到达终态 failed（上报成功也计入——
+		// 坏下载 URL 即此形态）、maybeApply 返回错误（上报失败等）、
+		// panic（recover defer 先于 endApply 执行置位）。连续失败由
+		// tracker 指数退避（2min→1h），成功复位。
+		failed := false
 		defer r.updateWG.Done()
 		// endApply 挂 defer：panic 等任何退出路径都必须释放 running，
 		// 否则后续更新指令被 beginApply 永久忽略且无诊断日志。闭包形式
 		// 让时间戳在调用时求值（抑制窗从更新结束起算，而非启动时刻）。
-		// 执行顺序（LIFO）：recover → endApply → Done。
-		defer func() { r.updates.endApply(signature, remoteUpdateNow()) }()
+		// 执行顺序（LIFO）：recover（置失败位）→ endApply → Done。
+		defer func() { r.updates.endApply(signature, remoteUpdateNow(), failed) }()
 		defer func() {
 			// 更新 goroutine 可能正处于二进制替换流程，panic 不得杀死
-			// 进程，记录后随 endApply 收尾。
+			// 进程，记录后随 endApply 收尾（panic 计入失败退避）。
 			if rec := recover(); rec != nil {
+				failed = true
 				log.Printf("执行远程更新 panic 已恢复: %v", rec)
 			}
 		}()
 		if err := maybeApplyRemoteUpdate(ctx, func(ctx context.Context, updateID, state, version, message string) error {
+			if state == "failed" {
+				failed = true
+			}
 			return r.reportUpdateWithToken(ctx, reportToken, updateID, state, version, message)
 		}, r.cfg, &update); err != nil {
+			failed = true
 			log.Printf("执行远程更新失败: %v", err)
 		}
 	}()

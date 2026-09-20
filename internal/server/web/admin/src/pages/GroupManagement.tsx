@@ -251,6 +251,10 @@ function serializeEditableTree(tree: EditableGroupNode[]) {
   );
 }
 
+// 展示页固定标签（ALL/全部 为平铺视图、C&R 为地区分组），用户分组
+// 与之同名会在展示页被虚拟分组吸收。
+const RESERVED_GROUP_NAMES = new Set(["全部", "ALL", "C&R"]);
+
 function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
   const validationIssues: ValidationIssue[] = [];
   const groupErrors: Record<string, string> = {};
@@ -282,10 +286,10 @@ function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
         target: { groupIndex },
       });
       groupErrors[String(groupIndex)] = message;
-    } else if (groupName === "全部") {
-      const message = "一级分组名称不能使用“全部”。";
+    } else if (RESERVED_GROUP_NAMES.has(groupName)) {
+      const message = "一级分组名称与展示页固定标签冲突，请换一个名称。";
       validationIssues.push({
-        key: `group-all-${groupIndex}`,
+        key: `group-reserved-${groupIndex}`,
         message,
         target: { groupIndex },
       });
@@ -329,10 +333,10 @@ function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
         return;
       }
 
-      if (tagName === "全部") {
-        const message = `${groupLabel} 下的标签不能使用“全部”。`;
+      if (RESERVED_GROUP_NAMES.has(tagName)) {
+        const message = `${groupLabel} 下的标签与展示页固定标签冲突，请换一个名称。`;
         validationIssues.push({
-          key: `tag-all-${groupIndex}-${tagIndex}`,
+          key: `tag-reserved-${groupIndex}-${tagIndex}`,
           message,
           target: { groupIndex, tagIndex },
         });

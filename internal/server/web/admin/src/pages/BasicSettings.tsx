@@ -45,6 +45,8 @@ import type {
   ConfigImportResponse,
   SettingsView,
   SystemUpdateInfo,
+  AdminAuthSettings,
+  SettingsUpdate,
 } from "@/lib/admin-types";
 import { useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
 import { AdminApiError, adminAppLocation } from "@/lib/admin-api";
@@ -79,7 +81,7 @@ import { cn } from "@/lib/utils";
 export interface BasicSettingsProps {
   settings: SettingsView | null;
   onDirtyChange?: (dirty: boolean) => void;
-  onSave: (payload: Record<string, unknown>) => Promise<SettingsView>;
+  onSave: (payload: SettingsUpdate) => Promise<SettingsView>;
   onExport: () => Promise<void>;
   onImport: (payload: Record<string, unknown>) => Promise<ConfigImportResponse>;
   systemUpdateInfo: SystemUpdateInfo | null;
@@ -166,7 +168,7 @@ function adminAuthDraft(settings: SettingsView | null) {
 
 type AdminAuthDraft = ReturnType<typeof adminAuthDraft>;
 
-function adminAuthPayload(draft: AdminAuthDraft) {
+function adminAuthPayload(draft: AdminAuthDraft): AdminAuthSettings {
   return {
     password_login_enabled: draft.passwordLoginEnabled,
     github: {
@@ -407,8 +409,8 @@ export default function BasicSettings({
     }
   };
 
-  const buildPayload = () => {
-    const payload: Record<string, unknown> = {
+  const buildPayload = (): SettingsUpdate => {
+    const payload: SettingsUpdate = {
       agent_endpoint: agentEndpoint.trim(),
       turnstile_site_key: turnstileSiteKey.trim(),
       site_title: siteTitle.trim(),

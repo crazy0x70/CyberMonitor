@@ -72,9 +72,11 @@ import type {
   NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
+  BootPublicSettings,
   PublicSettings,
   SettingsView,
   SystemUpdateInfo,
+  SettingsUpdate,
 } from "@/lib/admin-types";
 import {
   ADMIN_PAGE_QUERY_KEY,
@@ -262,7 +264,7 @@ function normalizePublicIconURL(value: string | undefined | null) {
   }
 }
 
-function publicSettingsFromSettings(settings: SettingsView | null): PublicSettings | null {
+function publicSettingsFromSettings(settings: SettingsView | null): BootPublicSettings | null {
   if (!settings) {
     return null;
   }
@@ -284,8 +286,8 @@ function publicSettingsFromSnapshot(settings: PublicSettings | undefined): Publi
 
 function mergePublicSettings(
   settings: SettingsView | null,
-  current: PublicSettings | null,
-): PublicSettings | null {
+  current: BootPublicSettings | null,
+): BootPublicSettings | null {
   const next = publicSettingsFromSettings(settings);
   if (!next) {
     return current;
@@ -594,7 +596,7 @@ export default function App() {
   // 加载完成（含失败）前不下发 passwordLoginEnabled 判定：避免"密码登录
   // 已禁用"的部署在配置到达前闪现密码表单。
   const [loginConfigLoaded, setLoginConfigLoaded] = useState(false);
-  const [publicSettings, setPublicSettings] = useState<PublicSettings | null>(() => BOOT_PAYLOAD.settings || null);
+  const [publicSettings, setPublicSettings] = useState<BootPublicSettings | null>(() => BOOT_PAYLOAD.settings || null);
   const [systemUpdateInfo, setSystemUpdateInfo] = useState<SystemUpdateInfo | null>(null);
   const [nodes, setNodes] = useState<NodeView[]>([]);
   const [currentPage, setCurrentPage] = useState<Page>(() => resolveInitialPage());
@@ -1123,7 +1125,7 @@ export default function App() {
     }
   }
 
-  async function updateSettings(page: Page, payload: Record<string, unknown>) {
+  async function updateSettings(page: Page, payload: SettingsUpdate) {
     setSavingPage(page);
     try {
       const data = await saveSettings(payload);
@@ -1396,12 +1398,12 @@ export default function App() {
         return (
           <Suspense fallback={<SectionLoader label={t("正在加载 AI 服务商…")} />}>
             <AIProviderPage
-              onFetchModels={(provider: string, config: AIProviderConfig) =>
+              onFetchModels={(provider: string, config: AIProviderConfig | null) =>
                 fetchAIModels(provider, config).then((data) => data.models || [])
               }
               onDirtyChange={setHasUnsavedPageChanges}
               onSave={(payload) => updateSettings("ai", payload)}
-              onTestProvider={(provider: string, config: AIProviderConfig) =>
+              onTestProvider={(provider: string, config: AIProviderConfig | null) =>
                 testAIProvider(provider, config).then(() => undefined)
               }
               saving={savingPage === "ai"}

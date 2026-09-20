@@ -314,6 +314,44 @@ func strictUnmarshalJSON(data []byte, target any) error {
 }
 
 func loadPersistedData(path string) (PersistedData, bool, error) {
+	payload, loaded, err := readPersistedDataFile(path)
+	if loaded {
+		return payload, loaded, nil
+	}
+	// 主文件"不存在"（savePersistedData 轮转后崩溃/写失败的窗口态）或
+	// "读取/解析失败"（磁盘坏块/手工编辑/外部截断）都从这里走备份自救；
+	// 真首装时 .bak 同样不存在，返回值保持首装语义。
+	backupPath := path + ".bak"
+	backupPayload, backupLoaded, backupErr := readPersistedDataFile(backupPath)
+	if !backupLoaded {
+		// 只有两个文件都缺失才是首装；保留每个损坏文件的路径和底层错误。
+		var loadErrors []error
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Errorf("读取 %s 失败: %w", path, err))
+		}
+		if backupErr != nil {
+			loadErrors = append(loadErrors, fmt.Errorf("读取备份 %s 失败: %w", backupPath, backupErr))
+		}
+		return payload, false, errors.Join(loadErrors...)
+	}
+	if err != nil {
+		log.Printf("读取 %s 失败（%v），从备份 %s 恢复", path, err, backupPath)
+	} else {
+		log.Printf("主文件 %s 缺失，已从备份 %s 恢复数据，下次持久化将写回主文件", path, backupPath)
+	}
+	if err != nil {
+		// 移除损坏的主文件：启动写回前的轮转不会把坏文件压进 .bak（唯一
+		// 好备份），写回失败的缺失窗口由本函数的备份回退兜底。
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			log.Printf("移除损坏的主文件 %s 失败（%v）", path, removeErr)
+		}
+	}
+	return backupPayload, backupLoaded, nil
+}
+
+// readPersistedDataFile 解析单个持久化文件；loaded=false 且 err=nil 表示
+// 文件不存在（首装语义）。
+func readPersistedDataFile(path string) (PersistedData, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -367,6 +405,12 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 }
 
 func savePersistedData(path string, payload PersistedData) error {
+	// 上一代轮转（尽力而为）：rename 当前主文件到 .bak 后再原子写入。
+	// 两次 rename 间崩溃的窗口内主文件缺失但 .bak 在——loadPersistedData
+	// 对"缺失"同样走备份回退，该窗口被覆盖。
+	if err := os.Rename(path, path+".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("轮转备份 %s 失败（%v），继续写入主文件", path+".bak", err)
+	}
 	return writeJSONFileAtomic(path, payload)
 }
 
@@ -1088,7 +1132,8 @@ func normalizeUniqueStrings(values []string, skip func(string) bool) []string {
 
 func normalizeGroups(groups []string) []string {
 	return normalizeUniqueStrings(groups, func(value string) bool {
-		return value == "全部"
+		_, reserved := reservedGroupNames[value]
+		return reserved
 	})
 }
 
@@ -1096,9 +1141,20 @@ func normalizeTagValues(tags []string) []string {
 	return normalizeUniqueStrings(tags, nil)
 }
 
+// reservedGroupNames 与展示页固定标签（ALL 平铺视图、C&R 地区分组）
+// 及既有保留名"全部"对齐，同名用户分组会被展示页虚拟分组吸收。
+var reservedGroupNames = map[string]struct{}{
+	"全部":  {},
+	"ALL": {},
+	"C&R": {},
+}
+
 func normalizeGroupName(value string) string {
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" || trimmed == "全部" {
+	if trimmed == "" {
+		return ""
+	}
+	if _, reserved := reservedGroupNames[trimmed]; reserved {
 		return ""
 	}
 	return trimmed
@@ -1113,7 +1169,11 @@ func canonicalGroupSelection(group, tag string) string {
 
 func parseGroupSelection(value string) (string, string) {
 	raw := strings.TrimSpace(value)
-	if raw == "" || raw == "全部" {
+	if raw == "" {
+		return "", ""
+	}
+	if _, reserved := reservedGroupNames[raw]; reserved {
+		// 节点历史数据上挂的保留名分组在展示页会造出重复/幽灵标签。
 		return "", ""
 	}
 	group := raw

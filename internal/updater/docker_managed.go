@@ -117,6 +117,10 @@ func (u *DockerManagedUpdater) CurrentImage() string {
 	return strings.TrimSpace(u.currentImage)
 }
 
+// DetectUpdateMode 返回展示用更新模式标签（system update 视图的
+// mode 字段），与部署判定 DetectDeployMode 语义不同：Docker 部署下
+// 未启用托管更新时仍上报 docker 模式（区别于 docker-managed），避免
+// 管理页给出不可用的更新入口。
 func DetectUpdateMode() string {
 	if DetectDeployMode() == DeployModeDocker {
 		if CanDockerManagedUpdate() {

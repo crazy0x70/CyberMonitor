@@ -41,7 +41,7 @@ import {
 import type { NodeView, SettingsView } from "@/lib/admin-types";
 import {
   adminPageHref,
-  resolveNodeSelectionValues,
+  resolveNodeSelections,
   shouldHandleAdminNavigation,
   type AdminPage,
 } from "@/lib/admin-format";
@@ -71,6 +71,9 @@ function readProviderLabel(settings: SettingsView | null, provider: string) {
     const match = settings?.ai_settings?.openai_compatibles?.find((item) => item.id === id);
     return match?.name || "兼容服务商";
   }
+  if (provider === "openai_compatible") {
+    return "OpenAI 兼容";
+  }
   return provider;
 }
 
@@ -81,8 +84,9 @@ function summarizeAI(settings: SettingsView | null) {
 }
 
 function countUngrouped(nodes: NodeView[]) {
-  // 与分组管理页同口径：stats.node_group / tags 派生的归属也算已分组。
-  return nodes.filter((node) => resolveNodeSelectionValues(node).length === 0).length;
+  // 与分组管理页同口径：走 parse 后丢弃非法项的 resolveNodeSelections，
+  // groups 含畸形值（如 ":"）的节点不会被误判为已分组。
+  return nodes.filter((node) => resolveNodeSelections(node).length === 0).length;
 }
 
 export default function Dashboard({ settings, nodes, onNavigate }: DashboardProps) {
