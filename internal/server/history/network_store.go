@@ -23,7 +23,6 @@ import (
 
 var errNilNetworkStore = errors.New("network history store is nil")
 
-// MigrationSample 是迁移专用的扁平样本（节点 ID + 原始探测结果）。
 type MigrationSample struct {
 	NodeID string
 	Test   metrics.NetworkTestResult
@@ -34,13 +33,9 @@ type NetworkStore struct {
 	appendMu         sync.Mutex
 	latestSeriesTime map[string]int64
 	latestLoaded     bool
-	// capLogUntil 序列触顶日志的限频闸（UnixNano）：触顶节点可被公开
-	// 端点反复查询，逐条打印会成日志洪水。
-	capLogUntil atomic.Int64
+	capLogUntil      atomic.Int64
 }
 
-// allowCapLog 触顶日志的限频闸：分钟级窗口至多放行一条，竞争下偶发
-// 多放一条无害。
 func (s *NetworkStore) allowCapLog(now time.Time) bool {
 	next := now.Add(time.Minute).UnixNano()
 	prev := s.capLogUntil.Load()
@@ -104,8 +99,6 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	}
 	normalizedID, err := NormalizeNodeID(nodeID)
 	if err != nil || normalizedID == "" {
-		// 迁移路径的 legacy 键未经上游校验：非法 nodeID 落库后 DeleteNode
-		// （同款严格校验）永远匹配不到，TSDB 序列残留。
 		log.Printf("history 拒绝非法节点 ID %q", strings.TrimSpace(nodeID))
 		return nil
 	}
@@ -153,10 +146,6 @@ func (s *NetworkStore) AppendBatch(nodeID string, tests []metrics.NetworkTestRes
 	return nil
 }
 
-// AppendMigrationSamples 以单一 appender、单次 Commit 提交全局升序样本：
-// TSDB head maxt 每次提交推进，按节点分批（各自 Commit）时，先落库批次
-// 的较新时间戳会让后续批次的更老样本命中 too-old 被静默丢弃。调用方须
-// 保证 samples 全局按 CheckedAt 升序。
 func (s *NetworkStore) AppendMigrationSamples(samples []MigrationSample) error {
 	if s == nil || s.db == nil {
 		return errNilNetworkStore
@@ -199,8 +188,6 @@ func (s *NetworkStore) QueryPublicRange(ctx context.Context, nodeID string, from
 	return s.queryRange(ctx, nodeID, from, to, false)
 }
 
-// QueryRangeRaw 跳过桶降采样，返回原始采样时间戳。需要精确时间去重的
-// 场景（如 legacy 迁移去重）必须走此路径：降采样输出的是桶起点时间。
 func (s *NetworkStore) QueryRangeRaw(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error) {
 	return s.queryRangeWithOptions(ctx, nodeID, from, to, true, 0)
 }
@@ -242,8 +229,6 @@ func (s *NetworkStore) queryRange(
 		return map[string]*NetworkHistoryEntry{}, nil
 	}
 
-	// 长窗口（如 1y）必须先定桶再采集：target ≤ ~1000 点/序列。
-	// 短窗口返回 0，走 raw 路径（与历史行为一致）。
 	bucketMillis := downsampleBucketMillis(from.UnixMilli(), to.UnixMilli())
 	return s.queryRangeWithOptions(ctx, nodeID, from, to, includeAvailability, bucketMillis)
 }
@@ -295,8 +280,6 @@ func (s *NetworkStore) queryRangeWithOptions(
 	result := make(map[string]*NetworkHistoryEntry, len(accumulators))
 	cutoffSeconds := to.UTC().Add(-networkRetentionDays * 24 * time.Hour).Unix()
 	if bucketMillis == 0 {
-		// raw 路径供迁移去重基线使用：保留期截断会让超期 legacy 序列
-		// 整体缺席基线，产生无谓的重复 append（TSDB 重复容忍兜底）。
 		cutoffSeconds = 0
 	}
 	for key, acc := range accumulators {
@@ -346,10 +329,6 @@ func (s *NetworkStore) DeleteNode(nodeID string) error {
 	return nil
 }
 
-// networkMaxFutureSkew 容忍 agent 时钟适度超前。上限之外的未来时间戳
-// 会把 TSDB head maxt 抬到未来：此后所有节点的实时样本全部命中
-// too-old 被静默丢弃（全网 history 瘫痪且无日志），重启后基线回扫还会
-// 把未来值重新载入，跨重启持续。
 const networkMaxFutureSkew = 5 * time.Minute
 
 func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {
@@ -357,13 +336,10 @@ func resolveTimestampMillis(checkedAt int64, now time.Time) int64 {
 		return now.UTC().UnixMilli()
 	}
 	if checkedAt > math.MaxInt64/1000 {
-		// 乘 1000 会溢出为负，按非法处理。
 		return now.UTC().UnixMilli()
 	}
 	millis := checkedAt * 1000
 	if millis > now.Add(networkMaxFutureSkew).UTC().UnixMilli() {
-		// 只钳上限：过老样本由 TSDB 拒收+容忍路径处理（迁移历史语义
-		// 依赖真实时间戳，不得向 now 收敛）。
 		return now.UTC().UnixMilli()
 	}
 	return millis
@@ -445,12 +421,6 @@ func (s *NetworkStore) appendMetricSampleIfFresh(
 		return false, nil
 	}
 	if err := appendMetricSample(appender, nodeID, sample, metricName, value); err != nil {
-		// 首扫窗口外的陈旧样本（时钟回拨、久离线节点回连）会被 TSDB 以
-		// 越界/重复/乱序拒绝：跳过单个样本，不让它拖垮整批提交。
-		// ErrTooOldSample：启用 OOO 窗口后，比 headMaxt-window 更老的样本
-		// 走该独立错误（而非 ErrOutOfBounds）。迁移场景下 map 随机序提交
-		// 多序列时，第二序列的老样本必然命中——不容忍会让 >24h 跨度的
-		// legacy 迁移永久失败（marker 不写、每次启动重试）。
 		if errors.Is(err, storage.ErrOutOfBounds) ||
 			errors.Is(err, storage.ErrTooOldSample) ||
 			errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
@@ -488,12 +458,7 @@ func (s *NetworkStore) ensureLatestSeriesTimeLoaded(now time.Time) error {
 	return nil
 }
 
-// queryRecentLatestTimestampMillis 只回扫乱序窗口内的样本建立去重基线：
-// 更老的样本本来就落在 TSDB 的 OutOfOrderTimeWindow 之外（写入时被拒），
-// 全量回扫在 366 天保留下会在重启后阻塞首个 ingest 数分钟。
 func (s *NetworkStore) queryRecentLatestTimestampMillis(now time.Time) (map[string]int64, error) {
-	// 1×乱序窗口即够：更老样本 TSDB 本就拒收（容忍路径），基线无需覆盖；
-	// 2× 会让重启后首次 ingest 在 appendMu 内全量迭代两天样本。
 	mint := now.Add(-networkOutOfOrderWindow).UnixMilli()
 	querier, err := s.db.Querier(mint, math.MaxInt64)
 	if err != nil {
@@ -549,11 +514,6 @@ func (s *NetworkStore) queryRecentLatestTimestampMillis(now time.Time) (map[stri
 	return latestSeriesTime, nil
 }
 
-// maxLatestSeriesTimeEntries 限制去重基线条目数：host/name 标签由 agent
-// 逐条可控，失控 agent 每次换标签即新增条目（数百字节/条），无上限会
-// 在进程生命周期内耗尽内存。超限先剪除陈旧条目（早于 2×乱序窗口的样本
-// 本就会被 TSDB 拒收，基线无需覆盖），仍超限则不记录新键——TSDB 侧由
-// head 截断与保留期自我限界，重复写入走容忍路径，仅损失去重效率。
 const maxLatestSeriesTimeEntries = 1 << 16
 
 func (s *NetworkStore) recordLatestSeriesTime(latestSeriesTimeUpdates map[string]int64) {
@@ -607,9 +567,6 @@ func (s *NetworkStore) deleteLatestSeriesTimeForNode(nodeID string) {
 	}
 }
 
-// escapeNodeIDKey 对去重基线复合键（metric|nodeID|seriesKey）中的 nodeID
-// 做 `|`/`%` 转义：ID 含 `|` 时切分错位会让按节点删除漏删，且不得为此
-// 拒绝存量持久化 ID（回溯会使升级后启动失败）。
 func escapeNodeIDKey(nodeID string) string {
 	nodeID = strings.ReplaceAll(nodeID, "%", "%25")
 	return strings.ReplaceAll(nodeID, "|", "%7C")

@@ -23,7 +23,6 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	duration, err := time.ParseDuration(value)
 	if err != nil {
 		if strings.TrimSpace(value) != "" {
-			// 空值（如 docker 中 CM_X=）视为未设置，静默回退。
 			log.Printf("环境变量 %s=%q 解析失败（%v），使用默认值 %s", key, value, err, def)
 		}
 		return def

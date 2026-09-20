@@ -4,9 +4,6 @@ package metrics
 
 import "syscall"
 
-// statFilesystemUsage is a package variable so tests can stub the
-// platform-specific stat call with synthetic inputs (e.g. Windows-shaped
-// mountpoints while running the tests on unix).
 var statFilesystemUsage = defaultStatFilesystemUsage
 
 func defaultStatFilesystemUsage(path string) (filesystemUsage, error) {

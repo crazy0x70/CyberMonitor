@@ -150,9 +150,6 @@ const (
 	defaultPublicIPRetryInterval     = time.Minute
 	defaultPublicIPLookupTimeout     = 2 * time.Second
 
-	// The agent samples metrics roughly every second; these TTLs keep
-	// identity-like inputs from being re-derived on every tick while staying
-	// short enough to pick up host changes.
 	nvidiaSMIPathRefreshInterval = 60 * time.Second
 	gpuSampleRefreshInterval     = 5 * time.Second
 	netFilterRefreshInterval     = 10 * time.Second
@@ -209,9 +206,6 @@ type Collector struct {
 	prevUDP    int
 	prevConnAt time.Time
 
-	// TTL caches for identity-like inputs that must not be re-derived on
-	// every ~1s tick. The Collector is used from a single goroutine, like
-	// the other sampler state above.
 	resolvedNetFilter    map[string]struct{}
 	resolvedNetFilterAt  time.Time
 	netSpeedMbps         float64
@@ -234,8 +228,6 @@ type Collector struct {
 	sourceWarningsShown  map[string]struct{}
 	sourceWarningsMu     sync.Mutex
 
-	// partitionsCache 缓存原生部署的挂载表（容器路径已有 hostMounts 缓存），
-	// 避免每个 tick 重新解析整张表。仅被 Collect 单线程访问。
 	partitionsCache    []disk.PartitionStat
 	partitionsCachedAt time.Time
 
@@ -245,9 +237,6 @@ type Collector struct {
 	publicIPsMu             sync.Mutex
 	publicIPRefreshRunning  bool
 
-	// 永不过期的设备/挂载点属性缓存：分区标记、设备容量、挂载点类型
-	// 在运行期视为不变（新增设备按 miss 现场查询后入缓存），避免每秒
-	// 采集 tick 对同一批路径重复 syscall。仅被 Collect 单线程访问。
 	blockPartitionAttr map[string]bool
 	blockDeviceTotal   map[string]uint64
 	mountpointIsDir    map[string]bool
@@ -267,9 +256,6 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		}
 		filter[name] = struct{}{}
 	}
-	// hostRoot 仅在确实是聚合根（含 proc/ 或 sys/）时生效。原生部署的
-	// 默认值 /host 不存在，若照用会让分区识别、网速、磁盘类型等 sysfs
-	// 读取全部落空——磁盘 IO 计数退化为整盘+分区求和（虚高 2-3x）。
 	hostRoot = strings.TrimSpace(hostRoot)
 	if hostRoot != "" && !isDir(filepath.Join(hostRoot, "proc")) && !isDir(filepath.Join(hostRoot, "sys")) {
 		hostRoot = ""
@@ -286,8 +272,6 @@ func NewCollector(nodeID, nodeName, hostRoot string, netIfaces []string) *Collec
 		blockDeviceTotal:          make(map[string]uint64),
 		mountpointIsDir:           make(map[string]bool),
 	}
-	// gopsutil 的 cpu.Percent 首次调用因无基线样本返回错误，预热一次建立
-	// 基线，避免启动后第一个 tick CPU=0 且误报采集失败。
 	_, _ = cpu.Percent(0, false)
 	return collector
 }
@@ -305,10 +289,6 @@ func (c *Collector) Collect() NodeStats {
 	loadAvg, err := load.Avg()
 	c.warnOnce("load.Avg", err)
 	memStat := c.collectMemoryStat()
-	// 容器模式（hostRoot）下 collectDiskUsage 走 host 挂载缓存/host-root
-	// statfs，disk.Partitions 的结果只有 30 分钟一次的静态信息刷新消费——
-	// 到期时由 refreshStaticInfoAt 自行获取，避免每个 tick 解析整张挂载表。
-	// 原生路径同样做短 TTL 缓存，与容器路径口径一致。
 	var partitions []disk.PartitionStat
 	if strings.TrimSpace(c.hostRoot) == "" {
 		if c.partitionsCachedAt.IsZero() || now.Sub(c.partitionsCachedAt) >= partitionsRefreshInterval {
@@ -316,7 +296,6 @@ func (c *Collector) Collect() NodeStats {
 				c.partitionsCache = list
 				c.partitionsCachedAt = now
 			} else {
-				// 失败保留 last-good 且不推进时间戳，下个 tick 重试。
 				c.warnOnce("disk.Partitions", err)
 			}
 		}
@@ -390,7 +369,6 @@ func (c *Collector) Collect() NodeStats {
 	stats.CPU.Cores = c.staticInfo.Cores
 	stats.DiskType = c.staticInfo.DiskType
 
-	// 计算速率需要前后采样差值
 	if !c.prevTime.IsZero() && c.prevNet != nil && c.prevDisk != nil {
 		delta := now.Sub(c.prevTime).Seconds()
 		if delta > 0 {
@@ -413,9 +391,6 @@ func (c *Collector) Collect() NodeStats {
 	return stats
 }
 
-// SanitizeNodeStats removes non-finite floating-point values before stats are
-// serialized or persisted. Some gopsutil backends can emit NaN during the
-// first Docker sample when a counter delta has no usable denominator.
 func SanitizeNodeStats(stats *NodeStats) {
 	if stats == nil {
 		return
@@ -463,9 +438,6 @@ func finiteNonNegative(value float64) float64 {
 	return value
 }
 
-// sampleHostIdentityAt 返回 hostname 兜底、uptime 与进程数。uptime 由
-// 一次性 BootTime 推算，进程数低频刷新——host.Info() 在 macOS/Linux 上
-// 每 tick fork 子进程并读多个文件，不能放进 ~1s 采集循环。
 func (c *Collector) sampleHostIdentityAt(now time.Time) (string, uint64, int) {
 	if !c.bootTimeOK {
 		if bt, err := host.BootTime(); err == nil && bt > 0 {
@@ -555,11 +527,6 @@ func (c *Collector) sampleConnectionCountsAt(
 	return c.prevTCP, c.prevUDP
 }
 
-// warnOnce logs the first error seen from a metrics source so a broken input
-// (e.g. a wrong HOST_PROC) surfaces in logs instead of silently producing
-// all-zero telemetry. Called from the sampler goroutine and the public-IP
-// lookup goroutines concurrently — sourceWarningsMu is mandatory（Go map
-// 并发写会直接 fatal）.
 func (c *Collector) warnOnce(source string, err error) {
 	if err == nil {
 		return
@@ -576,10 +543,6 @@ func (c *Collector) warnOnce(source string, err error) {
 	log.Printf("指标源 %s 采集失败: %v", source, err)
 }
 
-// resolveNetFilterAt returns the interface filter used to aggregate network
-// counters. An explicitly configured filter (len(c.netIfaces) > 0) is static;
-// otherwise the default filter is re-resolved from the interface list at most
-// once per netFilterRefreshInterval.
 func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 	if len(c.netIfaces) > 0 {
 		return c.netIfaces
@@ -587,8 +550,6 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 	if !c.resolvedNetFilterAt.IsZero() && now.Sub(c.resolvedNetFilterAt) < netFilterRefreshInterval {
 		return c.resolvedNetFilter
 	}
-	// 过滤器必须与计数器同源：容器部署时 IOCounters 读宿主机 /proc/net/dev，
-	// 而 Interfaces() 只见容器自身网络命名空间，混用会把宿主机网卡全部过滤掉。
 	if counters, err := gnet.IOCounters(true); err == nil {
 		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName, c.isAggregatingMaster)
 		c.resolvedNetFilterAt = now
@@ -596,8 +557,6 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 	return c.resolvedNetFilter
 }
 
-// collectNetSpeedMbpsAt caches the sampled link speed, which re-reads sysfs
-// per interface and changes at most when the interface set does.
 func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struct{}, netCounters []gnet.IOCountersStat) float64 {
 	if !c.netSpeedSampledAt.IsZero() && now.Sub(c.netSpeedSampledAt) < netSpeedRefreshInterval {
 		return c.netSpeedMbps
@@ -607,7 +566,6 @@ func (c *Collector) collectNetSpeedMbpsAt(now time.Time, filter map[string]struc
 	return c.netSpeedMbps
 }
 
-// readHostHostnameAt caches the host's /etc/hostname content.
 func (c *Collector) readHostHostnameAt(now time.Time) string {
 	if c.hostHostnameAt.IsZero() || now.Sub(c.hostHostnameAt) >= hostHostnameRefreshInterval {
 		c.hostHostname = readHostHostname(c.hostRoot)
@@ -616,9 +574,6 @@ func (c *Collector) readHostHostnameAt(now time.Time) string {
 	return c.hostHostname
 }
 
-// currentPublicIPs 返回缓存的公网 IP；到期时触发后台刷新并立即返回旧值。
-// 查询（最长 2s，离线端点串行重试）不再阻塞 Collect 热路径——原先内联
-// 同步等待会让 agent 单循环在每轮重试间隔掉 1-2 个上报 tick。
 func (c *Collector) currentPublicIPs(now time.Time) publicIPInfo {
 	c.publicIPsMu.Lock()
 	defer c.publicIPsMu.Unlock()
@@ -651,9 +606,6 @@ func (c *Collector) refreshPublicIPs() {
 		c.publicIPRefreshRunning = false
 		c.publicIPsMu.Unlock()
 	}()
-	// 总预算 = 单端点超时 × 单 family 最多端点数：若用单端点超时作为总预算，
-	// 首个被防火墙 DROP 的端点会耗尽全部预算，后续端点随父 ctx 过期立即取消，
-	// 公网 IP 将永远解析失败。
 	ctx, cancel := context.WithTimeout(context.Background(), publicIPLookupTotalBudget(defaultPublicIPLookupTimeout))
 	defer cancel()
 	type lookupResult struct {
@@ -689,7 +641,6 @@ func (c *Collector) refreshPublicIPs() {
 	}
 	c.publicIPsMu.Lock()
 	defer c.publicIPsMu.Unlock()
-	// 保留旧值中非空的结果：本轮查询失败（空串）不清掉已知的 IP。
 	if next.IPv4 == "" {
 		next.IPv4 = c.publicIPs.IPv4
 	}
@@ -743,7 +694,6 @@ func defaultPublicIPEndpointsForFamily(family publicIPFamily) []string {
 	}
 }
 
-// publicIPLookupTotalBudget 是一次公网 IP 刷新的总预算上界（family 间并发）。
 func publicIPLookupTotalBudget(perEndpoint time.Duration) time.Duration {
 	maxEndpoints := len(defaultPublicIPv4Endpoints)
 	if n := len(defaultPublicIPv6Endpoints); n > maxEndpoints {
@@ -864,9 +814,6 @@ func normalizePublicIPAddress(family publicIPFamily, raw string) string {
 }
 
 func (c *Collector) collectMemoryStat() *mem.VirtualMemoryStat {
-	// 容器部署下 agent 已设置 HOST_PROC 指向 /host/proc，
-	// mem.VirtualMemory 读到的就是宿主 meminfo（Used = Total - Available
-	// 语义与原手写解析一致），无需重复实现。
 	memStat, err := mem.VirtualMemory()
 	c.warnOnce("mem.VirtualMemory", err)
 	return memStat
@@ -919,11 +866,6 @@ func buildDefaultInterfaceFilter(
 	if len(stats) == 0 {
 		return nil
 	}
-	// 计数器中出现过的接口名集合：master 关系的剔除依据。
-	// 仅当 master 是"流量聚合型"设备（Linux bridge / bonding）时才剔除
-	// 成员口——bridge/bond 的计数器包含成员口的同一份报文，双计会按
-	// 成员数成倍虚高。VRF/OVS 等非聚合 master 不在此列：成员口的真实
-	// 流量不经 master 设备计数，剔除成员口会让流量塌缩为 ~0。
 	known := make(map[string]struct{}, len(stats))
 	for _, stat := range stats {
 		if name := normalizeInterfaceName(stat.Name); name != "" {
@@ -969,9 +911,6 @@ func shouldIgnoreDefaultInterface(
 	return false
 }
 
-// isAggregatingMaster 判断 master 设备是否把成员口流量计入自身计数器：
-// Linux bridge 有 /sys/class/net/<dev>/bridge/，bonding 有 .../bonding/。
-// team（libteam）不暴露这两个标记目录，team 成员口维持双计的既有行为。
 func (c *Collector) isAggregatingMaster(master string) bool {
 	if runtime.GOOS != "linux" || master == "" {
 		return false
@@ -1012,8 +951,6 @@ func canonicalInterfaceName(name string) string {
 	return trimmed
 }
 
-// hostSysPath resolves a path under /sys, honouring -host-root in container
-// deployments so reads hit the host sysfs instead of the container's own.
 func hostSysPath(hostRoot string, rel ...string) string {
 	root := strings.TrimSpace(hostRoot)
 	if root == "" {
@@ -1022,8 +959,6 @@ func hostSysPath(hostRoot string, rel ...string) string {
 	return filepath.Join(append([]string{root, "sys"}, rel...)...)
 }
 
-// readInterfaceMasterName reports the bridge a Linux interface is enslaved to,
-// reading through the host sysfs when running inside a container.
 func (c *Collector) readInterfaceMasterName(name string) string {
 	if runtime.GOOS != "linux" {
 		return ""
@@ -1089,10 +1024,6 @@ func parseSpeedMbps(raw string) float64 {
 	return parsed
 }
 
-// sumDiskIOBytes aggregates counters across whole disks only. /proc/diskstats
-// lists every device together with its partitions carrying identical counters,
-// so summing all rows would inflate the totals (loop/ram/zram mirror their
-// backing device or RAM, not a physical disk).
 func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot string, partitionAttr map[string]bool) (uint64, uint64) {
 	var read, write uint64
 	for name, stat := range counters {
@@ -1108,10 +1039,6 @@ func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot s
 	return read, write
 }
 
-// isPartitionOfCountedDisk 处理 BSD 的 GEOM/devstat 命名：ada0 与
-// ada0p1（GPT）、da0s1（MBR）计数器相同，分区后缀命中同集合中的整盘
-// 时剔除，避免整盘+分区求和导致 IO 虚高。legacy BSD disklabel 的双层
-// 嵌套（da0s1a）不覆盖，仍会多计一次（改动前全部求和更糟）。
 func isPartitionOfCountedDisk(name string, counters map[string]disk.IOCountersStat) bool {
 	i := len(name)
 	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
@@ -1137,9 +1064,6 @@ func isVirtualBlockDevice(name, hostRoot string, partitionAttr map[string]bool) 
 	if strings.HasPrefix(normalized, "loop") || strings.HasPrefix(normalized, "ram") || strings.HasPrefix(normalized, "zram") {
 		return true
 	}
-	// A "partition" attribute under /sys/class/block marks the entry as a
-	// partition of a parent disk whose counters are already counted.
-	// 属性永不变：按设备名缓存，避免每个采集 tick 重复 stat。
 	if isPartition, ok := partitionAttr[normalized]; ok {
 		return isPartition
 	}
@@ -1226,9 +1150,6 @@ func (c *Collector) collectHostDiskUsage(now time.Time) []DiskPartition {
 	return collectPartitionUsageCached(candidates, c.mountpointIsDir, c.blockDeviceTotal)
 }
 
-// readHostMountsAt caches the parsed host mount list. Mounts can appear while
-// the agent runs, so the cache only holds for hostMountsRefreshInterval;
-// failures are not cached and are retried on the next tick.
 func (c *Collector) readHostMountsAt(now time.Time) ([]hostMount, error) {
 	if !c.hostMountsAt.IsZero() && now.Sub(c.hostMountsAt) < hostMountsRefreshInterval {
 		return c.hostMounts, nil
@@ -1242,11 +1163,6 @@ func (c *Collector) readHostMountsAt(now time.Time) ([]hostMount, error) {
 	return mounts, nil
 }
 
-// apfsContainerDevice maps an APFS volume device (e.g. /dev/disk3s1s1) to
-// its container device (/dev/disk3). All volumes of one container share the
-// same physical space and statfs reports container-level totals for every
-// volume, so they must dedupe to one entry or the disk is counted N times
-// (a 1TB Mac shows ~4.6TB across 5 system volumes).
 var apfsContainerDevicePattern = regexp.MustCompile(`^(/dev/disk\d+)(?:s\d+)+$`)
 
 func apfsContainerDevice(fstype, device string) string {
@@ -1259,15 +1175,6 @@ func apfsContainerDevice(fstype, device string) string {
 	return device
 }
 
-// collectPartitionUsageCached converts mounts into disk usage entries. It filters
-// virtual and network filesystems, dedupes repeated mountpoints and devices
-// (the same block device mounted at several mountpoints, e.g. btrfs
-// subvolumes or bind mounts, is only counted once; APFS volumes of one
-// container dedupe to the container, preferring the root mountpoint),
-// samples filesystem usage, and overrides the statfs total with the backing
-// block device capacity when sysfs reports one.
-// collectPartitionUsageCached 接收挂载点类型与设备容量缓存（nil 时退化为
-// 每次现场查询，语义不变）。
 func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache map[string]bool, blockTotalCache map[string]uint64) []DiskPartition {
 	seenMountpoints := make(map[string]struct{})
 	seenDevices := make(map[string]struct{})
@@ -1291,9 +1198,6 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 		deviceKey := apfsContainerDevice(candidate.Fstype, device)
 		if device != "none" {
 			if _, exists := seenDevices[deviceKey]; exists {
-				// Same APFS container seen again: every volume reports the
-				// identical container-level statfs, so only upgrade the
-				// representative to the root mountpoint when it shows up.
 				if index, ok := apfsEntryIndex[deviceKey]; ok && candidate.Mountpoint == "/" && diskUsage[index].Mountpoint != "/" {
 					diskUsage[index].Device = deviceKey
 					diskUsage[index].Mountpoint = candidate.Mountpoint
@@ -1306,9 +1210,6 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 		if err != nil {
 			continue
 		}
-		// Mark the mountpoint and device as seen only after a successful
-		// stat so an unstatable candidate does not block a later statable
-		// candidate for the same mountpoint or device.
 		seenMountpoints[candidate.Mountpoint] = struct{}{}
 		if device != "none" {
 			seenDevices[deviceKey] = struct{}{}
@@ -1318,8 +1219,6 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 		}
 		total := resolvePartitionTotalCached(device, usageStat.Total, blockTotalCache)
 		if usageStat.Used > total {
-			// The device capacity cannot explain the statfs numbers;
-			// keep the filesystem-reported total instead.
 			total = usageStat.Total
 		} else if total != usageStat.Total {
 			usageStat.UsedPercent = percentOf(usageStat.Used, total)
@@ -1328,7 +1227,6 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 
 		entryDevice := device
 		if deviceKey != device {
-			// APFS container representative: report the container device.
 			entryDevice = deviceKey
 			apfsEntryIndex[deviceKey] = len(diskUsage)
 		}
@@ -1345,26 +1243,8 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 	return diskUsage
 }
 
-// resolvePartitionTotalCached returns the total capacity for a mount's backing
-// device. The statfs total (f_blocks * bsize) excludes filesystem metadata,
-// so a 40 GiB provisioned disk only reports ~39 GiB usable; sysfs exposes
-// the real device capacity and is preferred whenever available. statTotal is
-// returned unchanged when the device capacity cannot be determined — also
-// the expected behaviour outside Linux, where /sys/class/block does not
-// exist. When the collector runs in a container with a host root, sysfs
-// still exposes the host kernel's block devices, so the lookup stays valid.
-// resolvePartitionTotalCached 缓存设备容量（块设备容量运行期不变）：
-// sysfs size 读取与 /dev/mapper 符号链接解析不再每秒对每分区重复执行。
-// 三种结果（sysfs 命中 / 符号链接命中 / statfs 兜底）统一在出口回写缓存。
 func resolvePartitionTotalCached(device string, statTotal uint64, totalCache map[string]uint64) (total uint64) {
 	if sysfsBlockName(device) == "" {
-		// Devices outside /dev/ (Windows drive letters such as "C:" and
-		// volume mount folders, or synthetic host mounts) can never resolve
-		// to a sysfs block entry, so the symlink walk below would be pure
-		// overhead. On Windows it stats every path component of the device,
-		// which can stall for the SMB timeout when the mount folder lives on
-		// a disconnected mapped drive — inside the single-goroutine report
-		// loop.
 		return statTotal
 	}
 	if totalCache != nil {
@@ -1380,9 +1260,6 @@ func resolvePartitionTotalCached(device string, statTotal uint64, totalCache map
 	if size := readBlockDeviceSizeBytes(sysfsBlockName(device)); size > 0 {
 		return size
 	}
-	// Device paths such as /dev/mapper/vg-root are symlinks to the real
-	// block node (e.g. ../dm-0); resolve and retry with that name. Inside
-	// containers the symlink may be missing — the statfs fallback covers it.
 	if resolved, err := filepath.EvalSymlinks(device); err == nil {
 		if name := sysfsBlockName(resolved); name != "" {
 			if size := readBlockDeviceSizeBytes(name); size > 0 {
@@ -1393,8 +1270,6 @@ func resolvePartitionTotalCached(device string, statTotal uint64, totalCache map
 	return statTotal
 }
 
-// sysfsBlockName extracts the sysfs block device entry name (e.g. "sda1")
-// from a device path such as /dev/sda1, /dev/nvme0n1p2 or /dev/mapper/vg-root.
 func sysfsBlockName(device string) string {
 	device = strings.TrimSpace(device)
 	if !strings.HasPrefix(device, "/dev/") {
@@ -1407,9 +1282,6 @@ func sysfsBlockName(device string) string {
 	return name
 }
 
-// readBlockDeviceSizeBytes reads /sys/class/block/<name>/size, which holds
-// the device capacity in 512-byte sectors. It returns 0 when sysfs is
-// unavailable (non-Linux systems or unrecognized device names).
 func readBlockDeviceSizeBytes(name string) uint64 {
 	data, err := os.ReadFile(filepath.Join("/sys/class/block", name, "size"))
 	if err != nil {
@@ -1422,8 +1294,6 @@ func readBlockDeviceSizeBytes(name string) uint64 {
 	return sectors * 512
 }
 
-// 每 1s 采集一次都会遍历全部挂载点，前缀与文件系统黑名单保持包级只读，
-// 避免每次调用重建 map/slice。
 var skipMountPrefixes = []string{
 	"/proc",
 	"/sys",
@@ -1468,30 +1338,26 @@ var skipFilesystems = map[string]struct{}{
 	"nsfs":        {},
 	"bpf":         {},
 	"lxcfs":       {},
-	// Network and cluster filesystems: their capacity is remote or
-	// shared, not local disk.
-	"nfs":       {},
-	"nfs4":      {},
-	"cifs":      {},
-	"smbfs":     {},
-	"smb2":      {},
-	"9p":        {},
-	"virtiofs":  {},
-	"afs":       {},
-	"ceph":      {},
-	"cephfs":    {},
-	"glusterfs": {},
-	"lustre":    {},
-	"gfs":       {},
-	"gfs2":      {},
-	"ocfs2":     {},
-	"beegfs":    {},
-	"sshfs":     {},
-	"fdescfs":   {},
+	"nfs":         {},
+	"nfs4":        {},
+	"cifs":        {},
+	"smbfs":       {},
+	"smb2":        {},
+	"9p":          {},
+	"virtiofs":    {},
+	"afs":         {},
+	"ceph":        {},
+	"cephfs":      {},
+	"glusterfs":   {},
+	"lustre":      {},
+	"gfs":         {},
+	"gfs2":        {},
+	"ocfs2":       {},
+	"beegfs":      {},
+	"sshfs":       {},
+	"fdescfs":     {},
 }
 
-// mountpointDirCache 缓存挂载点是否为目录（永不过期）：Windows 上对断连的
-// SMB/映射盘 mount folder 的 stat 可能卡顿数秒，不得在每个采集 tick 重复。
 func shouldSkipPartition(p disk.PartitionStat, mountpointDirCache map[string]bool) bool {
 	if p.Mountpoint == "" || p.Mountpoint == "none" {
 		return true
@@ -1516,9 +1382,6 @@ func shouldSkipPartition(p disk.PartitionStat, mountpointDirCache map[string]boo
 	if _, ok := skipFilesystems[fstype]; ok && p.Mountpoint != "/" {
 		return true
 	}
-	// Any FUSE filesystem (rclone, alist, CloudDrive2, ...) is treated as a
-	// synthetic mount: advertised capacities (256TB/1PB) are fake and would
-	// dwarf the node's real disk size.
 	if strings.HasPrefix(fstype, "fuse.") {
 		return true
 	}
@@ -1946,9 +1809,6 @@ func readRotational(hostRoot, device string) (int, bool) {
 	return value, true
 }
 
-// lookupNVIDIASMIPath resolves the nvidia-smi binary path; the empty string
-// means it is not installed. It is a package variable so tests can stub the
-// PATH lookup.
 var lookupNVIDIASMIPath = defaultLookupNVIDIASMIPath
 
 func defaultLookupNVIDIASMIPath() string {
@@ -1959,12 +1819,6 @@ func defaultLookupNVIDIASMIPath() string {
 	return path
 }
 
-// collectGPUStatsAt returns GPU stats with a short cache: nvidia-smi is
-// forked at most once per gpuSampleRefreshInterval even though Collect runs
-// every second. The resolved nvidia-smi path (including the negative result)
-// is re-resolved at most once per nvidiaSMIPathRefreshInterval. When the
-// cached sample is fresh but was taken without static info and static info is
-// now requested, the sample is refreshed early.
 type gpuSampler func(path string, includeStatic bool) ([]GPUInfo, error)
 
 func (c *Collector) collectGPUStatsAt(
@@ -1980,20 +1834,14 @@ func (c *Collector) collectGPUStatsAt(
 		c.nvidiaSMIPathAt = now
 	}
 	if c.nvidiaSMIPath == "" {
-		// 机器上没有 nvidia-smi：确认性结果（无 GPU），server 端可安全
-		// 不保留 GPU 静态缓存。
 		return nil, true
 	}
 	fresh := !c.gpuSampleAt.IsZero() && now.Sub(c.gpuSampleAt) < gpuSampleRefreshInterval
 	if fresh && (!includeStatic || c.gpuSampleStatic) {
-		// 失败后的缓存必须继续上报失败态：fresh 窗口内返回 (nil,false)，
-		// 否则 server 会把"采样失败"当成"确认无 GPU"清掉静态缓存。
 		return c.gpuSample, c.gpuSampleOK
 	}
 	gpus, err := sampler(c.nvidiaSMIPath, includeStatic)
 	if err != nil {
-		// 失败采样不得断言"确认无 GPU"（返回 false），否则 server 端
-		// mergeGPUStaticInfo 会清掉已缓存的 GPU 静态信息。
 		c.warnOnce("nvidia-smi", err)
 		c.gpuSample = nil
 		c.gpuSampleStatic = includeStatic

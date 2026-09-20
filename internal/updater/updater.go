@@ -85,8 +85,6 @@ func NewClient(repo string, kind Kind, currentVersion string) *Client {
 	if strings.TrimSpace(repo) == "" {
 		repo = DefaultRepo
 	}
-	// 不设 Client.Timeout：512MB 上限的二进制下载在慢链路上远超任何整客户端
-	// 超时；API 类小请求由调用处的 ctx 超时约束，下载由 LimitReader+外层 ctx 兜底。
 	return &Client{
 		Repo:           repo,
 		Kind:           kind,
@@ -100,9 +98,6 @@ func NewClient(repo string, kind Kind, currentVersion string) *Client {
 					(req.URL.Port() != "" && req.URL.Port() != "443") {
 					return fmt.Errorf("更新下载重定向必须使用无用户信息的标准 HTTPS 地址")
 				}
-				// GitHub release 下载正常会 302 到 *.githubusercontent.com；
-				// 其余主机一律拒绝，防止上游开放重定向把二进制/校验文件
-				// 导向第三方源。
 				host := strings.ToLower(req.URL.Hostname())
 				if host == "github.com" || strings.HasSuffix(host, ".githubusercontent.com") {
 					return nil
@@ -190,8 +185,6 @@ func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloa
 		return fmt.Errorf("读取当前二进制信息失败: %w", err)
 	}
 	exeDir := filepath.Dir(exePath)
-	// 清扫此前进程被强杀（SIGKILL/OOM）残留的更新临时目录——defer 清理在
-	// 那些场景不会执行。只清修改时间超过 1 小时的，避免误删并发进行中的更新。
 	if matches, globErr := filepath.Glob(filepath.Join(exeDir, ".cm-update-*")); globErr == nil {
 		staleCutoff := time.Now().Add(-time.Hour)
 		for _, match := range matches {
@@ -215,7 +208,6 @@ func (c *Client) ApplyReleaseAsset(ctx context.Context, expectedVersion, downloa
 	if err := c.verifyChecksum(ctx, tmpBinary, checksumURL, downloadURL); err != nil {
 		return err
 	}
-	// 沿用现有权限位（至少保留属主可执行位），不把受限执行策略放宽为 0755。
 	newMode := exeInfo.Mode().Perm()
 	if newMode&0o100 == 0 {
 		newMode |= 0o100
@@ -352,8 +344,6 @@ func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) 
 	defer resp.Body.Close()
 
 	var release githubRelease
-	// 与其他读取路径（错误体 4KB、SHA256SUMS 1MB、下载 512MB）对齐：
-	// API 响应同样限长，截断会让 Decode 报错，fail-closed。
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseJSONBytes)).Decode(&release); err != nil {
 		return githubRelease{}, fmt.Errorf("解析 Release 信息失败: %w", err)
 	}
@@ -361,9 +351,6 @@ func (c *Client) fetchLatestRelease(ctx context.Context) (githubRelease, error) 
 }
 
 func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) error {
-	// agent 自更新路径的外层 ctx 无 deadline（server 路径有 10 分钟）：
-	// 连接 stall 会让 io.Copy 无限期挂起并占死 remoteUpdateTracker，此处
-	// 统一加时间兜底（512MB @ ~0.3MB/s 慢链路）。
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	resp, err := c.getOK(ctx, downloadURL, "", "下载更新文件失败", "", "下载返回状态码 %d")
@@ -391,7 +378,6 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 	if written > maxDownloadBytes {
 		return fmt.Errorf("更新文件超过大小限制")
 	}
-	// 落盘后再 rename：掉电/崩溃不留截断的二进制。
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("同步更新文件失败: %w", err)
 	}
@@ -399,7 +385,6 @@ func (c *Client) downloadFile(ctx context.Context, downloadURL, dest string) err
 }
 
 func (c *Client) verifyChecksum(ctx context.Context, filePath, checksumURL, downloadURL string) error {
-	// 校验文件是小请求：30s 足够，避免与二进制下载共用无超时客户端。
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	resp, err := c.getOK(ctx, checksumURL, "", "下载校验文件失败", "下载校验文件失败", "状态码 %d")
@@ -501,9 +486,6 @@ func lookupChecksum(contents, filename string) (string, error) {
 }
 
 func replaceExecutable(targetPath, nextPath string) error {
-	// 先复制备份、再单次原子 rename：两个 rename 之间存在目标路径短暂
-	// 不存在的窗口，进程恰在此刻崩溃会留下无可执行文件且无法自愈。
-	// 复制式备份下，rename 失败时旧二进制原位未动，无需回滚。
 	backupPath := targetPath + ".backup"
 	if err := copyExecutableBackup(targetPath, backupPath); err != nil {
 		return fmt.Errorf("备份当前二进制失败: %w", err)
@@ -515,8 +497,6 @@ func replaceExecutable(targetPath, nextPath string) error {
 	return nil
 }
 
-// syncDirForUpdate 对父目录做 fsync，确保 rename 的目录项在掉电后不回退。
-// Windows 不支持以文件语义打开目录，依赖 NTFS 元数据日志，跳过。
 func syncDirForUpdate(dir string) {
 	if runtime.GOOS == "windows" {
 		return
@@ -614,8 +594,6 @@ func HasVersionUpdate(current, latest string) bool {
 	}
 	currentVersion, currentOK := parseComparableVersion(current)
 	if !currentOK {
-		// dev/unknown 等无法解析的当前版本（多为源码构建）不做自动替换，
-		// 避免任意 release 都会覆盖非发布构建。
 		return false
 	}
 	return compareComparableVersions(currentVersion, latestVersion) < 0
@@ -640,7 +618,6 @@ func VersionCurrentOrNewer(current, latest string) bool {
 	return compareComparableVersions(currentVersion, latestVersion) >= 0
 }
 
-// VersionsEqual reports whether two non-empty version strings refer to the same version.
 func VersionsEqual(current, latest string) bool {
 	current = strings.TrimSpace(current)
 	latest = strings.TrimSpace(latest)
@@ -685,8 +662,6 @@ func parseComparableVersion(value string) (comparableVersion, bool) {
 	}
 	for idx := 0; idx < len(parts); idx++ {
 		part := strings.TrimSpace(parts[idx])
-		// isDecimalIdentifier 同时拒绝空段、"+" 前缀（Atoi 接受 "+5"）
-		// 与非数字段，保证数字语义不被strconv的宽松解析绕过。
 		if !isDecimalIdentifier(part) {
 			return version, false
 		}

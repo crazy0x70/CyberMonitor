@@ -80,9 +80,6 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// 采集/网络探测可能卡在不可中断的系统调用上，ctx 取消不被观察，
-	// 优雅退出链（含 updateWG 等待）无从进入：第二次信号直接强退
-	// （对齐 Windows 服务包装的放弃等待语义）。
 	forced := make(chan os.Signal, 2)
 	signal.Notify(forced, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(forced)

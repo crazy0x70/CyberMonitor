@@ -19,12 +19,7 @@ import (
 )
 
 const (
-	defaultTCPPort = 80
-	// icmpTimeout 必须覆盖 ping 完整运行时长（pingSampleCount 个包 ×
-	// 每包等待 2s + 发送间隔）：3s 预算会在命令打出汇总行前杀进程，
-	// 已成功的 reply 被错误改判为 100% 丢包——监控恰恰在丢包/高延迟
-	// 目标上触发此路径。代价：探测时长可能主导采集轮次，interval 小于
-	// 探测时长时实际采样周期取探测时长。
+	defaultTCPPort           = 80
 	icmpTimeout              = 8 * time.Second
 	tcpTimeout               = 3 * time.Second
 	publicProbeLookupTimeout = 2 * time.Second
@@ -43,15 +38,6 @@ var (
 	pingCountRegexes        = []*regexp.Regexp{pingTxRxRegex, pingWindowsCountRegex, pingChineseCountRegex}
 )
 
-// ParseNetTests 解析逗号分隔的网络测试目标列表。单项支持形式：
-//
-//	host[:port]                按端口推断 tcp / icmp
-//	icmp:host / tcp:host[:port]
-//	名称@host[:port] / 名称@icmp:host / 名称@tcp:host[:port]
-//	名称 icmp:host / 名称 tcp:host[:port]（名称与目标以空白分隔）
-//
-// IPv6 必须使用方括号：tcp:[2001:db8::1]:443、icmp:[2001:db8::1]。
-// 无法解析的单项记录日志并跳过，不影响其余目标。
 func ParseNetTests(raw string) []metrics.NetworkTestConfig {
 	items := strings.Split(raw, ",")
 	results := make([]metrics.NetworkTestConfig, 0, len(items))
@@ -71,7 +57,6 @@ func parseNetTestItem(item string) (metrics.NetworkTestConfig, bool) {
 	}
 
 	name, target := splitNamedTarget(target)
-	// “名称 + 空白 + 目标”形式：主机名不含空白，首个空白前一定是名称。
 	if name == "" {
 		if idx := strings.IndexAny(target, " \t"); idx > 0 {
 			name = strings.TrimSpace(target[:idx])
@@ -169,7 +154,6 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 				wg.Done()
 			}()
 			defer func() {
-				// 探测路径 panic 不得杀死整个 agent：以 error 结果占位。
 				if rec := recover(); rec != nil {
 					log.Printf("网络测试 %s panic 已恢复: %v", config.Name, rec)
 					results[index] = metrics.NetworkTestResult{
@@ -265,8 +249,6 @@ func testTCP(ctx context.Context, host string, port int) (*float64, string, stri
 	return &latency, "ok", ""
 }
 
-// pingPathOnce caches the resolved ping binary path (also when it is not
-// installed), so repeated ICMP tests do not rescan PATH.
 var pingPathOnce = sync.OnceValue(func() string {
 	path, err := exec.LookPath("ping")
 	if err != nil {
@@ -309,12 +291,7 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	return latency, loss, status, parseErr
 }
 
-// probeICMPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
-// 失败时返回最后一次结果（多 A 记录/双栈场景不再被首个地址单点拖死；
-// TCP 侧全败时聚合各候选原因，此处保持末次结果）。
 func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context.Context, string) (*float64, float64, string, string)) (*float64, float64, string, string) {
-	// 全部候选共享单项总预算：候选逐一尝试的最坏耗时不超过单地址路径，
-	// 排在前面的地址用不完的预算留给后续候选。
 	ctx, cancel := context.WithTimeout(ctx, icmpTimeout)
 	defer cancel()
 	var latency *float64
@@ -329,12 +306,7 @@ func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context
 	return latency, loss, status, errText
 }
 
-// probeTCPCandidates 依次尝试全部已验证地址，取首个成功结果；全部
-// 失败时聚合各候选失败原因（probeICMPCandidates 全败时保持末次结果，
-// 不聚合）。
 func probeTCPCandidates(ctx context.Context, hosts []string, port int, probe func(context.Context, string, int) (*float64, string, string)) (*float64, string, string) {
-	// 全部候选共享单项总预算：候选逐一尝试的最坏耗时不超过单地址路径
-	// （与 ICMP 同构），排在前面的地址用不完的预算留给后续候选。
 	ctx, cancel := context.WithTimeout(ctx, tcpTimeout)
 	defer cancel()
 	var latency *float64
@@ -347,7 +319,6 @@ func probeTCPCandidates(ctx context.Context, hosts []string, port int, probe fun
 		}
 		failures = append(failures, host+": "+errText)
 	}
-	// 单失败保持裸错误文案（与既有行为一致）；多失败才聚合，避免噪声。
 	if len(failures) > 1 {
 		shown := failures
 		if len(shown) > 3 {
@@ -419,10 +390,6 @@ func resolvePublicProbeHostWithResolver(ctx context.Context, host string, lookup
 	if len(ips) == 0 {
 		return nil, errors.New("解析远程网络测试主机失败: empty address set")
 	}
-	// 任一被采纳的地址非法即整体失败（防 rebinding；封顶后未检查的
-	// 地址不会被探测）；返回全部已验证地址供 TCP 探测依次尝试（双栈
-	// 主机首个地址不可达不应整体失败），封顶 maxProbeCandidates 防超
-	// 大地址集拖死 worker。
 	seen := make(map[string]struct{}, len(ips))
 	resolved := make([]string, 0, len(ips))
 	for _, ip := range ips {
@@ -627,8 +594,6 @@ func splitHostPort(value string) (string, int) {
 		return strings.Trim(trimmed, "[]"), 0
 	}
 
-	// 无括号的裸 IPv6（如 ::1、2001:db8::1）不含端口：整体视为主机，
-	// 避免被"最后一个冒号后是端口"的启发式拆坏。
 	if strings.Count(trimmed, ":") > 1 {
 		return trimmed, 0
 	}

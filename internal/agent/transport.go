@@ -61,10 +61,6 @@ func (o grpcTransportOptions) normalized() grpcTransportOptions {
 	return o
 }
 
-// nextGRPCBackoff 计算下一次 gRPC 失败后的回退时长：从 base 起按 2 倍
-// 指数增长，封顶 maxGRPCFallbackBackoff。current 为 0 表示当前无连续
-// 失败，直接返回 base。首次 gRPC 成功会将 current 归零，退避重新从
-// base 开始，避免瞬断后恢复过慢。
 func nextGRPCBackoff(base, current time.Duration) time.Duration {
 	if base <= 0 {
 		base = defaultGRPCFallbackBackoff
@@ -250,8 +246,6 @@ func (t *controlPlaneTransport) disableGRPCTemporarily(err error) {
 	now := time.Now()
 	var next time.Duration
 	if now.Before(t.grpcBackoffUntil) {
-		// 并发失败（config ticker/上报/更新报告同时命中）：已在退避窗口内
-		// 只延长窗口、不推进档位，一次故障事件不重复计连续失败。
 		t.grpcBackoffUntil = now.Add(t.grpcBackoffDuration)
 		next = t.grpcBackoffDuration
 	} else {
@@ -283,9 +277,6 @@ func callWithFallback[T any](
 			return zero, err
 		}
 		if st, ok := status.FromError(err); ok && st.Code() == codes.DeadlineExceeded && t.grpc.connReady() {
-			// callTimeout 包住的是服务端处理全程：健康连接上的
-			// DeadlineExceeded 是应用层慢而非传输故障，透传错误给调用方，
-			// 不拆连接、不退避、不做 HTTP 重放（重放同样慢且放大负载）。
 			return zero, err
 		}
 		t.disableGRPCTemporarily(err)
@@ -305,7 +296,6 @@ func (t *controlPlaneTransport) noteMode(mode string) {
 		if t.lastMode == "http" {
 			log.Printf("gRPC 控制链路已恢复")
 		}
-		// 首次 gRPC 成功即重置连续失败计数，退避从 base 重新开始。
 		t.grpcBackoffDuration = 0
 	}
 	t.lastMode = mode
@@ -325,8 +315,6 @@ func (h *httpControlPlane) ReportStats(ctx context.Context, stats metrics.NodeSt
 		return false, err
 	}
 	var result struct {
-		// 服务端 ingest 响应为 {"status":"ok","refresh_config":...}；
-		// 字段名需与服务端 key 对齐才能取到 refresh_config。
 		Status        string `json:"status"`
 		RefreshConfig bool   `json:"refresh_config"`
 	}
@@ -343,7 +331,6 @@ func (h *httpControlPlane) ReportUpdate(ctx context.Context, nodeID, token, upda
 }
 
 func (g *grpcControlPlane) RegisterNodeToken(ctx context.Context, nodeID, bootstrapToken string) (string, error) {
-	// 与 HTTP 路径的 registerNodeToken 预检对齐：空 nodeID/token 不发请求。
 	if strings.TrimSpace(nodeID) == "" {
 		return "", fmt.Errorf("node id required")
 	}
@@ -431,8 +418,6 @@ func (g *grpcControlPlane) Close() error {
 		g.conn = nil
 		g.client = nil
 	}
-	// 清除 dial 失败状态：瞬时失败不得永久杀死 gRPC 传输，
-	// HTTP 回退退避恢复后必须能够重拨。
 	g.dialErr = nil
 	return err
 }
@@ -448,7 +433,6 @@ func (g *grpcControlPlane) connectionStatus() (string, string) {
 	return target, conn.GetState().String()
 }
 
-// connReady 报告底层连接是否处于 Ready（用于区分应用层慢与传输故障）。
 func (g *grpcControlPlane) connReady() bool {
 	g.mu.Lock()
 	conn := g.conn
@@ -479,10 +463,6 @@ func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServi
 	return client, callCtx, cancel, nil
 }
 
-// clientConn 在锁内完成 dial 与状态读写：远程更新 goroutine 与主上报循环
-// 会并发使用同一 transport，历史上依赖"单 goroutine"假设的 dialOnce 重置
-// 模式构成数据竞态。dial 失败记入 dialErr 并保持到 Close 清除（与原
-// dialOnce 语义一致：瞬时失败不会永久杀死 gRPC 传输，Close 后可重拨）。
 func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServiceClient, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -490,8 +470,6 @@ func (g *grpcControlPlane) clientConn(ctx context.Context) (agentrpc.AgentServic
 		return g.client, nil
 	}
 	if g.dialErr != nil {
-		// 包装成 Unavailable 让 shouldFallbackToHTTP 命中，否则裸 dial 错误
-		// 不会回退 HTTP。
 		return nil, status.Errorf(codes.Unavailable, "grpc dial failed: %v", g.dialErr)
 	}
 
@@ -554,21 +532,15 @@ func shouldFallbackToHTTP(err error) bool {
 		return false
 	}
 	if st, ok := status.FromError(err); ok {
-		// gRPC status 错误只按 code 判定。status 的 message 会携带服务端
-		// 透传的应用层错误文本（grpcStatusFromAPIError 原样保留），其中
-		// 常见 "connection refused"（下游 store/数据库）等字样，若落入下方
-		// 原始串扫描会误触发回退，复活"关健康连接 + HTTP 重放"的抖动。
 		switch st.Code() {
 		case codes.Unavailable, codes.Unimplemented, codes.DeadlineExceeded:
 			return true
 		case codes.Internal:
-			// grpc 框架自身的编解码/传输类 Internal 以 message 关键字识别。
 			msg := strings.ToLower(st.Message())
 			return strings.Contains(msg, "transport") || strings.Contains(msg, "content-type") || strings.Contains(msg, "http status")
 		}
 		return false
 	}
-	// 非 status 错误是客户端本地/net 层错误，按 marker 启发式回退。
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{
 		"unexpected eof",

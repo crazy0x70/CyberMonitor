@@ -19,7 +19,6 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { AlertTriangle, Bell, Send, ShieldAlert } from "lucide-react";
 import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
@@ -225,6 +224,11 @@ export default function NotificationAlert({
       nextErrors.webhook = "测试飞书告警前，请先填写 Webhook 地址。";
     }
 
+    const webhookConfigured = Boolean(settings?.alert_webhook_set);
+    // 已配置态下 Webhook 清空保存 = 显式停用意图：服务端仅在收到显式
+    // 空值时才清除，省略字段一律保留。测试通道仍要求有效地址，不构成
+    // 停用意图。
+    const disableWebhook = webhookConfigured && !requireWebhook && !normalizedWebhook;
     // token 已配置但脱敏回显为空（保留态）：user_ids 回显非空不构成
     // "要求成对配置"的触发条件，留空保存表示保留现值。
     const telegramConfigured = Boolean(settings?.alert_telegram_token_set);
@@ -249,6 +253,7 @@ export default function NotificationAlert({
     const firstField = (Object.keys(alertFieldIDMap) as AlertField[]).find((field) => nextErrors[field]);
     return {
       disableTelegram,
+      disableWebhook,
       errors: nextErrors,
       firstField,
       ids,
@@ -271,8 +276,11 @@ export default function NotificationAlert({
     const payload: SettingsUpdate = {
       alert_offline_sec: validation.normalizedMinutes * 60,
     };
-    // 密钥已脱敏回传：留空表示保留现值（省略字段），仅在输入新值时携带。
-    if (validation.normalizedWebhook) {
+    // 已配置态清空并保存 = 显式停用（省略字段在服务端语义是"保留"，
+    // 必须显式下发空值）；其余情况仅在新值非空时携带。
+    if (validation.disableWebhook) {
+      payload.alert_webhook = "";
+    } else if (validation.normalizedWebhook) {
       payload.alert_webhook = validation.normalizedWebhook;
     }
     if (validation.disableTelegram) {
@@ -581,42 +589,12 @@ export default function NotificationAlert({
                   value={webhook}
                   disabled={isBusy}
                   onChange={createFieldChangeHandler("webhook", setWebhook)}
-                  placeholder={settings?.alert_webhook_set ? "已配置（留空保持不变）" : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}
+                  placeholder={settings?.alert_webhook_set ? "已配置（清空并保存即可停用）" : "https://open.feishu.cn/open-apis/bot/v2/hook/…"}
                 />
                 {fieldErrors.webhook ? (
                   <p id="feishu-webhook-error" className="text-[11px] font-medium text-rose-500" aria-live="polite">
                     {fieldErrors.webhook}
                   </p>
-                ) : null}
-                {settings?.alert_webhook_set ? (
-                  <AlertDialog>
-                    <AlertDialogTrigger
-                      type="button"
-                      className="h-8 w-fit px-2 text-xs font-bold text-rose-500 hover:text-rose-600"
-                      disabled={isBusy || isDirty}
-                      title={isDirty ? "请先保存或放弃当前修改" : undefined}
-                    >
-                      停用飞书 Webhook…
-                    </AlertDialogTrigger>
-                    <AlertDialogContent className={adminDialogContentClass}>
-                      <AlertDialogHeader className={adminDialogHeaderClass}>
-                        <AlertDialogTitle>确认停用飞书 Webhook？</AlertDialogTitle>
-                        <AlertDialogDescription>
-                          停用后节点离线将不再发送飞书通知，需重新填写 Webhook 才能恢复。
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter className={adminDialogFooterClass}>
-                        <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
-                        <AlertDialogAction
-                          className={adminDialogDangerActionClass}
-                          disabled={isBusy}
-                          onClick={() => runSave({ alert_webhook: "" })}
-                        >
-                          确认停用
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
                 ) : null}
               </div>
             </div>

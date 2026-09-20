@@ -1,5 +1,5 @@
-// AgentToken 已脱敏回传（agent_token_set 区分"已配置但隐藏"）：
-// 构建安装命令时用占位符，用户复制后自行替换。
+// AgentToken 由管理端设置 API 回传真实值：命令直接内嵌，复制即可执行；
+// 仅在尚未配置 Token 时退化为占位符 <你的AgentToken>。
 export function buildAgentInstallCommand(endpoint: string, token: string) {
   const normalizedEndpoint = endpoint.trim();
   if (!normalizedEndpoint) return "";

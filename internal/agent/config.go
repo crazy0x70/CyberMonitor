@@ -88,9 +88,6 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 空值不覆盖：新节点注册后服务端尚无 alias/group，首次 sync 发生在
-	// 首次上报之前，无条件覆盖会把 -node-alias/-node-group 种子值清掉，
-	// 服务端（以首次上报为种子）就永远收不到它们。
 	if remote.Alias != "" {
 		r.alias = remote.Alias
 	}
@@ -121,9 +118,6 @@ func markRemoteNetworkTests(tests []metrics.NetworkTestConfig, forcePublicOnly b
 	marked := make([]metrics.NetworkTestConfig, len(tests))
 	copy(marked, tests)
 	for i := range marked {
-		// 默认拒绝私网时统一覆写；allow-private 节点原样信任服务端下发
-		// 的目标列表（当前服务端不做逐项 PublicOnly 标记，即允许私网），
-		// 不在此处整体抹平。
 		if forcePublicOnly {
 			marked[i].PublicOnly = true
 		}
@@ -186,11 +180,6 @@ func fetchRemoteConfig(ctx context.Context, client *http.Client, endpoint, nodeI
 	return payload, nil
 }
 
-// performAgentRequest issues an agent API request and turns >=300 responses
-// into agentAPIStatusError. A non-nil decode callback receives the response
-// body (e.g. the strict-JSON decoder); nil means the body is ignored.
-// Redirects are returned as status errors, so agent credentials and request
-// bodies never follow a Location header, even within the same origin.
 func performAgentRequest(
 	client *http.Client,
 	req *http.Request,
@@ -203,8 +192,6 @@ func performAgentRequest(
 	if req == nil {
 		return fmt.Errorf("http request required")
 	}
-	// Copy rather than mutate the shared client: other users keep their redirect
-	// policy, while Transport, Jar and Timeout remain in effect for this request.
 	requestClient := *client
 	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -293,9 +280,6 @@ func readAgentAPIStatusError(resp *http.Response, operation string) error {
 	}
 }
 
-// decodeAgentResponseJSON 解码服务端响应：不做未知字段拒绝——server 先于
-// agent 滚动升级时，响应新增字段不得打挂存量 agent 的上报/配置同步；
-// trailing data 检查保留，足以发现协议错位。
 func decodeAgentResponseJSON(body io.Reader, target any, trailingMessage string) error {
 	decoder := json.NewDecoder(body)
 	if err := decoder.Decode(target); err != nil {

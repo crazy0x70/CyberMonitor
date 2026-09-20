@@ -24,8 +24,6 @@ func AddrFromIP(ip net.IP) (netip.Addr, bool) {
 	return addr, true
 }
 
-// isAllowedPublicAddr 仅接受经 AddrFromIP 归一化后的地址（4In6 已折叠
-// 为 v4），前缀表因此不含 ::ffff:0:0/96；255.255.255.255 被 /4 包含。
 func isAllowedPublicAddr(addr netip.Addr) bool {
 	for _, prefix := range blockedSpecialUsePrefixes {
 		if prefix.Contains(addr) {

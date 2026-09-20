@@ -62,10 +62,6 @@ func agentUpdateReportConflict() *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusConflict, message: "agent update report does not match pending instruction"}
 }
 
-// maxAgentNodeIDBytes 限制节点 ID 长度：该值流入持久化键、TSDB label、
-// 限流键与日志行，无上限时被控/异常 agent 可缓慢膨胀各存储。在 ingest
-// 收口处净化（截断+剔控制字符）而非 history.NormalizeNodeID 拒绝——
-// 后者被持久化加载链路复用，收紧会对存量脏 ID 回溯卡死启动。
 const maxAgentNodeIDBytes = 128
 
 func cleanAgentNodeID(nodeID string) string {
@@ -88,8 +84,6 @@ func normalizeAgentNodeID(nodeID string) (string, *agentAPIError) {
 		return "", badAgentRequest("invalid node id")
 	}
 	nodeID = cleanAgentNodeID(nodeID)
-	// 剔除控制字符可再造出 "." / ".."（如 "\x01..\x02"）——它们是
-	// NormalizeNodeID 显式拒绝的形态，净化后必须复查。
 	if nodeID == "" || nodeID == "." || nodeID == ".." {
 		return "", badAgentRequest("invalid node id")
 	}
@@ -109,8 +103,6 @@ func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agent
 		return metrics.NodeStats{}, apiErr
 	}
 	payload.NodeID = nodeID
-	// 身份类字符串经同一净化收口：它们播种 profile（Alias/Group）、进入
-	// 告警 webhook、WS 广播与日志，控制字符/超长文本不得原样入库。
 	payload.NodeName = cleanAgentText(payload.NodeName, 128)
 	payload.NodeAlias = cleanAgentText(payload.NodeAlias, 128)
 	payload.NodeGroup = cleanAgentText(payload.NodeGroup, 128)
@@ -152,7 +144,6 @@ func normalizeAgentNetworkTestResults(items []metrics.NetworkTestResult) []metri
 	if len(items) == 0 {
 		return nil
 	}
-	// 与下发侧 maxNetworkTestsPerNode（server.go）同一约束，共用常量。
 	if len(items) > maxNetworkTestsPerNode {
 		items = items[:maxNetworkTestsPerNode]
 	}
@@ -242,8 +233,6 @@ func (a *agentAPI) broadcastNodeDelta(nodeID string) {
 	if a.hub == nil {
 		return
 	}
-	// 零观众早退：无人订阅时跳过 NodeView 深拷贝与序列化
-	//（无面板常驻部署下每条上报都在做全链路空转）。
 	if !a.hub.HasVariant(publicVariantBalanced) && !a.hub.HasVariant(adminVariant) {
 		return
 	}
@@ -278,7 +267,6 @@ func (a *agentAPI) ingest(payload metrics.NodeStats, token string) (bool, *agent
 		}
 		updateReconciled, recoveryCandidate, err := a.store.updateNodeStats(payload)
 		if err != nil {
-			// 错误细节（含磁盘路径等）只留服务端日志，不回传给 agent。
 			log.Printf("节点 %s 数据写入失败: %v", payload.NodeID, err)
 			return false, false, nil, agentServiceUnavailable("节点数据写入失败")
 		}
@@ -308,8 +296,6 @@ func (a *agentAPI) config(nodeID, token string, remoteUpdateCapable bool) (Agent
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
 			return AgentConfig{}, false, apiErr
 		}
-		// ingest 同款限流：GetConfig 持全局写锁且 lease 变更触发整库
-		// persist，异常 agent 循环拉取不得绕过节流。
 		if !a.store.allowAgentRate("config:"+nodeID, agentIngestWindow, defaultAgentIngestLimit, time.Now(), false) {
 			return AgentConfig{}, false, agentRateLimitError()
 		}
@@ -356,8 +342,6 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 	if _, ok := normalizeAgentUpdateReportState(report.State); !ok {
 		return badAgentRequest("invalid agent update state")
 	}
-	// message 会随 NodeView 对全部 WS 订阅者放大重播并持久化，
-	// 与 network test 字段同策略截断，防单个 agent 写入 4MB 文本。
 	report.Message = cleanAgentText(report.Message, 240)
 	applied, apiErr := func() (bool, *agentAPIError) {
 		unlock := a.store.lockAgentNodeRead(nodeID)
@@ -391,9 +375,6 @@ func newAgentRPCServer(api *agentAPI) *grpc.Server {
 			Time:    30 * time.Second,
 			Timeout: 10 * time.Second,
 		}),
-		// 对齐客户端 keepalive 20s（transport.go ClientParameters.Time）：
-		// 默认 EnforcementPolicy MinTime=5min 且禁无流 ping，上报间隔被调大
-		// 或休眠恢复时客户端 keepalive 会触发 GOAWAY too_many_pings 断连。
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             10 * time.Second,
 			PermitWithoutStream: true,
@@ -418,8 +399,6 @@ func isAgentGRPCRequest(r *http.Request) bool {
 	if r == nil || r.ProtoMajor != 2 {
 		return false
 	}
-	// 精确匹配 grpc 媒体类型族：Contains 会把 grpc-web 也路由进
-	// grpc.Server（其不支持 grpc-web，只能报错），而非落回 public handler。
 	mediaType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
 		mediaType = strings.TrimSpace(mediaType[:i])
@@ -515,9 +494,6 @@ func grpcStatusFromAPIError(err *agentAPIError) error {
 	case http.StatusTooManyRequests:
 		return status.Error(codes.ResourceExhausted, err.message)
 	case http.StatusServiceUnavailable:
-		// 应用层 503（如 store 写入失败）不能映射为 Unavailable：
-		// agent 端会把它当传输故障，关闭健康连接并整包改走 HTTP 重发，
-		// 在 store 故障期间引发连接抖动与重复提交。Internal 不触发回退。
 		return status.Error(codes.Internal, err.message)
 	default:
 		return status.Error(codes.Internal, err.message)

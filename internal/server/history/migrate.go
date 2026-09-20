@@ -35,12 +35,7 @@ type legacyHistoryPayload struct {
 
 type networkHistoryStore interface {
 	AppendBatch(nodeID string, tests []metrics.NetworkTestResult, now time.Time) error
-	// AppendMigrationSamples 以单一事务提交全局按 CheckedAt 升序的迁移
-	// 样本（TSDB head maxt 全局单调且每次 Commit 推进，按节点分批提交
-	// 会让后处理批次的更老样本命中 too-old 被静默丢弃）。
 	AppendMigrationSamples(samples []MigrationSample) error
-	// QueryRangeRaw 返回原始采样时间戳：迁移去重需要精确时间匹配，
-	// 降采样查询输出的是桶起点时间，会造成漏判与幂等失效。
 	QueryRangeRaw(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkHistoryEntry, error)
 }
 
@@ -85,9 +80,6 @@ func MigrateLegacyJSONIfNeeded(path string, store networkHistoryStore, now time.
 		return result, err
 	}
 
-	// 迁移成功即用已读入的原始字节写备份：同一文件不再二次 ReadFile
-	//（7d×多序列的大文件原先在内存中同时存在 2-3 份）。source 为 .bak
-	// 回退时（marker 丢失场景）不再造二级备份。
 	if sourcePath == legacyPath {
 		if err := WriteFileAtomic(legacyBackupPath(legacyPath), data); err != nil {
 			return result, fmt.Errorf("backup legacy history: %w", err)
@@ -102,10 +94,6 @@ func migrateLegacyNodes(
 	nodes map[string]map[string]*legacyHistoryEntry,
 	now time.Time,
 ) error {
-	// 全部节点/序列的样本展平后按 CheckedAt 全局升序、单事务提交：
-	// TSDB head maxt 全局单调且每次 Commit 推进，任何"节点内有序/节点间
-	// 排序"的局部形态都无法约束跨批次的 maxt 重叠，后处理批次的更老样本
-	// 会命中 too-old 被"容忍"路径静默丢弃（不计数不打日志，源文件照删）。
 	maxCheckedAt := now.Add(networkMaxFutureSkew).Unix()
 	flat := make([]MigrationSample, 0)
 	for nodeID, tests := range nodes {
@@ -123,8 +111,6 @@ func migrateLegacyNodes(
 			}
 			identity, err := ParseNetworkSeriesKey(key)
 			if err != nil {
-				// 单个畸形序列键只跳过自身：向上返回错误会中止全部节点的
-				// 迁移，marker 不写导致每次启动重试、legacy 永不清理。
 				log.Printf("legacy 探测序列键 %q（节点 %s）解析失败，已跳过: %v", key, nodeID, err)
 				continue
 			}
@@ -132,9 +118,6 @@ func migrateLegacyNodes(
 			existingTimes := existingTimesBySeries[buildNetworkSeriesKey(identity)]
 			for idx, checkedAt := range entry.Times {
 				if checkedAt <= 0 || checkedAt > maxCheckedAt {
-					// 与 <=0 同理：非法/未来时间戳会经
-					// resolveTimestampMillis 回落为迁移时刻落库，污染当天
-					// 曲线且破坏重迁移幂等（去重按原始时间戳匹配）。
 					continue
 				}
 				if _, ok := existingTimes[checkedAt]; ok {
@@ -150,7 +133,6 @@ func migrateLegacyNodes(
 	if len(flat) == 0 {
 		return nil
 	}
-	// CheckedAt 已在构建时原样携带，直接按其排序，无需旁路结构。
 	sort.Slice(flat, func(i, j int) bool { return flat[i].Test.CheckedAt < flat[j].Test.CheckedAt })
 	return store.AppendMigrationSamples(flat)
 }
@@ -280,9 +262,6 @@ func writeLegacyMigrationArtifact(path string, pathFunc func(string) string, pay
 	return WriteFileAtomic(pathFunc(path), payload)
 }
 
-// WriteFileAtomic durably writes data to path: it writes a temp file in the
-// target directory, fsyncs it, renames it into place, and syncs the parent
-// directory. The parent directory is created if missing.
 func WriteFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -434,10 +413,6 @@ func normalizeJSONBytes(data []byte) []byte {
 	return bytes.TrimPrefix(trimmed, []byte{0xEF, 0xBB, 0xBF})
 }
 
-// DecodeFirstJSONValue decodes the first JSON value in data (after trimming
-// surrounding whitespace and any UTF-8 BOM) into target. It reports whether
-// non-whitespace content remains after the decoded value, and returns io.EOF
-// when data holds no JSON value at all.
 func DecodeFirstJSONValue(data []byte, target any) (bool, error) {
 	normalized := normalizeJSONBytes(data)
 	if len(normalized) == 0 {

@@ -426,8 +426,13 @@ export default function BasicSettings({
     if (turnstileSecretKey.trim()) {
       payload.turnstile_secret_key = turnstileSecretKey.trim();
     }
-    // 密钥已脱敏回传：留空表示保留现值，仅在用户输入新值时携带。
-    if (agentToken.trim()) {
+    // Agent Token 已回显真实值：仅与当前配置不同时携带；服务端空串
+    // 语义为非法值（不构成"清除"），清空已配置 Token 的保存直接拦截。
+    const currentAgentToken = (settings?.agent_token || "").trim();
+    if (settings?.agent_token_set && !agentToken.trim()) {
+      throw new Error("已配置的 Agent Token 不能清空；如需更换请输入新值。");
+    }
+    if (agentToken.trim() && agentToken.trim() !== currentAgentToken) {
       payload.agent_token = agentToken.trim();
     }
     if (adminPath.trim() !== (settings?.admin_path || "")) payload.admin_path = adminPath.trim();
@@ -1068,11 +1073,11 @@ export default function BasicSettings({
                     value={agentToken}
                     disabled={isBusy}
                     onChange={handleTextInputChange(setAgentToken)}
-                    placeholder={settings?.agent_token_set ? "已配置（留空保持不变，输入新值可更换）" : "例如：cm-agent-token-abc123…"}
+                    placeholder={settings?.agent_token_set ? "已配置（输入新值可更换）" : "例如：cm-agent-token-abc123…"}
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
                     {settings?.agent_token_set
-                      ? "Token 已隐藏。留空保存即保留当前值；更换后新接入 Agent 需使用新 Token。"
+                      ? "当前 Token 已回显，可选中复制；输入新值并保存即完成更换，更换后新接入 Agent 需使用新 Token。"
                       : "建议使用高强度随机 Token，修改后新接入 Agent 需使用新 Token。"}
                   </p>
                 </div>

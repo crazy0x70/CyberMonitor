@@ -21,7 +21,6 @@ const offlineDurationMetric = "cm_node_offline_duration_seconds"
 
 const offlineRetention = 2 * 365 * 24 * time.Hour
 
-// offlineOutOfOrderWindow 放行恢复事件的有限时钟乱序。
 const offlineOutOfOrderWindow = 6 * time.Hour
 
 var errNilOfflineStore = errors.New("offline history store is nil")
@@ -57,8 +56,6 @@ func OpenOfflineStore(dir string) (*OfflineStore, error) {
 	opts := tsdb.DefaultOptions()
 	opts.RetentionDuration = int64(offlineRetention / time.Millisecond)
 	opts.MaxBytes = offlineMaxBytes
-	// 恢复事件由服务器时钟打点，放行有限乱序，避免 NTP 回拨/重启
-	// 导致迟到的恢复事件被 TSDB 拒收（与网络历史的 OOO 窗口同理）。
 	opts.OutOfOrderTimeWindow = int64(offlineOutOfOrderWindow / time.Millisecond)
 
 	db, err := tsdb.Open(dir, nil, nil, opts, nil)
@@ -101,9 +98,6 @@ func (s *OfflineStore) AppendEvent(nodeID string, recoveredAt time.Time, duratio
 		labels.MetricName, offlineDurationMetric,
 		"node_id", nodeID,
 	), recoveredAt.UTC().UnixMilli(), duration.Seconds()); err != nil {
-		// 时钟回拨超过乱序窗口后样本会被永久拒收：与 network 路径对齐
-		// 容忍——事件放弃但返回 nil 让会话正常清理，否则每秒重试刷屏
-		// 且会话条目永存。
 		if errors.Is(err, storage.ErrOutOfOrderSample) ||
 			errors.Is(err, storage.ErrTooOldSample) ||
 			errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
@@ -370,12 +364,7 @@ func (s *OfflineStore) HasEventForSession(nodeID string, startedAt time.Time) (b
 	}
 
 	targetStartedAt := normalizeOfflineSessionStartedAt(startedAt)
-	// 下界用未取整的 startedAt 并多退 1s：存量事件时间戳是未取整的恢复
-	// 时刻，亚秒会话在 ±0.5s 归一化下可能早于 targetStartedAt，窄窗口会
-	// 让 crash 重放误判"未写入"而重复 append。
 	mint := startedAt.UnixMilli() - 1000
-	// 上界取当前时刻：事件只在恢复时刻（≤now）写入，且本会话存续期间
-	// 本节点不可能产生其他恢复事件，窗口内扫描量天然有界。
 	maxt := time.Now().UnixMilli()
 	found := false
 	if err := s.scanSessionsMillis(context.Background(), nodeID, mint, maxt, func(session OfflineSession) bool {

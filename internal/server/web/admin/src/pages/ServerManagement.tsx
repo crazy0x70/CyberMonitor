@@ -214,7 +214,8 @@ type FormState = {
   diskType: string;
   netSpeedMbps: string;
   alertEnabled: boolean;
-  hiddenFromDisplay: boolean;
+  visibleInCR: boolean;
+  visibleInAll: boolean;
   expireAt: string;
   renewPlan: RenewPlan;
   groups: string[];
@@ -433,7 +434,8 @@ function buildFormState(node: NodeView, catalog: TestCatalogItem[]): FormState {
   return {
     alias: node.alias || node.stats.node_alias || "",
     region: node.region || "",
-    hiddenFromDisplay: node.hidden_from_display === true,
+    visibleInCR: node.hidden_from_cr !== true,
+    visibleInAll: node.hidden_from_all !== true,
     diskType: node.disk_type || "",
     netSpeedMbps: node.net_speed_mbps ? String(node.net_speed_mbps) : "",
     alertEnabled: node.alert_enabled !== false,
@@ -448,7 +450,8 @@ function formDraftSignature(form: FormState) {
   return JSON.stringify({
     alias: form.alias,
     alertEnabled: form.alertEnabled,
-    hiddenFromDisplay: form.hiddenFromDisplay,
+    visibleInCR: form.visibleInCR,
+    visibleInAll: form.visibleInAll,
     diskType: form.diskType,
     expireAt: form.expireAt,
     groups: normalizeSelectionValues(form.groups),
@@ -492,7 +495,8 @@ function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfileP
   const payload: NodeProfilePayload = {
     alias: form.alias.trim(),
     alert_enabled: form.alertEnabled,
-    hide_from_display: form.hiddenFromDisplay,
+    hide_from_cr: !form.visibleInCR,
+    hide_from_all: !form.visibleInAll,
     auto_renew: autoRenew,
     disk_type: form.diskType.trim(),
     groups: normalizeSelectionValues(form.groups),
@@ -1226,7 +1230,9 @@ export default function ServerManagement({
                   </code>
                 </button>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
-                  Token 已隐藏：执行前请把命令中的 &lt;你的AgentToken&gt; 替换为基础设置中配置的 Agent Token。
+                  {agentToken
+                    ? "命令已内嵌当前配置的 Agent Token，复制后即可直接执行。"
+                    : "尚未配置 Agent Token：请先在基础设置的 Agent 配置中填写，命令占位符将自动替换为真实 Token。"}
                 </p>
               </div>
             </div>
@@ -1503,27 +1509,6 @@ export default function ServerManagement({
                                 )
                               }
                               placeholder="两位代码，如 SG / JP / HK"
-                            />
-                          </div>
-                          <div className="flex items-center justify-between gap-4">
-                            <div>
-                              <Label htmlFor="node-hidden" className="text-sm font-semibold">
-                                在展示页隐藏
-                              </Label>
-                              <p className={`mt-1 text-xs text-slate-500 dark:text-slate-400`}>
-                                隐藏后节点不出现在公开展示页与历史查询；告警照常推送，Telegram 与管理端不受影响。
-                              </p>
-                            </div>
-                            <Switch
-                              id="node-hidden"
-                              checked={form.hiddenFromDisplay}
-                              disabled={editorBusy || sourceConflict}
-                              onCheckedChange={(checked: boolean) => {
-                                if (editorBusy || sourceConflict) {
-                                  return;
-                                }
-                                updateFormField("hiddenFromDisplay", Boolean(checked));
-                              }}
                             />
                           </div>
                         </div>
@@ -1906,6 +1891,40 @@ export default function ServerManagement({
                         </div>
                       ) : null}
 
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="flex items-center justify-between gap-4">
+                          <Label htmlFor="node-visible-cr" className="text-sm font-semibold">
+                            在 C&R 视图显示
+                          </Label>
+                          <Switch
+                            id="node-visible-cr"
+                            checked={form.visibleInCR}
+                            disabled={editorBusy || sourceConflict}
+                            onCheckedChange={(checked: boolean) => {
+                              if (editorBusy || sourceConflict) {
+                                return;
+                              }
+                              updateFormField("visibleInCR", Boolean(checked));
+                            }}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between gap-4">
+                          <Label htmlFor="node-visible-all" className="text-sm font-semibold">
+                            在 ALL 视图显示
+                          </Label>
+                          <Switch
+                            id="node-visible-all"
+                            checked={form.visibleInAll}
+                            disabled={editorBusy || sourceConflict}
+                            onCheckedChange={(checked: boolean) => {
+                              if (editorBusy || sourceConflict) {
+                                return;
+                              }
+                              updateFormField("visibleInAll", Boolean(checked));
+                            }}
+                          />
+                        </div>
+                      </div>
                     </CardContent>
                   </Card>
 

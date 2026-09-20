@@ -16,29 +16,16 @@ const (
 	networkLossMetric         = "cm_network_test_packet_loss"
 	networkAvailabilityMetric = "cm_network_test_availability"
 
-	// 数据只保留 7 天（前端 range 最大 1W）。长窗口查询仍由服务端
-	// 按窗口降采样（见 downsampleBucketMillis），单次查询的内存与
-	// payload 始终有界（每序列 ≤ ~1000 点）。
 	networkRetentionDays    = 7
 	networkRetention        = networkRetentionDays * 24 * time.Hour
 	networkOutOfOrderWindow = 24 * time.Hour
 
-	// TSDB 磁盘容量上限：超出后按保留策略删除最旧块，为页缓存设界。
-	// 该值是病态增长的保护上限（按 7 天保留已非常宽松）。
 	networkMaxBytes = 2 << 30
 	offlineMaxBytes = 256 << 20
 )
 
-// 每条序列在单次查询中最多物化的点数目标。桶大小由此推导：
-// bucketMillis = ceil(窗口 / maxPointsPerSeries)。
 const maxPointsPerSeries = 1000
 
-// downsampleBucketMillis 计算某个 [mint, maxt] 查询窗口（Unix 毫秒）使用的
-// 聚合桶大小。返回 0 表示保留原始采样（短窗口走原有 raw 路径）。
-//
-// 目标：每序列最多输出 ~1000 个点（公开历史窗口白名单上限 7d）。向上
-// 取整保证桶数永远不超过 ~1000；桶再对齐到整秒（序列键以 Unix 秒存储，
-// 桶起点需满足 ts - ts%bucketSeconds 的对齐语义）。
 func downsampleBucketMillis(mint, maxt int64) int64 {
 	windowMillis := maxt - mint
 	if windowMillis <= 0 {
@@ -46,7 +33,6 @@ func downsampleBucketMillis(mint, maxt int64) int64 {
 	}
 	bucketMillis := (windowMillis + maxPointsPerSeries - 1) / maxPointsPerSeries
 	if bucketMillis <= 1000 {
-		// 桶 ≤ 1s 时没有可聚合的余量，直接走 raw 路径。
 		return 0
 	}
 	return ((bucketMillis + 999) / 1000) * 1000
@@ -69,12 +55,6 @@ type networkTestIdentity struct {
 	Name string
 }
 
-// seriesAccumulator 聚合单个网络测试身份在一次查询窗口内的全部采样。
-//
-// bucketMillis > 0 时，原始采样被折进固定时长的桶（输出均值），长窗口
-// （如 1 年 @5s 间隔 ≈ 630 万样本/序列）坍缩为每序列 ≤ ~1000 个点，
-// 避免内存炸弹与不可传输的 payload；bucketMillis == 0 时保留原始采样
-// （短窗口行为与降采样改造前完全一致）。
 type seriesAccumulator struct {
 	identity     networkTestIdentity
 	latency      *metricSeries
@@ -82,15 +62,6 @@ type seriesAccumulator struct {
 	availability *metricSeries
 }
 
-// metricSeries 承载序列中的一个指标（latency/loss/availability）。
-//
-//   - raw 模式（bucketSeconds == 0）：键为采样秒（Unix 秒，毫秒截断），
-//     同秒多采样后者覆盖前者，非有限值存为 nil 指针（时间点保留、无值），
-//     与降采样改造前的行为一致。
-//   - 桶模式（bucketSeconds > 0）：键为桶起点秒（ts - ts%bucketSeconds），
-//     桶内维护 sum+count，输出 sum/count（均值）。三个指标独立聚合成
-//     各自的桶表；条目的 Times 取桶键的有序并集（与改造前取原始键并集
-//     的对齐语义相同），某指标在某桶缺采样则该点为 nil 指针（同改造前）。
 type metricSeries struct {
 	bucketSeconds int64
 	raw           map[int64]*float64
@@ -103,8 +74,6 @@ type bucketAggregate struct {
 }
 
 func newMetricSeries(bucketMillis int64) *metricSeries {
-	// 只初始化活跃模式的 map；访问路径全部按 bucketSeconds 分支，
-	// 非活跃 map 恒为 nil（读安全），省去每序列一次无效分配。
 	if bucketMillis > 0 {
 		return &metricSeries{bucketSeconds: bucketMillis / 1000, buckets: make(map[int64]*bucketAggregate)}
 	}
@@ -115,11 +84,6 @@ func (m *metricSeries) sizeHint() int {
 	return len(m.raw) + len(m.buckets)
 }
 
-// observe 折入一个原始采样。tsSeconds 为 Unix 秒；value 可能为非有限值。
-//
-// 桶模式下均值语义：latency/loss 是采样均值；availability（每次测试
-// 0/1）的均值即该桶的在线率（uptime ratio）。非有限采样无法贡献均值，
-// 直接跳过。
 func (m *metricSeries) observe(tsSeconds int64, value float64) {
 	if m.bucketSeconds <= 0 {
 		m.raw[tsSeconds] = NormalizeFloat(value)
@@ -138,8 +102,6 @@ func (m *metricSeries) observe(tsSeconds int64, value float64) {
 	agg.count++
 }
 
-// valueAt 返回键 ts（raw 秒或桶起点秒）上的输出值；该指标在 ts 无采样
-// 时返回 nil。
 func (m *metricSeries) valueAt(ts int64) *float64 {
 	if m.bucketSeconds <= 0 {
 		return CloneFloatPtr(m.raw[ts])
@@ -177,8 +139,6 @@ func buildNetworkSeriesKey(identity networkTestIdentity) string {
 	return key
 }
 
-// ParseNetworkSeriesKey 解析序列键（type|host|port|name），供包外消费者
-// （AI 趋势摘要）复用，避免同一格式出现两套解析器。
 func ParseNetworkSeriesKey(key string) (networkTestIdentity, error) {
 	parts := strings.Split(key, "|")
 	if len(parts) != 4 {
@@ -211,10 +171,6 @@ func normalizeNetworkSeriesKey(identity networkTestIdentity) (networkTestIdentit
 	return identity, fmt.Sprintf("%s|%s|%d|%s", identity.Type, identity.Host, identity.Port, identity.Name)
 }
 
-// maxSeriesPerQuery 单次查询物化的序列数上限：series 身份由 agent 上报
-// 的 host/name 构成，基数在服务端无硬上限，公开免鉴权的历史查询一旦命中
-// 失控基数，序列数 × 3 指标 × ≤1000 桶的物化既是内存敞口也是响应体炸弹。
-// 超限序列丢弃不进结果。
 const maxSeriesPerQuery = 500
 
 func ensureSeriesAccumulator(
@@ -243,8 +199,6 @@ func ensureSeriesAccumulator(
 	return entry
 }
 
-// CloneFloatPtr returns a copy of value, or nil when value is nil or not
-// finite (NaN/Inf).
 func CloneFloatPtr(value *float64) *float64 {
 	if value == nil {
 		return nil
@@ -257,8 +211,6 @@ func CloneFloatPtr(value *float64) *float64 {
 	return &copyValue
 }
 
-// NormalizeFloat returns a pointer to value, or nil when value is not finite
-// (NaN/Inf).
 func NormalizeFloat(value float64) *float64 {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return nil

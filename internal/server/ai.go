@@ -21,19 +21,17 @@ import (
 )
 
 const (
-	aiProviderOpenAI           = "openai"
-	aiProviderOpenAICompatible = "openai_compatible"
-	defaultOpenAIBaseURL       = "https://api.openai.com/v1"
-	defaultOpenAIModel         = "gpt-5.2"
-	defaultAIMaxOutputTokens   = 512
-	defaultAITemperature       = 0.2
-	aiSnapshotConcurrency      = 4
-	defaultAITestPrompt        = "请仅回复 ok"
-	maxTelegramMessageRunes    = 3500
-	maxAIPromptRunes           = 2000
-	maxHTTPErrorBodyBytes      = 4096
-	// maxAISuccessBodyBytes 覆盖完整 JSON 响应；思考型模型（如 doubao-seed）
-	// 会输出 reasoning_content，4KB 的错误体上限会截断正常回复导致解析失败。
+	aiProviderOpenAI            = "openai"
+	aiProviderOpenAICompatible  = "openai_compatible"
+	defaultOpenAIBaseURL        = "https://api.openai.com/v1"
+	defaultOpenAIModel          = "gpt-5.2"
+	defaultAIMaxOutputTokens    = 512
+	defaultAITemperature        = 0.2
+	aiSnapshotConcurrency       = 4
+	defaultAITestPrompt         = "请仅回复 ok"
+	maxTelegramMessageRunes     = 3500
+	maxAIPromptRunes            = 2000
+	maxHTTPErrorBodyBytes       = 4096
 	maxAISuccessBodyBytes       = 1 << 20
 	aiOfflineRecentSessionLimit = 3
 	aiHTTPTimeout               = 18 * time.Second
@@ -465,9 +463,6 @@ func applyAIProviderDefaults(provider string, cfg AIProviderConfig) AIProviderCo
 	return cfg
 }
 
-// resolveAIProviderSelection 把 provider 选择器（支持 "openai_compatible:<id>"）
-// 解析为最终配置；selector 为空时回退 CommandProvider；override 非 nil 时直接
-// 替换配置（用于保存前的连通性测试）。
 func resolveAIProviderSelection(settings AISettings, selector string, override *AIProviderConfig) (aiProviderSelection, error) {
 	selector = normalizeAIProviderSelector(selector)
 	if selector == "" {
@@ -655,10 +650,7 @@ func buildAIUserPrompt(ctx context.Context, store *Store, question string) (stri
 
 func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 	snapshotTime := time.Now().UTC()
-	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
-	// 查询与开关告警——"隐藏"只裁剪公开展示面。
 	nodes := store.AdminSnapshot()
-	// 待接入（profile-only）节点无运行指标，进上下文只会产出全零误导。
 	filteredNodes := nodes[:0]
 	for _, node := range nodes {
 		if node.Status == nodeStatusWaitingRegistration {
@@ -668,7 +660,6 @@ func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 	}
 	nodes = filteredNodes
 	offlineStore := resolveAIOfflineStore(store)
-	// 每节点的 24h 历史查询串行会耗尽 18s 调用预算，有界并发后主预算留给 LLM。
 	servers := make([]aiServerSummary, len(nodes))
 	var (
 		wg        sync.WaitGroup

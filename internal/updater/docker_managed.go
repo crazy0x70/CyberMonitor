@@ -117,10 +117,6 @@ func (u *DockerManagedUpdater) CurrentImage() string {
 	return strings.TrimSpace(u.currentImage)
 }
 
-// DetectUpdateMode 返回展示用更新模式标签（system update 视图的
-// mode 字段），与部署判定 DetectDeployMode 语义不同：Docker 部署下
-// 未启用托管更新时仍上报 docker 模式（区别于 docker-managed），避免
-// 管理页给出不可用的更新入口。
 func DetectUpdateMode() string {
 	if DetectDeployMode() == DeployModeDocker {
 		if CanDockerManagedUpdate() {
@@ -410,8 +406,6 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	if targetImage == "" {
 		return fmt.Errorf("缺少 helper 目标镜像")
 	}
-	// 停掉旧容器后的任何一步挂死都等于服务宕机：整体预算兜底，
-	// 回滚路径用 WithoutCancel 派生，不受本预算到期影响。
 	ctx, cancel := context.WithTimeout(ctx, dockerRecreateOverallTimeout)
 	defer cancel()
 	cli, err := newDockerClient(socketPath)
@@ -444,17 +438,12 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	oldStopped := false
 	oldRenamed := false
 	connectedExtraNetworks := []string{}
-	// 回滚状态快照：信号 goroutine 与主 goroutine 并发，用 atomic.Pointer
-	// 发布一致的 {oldStopped, oldRenamed, connectedNetworks} 视图。
 	type rollbackState struct {
 		oldStopped bool
 		oldRenamed bool
 		connected  []string
 	}
 	rollbackSnapshot := atomic.Pointer[rollbackState]{}
-	// 显式参数版本：先把值写回局部变量（保持唯一状态源），再单次
-	// Store 发布——既无"变量已变、快照仍旧值"窗口，也无参/显参混用
-	// 时快照值互相覆写回退。
 	publishRollbackStateWith := func(stopped, renamed bool) {
 		oldStopped = stopped
 		oldRenamed = renamed
@@ -469,7 +458,6 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	}
 	publishRollbackState()
 	defer func() {
-		// CAS 防重入：信号 goroutine 与本 defer 并发时回滚全局只执行一次。
 		if !rollbackReplacement.CompareAndSwap(true, false) {
 			return
 		}
@@ -479,8 +467,6 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		rollbackErr := rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
 		err = appendDockerRollbackError(err, rollbackErr)
 	}()
-	// helper 容器在"旧容器已停止、新容器未就绪"窗口内被 docker stop（SIGTERM）
-	// 杀死时 defer 不会执行，服务将保持宕机。安装信号处理器直接回滚。
 	stopSignals := make(chan os.Signal, 1)
 	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(stopSignals)
@@ -502,9 +488,6 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		err = verifyErr
 		return err
 	}
-	// 附加网络连接分两段：无静态 IP 的端点可在旧容器停止前预连接；带
-	// IPAMConfig（静态 IP）的端点必须等旧容器停止释放地址后再连接，否则
-	// NetworkConnect 报地址冲突，静态 IP 部署的一键更新永远失败。
 	preConnectNetworks := map[string]*network.EndpointSettings{}
 	postConnectNetworks := map[string]*network.EndpointSettings{}
 	for networkName, endpoint := range extraNetworks {
@@ -555,8 +538,6 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		return err
 	}
 	rollbackReplacement.Store(false)
-	// 新容器已上线服务：清理旧容器失败只降级为残留日志，不把成功的
-	// 更新误报为失败（旧容器以 -prev- 名残留，不影响下次更新命名）。
 	if cleanupErr := cleanupOldContainerAfterReplacement(ctx, cli, inspect.ID); cleanupErr != nil {
 		log.Printf("%v", cleanupErr)
 	}
@@ -590,8 +571,6 @@ func rollbackCreatedContainer(ctx context.Context, cli dockerContainerRollbackCl
 		errs = append(errs, fmt.Errorf("删除替换容器失败: %w", removeErr))
 	}
 	if oldRenamed {
-		// 先按 ID 启动再恢复名称：SIGKILL 落在两步之间时服务已在线，
-		// 最多短暂保留 -prev- 名称。
 		if startErr := cli.ContainerStart(ctx, oldID, container.StartOptions{}); startErr != nil {
 			errs = append(errs, fmt.Errorf("重启旧容器失败: %w", startErr))
 		}
@@ -808,7 +787,6 @@ func sanitizeReplacementEnv(env []string) []string {
 		key, _, _ := strings.Cut(entry, "=")
 		switch strings.TrimSpace(key) {
 		case containerIDEnvKey, containerVersionEnvKey, containerCommitEnvKey:
-			// Let the replacement container resolve its own identity and baked version metadata.
 			continue
 		default:
 			filtered = append(filtered, entry)
@@ -888,7 +866,6 @@ func newDockerClient(socketPath string) (*client.Client, error) {
 }
 
 func pullDockerImage(ctx context.Context, cli *client.Client, targetImage string) error {
-	// 镜像拉取是 helper 内最容易无限挂起的一步，单独预算。
 	pullCtx, cancel := context.WithTimeout(ctx, dockerPullTimeout)
 	defer cancel()
 	reader, err := cli.ImagePull(pullCtx, targetImage, image.PullOptions{})

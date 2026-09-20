@@ -12,7 +12,6 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-// gracefulStopTimeout 略小于 SCM 默认等待超时，避免强杀跳过 Stopped 上报。
 const gracefulStopTimeout = 20 * time.Second
 
 type agentService struct {
@@ -36,8 +35,6 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 			case svc.Stop, svc.Shutdown:
 				status <- svc.Status{State: svc.StopPending}
 				cancel()
-				// Run 可能卡在不可中断的系统调用（如 SMB stat）上，无超时
-				// 等待会被 SCM 等待超时强杀并跳过 Stopped 状态上报。
 				select {
 				case err := <-done:
 					if err != nil && !errors.Is(err, context.Canceled) {

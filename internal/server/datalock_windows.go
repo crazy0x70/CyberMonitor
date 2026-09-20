@@ -10,8 +10,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// tryLockFile 对 path 建立进程级独占文件锁，锁随返回句柄的生命周期存在，
-// 关闭句柄即释放。锁被其他进程持有时返回 ErrDataDirLocked。
 func tryLockFile(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err

@@ -105,8 +105,6 @@ func resolveNodeID(opts NodeIDOptions) (string, error) {
 		case err == nil:
 			return value, nil
 		case errors.Is(err, os.ErrNotExist), errors.Is(err, os.ErrInvalid):
-			// 文件不存在或为空：默认 home 路径继续走指纹派生/重建
-			// （显式 -node-id-file 的硬失败语义不受影响）。
 		default:
 			return "", err
 		}
@@ -168,10 +166,6 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 		{label: "hostname", path: filepath.Join(root, "etc", "hostname")},
 	}
 
-	// 存在但不可读（sysfs product_uuid 等为 0400，非特权容器 EACCES）的
-	// 源不参与指纹：与占位符方案相比，指纹值与旧版本（同样跳过）一致，
-	// 版本升级不产生节点 ID 漂移；代价是权限状态变化（如改用
-	// --privileged）会漂移一次，两方案在此等价。日志点名该源，避免静默。
 	var readable, placeholders []string
 	for _, source := range sources {
 		value, err := readTrimmedFile(source.path)
@@ -189,12 +183,8 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 		return strings.Join(readable, "\n"), nil
 	}
 	if len(placeholders) > 0 {
-		// 全部源存在但均不可读：以占位符参与指纹，保证每次启动派生
-		// 同一 ID，不退化为每启动一个随机 UUID。
 		return strings.Join(placeholders, "\n"), nil
 	}
-	// 全部源不存在：hostRoot 未挂载或配置错误的典型症状。此时上层会
-	// 生成随机 node ID（容器重建即换新 ID），点名日志让这一后果可见。
 	log.Printf("机器指纹源目录 %s 下无可读指纹源，将退回随机 node id（请检查宿主机目录挂载）", root)
 	return "", os.ErrNotExist
 }
@@ -262,8 +252,6 @@ func readTrimmedFile(filePath string) (string, error) {
 	}
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
-		// 文件存在但为空/全空白：与"不存在"区分开，调用方（显式
-		// node-id-file 场景）才不会静默落到其他来源并以别的 ID 上报。
 		return "", fmt.Errorf("文件 %s 内容为空: %w", trimmedPath, os.ErrInvalid)
 	}
 	return trimmed, nil
@@ -279,8 +267,6 @@ func writeTrimmedFile(filePath, value string) error {
 		return fmt.Errorf("file value required")
 	}
 	dir := filepath.Dir(trimmedPath)
-	// 目录已存在时不改权限：默认路径的 dir 可能是 $HOME，
-	// 无条件 chmod 会把用户主目录改成 0700。
 	if _, statErr := os.Stat(dir); statErr != nil {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err

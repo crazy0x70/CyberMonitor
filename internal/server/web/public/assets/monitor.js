@@ -2098,8 +2098,14 @@ function renderGroupTabs(groups) {
 }
 
 function filterNodesByGroup(nodes, group) {
-  if (!group || group === DEFAULT_GROUP) return nodes;
-  if (group === REGION_GROUP) return nodes;
+  // 固定视图独立隐藏开关：ALL（平铺）视图剔除 hidden_from_all，C&R
+  // （地区分组）视图剔除 hidden_from_cr；用户分组视图不受影响。
+  if (!group || group === DEFAULT_GROUP) {
+    return nodes.filter((node) => node?.hidden_from_all !== true);
+  }
+  if (group === REGION_GROUP) {
+    return nodes.filter((node) => node?.hidden_from_cr !== true);
+  }
   return nodes.filter((node) => getGroupSelections(node, group).length > 0);
 }
 

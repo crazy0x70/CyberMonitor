@@ -374,10 +374,6 @@ func adminOAuthConfigForProvider(ctx context.Context, providerID string, setting
 		if !oidcOAuthReady(settings.OIDC) {
 			return oauth2.Config{}, nil, "", errors.New("oidc disabled")
 		}
-		// start 端点免鉴权：不缓存时每个请求都触发一次完整 discovery，
-		// 可被匿名用于出站放大。按 issuer 缓存 provider（失败不缓存）。
-		// nonce 每次调用都必须新生成：回调侧会校验 idToken.Nonce 与 start
-		// 下发值一致，缓存命中路径若复用空 nonce 会导致后续登录全部失败。
 		nonce, err := randomToken(32)
 		if err != nil {
 			return oauth2.Config{}, nil, "", err
@@ -539,9 +535,6 @@ func matchOAuthEmail(identity adminOAuthIdentity, allowedEmails, allowedDomains 
 	if at := strings.LastIndex(email, "@"); at >= 0 {
 		domain := email[at+1:]
 		if containsString(allowedDomains, domain) {
-			// 域白名单是对"该域全部已验证邮箱"的信任声明：IdP 未断言
-			// email_verified（requireVerified=false）时也必须拒绝未验证
-			// 邮箱——任何人都能注册 someone@corp.com 且不验证。
 			if !identity.EmailVerified {
 				return errors.New("email not verified")
 			}
@@ -592,8 +585,6 @@ func sanitizeAdminReturnTo(raw string, adminPath string) string {
 	if parsed.Path == "" {
 		parsed.Path = adminPath
 	}
-	// url.Parse 不清理 dot 段，"/admin/../x" 会通过前缀检查却被浏览器归一化
-	// 到 adminPath 之外；显式拒绝。
 	for _, seg := range strings.Split(parsed.Path, "/") {
 		if seg == "." || seg == ".." {
 			return adminPath

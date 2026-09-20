@@ -31,34 +31,31 @@ const (
 	defaultLoginFailLimit  = 5
 	defaultLoginFailWindow = 15 * 60
 	defaultLoginLockSec    = 15 * 60
-	// 时长类设置统一上限：int64 秒转 time.Duration 时超界会溢出为负数。
-	maxDurationSettingSec = 30 * 24 * 3600
-	testHistoryFileName   = "test_history.json"
-	configExportVersion   = 1
-	maxTestCatalogItems   = 512
+	maxDurationSettingSec  = 30 * 24 * 3600
+	testHistoryFileName    = "test_history.json"
+	configExportVersion    = 1
+	maxTestCatalogItems    = 512
 )
 
 var secureRandomReader io.Reader = rand.Reader
 
 type Settings struct {
-	AdminPath           string `json:"admin_path"`
-	AdminUser           string `json:"admin_user"`
-	AdminPass           string `json:"admin_pass"`
-	AdminPassPlain      string `json:"-"`
-	TurnstileSiteKey    string `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey  string `json:"turnstile_secret_key,omitempty"`
-	TokenSalt           string `json:"token_salt,omitempty"`
-	AuthToken           string `json:"auth_token,omitempty"`
-	AgentToken          string `json:"agent_token,omitempty"`
-	AgentEndpoint       string `json:"agent_endpoint,omitempty"`
-	SiteTitle           string `json:"site_title,omitempty"`
-	SiteIcon            string `json:"site_icon,omitempty"`
-	SiteBackgroundImage string `json:"site_background_image,omitempty"`
-	HomeTitle           string `json:"home_title,omitempty"`
-	HomeSubtitle        string `json:"home_subtitle,omitempty"`
-	Locale              string `json:"locale,omitempty"`
-	// 展示页"国家地区(C&R)分组导航"开关：反向存储使存量数据（字段缺省）
-	// 语义为启用，无需迁移。
+	AdminPath            string            `json:"admin_path"`
+	AdminUser            string            `json:"admin_user"`
+	AdminPass            string            `json:"admin_pass"`
+	AdminPassPlain       string            `json:"-"`
+	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
+	TokenSalt            string            `json:"token_salt,omitempty"`
+	AuthToken            string            `json:"auth_token,omitempty"`
+	AgentToken           string            `json:"agent_token,omitempty"`
+	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
+	SiteTitle            string            `json:"site_title,omitempty"`
+	SiteIcon             string            `json:"site_icon,omitempty"`
+	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
+	HomeTitle            string            `json:"home_title,omitempty"`
+	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
+	Locale               string            `json:"locale,omitempty"`
 	RegionGroupDisabled  bool              `json:"region_group_disabled,omitempty"`
 	AlertWebhook         string            `json:"alert_webhook,omitempty"`
 	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
@@ -76,21 +73,19 @@ type Settings struct {
 }
 
 type SettingsView struct {
-	AdminPath           string `json:"admin_path"`
-	AdminUser           string `json:"admin_user"`
-	TurnstileSiteKey    string `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey  string `json:"turnstile_secret_key,omitempty"`
-	AgentEndpoint       string `json:"agent_endpoint,omitempty"`
-	AgentToken          string `json:"agent_token,omitempty"`
-	AgentTokenSet       bool   `json:"agent_token_set,omitempty"`
-	SiteTitle           string `json:"site_title,omitempty"`
-	SiteIcon            string `json:"site_icon,omitempty"`
-	SiteBackgroundImage string `json:"site_background_image,omitempty"`
-	HomeTitle           string `json:"home_title,omitempty"`
-	HomeSubtitle        string `json:"home_subtitle,omitempty"`
-	Locale              string `json:"locale,omitempty"`
-	// 指针语义：解码时 nil=字段缺失（legacy 导出文件），只接受显式
-	// true/false——否则 pre-r54 导入会把缺省解码成"关闭"。
+	AdminPath             string            `json:"admin_path"`
+	AdminUser             string            `json:"admin_user"`
+	TurnstileSiteKey      string            `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey    string            `json:"turnstile_secret_key,omitempty"`
+	AgentEndpoint         string            `json:"agent_endpoint,omitempty"`
+	AgentToken            string            `json:"agent_token,omitempty"`
+	AgentTokenSet         bool              `json:"agent_token_set,omitempty"`
+	SiteTitle             string            `json:"site_title,omitempty"`
+	SiteIcon              string            `json:"site_icon,omitempty"`
+	SiteBackgroundImage   string            `json:"site_background_image,omitempty"`
+	HomeTitle             string            `json:"home_title,omitempty"`
+	HomeSubtitle          string            `json:"home_subtitle,omitempty"`
+	Locale                string            `json:"locale,omitempty"`
 	RegionGroupEnabled    *bool             `json:"region_group_enabled,omitempty"`
 	AlertWebhook          string            `json:"alert_webhook,omitempty"`
 	AlertWebhookSet       bool              `json:"alert_webhook_set,omitempty"`
@@ -190,14 +185,13 @@ type OfflineSessionState struct {
 	StartedAt int64 `json:"started_at"`
 }
 
-// AlertedState 记录已触发离线告警的节点，随 state.json 持久化，
-// 避免服务重启后对仍在离线的节点重复发送告警。
 type AlertedState struct {
-	OfflineSince time.Time `json:"offline_since"`
-	// 投递失败的指数退避：NextRetryAt 为零值表示无待重试投递（首次
-	// 告警在途或已送达）。旧持久化文件缺字段按零值加载，行为不变。
-	NextRetryAt time.Time `json:"next_retry_at,omitempty"`
-	RetryCount  int       `json:"retry_count,omitempty"`
+	OfflineSince      time.Time `json:"offline_since"`
+	NextRetryAt       time.Time `json:"next_retry_at,omitempty"`
+	RetryCount        int       `json:"retry_count,omitempty"`
+	DeliveredFeishu   bool      `json:"delivered_feishu,omitempty"`
+	DeliveredTelegram bool      `json:"delivered_telegram,omitempty"`
+	RecoveryPending   bool      `json:"recovery_pending,omitempty"`
 }
 
 type TestHistoryEntry struct {
@@ -238,7 +232,6 @@ type ResetResult struct {
 	AdminPath string
 }
 
-// ErrDataDirLocked 表示数据目录已被其他进程独占（服务运行中或另一实例）。
 var ErrDataDirLocked = errors.New("数据目录正被其他进程使用（服务可能正在运行）")
 
 func ResetAdminPassword(dataDir string) (ResetResult, error) {
@@ -246,7 +239,6 @@ func ResetAdminPassword(dataDir string) (ResetResult, error) {
 		return ResetResult{}, errors.New("data dir required")
 	}
 	dataPath := filepath.Join(dataDir, "state.json")
-	// 与运行中的服务实例互斥：无锁的重置会被实例下次持久化整体覆盖。
 	lockFile, err := tryLockFile(filepath.Join(dataDir, "server.lock"))
 	if err != nil {
 		return ResetResult{}, err
@@ -318,13 +310,9 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	if loaded {
 		return payload, loaded, nil
 	}
-	// 主文件"不存在"（savePersistedData 轮转后崩溃/写失败的窗口态）或
-	// "读取/解析失败"（磁盘坏块/手工编辑/外部截断）都从这里走备份自救；
-	// 真首装时 .bak 同样不存在，返回值保持首装语义。
 	backupPath := path + ".bak"
 	backupPayload, backupLoaded, backupErr := readPersistedDataFile(backupPath)
 	if !backupLoaded {
-		// 只有两个文件都缺失才是首装；保留每个损坏文件的路径和底层错误。
 		var loadErrors []error
 		if err != nil {
 			loadErrors = append(loadErrors, fmt.Errorf("读取 %s 失败: %w", path, err))
@@ -340,8 +328,6 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 		log.Printf("主文件 %s 缺失，已从备份 %s 恢复数据，下次持久化将写回主文件", path, backupPath)
 	}
 	if err != nil {
-		// 移除损坏的主文件：启动写回前的轮转不会把坏文件压进 .bak（唯一
-		// 好备份），写回失败的缺失窗口由本函数的备份回退兜底。
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			log.Printf("移除损坏的主文件 %s 失败（%v）", path, removeErr)
 		}
@@ -349,8 +335,6 @@ func loadPersistedData(path string) (PersistedData, bool, error) {
 	return backupPayload, backupLoaded, nil
 }
 
-// readPersistedDataFile 解析单个持久化文件；loaded=false 且 err=nil 表示
-// 文件不存在（首装语义）。
 func readPersistedDataFile(path string) (PersistedData, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -363,7 +347,6 @@ func readPersistedDataFile(path string) (PersistedData, bool, error) {
 	if err := strictUnmarshalJSON(data, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	// 迁移探测只提取所需的原始字段，避免对同一份 state.json 再做两次全量解码。
 	var probe struct {
 		Profiles map[string]json.RawMessage `json:"profiles"`
 		Settings struct {
@@ -405,9 +388,6 @@ func readPersistedDataFile(path string) (PersistedData, bool, error) {
 }
 
 func savePersistedData(path string, payload PersistedData) error {
-	// 上一代轮转（尽力而为）：rename 当前主文件到 .bak 后再原子写入。
-	// 两次 rename 间崩溃的窗口内主文件缺失但 .bak 在——loadPersistedData
-	// 对"缺失"同样走备份回退，该窗口被覆盖。
 	if err := os.Rename(path, path+".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("轮转备份 %s 失败（%v），继续写入主文件", path+".bak", err)
 	}
@@ -460,8 +440,6 @@ func normalizePersistedNodeStates(nodes map[string]NodeState) (map[string]NodeSt
 	return normalized, nil
 }
 
-// normalizePersistedAlertedStates 丢弃非法的节点 ID；告警状态属于可再生的
-// 瞬态数据，坏条目直接跳过，不让单个脏 key 阻塞启动。
 func normalizePersistedAlertedStates(alerted map[string]AlertedState) map[string]AlertedState {
 	if len(alerted) == 0 {
 		return map[string]AlertedState{}
@@ -510,10 +488,6 @@ func migrateLegacyProfileTests(rawProfiles map[string]json.RawMessage, payload *
 		return nil
 	}
 
-	// 目录钳制必须先于 legacy 短路：带毒持久化（历史迁移把目录撑到
-	// >512 后已落盘）在升级加载时 legacy tests 字段已被 JSON 往返丢弃，
-	// readLegacyProfileTests 返回空——若钳制放在短路之后则永不执行，
-	// 超限目录会让 UpdateSettings 永久报错，设置页卡死。
 	if payload.Settings.TestCatalog == nil {
 		payload.Settings.TestCatalog = []TestCatalogItem{}
 	}
@@ -553,8 +527,6 @@ func migrateLegacyProfileTests(rawProfiles map[string]json.RawMessage, payload *
 				continue
 			}
 			if item.ID == "" {
-				// 迁移同样受目录上限约束：目录已满时跳过新增，仅保留
-				// 引用既有条目的选择，避免迁移产物超限卡死设置页。
 				if len(payload.Settings.TestCatalog) >= maxTestCatalogItems {
 					continue
 				}
@@ -576,9 +548,6 @@ func migrateLegacyProfileTests(rawProfiles map[string]json.RawMessage, payload *
 			})
 		}
 		if len(selections) > 0 {
-			// selections 与下发链路同受 128 上限约束：超限时静默钳制
-			// （旧实现裸存，agent 端实际只收到前 128 条，管理端却全量
-			// 可见）。
 			profile.TestSelections = normalizeTestSelections(payload.Settings.TestCatalog, selections)
 		}
 	}
@@ -962,7 +931,6 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 			*dst = src
 		}
 		if *dst > maxDurationSettingSec {
-			// 遗留/手工数据防溢出：int64 秒转 time.Duration 时超界会变负数。
 			*dst = maxDurationSettingSec
 		}
 	}
@@ -1141,8 +1109,6 @@ func normalizeTagValues(tags []string) []string {
 	return normalizeUniqueStrings(tags, nil)
 }
 
-// reservedGroupNames 与展示页固定标签（ALL 平铺视图、C&R 地区分组）
-// 及既有保留名"全部"对齐，同名用户分组会被展示页虚拟分组吸收。
 var reservedGroupNames = map[string]struct{}{
 	"全部":  {},
 	"ALL": {},
@@ -1173,7 +1139,6 @@ func parseGroupSelection(value string) (string, string) {
 		return "", ""
 	}
 	if _, reserved := reservedGroupNames[raw]; reserved {
-		// 节点历史数据上挂的保留名分组在展示页会造出重复/幽灵标签。
 		return "", ""
 	}
 	group := raw
@@ -1198,8 +1163,6 @@ func parseGroupSelection(value string) (string, string) {
 	return group, tag
 }
 
-// groupSelectionSets 汇总 settings 中当前有效的分组名与 (分组\x00标签)
-// 集合；treeMode 表示分组树存在（标签维度可判定）。
 func groupSelectionSets(settings Settings) (map[string]struct{}, map[string]struct{}, bool) {
 	groupNames := make(map[string]struct{})
 	tagKeys := make(map[string]struct{})
@@ -1215,8 +1178,6 @@ func groupSelectionSets(settings Settings) (map[string]struct{}, map[string]stru
 	return groupNames, tagKeys, len(settings.GroupTree) > 0
 }
 
-// filterGroupSelections 剔除指向未配置分组/标签的选择：分组被删除、或
-// 树模式下标签不再存在的条目不保留（悬空引用会在展示页复活分组）。
 func filterGroupSelections(selections []string, groupNames, tagKeys map[string]struct{}, treeMode bool) []string {
 	kept := make([]string, 0, len(selections))
 	for _, selection := range selections {
@@ -1387,7 +1348,6 @@ func primaryGroupTagsFromSelections(selections []string) (string, []string) {
 	return group, tags
 }
 
-// isValidGroupName 排除会破坏 "group:tag" / "group/tag" 选择编码的分隔符。
 func isValidGroupName(name string) bool {
 	return !strings.ContainsAny(name, ":/")
 }

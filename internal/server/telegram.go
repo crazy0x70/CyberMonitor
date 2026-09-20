@@ -26,12 +26,8 @@ const (
 
 var telegramSendFunc = sendTelegramMessage
 
-// telegramBackoffCap 限制 429 Retry-After 的生效上限，防止异常大值
-// 把轮询挂起过久。
 const telegramBackoffCap = time.Minute
 
-// telegramBackoffDelay 依据结构化 API 错误决定退避时长，不嗅探错误文本
-// （响应 body 或下游错误里出现 "401" 字样会误判档位）。
 func telegramBackoffDelay(err error) time.Duration {
 	var apiErr *telegramAPIError
 	if err != nil && errors.As(err, &apiErr) {
@@ -102,9 +98,6 @@ func startTelegramBot(ctx context.Context, store *Store) {
 		client := noRedirectHTTPClient(12 * time.Second)
 		var offset int64
 		var lastToken string
-		// menuSetupPending 与 token 变更解耦：菜单设置失败只重试
-		// setTelegramCommands，不得触发 offset 重置（会把 Telegram
-		// 未确认 update 重新投递，造成命令重复执行）。
 		menuSetupPending := false
 		for {
 			select {
@@ -244,13 +237,8 @@ func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, event
 	return sendTelegramEventNotice(token, userIDs, siteTitle, events, buildRecoveryMessage, "恢复通知")
 }
 
-// telegramMessageLimit 是 sendMessage 文本上限（4096，Telegram 按 UTF-16
-// 计）的字节口径余量：批量离线超限时 API 返回 400 属永久失败，告警会
-// 静默丢失，必须分片。
 const telegramMessageLimit = 4000
 
-// splitTelegramMessage 把消息按行分片到字节上限内，超长单行按 rune 边界
-// 硬切（字节数 ≤ UTF-16 单元数，口径保守安全）。
 func splitTelegramMessage(text string, limit int) []string {
 	if len(text) <= limit {
 		return []string{text}
@@ -279,8 +267,6 @@ func splitTelegramMessage(text string, limit int) []string {
 					cut--
 				}
 				if cut == 0 {
-					// 非法 UTF-8（无 RuneStart）兜底：按字节硬切，
-					// 保证循环必然推进。
 					cut = limit
 				}
 				chunks = append(chunks, line[:cut])
@@ -315,9 +301,6 @@ func sendTelegramTest(token string, userIDs []int64, siteTitle string) []string 
 	return sendTelegramMessageToUsers(token, userIDs, message)
 }
 
-// telegramAPIError 携带 Bot API 的 HTTP 状态码与 429 Retry-After：退避
-// 决策与"配置类永久失败"判定都基于结构化字段。permanent 表示无效 token、
-// chat 不存在、bot 被拉黑等不可重试失败，告警投递中跳过重臂。
 type telegramAPIError struct {
 	statusCode int
 	retryAfter time.Duration
@@ -390,8 +373,6 @@ func telegramBotAPICall(ctx context.Context, client *http.Client, token, method 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := readResponseBodyLimited(resp.Body)
-		// 4xx（permanent()）属配置类永久失败，重试无意义；豁免后不触发
-		// 告警重臂，避免向其余收件人重发风暴。
 		return telegramSendResponse{}, &telegramAPIError{
 			statusCode: resp.StatusCode,
 			err:        fmt.Errorf("telegram %s响应错误: %d %s", label, resp.StatusCode, strings.TrimSpace(string(body))),
@@ -524,10 +505,6 @@ func toggleAlertForServer(store *Store, serverID string, enabled bool) string {
 	return fmt.Sprintf("%s告警：%s （%s）", action, display, serverID)
 }
 
-// parseAIAlertToggle 仅当 /ai 查询同时包含告警开关词且节点可被唯一
-// 识别（服务器ID 或显示名恰命中一个）时才视为开关命令；其余情况
-// （如"怎么恢复告警服务"）一律返回 false，交给 AI 回答，避免关键词
-// 劫持提问或误触发状态变更。
 func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -556,8 +533,6 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 	if !recognized {
 		return false, "", false
 	}
-	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
-	// 查询与开关告警——"隐藏"只裁剪公开展示面。
 	nodes := store.AdminSnapshot()
 	matched := 0
 	serverID := ""
@@ -586,8 +561,6 @@ func parseAIAlertToggle(query string, store *Store) (bool, string, bool) {
 }
 
 func buildTelegramAllStats(store *Store) string {
-	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
-	// 查询与开关告警——"隐藏"只裁剪公开展示面。
 	nodes := store.AdminSnapshot()
 	total := len(nodes)
 	if total == 0 {
@@ -604,7 +577,6 @@ func buildTelegramAllStats(store *Store) string {
 		case "offline":
 			offline++
 		case nodeStatusWaitingRegistration:
-			// profile-only 节点无指标，剔除出在线与均值分母。
 			waiting++
 			continue
 		default:
@@ -637,8 +609,6 @@ func buildTelegramAllStats(store *Store) string {
 }
 
 func buildTelegramServerList(store *Store) string {
-	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
-	// 查询与开关告警——"隐藏"只裁剪公开展示面。
 	nodes := store.AdminSnapshot()
 	if len(nodes) == 0 {
 		return "暂无服务器数据"
@@ -695,8 +665,6 @@ func buildTelegramServerStatus(store *Store, serverID string) string {
 	if serverID == "" {
 		return "用法: /status 服务器ID"
 	}
-	// Telegram/AI 属管理面：用完整视图（含 profile-only），隐藏节点仍可被
-	// 查询与开关告警——"隐藏"只裁剪公开展示面。
 	nodes := store.AdminSnapshot()
 	for _, node := range nodes {
 		if node.ServerID != serverID {

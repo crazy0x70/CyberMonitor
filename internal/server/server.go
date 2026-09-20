@@ -43,11 +43,9 @@ import (
 )
 
 const (
-	maxLogSize        = 10 * 1024 * 1024
-	maxLogBackupCount = 3
-	maxJSONBodySize   = 4 * 1024 * 1024
-	// wsMaxClientMessageBytes 限制 WS 客户端上行消息；仪表盘客户端
-	// 不发送数据消息，仅保留控制帧空间。
+	maxLogSize                      = 10 * 1024 * 1024
+	maxLogBackupCount               = 3
+	maxJSONBodySize                 = 4 * 1024 * 1024
 	wsMaxClientMessageBytes         = 4 * 1024
 	maxHTTPHeaderBytes              = 1 << 20
 	wsSendQueueSize                 = 8
@@ -203,8 +201,6 @@ const (
 //go:embed web/public/* web/public/assets/* web/dist/admin/* web/dist/admin/assets/*
 var webFS embed.FS
 
-// webAssetRefPattern 匹配前端 index.html 中对 ./assets/ 资源的引用
-// （script src / link href）。
 var webAssetRefPattern = regexp.MustCompile(`(?i)(?:src|href)="\.?/?assets/([^"]+)"`)
 
 func verifyEmbeddedWebAssets() error {
@@ -284,16 +280,16 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID       string   `json:"server_id,omitempty"`
-	AgentAuthToken string   `json:"agent_auth_token,omitempty"`
-	AlertEnabled   *bool    `json:"alert_enabled,omitempty"`
-	Alias          string   `json:"alias,omitempty"`
-	Group          string   `json:"group,omitempty"`
-	Tags           []string `json:"tags,omitempty"`
-	Groups         []string `json:"groups,omitempty"`
-	Region         string   `json:"region,omitempty"`
-	// 在公开展示页隐藏本节点（管理端仍可见可管理）；零值=显示，存量
-	// 数据无需迁移。
+	ServerID                 string                  `json:"server_id,omitempty"`
+	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
+	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
+	Alias                    string                  `json:"alias,omitempty"`
+	Group                    string                  `json:"group,omitempty"`
+	Tags                     []string                `json:"tags,omitempty"`
+	Groups                   []string                `json:"groups,omitempty"`
+	Region                   string                  `json:"region,omitempty"`
+	HideFromCR               bool                    `json:"hide_from_cr,omitempty"`
+	HideFromAll              bool                    `json:"hide_from_all,omitempty"`
 	HideFromDisplay          bool                    `json:"hide_from_display,omitempty"`
 	DiskType                 string                  `json:"disk_type,omitempty"`
 	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
@@ -346,6 +342,8 @@ type NodeView struct {
 	Groups                   []string          `json:"groups,omitempty"`
 	Region                   string            `json:"region,omitempty"`
 	HiddenFromDisplay        bool              `json:"hidden_from_display,omitempty"`
+	HiddenFromCR             bool              `json:"hidden_from_cr,omitempty"`
+	HiddenFromAll            bool              `json:"hidden_from_all,omitempty"`
 	DiskType                 string            `json:"disk_type,omitempty"`
 	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
 	ExpireAt                 int64             `json:"expire_at,omitempty"`
@@ -398,9 +396,7 @@ type Hub struct {
 }
 
 type hubMessage struct {
-	payload []byte
-	// prepared 非空时走 WritePreparedMessage：同一快照广播给 N 个
-	// 客户端时帧化/压缩只执行一次（含压缩协商的连接取缓存压缩帧）。
+	payload  []byte
 	prepared *websocket.PreparedMessage
 }
 
@@ -449,14 +445,9 @@ func (c *hubClient) close() error {
 	if c.conn == nil {
 		return nil
 	}
-	// gorilla/websocket 的 Close 可与读写并发调用（Close 后在途写立即报错）。
-	// 不持 c.mu：写泵卡在死对端的写超时期间（最长 10s），持锁的 close 会
-	// 同步阻塞广播方的 removeClient，拖慢 tick 循环与 ingest 广播。
 	return c.conn.Close()
 }
 
-// enqueue 仅承接文本数据帧（PING 已改走 WriteControl 直发）。队列满时
-// drop-oldest 丢最老帧重试；广播调用方对 false 的处理是踢掉该客户端。
 func (c *hubClient) enqueue(payload []byte, prepared *websocket.PreparedMessage) bool {
 	if c == nil {
 		return false
@@ -475,8 +466,6 @@ func (c *hubClient) enqueue(payload []byte, prepared *websocket.PreparedMessage)
 			return false
 		case <-c.send:
 		default:
-			// 队列恰好被写泵抽空的竞态：回到顶部重试入队而不是误判失败
-			//（removeClient 会把正在恢复排水的健康客户端踢掉）。
 			continue
 		}
 	}
@@ -484,22 +473,16 @@ func (c *hubClient) enqueue(payload []byte, prepared *websocket.PreparedMessage)
 
 const shutdownGraceTimeout = 5 * time.Second
 
-// Run 完成服务端全部启动序：数据目录锁 → 持久化加载与归一 → 历史
-// 存储打开 → HTTP/gRPC 路由装配 → 监听服务，阻塞至 ctx 取消或监听
-// 失败。返回值经 log.Fatalf 上报（cmd/server/main.go）。
 func Run(ctx context.Context, cfg Config) error {
 	if err := applyDefaults(&cfg); err != nil {
 		return err
 	}
 	setupLogger(cfg.DataDir)
 
-	// 构建产物残缺（如源码包只带了部分 dist）时页面在浏览器端白屏，
-	// curl HTML 无法暴露——启动时直接失败，错误信息点名缺失文件。
 	if err := verifyEmbeddedWebAssets(); err != nil {
 		return err
 	}
 
-	// 进程生命周期内独占数据目录：双实例同目录启动与 reset-password 竞态都在这里拦下。
 	lockPath := filepath.Join(cfg.DataDir, "server.lock")
 	lockFile, err := tryLockFile(lockPath)
 	if err != nil {
@@ -648,8 +631,6 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
-			// 用户名不匹配时也执行一次等价 bcrypt 比较，抹平响应时序差，
-			// 避免通过 401 延迟枚举有效管理员用户名。
 			if req.Username != creds.AdminUser {
 				verifyAdminPasswordDummy(req.Password)
 			}
@@ -735,9 +716,6 @@ func Run(ctx context.Context, cfg Config) error {
 		adminMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
 	}
 
-	// 公开历史查询会触发整段 TSDB 扫描（7d 窗口最大），且端点免鉴权：
-	// 限制并发数、通过 r.Context() 在客户端断开时取消扫描，并施加服务端
-	// deadline——慢读客户端不得长期占住并发名额。
 	publicHistorySem := make(chan struct{}, 4)
 	publicHistoryQueryTimeout := 30 * time.Second
 	publicMux.HandleFunc("/api/v1/public/nodes/", withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -886,8 +864,6 @@ func Run(ctx context.Context, cfg Config) error {
 				view.AgentEndpoint = cfg.PublicAddr
 			}
 			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
-				// 写库已提交：cookie 刷新失败只降级为日志（现有会话仍有效），
-				// 不得返回 500 触发前端重试，也不得跳过快照广播。
 				log.Printf("更新设置后刷新会话 cookie 失败: %v", err)
 			}
 			broadcastStoreSnapshot(hub, store)
@@ -921,8 +897,6 @@ func Run(ctx context.Context, cfg Config) error {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
 			}
-			// 任何未走到 reservation.Start 的退出路径都释放占位，避免
-			// panic 或遗漏分支把更新永久卡在 409。
 			started := false
 			defer func() {
 				if !started {
@@ -1030,8 +1004,6 @@ func Run(ctx context.Context, cfg Config) error {
 			view.AgentEndpoint = cfg.PublicAddr
 		}
 		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
-			// 写库已提交：cookie 刷新失败只降级为日志（现有会话仍有效），
-			// 不得返回 500 触发前端重试，也不得跳过快照广播。
 			log.Printf("导入配置后刷新会话 cookie 失败: %v", err)
 		}
 		broadcastStoreSnapshot(hub, store)
@@ -1232,16 +1204,8 @@ func Run(ctx context.Context, cfg Config) error {
 				adminTokenSalt = store.Credentials().TokenSalt
 			}
 			upgrader := websocket.Upgrader{
-				// permessage-deflate（gorilla 实现为双向 no_context_takeover，
-				// level 1）：快照广播对每个客户端省约 78% 流量；客户端未
-				// 提供扩展时自动回退明文。101 响应走 Hijack，不经过 HTTP
-				// gzip 中间件。
 				EnableCompression: true,
 				CheckOrigin: func(request *http.Request) bool {
-					// admin 连接保持严格的同源校验（连 token 都要求
-					// same-origin）。public 数据按设计免认证公开，允许
-					// 任意 Origin 连接——静态托管（Cloudflare Pages 等）
-					// 跨源访问公开看板必须如此。
 					if audience == "admin" {
 						return isSameOrigin(request)
 					}
@@ -1259,7 +1223,6 @@ func Run(ctx context.Context, cfg Config) error {
 				variant = adminVariant
 				snapshot = adminStoreSnapshot(store)
 			}
-			// 首次连接立即推送快照（Add 内与注册原子入队，marshal 失败直接关闭）。
 			payload, err := json.Marshal(snapshot)
 			if err != nil {
 				log.Printf("序列化初始节点快照失败: %v", err)
@@ -1328,8 +1291,6 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		// HTML 壳不缓存：中间缓存在无指令时可能缓存旧壳，引用已被
-		// 更新替换的资源路径导致页面空白。
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(htmlText))
@@ -1433,11 +1394,6 @@ func Run(ctx context.Context, cfg Config) error {
 		adminServer = newHTTPServer(cfg.Addr, withSecurityHeaders(stripForwardedPrefixPath(adminMux, trustedProxyHeaders)))
 	}
 
-	// tick 循环写入 historyManager；done 在 Run 返回前 join，
-	// 保证 defer historyManager.Close() 不与在途写并发（use-after-close）。
-	// defer 在 Close 的 defer 之后注册（LIFO 先执行 join 再 Close）。
-	// tick 用派生 runCtx：错误提前返回（如端口占用）时外层 ctx 未 cancel，
-	// runCancel 的 defer（LIFO 在 join 之前执行）负责放行 tick，避免 join 死锁。
 	tickDone := make(chan struct{})
 	defer func() { <-tickDone }()
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -1450,8 +1406,6 @@ func Run(ctx context.Context, cfg Config) error {
 	startTelegramBot(ctx, store)
 
 	go func() {
-		// runCtx 兜底：监听失败的提前返回路径外层 ctx 未取消，
-		// 否则本 goroutine 永久阻塞在 ctx.Done() 上。
 		select {
 		case <-ctx.Done():
 		case <-runCtx.Done():
@@ -1523,10 +1477,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// shutdownHTTPServer 给优雅关停设上限：慢 handler 不得无限拖住进程退出。
-// 超时后放弃等待在途 handler（它们随进程退出终止）；Run 返回后的
-// historyManager.Close 与极慢的在途历史查询并发是可接受降级（TSDB 内部
-// 有锁，不致 panic，请求侧报错返回）。
 func shutdownHTTPServer(server *http.Server) {
 	if server == nil {
 		return
@@ -1536,8 +1486,6 @@ func shutdownHTTPServer(server *http.Server) {
 	_ = server.Shutdown(ctx)
 }
 
-// runTickLoop 每秒驱动快照广播与告警巡检。Run 返回前 join（见 tickDone），
-// 避免与 historyManager.Close 产生 use-after-close。
 func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1549,10 +1497,6 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// tick 承载快照广播、persist 调度与告警状态机全部副作用，单次
-			// panic 不得杀死进程（对齐 agent 侧 runRecovered：崩溃即监控中
-			// 断）；各阶段临界区内的 defer Unlock 在 panic 展开时先执行，锁
-			// 不会遗留。recover 必须在分支体内——包在 for 外层会终止循环。
 			func() {
 				defer func() {
 					if rec := recover(); rec != nil {
@@ -1564,9 +1508,6 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 					store.sweepExpiredAgentRateWindows(now)
 					lastRateSweep = now
 				}
-				// admin 变体同样需要 tick 驱动的变更推送：节点静默离线后不再有
-				// ingest delta，状态翻转只能靠这里下发，否则 admin 面板停留在
-				// 旧在线状态（admin 前端直接消费服务端 status，不做本地推导）。
 				if hub.HasVariant(adminVariant) {
 					adminSnap := adminStoreSnapshot(store)
 					adminDigest := digestPublicSnapshot(adminSnap)
@@ -1602,40 +1543,29 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 				logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
 				if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
 					go func() {
-						// 投递 goroutine 顶层 panic 同样不得杀死进程；网络栈
-						// 调用链未来演化时的未预期崩溃只损失本轮投递（panic 路径
-						// 不重臂：已发射事件保持“在途”，待节点恢复由恢复分支收尾；
-						// 仅 send 返回失败才经 Rearm 补投）。
 						defer func() {
 							if rec := recover(); rec != nil {
 								log.Printf("告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
 							}
 						}()
-						// 双通道均未配置时"投递成功"是假成功：对离线告警保持
-						// 重臂循环（退避封顶 5min），管理员补配 webhook/token
-						// 后自动补投。恢复通知不重臂——恢复通知时效敏感，空通道
-						// 期重臂没有投递目标，只产生无意义的退避 persist 循环。
 						if targets.FeishuWebhook == "" && targets.TelegramToken == "" {
-							store.RearmAlertDelivery(offlineEvents, true)
+							store.RecordAlertDelivery(offlineEvents, false, false, true)
 							return
 						}
-						// 发送失败回滚告警状态，下个 tick 自动重试，
-						// 避免网络抖动导致该次离线/恢复通知永久丢失。
 						if len(offlineEvents) > 0 {
-							// 两通道独立投递：&& 短路会让第一个通道持续失败时
-							// 另一个彻底饿死。若仅一个通道失败，重臂会让成功通道
-							// 下轮重发（重复通知），好过整条通知丢失。
-							feishuOK := sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, offlineEvents)
-							telegramOK := sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, offlineEvents)
+							feishuOwed, telegramOwed := splitOwedChannels(offlineEvents)
+							feishuOK := sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, feishuOwed)
+							telegramOK := sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
 							if !feishuOK || !telegramOK {
-								store.RearmAlertDelivery(offlineEvents, true)
+								store.RecordAlertDelivery(offlineEvents, feishuOK, telegramOK, true)
 							}
 						}
 						if len(recoveredEvents) > 0 {
-							feishuOK := sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, recoveredEvents)
-							telegramOK := sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, recoveredEvents)
+							feishuOwed, telegramOwed := splitOwedChannels(recoveredEvents)
+							feishuOK := sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, feishuOwed)
+							telegramOK := sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
 							if !feishuOK || !telegramOK {
-								store.RearmAlertDelivery(recoveredEvents, false)
+								store.RecordAlertDelivery(recoveredEvents, feishuOK, telegramOK, false)
 							}
 						}
 					}()
@@ -1657,9 +1587,6 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// withGzip 对可压缩的 GET 响应做透明 gzip。公开资产全部 no-store，
-// 每次访问都会重新下载，monitor.js 131KB 压缩后约 37KB；snapshot JSON
-// 每次轮询同样受益。WebSocket 升级与 gRPC 流量在此层之外直通。
 func withGzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet ||
@@ -1708,8 +1635,6 @@ type gzipResponseWriter struct {
 	buf     []byte
 }
 
-// WriteHeader 仅记录状态码；压缩决策统一推迟到首块数据或 finish，
-// 因为流式 JSON 响应到达 WriteHeader 时没有 Content-Length 可判定大小。
 func (g *gzipResponseWriter) WriteHeader(status int) {
 	if g.decided {
 		return
@@ -1720,7 +1645,6 @@ func (g *gzipResponseWriter) WriteHeader(status int) {
 	}
 }
 
-// decide 依据已有信息（Content-Length 或已缓冲的首块）判定是否压缩。
 func (g *gzipResponseWriter) decide() {
 	if g.decided {
 		return
@@ -1749,11 +1673,11 @@ func (g *gzipResponseWriter) decide() {
 	header.Del("Content-Length")
 	header.Del("Accept-Ranges")
 	g.on = true
+	g.ResponseWriter.WriteHeader(g.status)
 	if len(g.buf) > 0 {
 		g.gz.Write(g.buf)
 		g.buf = nil
 	}
-	g.ResponseWriter.WriteHeader(g.status)
 }
 
 func (g *gzipResponseWriter) Write(p []byte) (int, error) {
@@ -1770,11 +1694,6 @@ func (g *gzipResponseWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// finish 在 handler 返回后收尾：压缩路径关闭 gzip 流；缓冲中的小
-// 响应或从未写 body 的响应在此完成最终决策并原样补写。决策可能在
-// 本函数内部的 decide 才发生（响应体小于决策缓冲时），因此 Close
-// 的判定必须放在 decide 之后，否则小响应的 gzip 流永不收尾——
-// 只有 gzip 头 10 字节被写出，浏览器解压得到空文档（页面白屏）。
 func (g *gzipResponseWriter) finish() {
 	if !g.on {
 		g.decide()
@@ -1790,8 +1709,6 @@ func (g *gzipResponseWriter) finish() {
 	}
 }
 
-// passthrough 把缓冲内容按原始状态码直传。仅在 decide 内调用一次，
-// 此刻底层 ResponseWriter 尚未写过任何字节。
 func (g *gzipResponseWriter) passthrough() {
 	g.ResponseWriter.WriteHeader(g.status)
 	if len(g.buf) > 0 {
@@ -1876,13 +1793,10 @@ func verifyPassword(password, stored string) bool {
 	return subtle.ConstantTimeCompare([]byte(stored), []byte(password)) == 1
 }
 
-// bootstrap token 仅作一次性共享密钥使用（agent 注册后即被专属 token 取代），
-// 无 claims 语义，直接用随机串即可。
 func generateBootstrapToken() (string, error) {
 	return randomToken(48)
 }
 
-// updateNodeStats requires the caller to hold lockAgentNodeRead(stats.NodeID).
 func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecoveryCandidate, error) {
 	var persist bool
 	var recoveryCandidate *offlineRecoveryCandidate
@@ -2082,16 +1996,14 @@ func mergeSingleGPUStaticInfo(current, incoming metrics.GPUInfo) metrics.GPUInfo
 }
 
 type AlertEvent struct {
-	NodeID     string
-	Display    string
-	OS         string
-	LastSeen   int64
-	OfflineSec int64
-	// RetryCount 携带发射时 AlertedState 的投递重试计数：恢复事件发射即
-	// 删除条目，重臂重建时以此为基递增——否则重建条目零值归零，退避退化
-	// 为 2s 恒定循环。仅在恢复路径使用（离线事件发射不删条目，重臂直接
-	// 读存置状态递增）。
-	RetryCount int
+	NodeID            string
+	Display           string
+	OS                string
+	LastSeen          int64
+	OfflineSec        int64
+	RetryCount        int
+	DeliveredFeishu   bool
+	DeliveredTelegram bool
 }
 
 type AlertTargets struct {
@@ -2101,13 +2013,8 @@ type AlertTargets struct {
 	SiteTitle       string
 }
 
-// offlineSessionDefaultThreshold：告警阈值关闭（<=0）时，离线轨迹仍按此默认阈值记录，
-// 否则 offline TSDB 时长与恢复事件随告警停用整体失活。
 const offlineSessionDefaultThreshold = 5 * time.Minute
 
-// offlineAlertThreshold 把秒设置转换为告警/离线轨迹共用的时长阈值；非法
-// 或溢出值（写入端已钳制，此处为防御性回退）回退默认阈值。调用方须持
-// s.mu（读或写）。
 func (s *Store) offlineAlertThreshold() time.Duration {
 	threshold := time.Duration(s.settings.AlertOfflineSec) * time.Second
 	if threshold <= 0 {
@@ -2153,7 +2060,6 @@ func (s *Store) ReconcileOfflineTracker(now time.Time) {
 			continue
 		}
 		if session.StartedAt > now.Unix() {
-			// 时钟回拨会让恢复判定永不成立、会话永久卡死，钳回当前时间
 			s.offlineSessions[nodeID] = OfflineSessionState{StartedAt: now.Unix()}
 			needsPersist = true
 			continue
@@ -2199,8 +2105,6 @@ func (s *Store) completeOfflineRecovery(candidate offlineRecoveryCandidate) {
 	s.completeOfflineRecoveryProtected(candidate)
 }
 
-// completeOfflineRecoveryProtected requires the caller to hold a node mutation
-// gate that blocks DeleteNode/ClearNodes for candidate.NodeID.
 func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandidate) {
 	candidate.NodeID = strings.TrimSpace(candidate.NodeID)
 	if candidate.StartedAt <= 0 {
@@ -2256,9 +2160,6 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 	}
 }
 
-// CollectAlertEvents 巡检全部节点的离线/恢复状态，产出待投递事件并
-// 维护 alerted 状态机（重臂/退避/失效清理）。调用方须持无锁（内部自
-// 取 s.mu）；投递失败由 RearmAlertDelivery 在后续 tick 重试。
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
 
@@ -2272,8 +2173,6 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		targets.TelegramToken = ""
 		targets.TelegramUserIDs = nil
 	}
-	// 阈值非法时视为全局禁用，但仍需走清理循环：禁用前产生的 alerted
-	// 残留会抑制重新启用后的下一次离线告警。
 	alertDisabled := s.settings.AlertOfflineSec <= 0
 	threshold := s.offlineAlertThreshold()
 	offlineEvents := make([]AlertEvent, 0)
@@ -2299,9 +2198,6 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		offlineFor := now.Sub(node.LastSeen)
 		if offlineFor < threshold {
 			if wasAlerted {
-				// NextRetryAt 非零且未到期：上次投递失败，退避等待中。
-				// 剩余等待超出退避封顶视为已到期（时钟回拨护栏，与离线分支
-				// 同参：合法 NextRetryAt 距今恒 ≤ maxAlertRetryBackoff）。
 				if !state.NextRetryAt.IsZero() && now.Before(state.NextRetryAt) &&
 					state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff {
 					continue
@@ -2312,13 +2208,20 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				if state.OfflineSince.IsZero() {
 					offlineSec = 0
 				}
+				deliveredFeishu, deliveredTelegram := false, false
+				if state.RecoveryPending {
+					deliveredFeishu = state.DeliveredFeishu
+					deliveredTelegram = state.DeliveredTelegram
+				}
 				recoveredEvents = append(recoveredEvents, AlertEvent{
-					NodeID:     nodeID,
-					Display:    display,
-					OS:         stats.OS,
-					LastSeen:   node.LastSeen.Unix(),
-					OfflineSec: offlineSec,
-					RetryCount: state.RetryCount,
+					NodeID:            nodeID,
+					Display:           display,
+					OS:                stats.OS,
+					LastSeen:          node.LastSeen.Unix(),
+					OfflineSec:        offlineSec,
+					RetryCount:        state.RetryCount,
+					DeliveredFeishu:   deliveredFeishu,
+					DeliveredTelegram: deliveredTelegram,
 				})
 				delete(s.alerted, nodeID)
 				needsPersist = true
@@ -2326,20 +2229,14 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			continue
 		}
 		if wasAlerted {
-			// 已告警节点仅在退避到期时重发（投递失败的补投），重发沿用
-			// OfflineSince 口径并清空 NextRetryAt（本轮投递在途，再次
-			// 失败由 Rearm 重新设置退避）。RetryCount 不在此处清零：同
-			// 一离线周期内持续失败应继续放大退避；跨周期继承——经恢复重建
-			// 进入的新离线周期沿用累计计数（偏少通知方向，可接受）。
-			// 时钟回拨会把 NextRetryAt 推到未来超过任何合法退避值，
-			// 剩余等待超出上限时视为已到期。
 			if state.NextRetryAt.IsZero() || (now.Before(state.NextRetryAt) && state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff) {
 				continue
 			}
-			// 回抖后残留的上一会话起点会把在线空档算进离线时长，
-			// 钳到当前离线起点。
 			if state.OfflineSince.Before(node.LastSeen) {
 				state.OfflineSince = node.LastSeen
+				state.DeliveredFeishu = false
+				state.DeliveredTelegram = false
+				state.RecoveryPending = false
 			}
 			stats := node.Stats
 			offlineSec := int64(now.Sub(state.OfflineSince).Seconds())
@@ -2347,11 +2244,13 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				offlineSec = 0
 			}
 			offlineEvents = append(offlineEvents, AlertEvent{
-				NodeID:     nodeID,
-				Display:    resolveAlertDisplay(profile, stats, nodeID),
-				OS:         stats.OS,
-				LastSeen:   node.LastSeen.Unix(),
-				OfflineSec: offlineSec,
+				NodeID:            nodeID,
+				Display:           resolveAlertDisplay(profile, stats, nodeID),
+				OS:                stats.OS,
+				LastSeen:          node.LastSeen.Unix(),
+				OfflineSec:        offlineSec,
+				DeliveredFeishu:   state.DeliveredFeishu,
+				DeliveredTelegram: state.DeliveredTelegram,
 			})
 			state.NextRetryAt = time.Time{}
 			s.alerted[nodeID] = state
@@ -2380,7 +2279,6 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 
 	s.mu.Unlock()
 	if needsPersist {
-		// 告警状态已持久化到 state.json，重启后不再对仍离线的节点重复告警。
 		s.persist()
 	}
 	return targets, offlineEvents, recoveredEvents
@@ -2388,8 +2286,6 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 
 const maxAlertRetryBackoff = 5 * time.Minute
 
-// alertRetryBackoff 第 n 次重试（n 从 1 起）的退避：2s 起指数增长，封顶
-// maxAlertRetryBackoff——1s tick 下投递失败不会造成健康通道重发风暴。
 func alertRetryBackoff(retryCount int) time.Duration {
 	backoff := 2 * time.Second
 	for i := 1; i < retryCount && backoff < maxAlertRetryBackoff; i++ {
@@ -2401,11 +2297,21 @@ func alertRetryBackoff(retryCount int) time.Duration {
 	return backoff
 }
 
-// RearmAlertDelivery 在告警/恢复通知发送失败时调度退避重发：保留
-// OfflineSince 口径，按重试次数设置 NextRetryAt，由 CollectAlertEvents
-// 到期重投。offline=true 重调度离线告警，false 重调度恢复通知（仅在
-// 状态缺失时重建——期间节点若再次离线，新离线告警状态不得被覆写吞掉）。
-func (s *Store) RearmAlertDelivery(events []AlertEvent, offline bool) {
+func splitOwedChannels(events []AlertEvent) (feishu, telegram []AlertEvent) {
+	feishu = make([]AlertEvent, 0, len(events))
+	telegram = make([]AlertEvent, 0, len(events))
+	for _, event := range events {
+		if !event.DeliveredFeishu {
+			feishu = append(feishu, event)
+		}
+		if !event.DeliveredTelegram {
+			telegram = append(telegram, event)
+		}
+	}
+	return feishu, telegram
+}
+
+func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bool, offline bool) {
 	needsPersist := false
 	s.mu.Lock()
 	now := time.Now()
@@ -2415,23 +2321,43 @@ func (s *Store) RearmAlertDelivery(events []AlertEvent, offline bool) {
 			if !ok {
 				continue
 			}
-			state.RetryCount++
-		} else {
-			if !ok {
-				// 节点已删除时不复活条目（DeleteNode 与发送 goroutine
-				// 并发窗口内的重建会让孤儿状态多活一个 tick）。
-				if _, alive := s.nodes[event.NodeID]; !alive {
-					continue
-				}
-				// 重建以事件携带的 RetryCount 为基递增：发射时条目已删，
-				// 零值重建会把退避钉死在 backoff(1)=2s 的恒定循环。
-				state = AlertedState{
-					OfflineSince: now.Add(-time.Duration(event.OfflineSec) * time.Second),
-					RetryCount:   event.RetryCount + 1,
-				}
-			} else {
-				state.RetryCount++
+			if feishuOK {
+				state.DeliveredFeishu = true
 			}
+			if telegramOK {
+				state.DeliveredTelegram = true
+			}
+			if state.DeliveredFeishu && state.DeliveredTelegram {
+				continue
+			}
+			state.RetryCount++
+			state.NextRetryAt = now.Add(alertRetryBackoff(state.RetryCount))
+			s.alerted[event.NodeID] = state
+			needsPersist = true
+			continue
+		}
+		feishuDelivered := event.DeliveredFeishu || feishuOK
+		telegramDelivered := event.DeliveredTelegram || telegramOK
+		if feishuDelivered && telegramDelivered {
+			continue
+		}
+		if !ok {
+			if _, alive := s.nodes[event.NodeID]; !alive {
+				continue
+			}
+			state = AlertedState{
+				OfflineSince:      now.Add(-time.Duration(event.OfflineSec) * time.Second),
+				RetryCount:        event.RetryCount + 1,
+				DeliveredFeishu:   feishuDelivered,
+				DeliveredTelegram: telegramDelivered,
+				RecoveryPending:   true,
+			}
+		} else {
+			if state.RecoveryPending {
+				state.DeliveredFeishu = feishuDelivered
+				state.DeliveredTelegram = telegramDelivered
+			}
+			state.RetryCount++
 		}
 		state.NextRetryAt = now.Add(alertRetryBackoff(state.RetryCount))
 		s.alerted[event.NodeID] = state
@@ -2506,7 +2432,6 @@ func sendFeishuText(webhook, text string) error {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := sharedWebhookClient().Do(req)
 	if err != nil {
-		// url.Error 全文含 webhook secret，剥掉只留根因。
 		return fmt.Errorf("告警发送失败: %s", telegramRequestErrorMessage(err))
 	}
 	defer resp.Body.Close()
@@ -2514,10 +2439,6 @@ func sendFeishuText(webhook, text string) error {
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	// 飞书自定义机器人在签名不匹配/关键词过滤/bot 失效等场景返回
-	// HTTP 200 + {"code":!=0}：只看状态码会把失败判成成功、整条通知
-	// 静默丢失。body 非 JSON（拦截代理/异常网关）同样无法确认投递——
-	// 告警场景重复优于丢失，判失败交由重臂兜底。
 	var feishuResp struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -2609,7 +2530,6 @@ func formatAlertDuration(seconds int64) string {
 }
 
 func formatAlertValue(value, fallback string) string {
-	// 剔除控制字符：别名/主机名含换行时可在通知里注入伪造条目行。
 	value = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
 			return -1
@@ -2830,12 +2750,8 @@ func agentUpdateLeaseForState(state string) time.Duration {
 	}
 }
 
-// agentUpdateDispatchTimeout 是指令的最长存活期：agent 失联/反复失败时
-// 不再无限重投与续租，超时收口为 failed 供 admin 重新触发。
 const agentUpdateDispatchTimeout = time.Hour
 
-// agentUpdateProgressTimeout 是收口判定的"无进展"窗口：距 agent 最近一次
-// 状态上报超过该时长才允许超时收口。
 const agentUpdateProgressTimeout = 10 * time.Minute
 
 func shouldDispatchAgentUpdate(profile *NodeProfile, now time.Time) bool {
@@ -2848,8 +2764,6 @@ func shouldDispatchAgentUpdate(profile *NodeProfile, now time.Time) bool {
 	return profile.AgentUpdateLeaseUntil <= now.Unix()
 }
 
-// expireStaleAgentUpdateLocked 把超过存活期的非终态更新指令收口为 failed。
-// 返回是否发生变更（调用方负责 persist 与广播）。
 func expireStaleAgentUpdateLocked(profile *NodeProfile, now time.Time) bool {
 	if profile == nil || profile.AgentUpdate == nil {
 		return false
@@ -2861,9 +2775,6 @@ func expireStaleAgentUpdateLocked(profile *NodeProfile, now time.Time) bool {
 	if requestedAt <= 0 || now.Unix()-requestedAt < int64(agentUpdateDispatchTimeout/time.Second) {
 		return false
 	}
-	// 慢链路 agent 持续上报 updating（续租活跃）时不强制收口——只在
-	// 总时长超限且最近 10 分钟无任何上报进展时收口，避免收口后 agent
-	// 的终态上报被 409 拒绝造成状态与事实不符。
 	if profile.AgentUpdateReportedAt > 0 && now.Unix()-profile.AgentUpdateReportedAt < int64(agentUpdateProgressTimeout/time.Second) {
 		return false
 	}
@@ -2934,7 +2845,7 @@ func resolveAgentUpdateUnsupportedReason(stats metrics.NodeStats) string {
 	case "docker-managed":
 		return ""
 	case string(updater.DeployModeDocker):
-		return "Docker 部署的 Agent 需要挂载 /var/run/docker.sock 才能启用后台一键更新"
+		return "Docker 部署的 Agent 需同时设置 CM_ENABLE_DOCKER_UPDATE=1 并挂载 /var/run/docker.sock 才能启用后台一键更新；否则请拉取最新镜像并重建容器"
 	default:
 		return ""
 	}
@@ -3132,7 +3043,6 @@ func convertNetworkHistoryToTestHistory(
 		if entry == nil {
 			continue
 		}
-		// source 由查询新建、仅此处引用，克隆切片一次即可。
 		result[key] = &TestHistoryEntry{
 			Latency:        slices.Clone(entry.Latency),
 			Loss:           slices.Clone(entry.Loss),
@@ -3152,8 +3062,7 @@ func (s *Store) HasNode(nodeID string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// 隐藏节点对公开历史端点视为不存在（管理端不受影响）。
-	if profile := s.profiles[nodeID]; profile != nil && profile.HideFromDisplay {
+	if profile := s.profiles[nodeID]; profile != nil && profile.HideFromCR && profile.HideFromAll {
 		return false
 	}
 	_, exists := s.nodes[nodeID]
@@ -3175,13 +3084,11 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 	return convertNetworkHistoryToTestHistory(entries), nil
 }
 
-// Snapshot 返回公开展示视图：hide_from_display 节点不出现（管理端
-// AdminSnapshot 不过滤）。
 func (s *Store) Snapshot() []NodeView {
 	all := s.snapshot(false)
 	visible := all[:0]
 	for _, view := range all {
-		if view.HiddenFromDisplay {
+		if view.HiddenFromCR && view.HiddenFromAll {
 			continue
 		}
 		visible = append(visible, view)
@@ -3193,9 +3100,6 @@ func (s *Store) AdminSnapshot() []NodeView {
 	return s.snapshot(true)
 }
 
-// snapshot 是纯读路径（RLock）：profile 惰性创建与到期自动续费等写副作用
-// 由 tick 的 reconcileProfiles 承担——原先它们内联在快照里，导致每秒
-// 双变体 digest 构建全程持有写锁，阻塞全部 agent ingest。
 func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
 	s.mu.RLock()
 
@@ -3234,9 +3138,6 @@ func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
 	return views
 }
 
-// reconcileProfiles 在 tick 的写窗口内执行原先内联于快照的写副作用：
-// 为已上报但尚无 profile 的节点惰性创建 profile、推进到期自动续费。
-// 返回是否发生需要持久化的变更。
 func (s *Store) reconcileProfiles(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3288,6 +3189,8 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		ServerID:                 profile.ServerID,
 		AlertEnabled:             isAlertEnabled(profile),
 		HiddenFromDisplay:        profile.HideFromDisplay,
+		HiddenFromCR:             profile.HideFromCR,
+		HiddenFromAll:            profile.HideFromAll,
 		Alias:                    alias,
 		Group:                    group,
 		Tags:                     cloneStringSlice(tags),
@@ -3313,7 +3216,7 @@ func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 
 	now := time.Now()
 	node, ok := s.nodeViewLocked(nodeID, now)
-	if !ok || node.HiddenFromDisplay {
+	if !ok || (node.HiddenFromCR && node.HiddenFromAll) {
 		return NodeDelta{}, false
 	}
 	return NodeDelta{
@@ -3344,8 +3247,6 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 
 	stats := cloneNodeStats(node.Stats)
 	if status == nodeStatusOffline {
-		// Offline nodes keep lifetime counters, but their last-reported
-		// instantaneous rates are stale and must not feed live totals.
 		stats.Network.TxBytesPerSec = 0
 		stats.Network.RxBytesPerSec = 0
 		stats.DiskIO.ReadBytesPerSec = 0
@@ -3360,6 +3261,8 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		ServerID:                 profile.ServerID,
 		AlertEnabled:             isAlertEnabled(profile),
 		HiddenFromDisplay:        profile.HideFromDisplay,
+		HiddenFromCR:             profile.HideFromCR,
+		HiddenFromAll:            profile.HideFromAll,
 		Alias:                    profile.Alias,
 		Group:                    group,
 		Tags:                     cloneStringSlice(tags),
@@ -3413,8 +3316,6 @@ func (h *Hub) Add(conn *websocket.Conn, variant string, adminTokenSalt string, i
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// 注册与初始快照入队在同一临界区：先 Add 后 enqueue 的窗口内并发
-	// 广播会先入队 delta，客户端先收新值再被更旧的全量快照覆盖。
 	h.clients[conn] = client
 	select {
 	case client.send <- hubMessage{payload: initialPayload, prepared: nil}:
@@ -3446,9 +3347,6 @@ func (h *Hub) CloseAdminClients() {
 	}
 }
 
-// BroadcastVariant/BroadcastAdmin share one immutable payload slice across
-// clients: the payload is never mutated after marshal and every write loop
-// only reads it, so per-client bytes.Clone allocations are pure waste.
 func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 	clients := h.snapshotClients()
 	prepared := h.prepareBroadcast(payload)
@@ -3480,8 +3378,6 @@ func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
 	}
 }
 
-// BroadcastAllVariants 把同一 payload 发给公开 balanced 与通过 salt 校验的
-// admin 连接，PreparedMessage 只帧化一次（原先两个方法各自帧化，分配翻倍）。
 func (h *Hub) BroadcastAllVariants(payload []byte, tokenSalt string) {
 	clients := h.snapshotClients()
 	if len(clients) == 0 {
@@ -3512,10 +3408,6 @@ func (h *Hub) BroadcastAllVariants(payload []byte, tokenSalt string) {
 	}
 }
 
-// prepareBroadcast 把广播 payload 预帧化为 PreparedMessage：同一对象
-// 广播给全部连接，帧缓存按连接的压缩协商各构建一次（明文帧在构建时
-// 预生成，压缩帧由首个压缩连接的写入惰性生成并复用），之后每秒广播
-// 零重复帧化开销。
 func (h *Hub) prepareBroadcast(payload []byte) *websocket.PreparedMessage {
 	prepared, err := websocket.NewPreparedMessage(websocket.TextMessage, payload)
 	if err != nil {
@@ -3561,9 +3453,6 @@ func configureWSConn(conn *websocket.Conn) {
 	if conn == nil {
 		return
 	}
-	// 客户端只需发 pong/close 控制帧（不受读上限约束）；启用
-	// permessage-deflate 后读路径多了解压环节，收紧上限封死
-	// 压缩炸弹面（小压缩帧解出超大消息）。
 	conn.SetReadLimit(wsMaxClientMessageBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	conn.SetPongHandler(func(string) error {
@@ -3583,9 +3472,6 @@ func heartbeatLoop(client *hubClient, hub *Hub) {
 			return
 		case <-ticker.C:
 		}
-		// PING 走 WriteControl 直发：gorilla 文档保证控制帧可与数据帧写并发，
-		// 不占共享发送队列——既不会被 drop-oldest 挤掉导致 60s 读超时误断
-		// 慢客户端，也不再依赖"队满即断"充当拥塞探测（广播路径已有该语义）。
 		if err := client.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)); err != nil {
 			hub.removeClient(client)
 			return
@@ -3783,6 +3669,8 @@ type NodeProfileUpdate struct {
 	ExpireAt         *int64           `json:"expire_at"`
 	AutoRenew        *bool            `json:"auto_renew"`
 	HideFromDisplay  *bool            `json:"hide_from_display"`
+	HideFromCR       *bool            `json:"hide_from_cr"`
+	HideFromAll      *bool            `json:"hide_from_all"`
 	RenewIntervalSec *int64           `json:"renew_interval_sec"`
 	TestIntervalSec  *int             `json:"test_interval_sec"`
 	TestSelections   *[]TestSelection `json:"test_selections"`
@@ -3813,8 +3701,6 @@ func (s *Store) RotateAdminTokenSalt() error {
 	return nil
 }
 
-// dummyAdminBcryptHash 是一个预生成的合法 bcrypt 哈希（对应随机口令），
-// 仅用于登录时对无效用户名执行等价代价的比较运算。
 var dummyAdminBcryptHash = "$2a$10$N9qo8uLOickgx2ZMRZoMye.IjPeGqBQVLf1F5zq1CzU9xUvOzX8fO"
 
 func verifyAdminPasswordDummy(password string) {
@@ -3989,8 +3875,6 @@ func (s *Store) allowAgentRateLocked(key string, window time.Duration, limit int
 			s.agentRegisterRate = rates
 		}
 	}
-	// 每个 ingest 都在全局写锁内：只清理当前 key 的过期窗口，整体清扫
-	// 交给低频的 sweepExpiredAgentRateWindows，避免 O(N) 全表扫描。
 	state, exists := rates[key]
 	if exists && !state.until.IsZero() && !now.Before(state.until) {
 		delete(rates, key)
@@ -4008,8 +3892,6 @@ func (s *Store) allowAgentRateLocked(key string, window time.Duration, limit int
 	return true
 }
 
-// sweepExpiredAgentRateWindows 定期清理全部过期限流窗口。写入方在命中时
-// 已自清理当前 key，这里只兜底清理不再活跃的 key，防止长期缓慢增长。
 func (s *Store) sweepExpiredAgentRateWindows(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -4037,11 +3919,8 @@ func (s *Store) upgradeAdminPasswordHash(password, stored string) {
 	s.persist()
 }
 
-// redactAISettingsForView 抹掉全部 provider API Key：保存路径的
-// mergeRedactedAISettings 对空值执行"保留现值"合并。
 func redactAISettingsForView(settings AISettings) AISettings {
 	settings = cloneAISettings(settings)
-	// 先按明文记录"已配置"事实，再抹掉明文。
 	settings.OpenAI.APIKeySet = strings.TrimSpace(settings.OpenAI.APIKey) != ""
 	settings.OpenAI.APIKey = ""
 	for i := range settings.OpenAICompatibles {
@@ -4065,21 +3944,18 @@ func (s *Store) PublicSettings() PublicSettings {
 	}
 }
 
-// settingsViewLocked requires the caller to hold s.mu (read or write).
 func (s *Store) settingsViewLocked() SettingsView {
 	loginFailLimit := s.settings.LoginFailLimit
 	if loginFailLimit < 0 {
 		loginFailLimit = 0
 	}
 	return SettingsView{
-		AdminPath:          s.settings.AdminPath,
-		AdminUser:          s.settings.AdminUser,
-		TurnstileSiteKey:   strings.TrimSpace(s.settings.TurnstileSiteKey),
-		TurnstileSecretKey: "",
-		AgentEndpoint:      strings.TrimSpace(s.settings.AgentEndpoint),
-		// 密钥不回传（与 TurnstileSecretKey 同策略）：admin UI 通过 *_set
-		// 布尔区分"已配置但隐藏"与"未配置"，保存时空值表示保留现值。
-		AgentToken:            "",
+		AdminPath:             s.settings.AdminPath,
+		AdminUser:             s.settings.AdminUser,
+		TurnstileSiteKey:      strings.TrimSpace(s.settings.TurnstileSiteKey),
+		TurnstileSecretKey:    "",
+		AgentEndpoint:         strings.TrimSpace(s.settings.AgentEndpoint),
+		AgentToken:            strings.TrimSpace(s.settings.AgentToken),
 		AgentTokenSet:         strings.TrimSpace(s.settings.AgentToken) != "",
 		AlertWebhook:          "",
 		AlertWebhookSet:       strings.TrimSpace(s.settings.AlertWebhook) != "",
@@ -4115,8 +3991,6 @@ func (s *Store) SettingsView() SettingsView {
 }
 
 func (s *Store) ExportConfig() ConfigTransferData {
-	// 单次持锁取 settings 与 profiles，避免导出"新 settings + 旧 profiles"
-	// 的混代快照。
 	s.mu.RLock()
 	view := redactSettingsViewForExport(s.settingsViewLocked())
 	profiles := configTransferProfilesFromNodeProfiles(s.profiles)
@@ -4140,7 +4014,6 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 	view.AdminAuth = redactAdminAuthSettings(view.AdminAuth)
 	view.AISettings = redactAISettingsForExport(view.AISettings)
 	view.Commit = ""
-	// set 布尔只服务于 admin 视图，导出文件保持最小信息量。
 	view.AgentTokenSet = false
 	view.AlertWebhookSet = false
 	view.AlertTelegramTokenSet = false
@@ -4246,17 +4119,16 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	testCatalog := cloneTestCatalogItems(view.TestCatalog)
 
 	update := SettingsUpdate{
-		AdminPath:           stringPointer(adminPath),
-		AdminUser:           stringPointer(adminUser),
-		TurnstileSiteKey:    stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
-		AgentEndpoint:       stringPointer(agentEndpoint),
-		SiteTitle:           stringPointer(siteTitle),
-		SiteIcon:            stringPointer(siteIcon),
-		SiteBackgroundImage: stringPointer(siteBackgroundImage),
-		HomeTitle:           stringPointer(homeTitle),
-		HomeSubtitle:        stringPointer(homeSubtitle),
-		Locale:              stringPointer(locale),
-		// 指针直传：nil（legacy 导出文件缺省）表示不触碰现值。
+		AdminPath:            stringPointer(adminPath),
+		AdminUser:            stringPointer(adminUser),
+		TurnstileSiteKey:     stringPointer(strings.TrimSpace(view.TurnstileSiteKey)),
+		AgentEndpoint:        stringPointer(agentEndpoint),
+		SiteTitle:            stringPointer(siteTitle),
+		SiteIcon:             stringPointer(siteIcon),
+		SiteBackgroundImage:  stringPointer(siteBackgroundImage),
+		HomeTitle:            stringPointer(homeTitle),
+		HomeSubtitle:         stringPointer(homeSubtitle),
+		Locale:               stringPointer(locale),
 		RegionGroupEnabled:   view.RegionGroupEnabled,
 		AlertWebhook:         stringPointer(alertWebhook),
 		AlertOfflineSec:      int64Pointer(view.AlertOfflineSec),
@@ -4298,13 +4170,7 @@ func (s *Store) SiteTitle() string {
 	return normalizeSiteTitle(s.settings.SiteTitle)
 }
 
-// UpdateSettings 应用设置增量：指针字段 nil=不变，非 nil=显式写入
-// （含清零）。bcrypt 等慢操作在全局锁外完成；成功路径由本方法在锁外
-// 触发 persist（导入暂存 Store 的 dataPath 为空时 persist 为 no-op，
-// 由 ImportConfig 统一落盘）。返回保存后的脱敏视图。
 func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
-	// bcrypt 校验/哈希单次约 60–100ms，必须在全局写锁外完成，
-	// 否则会阻塞所有 agent ingest 与快照广播。
 	var (
 		storedAdminPass  string
 		newAdminPassHash string
@@ -4367,7 +4233,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 	}
 	if update.AdminPass != nil {
-		// 锁外哈希期间密码可能已被并发修改：检测到即拒绝，避免覆盖。
 		if s.settings.AdminPass != storedAdminPass {
 			return fail(errors.New("admin_pass changed concurrently, please retry"))
 		}
@@ -4558,9 +4423,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 	}
 	if update.AISettings != nil {
-		// 先 merge 后 normalize（与导入路径同序）：normalize 会丢弃全空条目，
-		// 脱敏视图下"仅配了密钥"的兼容服务商若先 normalize 会在密钥恢复前
-		// 被连同密钥一起丢弃。merge 对空 key 保留现值。
 		merged := mergeRedactedAISettings(*update.AISettings, s.settings.AISettings)
 		normalized, err := normalizeAISettings(merged)
 		if err != nil {
@@ -4592,9 +4454,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.pruneProfileTestSelectionsLocked()
 	}
 	if update.Groups != nil || update.GroupTree != nil {
-		// 分组/标签被删除时，节点档案上的对应选择同步剔除——否则悬空
-		// 选择会把已删除的分组在展示页"复活"。置于全部校验之后：fail
-		// 回滚只恢复 settings，不能让 prune 的档案变异先于校验发生。
 		s.pruneProfileGroupSelectionsLocked()
 	}
 	view = s.settingsViewLocked()
@@ -4760,6 +4619,10 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if rawProfile != nil {
 			*profile = *rawProfile
 		}
+		if profile.HideFromDisplay && !profile.HideFromCR && !profile.HideFromAll {
+			profile.HideFromCR = true
+			profile.HideFromAll = true
+		}
 		profile.Alias = strings.TrimSpace(profile.Alias)
 		profile.Group = strings.TrimSpace(profile.Group)
 		profile.Tags = normalizeGroups(profile.Tags)
@@ -4767,15 +4630,12 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if len(profile.Groups) == 0 && (profile.Group != "" || len(profile.Tags) > 0) {
 			profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
 		}
-		// legacy Group/Tags 重建的选择同样可能指向已删除的分组/标签，
-		// 按当前 settings 分组集剔除（覆盖启动加载与导入两个入口）。
 		profile.Groups = filterGroupSelections(profile.Groups, groupNames, tagKeys, treeMode)
 		if len(profile.Groups) > 0 {
 			group, tags := primaryGroupTagsFromSelections(profile.Groups)
 			profile.Group = group
 			profile.Tags = tags
 		} else {
-			// 剔除清空时同步清 legacy 字段，避免悬空组名残留持久化数据。
 			profile.Group = ""
 			profile.Tags = nil
 		}
@@ -4850,8 +4710,6 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	}
 	s.mu.Lock()
 	expectedBootstrapToken := strings.TrimSpace(s.settings.AgentToken)
-	// register 是未认证端点，全局限流必须先于 token 比对，
-	// 否则攻击者可不限速地暴力猜测共享 bootstrap token。
 	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
 		s.mu.Unlock()
 		return "", agentRateLimitError()
@@ -4892,7 +4750,6 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	if strings.TrimSpace(profile.AgentAuthToken) == "" || s.isAgentAuthTokenDuplicateLocked(nodeID, profile.AgentAuthToken) {
 		token, err := s.generateAgentAuthTokenLocked()
 		if err != nil {
-			// 内部错误细节只留日志；err 无附加上下文，固定文案即可。
 			log.Printf("生成 Agent 凭据失败: %v", err)
 			rollbackProfile()
 			s.mu.Unlock()
@@ -4984,9 +4841,6 @@ func (s *Store) ensureServerIDLocked(nodeID string, profile *NodeProfile) (bool,
 	if profile == nil {
 		return false, nil
 	}
-	// 唯一性由生成路径（isServerIDUsedLocked）与导入规范化
-	// （ensureServerIDsForProfiles）保证；每个 ingest 都在全局写锁内
-	// 重新做 O(N) 全表扫描代价过高。
 	if strings.TrimSpace(profile.ServerID) == "" {
 		id, err := s.generateServerIDLocked()
 		if err != nil {
@@ -5066,11 +4920,6 @@ func containsKey(seen map[string]struct{}, key string) bool {
 	return ok
 }
 
-// UpdateProfile 应用节点档案增量（指针契约：nil=不变，非 nil 空串=
-// 清除；renew_interval_sec 例外，仅 >0 生效）。region 经别名映射归一
-// 为两位码，非法输入经 handler 400 拒绝、其它调用面静默归一为清除；
-// test_interval_sec 仅 >0 生效且 UI 未暴露（仅 API 可写）。第二个返
-// 回值 false 表示节点不存在。
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProfile, bool) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
@@ -5114,7 +4963,6 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		profile.Groups = normalizeGroupSelections(profile.Groups)
 	}
 	if update.Region != nil {
-		// handler 已前置校验；此处归一（别名映射/大写）兜底其它调用面。
 		profile.Region, _ = normalizeRegionCode(*update.Region)
 	}
 	if update.DiskType != nil {
@@ -5127,9 +4975,18 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		}
 		profile.NetSpeedMbps = value
 	}
-	if update.HideFromDisplay != nil {
-		profile.HideFromDisplay = *update.HideFromDisplay
+	if update.HideFromCR != nil || update.HideFromAll != nil {
+		if update.HideFromCR != nil {
+			profile.HideFromCR = *update.HideFromCR
+		}
+		if update.HideFromAll != nil {
+			profile.HideFromAll = *update.HideFromAll
+		}
+	} else if update.HideFromDisplay != nil {
+		profile.HideFromCR = *update.HideFromDisplay
+		profile.HideFromAll = *update.HideFromDisplay
 	}
+	profile.HideFromDisplay = profile.HideFromCR && profile.HideFromAll
 	if update.AutoRenew != nil {
 		profile.AutoRenew = *update.AutoRenew
 		if profile.AutoRenew && profile.ExpireAt > 0 && profile.RenewIntervalSec <= 0 {
@@ -5481,8 +5338,6 @@ func recoverLegacyHistoryAndPendingCleanup(
 		log.Printf("%v", wrapDataPathError("迁移探测历史失败", historyPath, err))
 	} else if migration.LegacyFound {
 		legacyMigrationComplete = false
-		// 备份已在 MigrateLegacyJSONIfNeeded 内部用已读字节完成（迁移成功
-		// 才写），此处只剩清理源文件与落迁移标记。
 		if migration.SourcePath == historyPath {
 			if err := os.Remove(historyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 				log.Printf("%v", wrapDataPathError("清理 legacy 探测历史失败", historyPath, err))
@@ -5647,7 +5502,6 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	return result, agentUpdateQueueQueued, nil
 }
 
-// applyAgentUpdateReportNodeLocked requires the caller to hold lockAgentNodeRead(nodeID).
 func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) (NodeProfile, bool) {
 	s.mu.Lock()
 	if _, nodeExists := s.nodes[nodeID]; !nodeExists {
@@ -5800,8 +5654,6 @@ func (s *Store) buildAgentConfigLocked(nodeID string, remoteUpdateCapable bool) 
 func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time, remoteUpdateCapable bool) AgentConfig {
 	profile := s.profiles[nodeID]
 	if profile == nil {
-		// Tests 保持 nil（序列化为 null）：表示"服务端未配置"，agent 端
-		// 保留 -net-tests / CM_NET_TESTS 本地种子，而不是被静默清空。
 		return AgentConfig{
 			TestIntervalSec: defaultTestIntervalSec,
 		}
@@ -5949,8 +5801,6 @@ func (s *Store) persist() {
 	}
 }
 
-// writePersistedSnapshotLocked expects persistMu to be held so queued snapshots
-// keep the same write order as the mutations that produced them.
 func (s *Store) writePersistedSnapshotLocked(data PersistedData) error {
 	if err := savePersistedData(s.dataPath, data); err != nil {
 		return wrapDataPathError("持久化失败", s.dataPath, err)
@@ -6123,8 +5973,6 @@ func (s *Store) pruneProfileTestSelectionsLocked() {
 	}
 }
 
-// pruneProfileGroupSelectionsLocked 剔除节点档案上指向已删除分组/标签
-// 的选择。要求持 s.mu 写锁；调用时机为 settings 中分组集合发生变化后。
 func (s *Store) pruneProfileGroupSelectionsLocked() {
 	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
 	for _, profile := range s.profiles {
@@ -6417,13 +6265,6 @@ var (
 	defaultCallbackDialer                    = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
 )
 
-// sharedWebhookClient 进程级复用连接池：webhook 目标固定且受 SSRF
-// 校验约束，逐次新建 Transport 白白放弃 keep-alive。
-//
-// webhook 通道直连-only（不继承 HTTPS_PROXY）：拨号侧 SSRF 校验针对
-// 直连目标设计，代理模式下拨号对象变成代理服务器、目标由代理侧解析，
-// 校验失效且本地代理会被私网拒绝。Telegram 端点固定无需该防护，可
-// 继承环境代理——两通道的代理语义差异是有意取舍。
 var sharedWebhookClient = sync.OnceValue(func() *http.Client {
 	return &http.Client{
 		Timeout: 6 * time.Second,
@@ -6438,10 +6279,6 @@ var sharedWebhookClient = sync.OnceValue(func() *http.Client {
 	}
 })
 
-// webhookRedirectPolicy：跟随语义保留（r50 逐跳 SSRF 校验设计）；Referer
-// 必须摘除——Go 在调用 CheckRedirect 前会把上一跳完整 URL 写入新请求的
-// Referer（net/http client.go 官方指定的覆盖位置就是回调内），而 webhook
-// secret 在 URL path 中，不摘除即随 Referer 泄漏给重定向目标。
 func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("webhook redirect limit exceeded")
@@ -6450,11 +6287,6 @@ func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return validateWebhookURL(req.URL.String())
 }
 
-// noRedirectHTTPClient 构造凭据类出站请求的 http.Client：3xx 一律原样
-// 返回调用方，防止 Authorization/Bearer、form body 中的 secret 或 URL
-// path 中的 token 被转发到重定向目标（默认策略下同 host 不同端口也会
-// 保留 Authorization，307/308 还会原样重放 body）。Telegram/OAuth/
-// Turnstile/AI 端点固定，正常路径不返回 3xx。
 func noRedirectHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
@@ -6566,7 +6398,6 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if update.Region != nil && strings.TrimSpace(*update.Region) != "" {
-		// 空串放行：与 alias/group 同契约，非 nil 空串 = 清除 region。
 		if _, ok := normalizeRegionCode(*update.Region); !ok {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "region 必须是两位地区代码（如 SG/JP/HK）"})
 			return
@@ -6580,8 +6411,6 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// adminNodeIDFromPath unescapes and normalizes the node ID carried in an
-// admin API path segment, writing the 400 response itself on failure.
 func adminNodeIDFromPath(w http.ResponseWriter, rawPath string) (string, bool) {
 	nodeID, err := url.PathUnescape(rawPath)
 	if err != nil {
@@ -6600,9 +6429,6 @@ func adminNodeIDFromPath(w http.ResponseWriter, rawPath string) (string, bool) {
 	return nodeID, true
 }
 
-// releaseCheckContext 限定 release 检查的执行时长：内层 GitHub API 调用
-// 30s、下载 30min，均远超管理端 10s WriteTimeout——统一压到 8s，
-// 慢网络下客户端只会看到连接被切断而不是长时间挂起。
 func releaseCheckContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 8*time.Second)
 }
@@ -6615,9 +6441,6 @@ type agentReleaseCacheEntry struct {
 	expiresAt time.Time
 }
 
-// defaultAgentReleaseChecker 按节点 agent 版本缓存检查结果：GitHub 匿名
-// API 配额 60 次/小时/IP，管理端多节点轮询很快打满，之后所有 release
-// 检查集体 502。失败结果同样缓存（保护配额优先于即时重试）。
 var agentReleaseCache = struct {
 	sync.Mutex
 	entries map[string]agentReleaseCacheEntry
@@ -6639,8 +6462,6 @@ func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (u
 			}
 		}
 		if len(agentReleaseCache.entries) > 32 {
-			// 60s 内出现 >32 个不同版本属异常输入，整体失效缓存即可，
-			// 不为排序驱逐维护额外状态。
 			agentReleaseCache.entries = map[string]agentReleaseCacheEntry{}
 		}
 	}
@@ -6649,8 +6470,6 @@ func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (u
 	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, version)
 	info, err := client.CheckLatest(ctx)
 
-	// ctx 取消/超时不缓存：不消耗 GitHub 配额，缓存它只会让一个断开的
-	// 管理端请求连坐同版本节点 60s。
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		agentReleaseCache.Lock()
 		agentReleaseCache.entries[version] = agentReleaseCacheEntry{info: info, err: err, expiresAt: now.Add(agentReleaseCacheTTL)}
@@ -6769,7 +6588,6 @@ func handleAdminPostAgentUpdate(
 	if queueStatus == agentUpdateQueueQueued {
 		status = "queued"
 	} else if pending := strings.TrimSpace(queuedProfile.AgentUpdateTargetVersion); pending != "" {
-		// 已有进行中的任务：回显其实际目标版本，而非刚查到的最新版。
 		targetVersion = pending
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{
@@ -6870,9 +6688,6 @@ func agentUpdateReportHTTPHandler(agentAPI *agentAPI) http.HandlerFunc {
 	}
 }
 
-// cleanAdminProfileText 收敛 admin 侧 profile 文本字段：去首尾空白并按
-// rune 截断（与 agent 侧上报字段的既定 cap 策略一致）。
-// regionAliases 把常见地区中英文名映射为两位码；键一律小写。
 var regionAliases = map[string]string{
 	"新加坡": "SG", "japan": "JP", "日本": "JP",
 	"香港": "HK", "中国香港": "HK", "hong kong": "HK", "hongkong": "HK",
@@ -6891,8 +6706,6 @@ var regionAliases = map[string]string{
 	"singapore": "SG",
 }
 
-// normalizeRegionCode 把用户输入归一为两位地区码（别名映射 + 大写）。
-// ok=false 表示输入既非别名也非两位码。
 func normalizeRegionCode(value string) (string, bool) {
 	key := strings.ToLower(strings.TrimSpace(value))
 	if key == "" {
@@ -6930,27 +6743,17 @@ func withNoStore(next http.Handler) http.Handler {
 	})
 }
 
-// isPublicReadMethod reports whether the request is a safe read (GET/HEAD)
-// for the public read-only endpoints; HEAD keeps uptime monitors happy and
-// the net/http server discards any body written for HEAD.
 func isPublicReadMethod(r *http.Request) bool {
 	return r != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead)
 }
 
 func applyPublicCORSHeaders(w http.ResponseWriter) {
-	// 公开只读数据（snapshot/health/公开历史）按设计就是免认证的，任意
-	// Origin 可读。Vary: Origin 防止共享缓存把响应误用于按 Origin 变化的
-	// 场景。该函数只允许用于公开端点，admin 端点绝不携带 CORS 头。
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Add("Vary", "Origin")
 }
 
-// withPublicCORS wraps a public read-only handler so the public dashboard can
-// be statically hosted on another origin (Cloudflare Pages 等). Preflight
-// OPTIONS is answered with 204. Do NOT wrap admin handlers — they must not
-// emit CORS headers.
 func withPublicCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {

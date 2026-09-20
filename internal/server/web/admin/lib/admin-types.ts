@@ -305,6 +305,8 @@ export interface NodeView {
   auto_renew?: boolean;
   renew_interval_sec?: number;
   hidden_from_display?: boolean;
+  hidden_from_cr?: boolean;
+  hidden_from_all?: boolean;
   test_interval_sec?: number;
   test_selections?: TestSelection[];
   agent_update_supported: boolean;
@@ -391,6 +393,8 @@ export interface NodeProfilePayload {
   groups?: string[];
   region?: string;
   hide_from_display?: boolean;
+  hide_from_cr?: boolean;
+  hide_from_all?: boolean;
   disk_type?: string;
   net_speed_mbps?: number;
   expire_at?: number;
