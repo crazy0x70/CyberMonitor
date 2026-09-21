@@ -217,12 +217,15 @@ export function normalizeSelectionValues(values: string[]) {
 }
 
 export function resolveNodeSelectionValues(
-  node: Pick<NodeView, "group" | "groups" | "tags" | "stats">,
+  node: Pick<NodeView, "group" | "groups" | "tags">,
 ) {
+  // r84：不再回退 node.stats.node_group（agent 上报组）——否则管理员清
+  // 空分组后重开表单会重新勾回（无法移除/强制一级的复活闭环）。node.group
+  // 保留：它是视图从选择/存量 legacy 解析出的组，用于旧数据迁移展示。
   return normalizeSelectionValues(
     Array.isArray(node.groups) && node.groups.length > 0
       ? node.groups
-      : buildSelectionValues(node.group || node.stats.node_group || "", node.tags || []),
+      : buildSelectionValues(node.group || "", node.tags || []),
   );
 }
 

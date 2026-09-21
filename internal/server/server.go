@@ -3207,7 +3207,7 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		Hostname:  nodeID,
 		Timestamp: profile.UpdatedAt,
 	}
-	group, tags := resolveProfileGroupTags(profile, stats)
+	group, tags := resolveProfileGroupTags(profile)
 	stats.NodeGroup = group
 	groups := normalizeGroupSelections(profile.Groups)
 	return NodeView{
@@ -3268,11 +3268,14 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
 	}
 	status := resolveNodeStatus(now, node)
-	group, tags := resolveProfileGroupTags(profile, node.Stats)
+	group, tags := resolveProfileGroupTags(profile)
 	groups := normalizeGroupSelections(profile.Groups)
 	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
 	stats := cloneNodeStats(node.Stats)
+	// 视图侧 stats.node_group 镜像选择解析出的组（而非 agent 原始上报），
+	// 清空后为空——否则 admin 表单/公开页的回退链会重新勾回。
+	stats.NodeGroup = group
 	if status == nodeStatusOffline {
 		stats.Network.TxBytesPerSec = 0
 		stats.Network.RxBytesPerSec = 0
@@ -3310,15 +3313,16 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 	}, true
 }
 
-func resolveProfileGroupTags(profile *NodeProfile, stats metrics.NodeStats) (string, []string) {
+func resolveProfileGroupTags(profile *NodeProfile) (string, []string) {
 	selections := normalizeGroupSelections(profile.Groups)
 	if len(selections) == 0 {
 		selections = selectionsFromGroupTags(profile.Group, profile.Tags)
 	}
+	// r84：不再从 stats.NodeGroup（agent 上报组）兑底回填——否则管理员
+	// 清空分组后视图 group 仍非空，admin 表单初始化回退链会把它重新勾
+	// 回（无法移除/强制一级的复活闭环）。agent 组名的唯一物化路径是
+	// updateNodeStats 的一次性播种（GroupSeeded，管理员所有权优先）。
 	group, tags := primaryGroupTagsFromSelections(selections)
-	if group == "" && stats.NodeGroup != "" {
-		group = strings.TrimSpace(stats.NodeGroup)
-	}
 	return group, tags
 }
 
