@@ -669,6 +669,8 @@ export default function ServerManagement({
   const [deleting, setDeleting] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [updateAllDialogOpen, setUpdateAllDialogOpen] = useState(false);
+  const [updatingAllAgents, setUpdatingAllAgents] = useState(false);
   const [refreshingAgentUpdate, setRefreshingAgentUpdate] = useState(false);
   const [agentUpdateInfo, setAgentUpdateInfo] = useState<AgentUpdateInfo | null>(null);
   const [updatingAgent, setUpdatingAgent] = useState(false);
@@ -885,7 +887,6 @@ export default function ServerManagement({
     [form?.testSelections, testCatalog],
   );
   const hasExpireAt = Boolean(form?.expireAt.trim());
-  const renewActive = Boolean(hasExpireAt && form?.renewPlan !== "none");
   const alertStatusLabel = form?.alertEnabled ? "已启用离线告警" : "已关闭离线告警";
   const editingAgentVersion = editingNode?.stats.agent_version?.trim() || "";
   const agentUpdateDisabledReason = !editingNode
@@ -967,6 +968,51 @@ export default function ServerManagement({
       successToast: "节点列表已刷新",
       setBusy: setRefreshing,
     });
+  };
+
+  // 批量下发：逐台调用既有单节点更新接口，各自计结果；等待注册的纯档案
+  // 节点无 Agent 可更新，跳过。已是最新/不支持的平台由接口返回或计入失败。
+  const handleTriggerAllAgentUpdates = async () => {
+    const targets = nodes.filter(
+      (node) => node.status !== "waiting_registration" && resolveNodeId(node),
+    );
+    if (targets.length === 0) {
+      toast.info("没有可下发更新的节点");
+      return;
+    }
+    if (updatingAllAgents) {
+      return;
+    }
+    setUpdatingAllAgents(true);
+    let dispatched = 0;
+    let upToDate = 0;
+    let failed = 0;
+    try {
+      for (const node of targets) {
+        try {
+          const result = await onTriggerAgentUpdate(resolveNodeId(node));
+          if (result.status === "up_to_date") {
+            upToDate += 1;
+          } else {
+            dispatched += 1;
+          }
+        } catch {
+          failed += 1;
+        }
+      }
+    } finally {
+      setUpdatingAllAgents(false);
+    }
+    const summary = [
+      dispatched ? `已下发 ${dispatched}` : "",
+      upToDate ? `已是最新 ${upToDate}` : "",
+      failed ? `失败 ${failed}` : "",
+    ]
+      .filter(Boolean)
+      .join("，");
+    if (summary) {
+      toast.success(`批量更新完成：${summary}`);
+    }
   };
 
   const handleToggleGroupSelection = (value: string) => {
@@ -1178,6 +1224,51 @@ export default function ServerManagement({
             )}
             刷新节点
           </Button>
+          <AlertDialog
+            open={updateAllDialogOpen}
+            onOpenChange={(open) => {
+              if (updatingAllAgents && !open) {
+                return;
+              }
+              setUpdateAllDialogOpen(open);
+            }}
+          >
+            <AlertDialogTrigger
+              render={(
+                <Button
+                  type="button"
+                  variant="outline"
+                  className={outlineActionClass}
+                  disabled={updatingAllAgents || loading || nodes.length === 0}
+                >
+                  {updatingAllAgents ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-2 h-4 w-4" />
+                  )}
+                  全部更新
+                </Button>
+              )}
+            />
+            <AlertDialogContent className={adminDialogContentClass}>
+              <AlertDialogHeader className={adminDialogHeaderClass}>
+                <AlertDialogTitle>
+                  确认对全部 {nodes.length} 台节点下发 Agent 更新？
+                </AlertDialogTitle>
+              </AlertDialogHeader>
+              <AlertDialogFooter className={adminDialogFooterClass}>
+                <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  className={adminPrimaryButtonClass}
+                  disabled={updatingAllAgents}
+                  onClick={handleTriggerAllAgentUpdates}
+                >
+                  {updatingAllAgents ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  确认下发
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </section>
 

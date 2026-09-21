@@ -280,13 +280,18 @@ type NodeState struct {
 }
 
 type NodeProfile struct {
-	ServerID                 string                  `json:"server_id,omitempty"`
-	AgentAuthToken           string                  `json:"agent_auth_token,omitempty"`
-	AlertEnabled             *bool                   `json:"alert_enabled,omitempty"`
-	Alias                    string                  `json:"alias,omitempty"`
-	Group                    string                  `json:"group,omitempty"`
-	Tags                     []string                `json:"tags,omitempty"`
-	Groups                   []string                `json:"groups,omitempty"`
+	ServerID       string   `json:"server_id,omitempty"`
+	AgentAuthToken string   `json:"agent_auth_token,omitempty"`
+	AlertEnabled   *bool    `json:"alert_enabled,omitempty"`
+	Alias          string   `json:"alias,omitempty"`
+	Group          string   `json:"group,omitempty"`
+	Tags           []string `json:"tags,omitempty"`
+	Groups         []string `json:"groups,omitempty"`
+	// GroupSeeded：分组自动播种（agent 上报 NodeGroup → 选择）已消费过一次。
+	// 置位后 reconcile 不再从 agent 上报重建选择——管理员清空分组是最终
+	// 裁决，不再被每 tick 复活（r82 用户报障）；管理员编辑分组字段时同样
+	// 置位（所有权断言）。旧持久化文件缺字段按 false 加载，最多再播种一次。
+	GroupSeeded              bool                    `json:"group_seeded,omitempty"`
 	Region                   string                  `json:"region,omitempty"`
 	HideFromCR               bool                    `json:"hide_from_cr,omitempty"`
 	HideFromAll              bool                    `json:"hide_from_all,omitempty"`
@@ -1872,10 +1877,9 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 			persist = true
 		}
 	}
-	if storedStats.NodeGroup != "" {
+	if storedStats.NodeGroup != "" && !profile.GroupSeeded {
 		if profile.Group == "" {
 			profile.Group = storedStats.NodeGroup
-			persist = true
 		}
 		if len(profile.Groups) == 0 {
 			profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(storedStats.NodeGroup, nil))
@@ -1884,8 +1888,11 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 				profile.Group = group
 			}
 			profile.Tags = tags
-			persist = true
 		}
+		// 一次性消费：无论本轮是否实际播种（选择非空时跳过），都不再从
+		// agent 上报重建——否则管理员清空分组后每 tick 复活（r82 报障③）。
+		profile.GroupSeeded = true
+		persist = true
 	}
 	if s.applyAutoRenewLocked(profile, now) {
 		persist = true
@@ -4981,6 +4988,10 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		profile.Groups = selectionsFromGroupTags(profile.Group, profile.Tags)
 	} else if update.Groups == nil && len(profile.Groups) > 0 {
 		profile.Groups = normalizeGroupSelections(profile.Groups)
+	}
+	if update.Group != nil || update.Tags != nil || update.Groups != nil {
+		// 管理员显式编辑分组字段：断言所有权，后续不再自动播种。
+		profile.GroupSeeded = true
 	}
 	if update.Region != nil {
 		profile.Region, _ = normalizeRegionCode(*update.Region)
