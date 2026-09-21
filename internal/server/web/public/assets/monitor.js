@@ -1023,7 +1023,9 @@ function render() {
   renderGroupTabs(groups);
   const groupNodes = filterNodesByGroup(state.lastNodes, state.selectedGroup);
   const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
-  updateStats(groupNodes);
+  // 统计卡取全快照口径：仅剩自建分组的双隐藏节点也计入总数/在线/离线
+  //（当前 tab 的可见性过滤不影响总量，三个计数同源保持自洽）。
+  updateStats(state.lastNodes);
   updateEmptyState(visibleNodes.length, groupNodes.length);
   const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
   if (state.renderMode !== mode) {
@@ -3297,8 +3299,18 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
   const flatValues = paddedSeries
     .flatMap((series) => series)
     .filter((value) => value !== null && value !== undefined && Number.isFinite(value));
-  const rawMax = flatValues.length ? Math.max(...flatValues) : 1;
-  const paddedMax = rawMax * 1.1;
+  // 尖峰抑制：Y 轴按 P95 定标（留 25% 顶部余量），偶发高延迟点在顶部
+  // 截断绘制（悬停 tooltip 仍展示真实值）；点数稀少时 P95≈max，退化
+  // 为旧的全量定标行为。持续高位（>5% 点都高）时轴自然放大。
+  const sortedValues = [...flatValues].sort((a, b) => a - b);
+  const percentile = (q) =>
+    sortedValues.length
+      ? sortedValues[
+          Math.min(sortedValues.length - 1, Math.floor(sortedValues.length * q))
+        ]
+      : 1;
+  const axisBase = Math.max(percentile(0.95), 1);
+  const paddedMax = axisBase * 1.25;
   const stepValue = niceStep(paddedMax / 4 || 1);
   const maxValue = Math.max(stepValue * 4, paddedMax, 1);
 
@@ -3327,8 +3339,15 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
 
   const lines = paddedSeries
     .map((series, idx) => {
+      // 超出 Y 轴上限的尖峰钳到顶部绘制，避免拉高整张图；tooltip 与
+      // 悬停取值用 meta 中的原始序列，不受钳制影响。
+      const clampedSeries = series.map((value) =>
+        value === null || value === undefined || !Number.isFinite(value)
+          ? value
+          : Math.min(value, maxValue)
+      );
       const path = buildLinePath(
-        series,
+        clampedSeries,
         stepX,
         padding,
         plotWidth,

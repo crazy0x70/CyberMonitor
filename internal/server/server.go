@@ -3062,7 +3062,9 @@ func (s *Store) HasNode(nodeID string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if profile := s.profiles[nodeID]; profile != nil && profile.HideFromCR && profile.HideFromAll {
+	if profile := s.profiles[nodeID]; profile != nil &&
+		!s.nodePublicVisibleLocked(profile.HideFromDisplay, profile.HideFromCR, profile.HideFromAll,
+			normalizeGroupSelections(profile.Groups)) {
 		return false
 	}
 	_, exists := s.nodes[nodeID]
@@ -3086,14 +3088,32 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 
 func (s *Store) Snapshot() []NodeView {
 	all := s.snapshot(false)
+	s.mu.RLock()
 	visible := all[:0]
 	for _, view := range all {
-		if view.HiddenFromCR && view.HiddenFromAll {
+		if !s.nodePublicVisibleLocked(view.HiddenFromDisplay, view.HiddenFromCR, view.HiddenFromAll, view.Groups) {
 			continue
 		}
 		visible = append(visible, view)
 	}
+	s.mu.RUnlock()
 	return visible
+}
+
+// nodePublicVisibleLocked 判定节点在公开页的可见性，调用方须持 s.mu（读或写）。
+// HideFromDisplay=完全隐藏；仅双开关（CR∧All）隐藏时，若节点仍挂着
+// 任一有效自建分组（选择 ∈ settings 分组集合，与展示页分组 tab 归属
+// 同口径）则保留——它在分组视图可见且计入总数，ALL/C&R 视图由前端
+// hidden_from_* 过滤剔除。悬空选择不算（与 collectGroupNames 一致）。
+func (s *Store) nodePublicVisibleLocked(hideDisplay, hideCR, hideAll bool, groups []string) bool {
+	if hideDisplay {
+		return false
+	}
+	if !hideCR || !hideAll {
+		return true
+	}
+	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
+	return len(filterGroupSelections(groups, groupNames, tagKeys, treeMode)) > 0
 }
 
 func (s *Store) AdminSnapshot() []NodeView {
@@ -3216,7 +3236,7 @@ func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
 
 	now := time.Now()
 	node, ok := s.nodeViewLocked(nodeID, now)
-	if !ok || (node.HiddenFromCR && node.HiddenFromAll) {
+	if !ok || !s.nodePublicVisibleLocked(node.HiddenFromDisplay, node.HiddenFromCR, node.HiddenFromAll, node.Groups) {
 		return NodeDelta{}, false
 	}
 	return NodeDelta{
