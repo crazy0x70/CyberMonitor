@@ -564,7 +564,11 @@ export default function GroupManagement({
     }
 
     const nextTree = normalizeGroupTree(draftTree);
-    if (nextTree.length === 0) {
+    // 空树合法（用户删光全部分组：保存后服务端级联清空节点选择）；
+    // 仅当草稿非空但规范化后为空（全部条目无效/重名/保留名）时报错，
+    // 不再静默丢弃——否则最后一个分组永远删不掉，节点侧选择悬空。
+    if (nextTree.length === 0 && draftTree.length > 0) {
+      toast.error("分组条目无效：请检查空白、重名或保留名（如“全部”）。");
       return;
     }
 
