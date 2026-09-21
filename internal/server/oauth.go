@@ -70,14 +70,14 @@ func mergeAdminAuthSettings(existing, fallback AdminAuthSettings) AdminAuthSetti
 }
 
 func cloneAdminAuthSettings(settings AdminAuthSettings) AdminAuthSettings {
-	settings.GitHub.Scopes = cloneStringSlice(settings.GitHub.Scopes)
-	settings.GitHub.AllowedLogins = cloneStringSlice(settings.GitHub.AllowedLogins)
-	settings.GitHub.AllowedEmails = cloneStringSlice(settings.GitHub.AllowedEmails)
-	settings.GitHub.AllowedEmailDomains = cloneStringSlice(settings.GitHub.AllowedEmailDomains)
-	settings.OIDC.Scopes = cloneStringSlice(settings.OIDC.Scopes)
-	settings.OIDC.AllowedSubjects = cloneStringSlice(settings.OIDC.AllowedSubjects)
-	settings.OIDC.AllowedEmails = cloneStringSlice(settings.OIDC.AllowedEmails)
-	settings.OIDC.AllowedEmailDomains = cloneStringSlice(settings.OIDC.AllowedEmailDomains)
+	settings.GitHub.Scopes = slices.Clone(settings.GitHub.Scopes)
+	settings.GitHub.AllowedLogins = slices.Clone(settings.GitHub.AllowedLogins)
+	settings.GitHub.AllowedEmails = slices.Clone(settings.GitHub.AllowedEmails)
+	settings.GitHub.AllowedEmailDomains = slices.Clone(settings.GitHub.AllowedEmailDomains)
+	settings.OIDC.Scopes = slices.Clone(settings.OIDC.Scopes)
+	settings.OIDC.AllowedSubjects = slices.Clone(settings.OIDC.AllowedSubjects)
+	settings.OIDC.AllowedEmails = slices.Clone(settings.OIDC.AllowedEmails)
+	settings.OIDC.AllowedEmailDomains = slices.Clone(settings.OIDC.AllowedEmailDomains)
 	return settings
 }
 

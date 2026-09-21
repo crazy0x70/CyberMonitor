@@ -266,6 +266,9 @@ type Store struct {
 	configRefresh      map[string]struct{}
 	agentIngestRate    map[string]agentRateWindow
 	agentRegisterRate  map[string]agentRateWindow
+	// nodeID → 上次广播的 node delta 内容摘要（已中和每报必变字段），
+	// 用于 ingest 增量去重；受 s.mu 保护，节点删除时同步清理。
+	deltaDigests map[string]uint64
 }
 
 type nodeMutationLock struct {
@@ -582,6 +585,7 @@ func Run(ctx context.Context, cfg Config) error {
 		configRefresh:     make(map[string]struct{}),
 		agentIngestRate:   make(map[string]agentRateWindow),
 		agentRegisterRate: make(map[string]agentRateWindow),
+		deltaDigests:      make(map[string]uint64),
 	}
 	if _, err := recoverLegacyHistoryAndPendingCleanup(dataPath, historyPath, historyManager, persistedSnapshot); err != nil {
 		return wrapDataPathError("恢复历史清理任务失败", dataPath, err)
@@ -1514,30 +1518,23 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 					lastRateSweep = now
 				}
 				if hub.HasVariant(adminVariant) {
-					adminSnap := adminStoreSnapshot(store)
-					adminDigest := digestPublicSnapshot(adminSnap)
-					if adminDigest != lastAdminDigest {
-						payload, err := json.Marshal(adminSnap)
-						if err != nil {
-							log.Printf("序列化管理端节点快照失败: %v", err)
-						} else {
-							hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
-							lastAdminDigest = adminDigest
-						}
+					// 每变体只编码一次：digest 直接取自 payload 字节，
+					// 变化时复用同一份 payload 广播（原先编码两次）。
+					payload, err := json.Marshal(adminStoreSnapshot(store))
+					if err != nil {
+						log.Printf("序列化管理端节点快照失败: %v", err)
+					} else if digest := snapshotPayloadDigest(payload); digest != lastAdminDigest {
+						hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
+						lastAdminDigest = digest
 					}
 				}
-				hasBalanced := hub.HasVariant(publicVariantBalanced)
-				if hasBalanced {
-					snapshot := storeSnapshot(store)
-					digest := digestPublicSnapshot(snapshot)
-					if digest != lastBalancedDigest {
-						payload, err := json.Marshal(snapshot)
-						if err != nil {
-							log.Printf("序列化节点快照失败: %v", err)
-						} else {
-							hub.BroadcastVariant(payload, publicVariantBalanced)
-							lastBalancedDigest = digest
-						}
+				if hub.HasVariant(publicVariantBalanced) {
+					payload, err := json.Marshal(storeSnapshot(store))
+					if err != nil {
+						log.Printf("序列化节点快照失败: %v", err)
+					} else if digest := snapshotPayloadDigest(payload); digest != lastBalancedDigest {
+						hub.BroadcastVariant(payload, publicVariantBalanced)
+						lastBalancedDigest = digest
 					}
 				}
 				if store.reconcileProfiles(now) {
@@ -1559,7 +1556,7 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 						}
 						if len(offlineEvents) > 0 {
 							feishuOwed, telegramOwed := splitOwedChannels(offlineEvents)
-							feishuOK := sendFeishuAlert(targets.FeishuWebhook, targets.SiteTitle, feishuOwed)
+							feishuOK := sendFeishuEventNotice(targets.FeishuWebhook, targets.SiteTitle, feishuOwed, buildAlertMessage, "告警")
 							telegramOK := sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
 							if !feishuOK || !telegramOK {
 								store.RecordAlertDelivery(offlineEvents, feishuOK, telegramOK, true)
@@ -1567,7 +1564,7 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 						}
 						if len(recoveredEvents) > 0 {
 							feishuOwed, telegramOwed := splitOwedChannels(recoveredEvents)
-							feishuOK := sendFeishuRecovery(targets.FeishuWebhook, targets.SiteTitle, feishuOwed)
+							feishuOK := sendFeishuEventNotice(targets.FeishuWebhook, targets.SiteTitle, feishuOwed, buildRecoveryMessage, "恢复通知")
 							telegramOK := sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
 							if !feishuOK || !telegramOK {
 								store.RecordAlertDelivery(recoveredEvents, feishuOK, telegramOK, false)
@@ -1810,28 +1807,18 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 
 	s.mu.Lock()
 
-	prev, hadNode := s.nodes[stats.NodeID]
-	previousProfile, hadProfile := s.profiles[stats.NodeID]
-	var previousProfileSnapshot NodeProfile
-	if previousProfile != nil {
-		previousProfileSnapshot = cloneNodeProfileValue(previousProfile)
-	}
-	rollbackNodeProfile := func() {
-		if hadNode {
-			s.nodes[stats.NodeID] = prev
-		} else {
-			delete(s.nodes, stats.NodeID)
+	prev := s.nodes[stats.NodeID]
+	// ServerID 分配（randomToken 失败）是唯一的错误路径：提前到任何状态
+	// 变更之前，失败直接返回，无需回滚快照。生成只读 s.profiles，判定与
+	// 原 ensureServerIDLocked 一致（profile 缺失或 ServerID 为空才生成）。
+	var newServerID string
+	if profile := s.profiles[stats.NodeID]; profile == nil || strings.TrimSpace(profile.ServerID) == "" {
+		id, err := s.generateServerIDLocked()
+		if err != nil {
+			s.mu.Unlock()
+			return false, nil, err
 		}
-		if !hadProfile {
-			delete(s.profiles, stats.NodeID)
-			return
-		}
-		if previousProfile == nil {
-			s.profiles[stats.NodeID] = nil
-			return
-		}
-		restoredProfile := previousProfileSnapshot
-		s.profiles[stats.NodeID] = &restoredProfile
+		newServerID = id
 	}
 	firstSeen := prev.FirstSeen
 	if firstSeen.IsZero() {
@@ -1839,11 +1826,14 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	}
 	acceptStats := shouldReplaceNodeStats(prev.Stats, stats)
 	mergedStats := mergeNodeStatsStaticInfo(prev.Stats, stats)
-	storedStats := cloneNodeStats(mergedStats)
-	if !acceptStats {
+	var storedStats metrics.NodeStats
+	if acceptStats {
+		storedStats = cloneNodeStats(mergedStats)
+		if !mergedStats.NetworkTestsChanged && len(mergedStats.NetworkTests) == 0 && len(prev.Stats.NetworkTests) > 0 {
+			storedStats.NetworkTests = cloneNetworkTestResults(prev.Stats.NetworkTests)
+		}
+	} else {
 		storedStats = cloneNodeStats(prev.Stats)
-	} else if !mergedStats.NetworkTestsChanged && len(mergedStats.NetworkTests) == 0 && len(prev.Stats.NetworkTests) > 0 {
-		storedStats.NetworkTests = cloneNetworkTestResults(prev.Stats.NetworkTests)
 	}
 	s.nodes[stats.NodeID] = NodeState{
 		Stats:     storedStats,
@@ -1852,13 +1842,8 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	}
 
 	profile := s.ensureProfileLocked(stats.NodeID)
-	serverIDChanged, err := s.ensureServerIDLocked(stats.NodeID, profile)
-	if err != nil {
-		rollbackNodeProfile()
-		s.mu.Unlock()
-		return false, nil, err
-	}
-	if serverIDChanged {
+	if newServerID != "" {
+		profile.ServerID = newServerID
 		persist = true
 	}
 	if profile.TestIntervalSec == 0 {
@@ -1878,21 +1863,28 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 		}
 	}
 	if storedStats.NodeGroup != "" && !profile.GroupSeeded {
-		if profile.Group == "" {
-			profile.Group = storedStats.NodeGroup
-		}
-		if len(profile.Groups) == 0 {
-			profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(storedStats.NodeGroup, nil))
-			group, tags := primaryGroupTagsFromSelections(profile.Groups)
-			if group != "" {
-				profile.Group = group
+		// r85：只播种当前分组树里真实存在的组——agent 配置常残留已删除
+		// 的旧组名，升级后旧数据无播种标记，首次上报会把悬空选择写回
+		//（启动自愈刚清掉又被复活），双隐藏节点因此永久隐藏。未知组
+		// 不消耗播种机会：管理员建同名组后仍可自动物化。
+		groupNames, _, _ := groupSelectionSets(s.settings)
+		if _, known := groupNames[normalizeGroupName(strings.TrimSpace(storedStats.NodeGroup))]; known {
+			if profile.Group == "" {
+				profile.Group = storedStats.NodeGroup
 			}
-			profile.Tags = tags
+			if len(profile.Groups) == 0 {
+				profile.Groups = normalizeGroupSelections(selectionsFromGroupTags(storedStats.NodeGroup, nil))
+				group, tags := primaryGroupTagsFromSelections(profile.Groups)
+				if group != "" {
+					profile.Group = group
+				}
+				profile.Tags = tags
+			}
+			// 一次性消费：此后不再从 agent 上报重建（管理员所有权优先，
+			// r82 报障③）。
+			profile.GroupSeeded = true
+			persist = true
 		}
-		// 一次性消费：无论本轮是否实际播种（选择非空时跳过），都不再从
-		// agent 上报重建——否则管理员清空分组后每 tick 复活（r82 报障③）。
-		profile.GroupSeeded = true
-		persist = true
 	}
 	if s.applyAutoRenewLocked(profile, now) {
 		persist = true
@@ -1964,7 +1956,7 @@ func mergeGPUStaticInfo(current, incoming []metrics.GPUInfo, collected bool) []m
 		if collected {
 			return nil
 		}
-		return cloneGPUInfos(current)
+		return slices.Clone(current)
 	}
 	byID := make(map[string]metrics.GPUInfo, len(current))
 	byIndex := make(map[int]metrics.GPUInfo, len(current))
@@ -2387,23 +2379,12 @@ func resolveAlertDisplay(profile *NodeProfile, stats metrics.NodeStats, nodeID s
 	return display
 }
 
-func sendFeishuAlert(webhook, siteTitle string, events []AlertEvent) bool {
+func sendFeishuEventNotice(webhook, siteTitle string, events []AlertEvent, build func(string, []AlertEvent) string, label string) bool {
 	if webhook == "" || len(events) == 0 {
 		return true
 	}
-	if err := sendFeishuText(webhook, buildAlertMessage(siteTitle, events)); err != nil {
-		log.Printf("告警发送失败: %v", err)
-		return false
-	}
-	return true
-}
-
-func sendFeishuRecovery(webhook, siteTitle string, events []AlertEvent) bool {
-	if webhook == "" || len(events) == 0 {
-		return true
-	}
-	if err := sendFeishuText(webhook, buildRecoveryMessage(siteTitle, events)); err != nil {
-		log.Printf("恢复通知发送失败: %v", err)
+	if err := sendFeishuText(webhook, build(siteTitle, events)); err != nil {
+		log.Printf("%s发送失败: %v", label, err)
 		return false
 	}
 	return true
@@ -2460,8 +2441,8 @@ func sendFeishuText(webhook, text string) error {
 	return nil
 }
 
-func buildAlertMessage(siteTitle string, events []AlertEvent) string {
-	lines := []string{fmt.Sprintf("【%s】服务器离线告警", normalizeSiteTitle(siteTitle)), "", "离线节点："}
+func buildEventMessage(siteTitle, title, lead, footer string, events []AlertEvent) string {
+	lines := []string{fmt.Sprintf("【%s】%s", normalizeSiteTitle(siteTitle), title), "", lead}
 	for _, event := range events {
 		label := formatAlertValue(event.Display, "未命名节点")
 		detail := ""
@@ -2470,22 +2451,16 @@ func buildAlertMessage(siteTitle string, events []AlertEvent) string {
 		}
 		lines = append(lines, fmt.Sprintf("• %s%s", label, detail))
 	}
-	lines = append(lines, "", "请及时检查服务器状态。")
+	lines = append(lines, "", footer)
 	return strings.Join(lines, "\n")
 }
 
+func buildAlertMessage(siteTitle string, events []AlertEvent) string {
+	return buildEventMessage(siteTitle, "服务器离线告警", "离线节点：", "请及时检查服务器状态。", events)
+}
+
 func buildRecoveryMessage(siteTitle string, events []AlertEvent) string {
-	lines := []string{fmt.Sprintf("【%s】服务器恢复在线", normalizeSiteTitle(siteTitle)), "", "已恢复节点："}
-	for _, event := range events {
-		label := formatAlertValue(event.Display, "未命名节点")
-		detail := ""
-		if event.OfflineSec > 0 {
-			detail = fmt.Sprintf("（离线 %s）", formatAlertDuration(event.OfflineSec))
-		}
-		lines = append(lines, fmt.Sprintf("• %s%s", label, detail))
-	}
-	lines = append(lines, "", "服务已恢复。")
-	return strings.Join(lines, "\n")
+	return buildEventMessage(siteTitle, "服务器恢复在线", "已恢复节点：", "服务已恢复。", events)
 }
 
 func logReportEvents(siteTitle string, offlineEvents, recoveredEvents []AlertEvent) {
@@ -2565,42 +2540,6 @@ func int64Pointer(value int64) *int64 {
 	return &value
 }
 
-func cloneStringSlice(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]string, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
-func cloneInt64Slice(values []int64) []int64 {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]int64, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
-func cloneDiskPartitions(values []metrics.DiskPartition) []metrics.DiskPartition {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]metrics.DiskPartition, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
-func cloneGPUInfos(values []metrics.GPUInfo) []metrics.GPUInfo {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]metrics.GPUInfo, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
 func cloneNetworkTestResults(values []metrics.NetworkTestResult) []metrics.NetworkTestResult {
 	if len(values) == 0 {
 		return nil
@@ -2617,8 +2556,8 @@ func cloneNetworkTestResults(values []metrics.NetworkTestResult) []metrics.Netwo
 }
 
 func cloneNodeStats(stats metrics.NodeStats) metrics.NodeStats {
-	stats.Disk = cloneDiskPartitions(stats.Disk)
-	stats.GPU = cloneGPUInfos(stats.GPU)
+	stats.Disk = slices.Clone(stats.Disk)
+	stats.GPU = slices.Clone(stats.GPU)
 	stats.NetworkTests = cloneNetworkTestResults(stats.NetworkTests)
 	return stats
 }
@@ -2639,33 +2578,6 @@ func cloneNodeStates(values map[string]NodeState) map[string]NodeState {
 	return cloned
 }
 
-func cloneNetworkTestConfigs(values []metrics.NetworkTestConfig) []metrics.NetworkTestConfig {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]metrics.NetworkTestConfig, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
-func cloneTestSelections(values []TestSelection) []TestSelection {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]TestSelection, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
-func cloneTestCatalogItems(values []TestCatalogItem) []TestCatalogItem {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]TestCatalogItem, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
 func cloneGroupNodes(values []GroupNode) []GroupNode {
 	if len(values) == 0 {
 		return nil
@@ -2680,27 +2592,18 @@ func cloneGroupNodes(values []GroupNode) []GroupNode {
 	return cloned
 }
 
-func cloneAICompatibles(values []AIProviderProfile) []AIProviderProfile {
-	if len(values) == 0 {
-		return nil
-	}
-	cloned := make([]AIProviderProfile, len(values))
-	copy(cloned, values)
-	return cloned
-}
-
 func cloneAISettings(settings AISettings) AISettings {
-	settings.OpenAICompatibles = cloneAICompatibles(settings.OpenAICompatibles)
+	settings.OpenAICompatibles = slices.Clone(settings.OpenAICompatibles)
 	return settings
 }
 
 func cloneSettings(settings Settings) Settings {
-	settings.AlertTelegramUserIDs = cloneInt64Slice(settings.AlertTelegramUserIDs)
+	settings.AlertTelegramUserIDs = slices.Clone(settings.AlertTelegramUserIDs)
 	settings.AdminAuth = cloneAdminAuthSettings(settings.AdminAuth)
 	settings.AISettings = cloneAISettings(settings.AISettings)
-	settings.Groups = cloneStringSlice(settings.Groups)
+	settings.Groups = slices.Clone(settings.Groups)
 	settings.GroupTree = cloneGroupNodes(settings.GroupTree)
-	settings.TestCatalog = cloneTestCatalogItems(settings.TestCatalog)
+	settings.TestCatalog = slices.Clone(settings.TestCatalog)
 	return settings
 }
 
@@ -2891,14 +2794,6 @@ func normalizeTelegramUserIDs(ids []int64) []int64 {
 	return normalized
 }
 
-func firstTelegramUserID(ids []int64) int64 {
-	normalized := normalizeTelegramUserIDs(ids)
-	if len(normalized) == 0 {
-		return 0
-	}
-	return normalized[0]
-}
-
 func normalizeSiteTitle(title string) string {
 	value := strings.TrimSpace(title)
 	if value == "" {
@@ -2981,21 +2876,22 @@ func broadcastStoreSnapshot(hub *Hub, store *Store) {
 	hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
 }
 
-func digestPublicSnapshot(snapshot Snapshot) string {
-	hash := fnv.New64a()
-	encoder := json.NewEncoder(hash)
-	_ = encoder.Encode(struct {
-		Type     string         `json:"type"`
-		Nodes    []NodeView     `json:"nodes"`
-		Groups   []string       `json:"groups,omitempty"`
-		Settings PublicSettings `json:"settings,omitempty"`
-	}{
-		Type:     snapshot.Type,
-		Nodes:    snapshot.Nodes,
-		Groups:   snapshot.Groups,
-		Settings: snapshot.Settings,
-	})
-	return fmt.Sprintf("%x", hash.Sum(nil))
+// snapshotPayloadDigest 对已序列化的快照 payload 计算 FNV-1a 摘要，跳过
+// 每秒必变的 generated_at 数值段，保持"内容未变不广播"的门控语义。
+// 依赖 Snapshot 的字段顺序（type, generated_at, nodes…）；结构变化时
+// 退化为全量摘要——只多广播，不影响正确性。
+func snapshotPayloadDigest(payload []byte) string {
+	const prefix = `{"type":"snapshot","generated_at":`
+	digest := fnv.New64a()
+	if rest, ok := bytes.CutPrefix(payload, []byte(prefix)); ok {
+		if comma := bytes.IndexByte(rest, ','); comma >= 0 {
+			digest.Write([]byte(prefix))
+			digest.Write(rest[comma:])
+			return fmt.Sprintf("%x", digest.Sum(nil))
+		}
+	}
+	digest.Write(payload)
+	return fmt.Sprintf("%x", digest.Sum(nil))
 }
 
 func normalizeHistoryEntry(entry *TestHistoryEntry) {
@@ -3028,17 +2924,6 @@ func normalizeHistoryEntry(entry *TestHistoryEntry) {
 	}
 	for len(entry.Loss) < count {
 		entry.Loss = append(entry.Loss, nil)
-	}
-}
-
-func cloneTestHistoryEntry(entry *TestHistoryEntry) *TestHistoryEntry {
-	return &TestHistoryEntry{
-		Latency:        slices.Clone(entry.Latency),
-		Loss:           slices.Clone(entry.Loss),
-		Times:          slices.Clone(entry.Times),
-		LastAt:         entry.LastAt,
-		MinIntervalSec: entry.MinIntervalSec,
-		AvgIntervalSec: entry.AvgIntervalSec,
 	}
 }
 
@@ -3094,16 +2979,19 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 }
 
 func (s *Store) Snapshot() []NodeView {
-	all := s.snapshot(false)
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// 分组集合在过滤前算一次，逐节点复用（原先每节点重建两份 map）。
+	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
+	all := s.snapshotLocked(false)
 	visible := all[:0]
 	for _, view := range all {
-		if !s.nodePublicVisibleLocked(view.HiddenFromDisplay, view.HiddenFromCR, view.HiddenFromAll, view.Groups) {
+		if !nodePublicVisibleSetsLocked(groupNames, tagKeys, treeMode,
+			view.HiddenFromDisplay, view.HiddenFromCR, view.HiddenFromAll, view.Groups) {
 			continue
 		}
 		visible = append(visible, view)
 	}
-	s.mu.RUnlock()
 	return visible
 }
 
@@ -3113,23 +3001,30 @@ func (s *Store) Snapshot() []NodeView {
 // 同口径）则保留——它在分组视图可见且计入总数，ALL/C&R 视图由前端
 // hidden_from_* 过滤剔除。悬空选择不算（与 collectGroupNames 一致）。
 func (s *Store) nodePublicVisibleLocked(hideDisplay, hideCR, hideAll bool, groups []string) bool {
+	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
+	return nodePublicVisibleSetsLocked(groupNames, tagKeys, treeMode, hideDisplay, hideCR, hideAll, groups)
+}
+
+// nodePublicVisibleSetsLocked 是 nodePublicVisibleLocked 的预计算版本：
+// 分组集合由调用方一次算好后传入，避免快照逐节点重建。调用方须持 s.mu。
+func nodePublicVisibleSetsLocked(groupNames, tagKeys map[string]struct{}, treeMode, hideDisplay, hideCR, hideAll bool, groups []string) bool {
 	if hideDisplay {
 		return false
 	}
 	if !hideCR || !hideAll {
 		return true
 	}
-	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
 	return len(filterGroupSelections(groups, groupNames, tagKeys, treeMode)) > 0
 }
 
 func (s *Store) AdminSnapshot() []NodeView {
-	return s.snapshot(true)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.snapshotLocked(true)
 }
 
-func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
-	s.mu.RLock()
-
+// snapshotLocked 要求调用方已持 s.mu 读锁。
+func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 	views := make([]NodeView, 0, len(s.nodes))
 	now := time.Now()
 	seenNodes := make(map[string]struct{}, len(s.nodes))
@@ -3161,7 +3056,6 @@ func (s *Store) snapshot(includeProfileOnly bool) []NodeView {
 		}
 		return leftGroup < rightGroup
 	})
-	s.mu.RUnlock()
 	return views
 }
 
@@ -3220,8 +3114,8 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		HiddenFromAll:            profile.HideFromAll,
 		Alias:                    alias,
 		Group:                    group,
-		Tags:                     cloneStringSlice(tags),
-		Groups:                   cloneStringSlice(groups),
+		Tags:                     slices.Clone(tags),
+		Groups:                   slices.Clone(groups),
 		Region:                   profile.Region,
 		DiskType:                 profile.DiskType,
 		NetSpeedMbps:             profile.NetSpeedMbps,
@@ -3229,7 +3123,7 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		AutoRenew:                profile.AutoRenew,
 		RenewIntervalSec:         profile.RenewIntervalSec,
 		TestIntervalSec:          profile.TestIntervalSec,
-		TestSelections:           cloneTestSelections(profile.TestSelections),
+		TestSelections:           slices.Clone(profile.TestSelections),
 		AgentUpdateSupported:     false,
 		AgentUpdateState:         strings.TrimSpace(profile.AgentUpdateState),
 		AgentUpdateTargetVersion: strings.TrimSpace(profile.AgentUpdateTargetVersion),
@@ -3237,20 +3131,48 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 	}, true
 }
 
-func (s *Store) PublicNodeDelta(nodeID string) (NodeDelta, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+// PublicNodeDeltaIfChanged 构建该节点的 node_delta，但先做内容去重：
+// 中和每报必变字段（LastSeen/Timestamp/UptimeSec）后取 FNV-1a 摘要与
+// 上次广播比对，未变化则不再推送——完整的 tick 快照仍会携带新鲜
+// LastSeen，UI 新鲜度不受影响。需持锁写摘要，故取写锁（临界区内无 I/O）。
+func (s *Store) PublicNodeDeltaIfChanged(nodeID string) (NodeDelta, bool) {
 	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	node, ok := s.nodeViewLocked(nodeID, now)
 	if !ok || !s.nodePublicVisibleLocked(node.HiddenFromDisplay, node.HiddenFromCR, node.HiddenFromAll, node.Groups) {
 		return NodeDelta{}, false
 	}
+	digest := nodeDeltaContentDigest(node)
+	if prev, seen := s.deltaDigests[nodeID]; seen && prev == digest {
+		return NodeDelta{}, false
+	}
+	if s.deltaDigests == nil {
+		s.deltaDigests = make(map[string]uint64)
+	}
+	s.deltaDigests[nodeID] = digest
 	return NodeDelta{
 		Type:        "node_delta",
 		GeneratedAt: now.Unix(),
 		Node:        node,
 	}, true
+}
+
+// nodeDeltaContentDigest 对 NodeView 取内容摘要。Type 恒定、
+// GeneratedAt 每次必变，均不参与；LastSeen/Timestamp/UptimeSec 属于
+// 每报必变的时钟字段，中和后仅真正的指标/配置变化才会改变摘要。
+func nodeDeltaContentDigest(node NodeView) uint64 {
+	node.LastSeen = 0
+	node.Stats.Timestamp = 0
+	node.Stats.UptimeSec = 0
+	data, err := json.Marshal(node)
+	if err != nil {
+		return 0
+	}
+	digest := fnv.New64a()
+	digest.Write(data)
+	return digest.Sum64()
 }
 
 func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
@@ -3268,8 +3190,8 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		profile = &NodeProfile{TestIntervalSec: defaultTestIntervalSec}
 	}
 	status := resolveNodeStatus(now, node)
-	group, tags := resolveProfileGroupTags(profile)
 	groups := normalizeGroupSelections(profile.Groups)
+	group, tags := resolveProfileGroupTagsSelections(profile, groups)
 	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
 	stats := cloneNodeStats(node.Stats)
@@ -3295,8 +3217,8 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		HiddenFromAll:            profile.HideFromAll,
 		Alias:                    profile.Alias,
 		Group:                    group,
-		Tags:                     cloneStringSlice(tags),
-		Groups:                   cloneStringSlice(groups),
+		Tags:                     slices.Clone(tags),
+		Groups:                   slices.Clone(groups),
 		Region:                   profile.Region,
 		DiskType:                 profile.DiskType,
 		NetSpeedMbps:             profile.NetSpeedMbps,
@@ -3304,7 +3226,7 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		AutoRenew:                profile.AutoRenew,
 		RenewIntervalSec:         profile.RenewIntervalSec,
 		TestIntervalSec:          profile.TestIntervalSec,
-		TestSelections:           cloneTestSelections(profile.TestSelections),
+		TestSelections:           slices.Clone(profile.TestSelections),
 		AgentUpdateSupported:     updateSupported,
 		AgentUpdateMode:          updateMode,
 		AgentUpdateState:         updateState,
@@ -3314,7 +3236,12 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 }
 
 func resolveProfileGroupTags(profile *NodeProfile) (string, []string) {
-	selections := normalizeGroupSelections(profile.Groups)
+	return resolveProfileGroupTagsSelections(profile, normalizeGroupSelections(profile.Groups))
+}
+
+// resolveProfileGroupTagsSelections 允许调用方复用已算好的规范化选择，
+// 避免同一 profile 在一次视图构建里重复跑 normalizeGroupSelections。
+func resolveProfileGroupTagsSelections(profile *NodeProfile, selections []string) (string, []string) {
 	if len(selections) == 0 {
 		selections = selectionsFromGroupTags(profile.Group, profile.Tags)
 	}
@@ -3378,65 +3305,46 @@ func (h *Hub) CloseAdminClients() {
 	}
 }
 
-func (h *Hub) BroadcastVariant(payload []byte, variant string) {
-	clients := h.snapshotClients()
-	prepared := h.prepareBroadcast(payload)
-	for _, client := range clients {
-		if client == nil || client.variant != variant {
-			continue
-		}
-		if ok := client.enqueue(payload, prepared); !ok {
-			h.removeClient(client)
-		}
-	}
-}
-
-func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
-	clients := h.snapshotClients()
-	prepared := h.prepareBroadcast(payload)
-	currentSalt := strings.TrimSpace(tokenSalt)
-	for _, client := range clients {
-		if client == nil || client.variant != adminVariant {
-			continue
-		}
-		if client.adminTokenSalt != currentSalt {
-			h.removeClient(client)
-			continue
-		}
-		if ok := client.enqueue(payload, prepared); !ok {
-			h.removeClient(client)
-		}
-	}
-}
-
-func (h *Hub) BroadcastAllVariants(payload []byte, tokenSalt string) {
+func (h *Hub) broadcast(payload []byte, salt string, include func(client *hubClient, currentSalt string) bool) {
 	clients := h.snapshotClients()
 	if len(clients) == 0 {
 		return
 	}
+	currentSalt := strings.TrimSpace(salt)
 	prepared := h.prepareBroadcast(payload)
-	currentSalt := strings.TrimSpace(tokenSalt)
 	for _, client := range clients {
-		if client == nil {
+		if client == nil || !include(client, currentSalt) {
 			continue
 		}
-		var ok bool
-		switch client.variant {
-		case publicVariantBalanced:
-			ok = client.enqueue(payload, prepared)
-		case adminVariant:
-			if client.adminTokenSalt != currentSalt {
-				h.removeClient(client)
-				continue
-			}
-			ok = client.enqueue(payload, prepared)
-		default:
-			continue
-		}
-		if !ok {
+		if ok := client.enqueue(payload, prepared); !ok {
 			h.removeClient(client)
 		}
 	}
+}
+
+func (h *Hub) adminClientAllowed(client *hubClient, currentSalt string) bool {
+	if client.variant != adminVariant {
+		return false
+	}
+	if client.adminTokenSalt != currentSalt {
+		h.removeClient(client)
+		return false
+	}
+	return true
+}
+
+func (h *Hub) BroadcastVariant(payload []byte, variant string) {
+	h.broadcast(payload, "", func(client *hubClient, _ string) bool { return client.variant == variant })
+}
+
+func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
+	h.broadcast(payload, tokenSalt, h.adminClientAllowed)
+}
+
+func (h *Hub) BroadcastAllVariants(payload []byte, tokenSalt string) {
+	h.broadcast(payload, tokenSalt, func(client *hubClient, currentSalt string) bool {
+		return client.variant == publicVariantBalanced || h.adminClientAllowed(client, currentSalt)
+	})
 }
 
 func (h *Hub) prepareBroadcast(payload []byte) *websocket.PreparedMessage {
@@ -4000,8 +3908,7 @@ func (s *Store) settingsViewLocked() SettingsView {
 		Locale:                normalizeLocale(s.settings.Locale),
 		RegionGroupEnabled:    boolPointer(!s.settings.RegionGroupDisabled),
 		AlertOfflineSec:       s.settings.AlertOfflineSec,
-		AlertTelegramUserIDs:  cloneInt64Slice(s.settings.AlertTelegramUserIDs),
-		AlertTelegramUserID:   firstTelegramUserID(s.settings.AlertTelegramUserIDs),
+		AlertTelegramUserIDs:  slices.Clone(s.settings.AlertTelegramUserIDs),
 		LoginFailLimit:        loginFailLimit,
 		LoginFailWindowSec:    s.settings.LoginFailWindowSec,
 		LoginLockSec:          s.settings.LoginLockSec,
@@ -4009,9 +3916,9 @@ func (s *Store) settingsViewLocked() SettingsView {
 		AISettings:            redactAISettingsForView(s.settings.AISettings),
 		Version:               s.buildVersion,
 		Commit:                s.buildCommit,
-		Groups:                cloneStringSlice(s.settings.Groups),
+		Groups:                slices.Clone(s.settings.Groups),
 		GroupTree:             cloneGroupNodes(s.settings.GroupTree),
-		TestCatalog:           cloneTestCatalogItems(s.settings.TestCatalog),
+		TestCatalog:           slices.Clone(s.settings.TestCatalog),
 	}
 }
 
@@ -4041,7 +3948,6 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 	view.AlertWebhook = ""
 	view.AlertTelegramToken = ""
 	view.AlertTelegramUserIDs = nil
-	view.AlertTelegramUserID = 0
 	view.AdminAuth = redactAdminAuthSettings(view.AdminAuth)
 	view.AISettings = redactAISettingsForExport(view.AISettings)
 	view.Commit = ""
@@ -4142,12 +4048,12 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	locale := strings.TrimSpace(view.Locale)
 	alertWebhook := strings.TrimSpace(view.AlertWebhook)
 	alertTelegramToken := strings.TrimSpace(view.AlertTelegramToken)
-	alertTelegramUserIDs := cloneInt64Slice(view.AlertTelegramUserIDs)
+	alertTelegramUserIDs := slices.Clone(view.AlertTelegramUserIDs)
 	adminAuth := cloneAdminAuthSettings(view.AdminAuth)
 	aiSettings := cloneAISettings(view.AISettings)
-	groups := cloneStringSlice(view.Groups)
+	groups := slices.Clone(view.Groups)
 	groupTree := cloneGroupNodes(view.GroupTree)
-	testCatalog := cloneTestCatalogItems(view.TestCatalog)
+	testCatalog := slices.Clone(view.TestCatalog)
 
 	update := SettingsUpdate{
 		AdminPath:            stringPointer(adminPath),
@@ -4378,25 +4284,9 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AlertTelegramToken = value
 	}
-	telegramIDsUpdated := false
-	var telegramUserIDs []int64
 	if update.AlertTelegramUserIDs != nil {
-		telegramUserIDs = normalizeTelegramUserIDs(*update.AlertTelegramUserIDs)
-		telegramIDsUpdated = true
+		s.settings.AlertTelegramUserIDs = normalizeTelegramUserIDs(*update.AlertTelegramUserIDs)
 	}
-	if update.AlertTelegramUserID != nil && update.AlertTelegramUserIDs == nil {
-		value := *update.AlertTelegramUserID
-		if value > 0 {
-			telegramUserIDs = []int64{value}
-		} else {
-			telegramUserIDs = []int64{}
-		}
-		telegramIDsUpdated = true
-	}
-	if telegramIDsUpdated {
-		s.settings.AlertTelegramUserIDs = telegramUserIDs
-	}
-	s.settings.AlertTelegramUserID = 0
 	if (s.settings.AlertTelegramToken != "" || len(s.settings.AlertTelegramUserIDs) > 0) &&
 		(s.settings.AlertTelegramToken == "" || len(s.settings.AlertTelegramUserIDs) == 0) {
 		return fail(errors.New("telegram token 与 telegram 用户 ID 需要同时配置"))
@@ -4475,7 +4365,7 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		s.settings.Groups = flattenGroupTree(s.settings.GroupTree)
 	}
 	if update.TestCatalog != nil {
-		previousCatalog := cloneTestCatalogItems(s.settings.TestCatalog)
+		previousCatalog := slices.Clone(s.settings.TestCatalog)
 		catalog, err := normalizeTestCatalog(*update.TestCatalog)
 		if err != nil {
 			return fail(err)
@@ -4578,7 +4468,6 @@ func preserveRedactedSensitiveSettings(update *SettingsUpdate, imported Settings
 	if strings.TrimSpace(imported.AlertTelegramToken) == "" {
 		update.AlertTelegramToken = nil
 		update.AlertTelegramUserIDs = nil
-		update.AlertTelegramUserID = nil
 	}
 	if update.AdminAuth != nil {
 		merged := preserveAdminAuthSecrets(*update.AdminAuth, existing.AdminAuth)
@@ -4650,10 +4539,11 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if rawProfile != nil {
 			*profile = *rawProfile
 		}
-		if profile.HideFromDisplay && !profile.HideFromCR && !profile.HideFromAll {
-			profile.HideFromCR = true
-			profile.HideFromAll = true
-		}
+		// r85 迁移：旧版在双开关保存时无条件派生 HideFromDisplay（UI 无
+		// 该开关，存量 true 均为派生残渣）——加载即清零，双隐藏+有效分组
+		// 节点按 r80 语义在分组页可见。display 转为纯显式 API 字段，重启
+		// 即失效的完整隐藏应改用双开关+不挂分组表达。
+		profile.HideFromDisplay = false
 		profile.Alias = strings.TrimSpace(profile.Alias)
 		profile.Group = strings.TrimSpace(profile.Group)
 		profile.Tags = normalizeGroups(profile.Tags)
@@ -4684,7 +4574,7 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if profile.TestIntervalSec <= 0 {
 			profile.TestIntervalSec = defaultTestIntervalSec
 		}
-		profile.TestSelections = s.normalizeSelectionsLocked(cloneTestSelections(profile.TestSelections))
+		profile.TestSelections = s.normalizeSelectionsLocked(slices.Clone(profile.TestSelections))
 		if profile.AlertEnabled == nil {
 			profile.AlertEnabled = boolPointer(true)
 		} else {
@@ -4868,21 +4758,6 @@ func (s *Store) isAgentAuthTokenDuplicateLocked(nodeID, token string) bool {
 	return false
 }
 
-func (s *Store) ensureServerIDLocked(nodeID string, profile *NodeProfile) (bool, error) {
-	if profile == nil {
-		return false, nil
-	}
-	if strings.TrimSpace(profile.ServerID) == "" {
-		id, err := s.generateServerIDLocked()
-		if err != nil {
-			return false, err
-		}
-		profile.ServerID = id
-		return true, nil
-	}
-	return false, nil
-}
-
 func (s *Store) generateServerIDLocked() (string, error) {
 	for {
 		id, err := randomToken(10)
@@ -5017,11 +4892,16 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		if update.HideFromAll != nil {
 			profile.HideFromAll = *update.HideFromAll
 		}
+		// r85：双开关保存不再派生完全隐藏——旧派生把“双隐藏+挂有效组”
+		// 节点整体剔除，击穿 r80 分组页可见性（用户三轮报障真根因）。
+		// 两开关是可见性的完整契约；编辑即清除历史派生的 display 残留，
+		// 仅显式携带该字段时才true。
+		profile.HideFromDisplay = update.HideFromDisplay != nil && *update.HideFromDisplay
 	} else if update.HideFromDisplay != nil {
 		profile.HideFromCR = *update.HideFromDisplay
 		profile.HideFromAll = *update.HideFromDisplay
+		profile.HideFromDisplay = *update.HideFromDisplay
 	}
-	profile.HideFromDisplay = profile.HideFromCR && profile.HideFromAll
 	if update.AutoRenew != nil {
 		profile.AutoRenew = *update.AutoRenew
 		if profile.AutoRenew && profile.ExpireAt > 0 && profile.RenewIntervalSec <= 0 {
@@ -5469,6 +5349,7 @@ func (s *Store) deleteNodeMemoryLocked(nodeID string) {
 	delete(s.alerted, nodeID)
 	delete(s.offlineSessions, nodeID)
 	delete(s.configRefresh, nodeID)
+	delete(s.deltaDigests, nodeID)
 }
 
 func (s *Store) clearNodesMemoryLocked() {
@@ -5477,6 +5358,7 @@ func (s *Store) clearNodesMemoryLocked() {
 	s.alerted = make(map[string]AlertedState)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.configRefresh = make(map[string]struct{})
+	s.deltaDigests = make(map[string]uint64)
 }
 
 type AgentUpdateReport struct {
@@ -5708,7 +5590,7 @@ func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time, remoteUpd
 		Group:           group,
 		AgentToken:      strings.TrimSpace(profile.AgentAuthToken),
 		TestIntervalSec: profile.TestIntervalSec,
-		Tests:           cloneNetworkTestConfigs(tests),
+		Tests:           slices.Clone(tests),
 		Update:          update,
 	}
 }

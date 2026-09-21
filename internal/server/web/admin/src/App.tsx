@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -629,7 +629,7 @@ export default function App() {
   const deployedVersion = (settings?.version || publicSettings?.version || "").trim();
   const deployedVersionLabel = formatVersionLabel(deployedVersion);
   const activeThemeOption = ADMIN_THEME_OPTIONS.find((item) => item.value === themeMode) || ADMIN_THEME_OPTIONS[0];
-  const t = (text: string) => adminText(locale, text);
+  const t = useCallback((text: string) => adminText(locale, text), [locale]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -792,20 +792,23 @@ export default function App() {
     setIsMobileMenuOpen(false);
   }
 
-  function navigateToPage(page: Page) {
-    if (page === currentPage) {
-      setIsMobileMenuOpen(false);
-      return;
-    }
-    if (hasUnsavedPageChanges) {
-      setPendingPageNavigation(page);
-      setUnsavedDialogOpen(true);
-      setIsMobileMenuOpen(false);
-      return;
-    }
-    proceedToPage(page);
-  }
-
+  const navigateToPage = useCallback(
+    (page: Page) => {
+      if (page === currentPage) {
+        setIsMobileMenuOpen(false);
+        return;
+      }
+      if (hasUnsavedPageChanges) {
+        setPendingPageNavigation(page);
+        setUnsavedDialogOpen(true);
+        setIsMobileMenuOpen(false);
+        return;
+      }
+      proceedToPage(page);
+    },
+    // proceedToPage 只触发 setter/URL 同步，无状态读取，不需入依赖。
+    [currentPage, hasUnsavedPageChanges],
+  );
 
 
   function handleNavLinkClick(event: MouseEvent<HTMLAnchorElement>, page: Page) {
@@ -816,7 +819,7 @@ export default function App() {
     navigateToPage(page);
   }
 
-  function handleLogout(nextLoginState?: Partial<LoginState>) {
+  const handleLogout = useCallback((nextLoginState?: Partial<LoginState>) => {
     loadAllRequestRef.current += 1;
     socketRef.current?.close();
     socketRef.current = null;
@@ -836,7 +839,7 @@ export default function App() {
         nextLoginState?.retryAfterSec || 0,
       ),
     );
-  }
+  }, []);
 
   async function loadAll() {
     if (!token) {
@@ -1104,218 +1107,244 @@ export default function App() {
     },
   ];
 
-  async function refreshNodesAfterMutation(successLabel: string, successLocale: AdminLocale = locale) {
-    const requestID = loadAllRequestRef.current;
-    try {
-      const snapshot = await fetchNodes();
-      if (loadAllRequestRef.current !== requestID) {
-        return;
+  const refreshNodesAfterMutation = useCallback(
+    async (successLabel: string, successLocale: AdminLocale = locale) => {
+      const requestID = loadAllRequestRef.current;
+      try {
+        const snapshot = await fetchNodes();
+        if (loadAllRequestRef.current !== requestID) {
+          return;
+        }
+        setNodes(snapshot.nodes || []);
+      } catch (error) {
+        if (loadAllRequestRef.current !== requestID) {
+          return;
+        }
+        const message = getErrorMessage(error, adminText(successLocale, "节点列表刷新失败"));
+        toast.warning(
+          successLocale === "en-US"
+            ? `${successLabel}, but node refresh failed: ${message}`
+            : `${successLabel}，但节点列表刷新失败：${message}`,
+        );
       }
-      setNodes(snapshot.nodes || []);
-    } catch (error) {
-      if (loadAllRequestRef.current !== requestID) {
-        return;
-      }
-      const message = getErrorMessage(error, adminText(successLocale, "节点列表刷新失败"));
-      toast.warning(
-        successLocale === "en-US"
-          ? `${successLabel}, but node refresh failed: ${message}`
-          : `${successLabel}，但节点列表刷新失败：${message}`,
-      );
-    }
-  }
+    },
+    [locale],
+  );
 
-  async function updateSettings(page: Page, payload: SettingsUpdate) {
-    setSavingPage(page);
-    try {
-      const data = await saveSettings(payload);
-      setSettings(data);
-      setPublicSettings((current) => mergePublicSettings(data, current));
-      const nextLocale = normalizeAdminLocale(data.locale);
-      setLocale(nextLocale);
-      writeStoredAdminLocale(nextLocale);
-      setStoredAdminToken("session");
-      setToken("session");
-      void refreshNodesAfterMutation(adminText(nextLocale, "设置已保存"), nextLocale);
-      return data;
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "管理员凭证或会话已更新，请重新登录后继续。",
-          errorType: "expired",
-        });
-      }
-      throw error;
-    } finally {
-      setSavingPage(null);
-    }
-  }
-
-  async function handleExport() {
-    const data = await exportConfig();
-    triggerDownload(data.blob, parseDownloadFilename(data.disposition));
-  }
-
-  async function handleImport(payload: Record<string, unknown>): Promise<ConfigImportResponse> {
-    setSavingPage("settings");
-    try {
-      const data = await importConfig(payload);
-      let nextLocale = locale;
-      if (data.settings) {
-        setSettings(data.settings);
-        setPublicSettings((current) => mergePublicSettings(data.settings || null, current));
-        nextLocale = normalizeAdminLocale(data.settings.locale);
+  const updateSettings = useCallback(
+    async (page: Page, payload: SettingsUpdate) => {
+      setSavingPage(page);
+      try {
+        const data = await saveSettings(payload);
+        setSettings(data);
+        setPublicSettings((current) => mergePublicSettings(data, current));
+        const nextLocale = normalizeAdminLocale(data.locale);
         setLocale(nextLocale);
         writeStoredAdminLocale(nextLocale);
-      }
-      setStoredAdminToken("session");
-      setToken("session");
-      void refreshNodesAfterMutation(adminText(nextLocale, "配置已导入"), nextLocale);
-      if (data.settings?.admin_path) {
-        const nextAdminPath = adminAppLocation(data.settings.admin_path);
-        if (nextAdminPath) {
-          window.history.replaceState({}, "", nextAdminPath);
+        setStoredAdminToken("session");
+        setToken("session");
+        void refreshNodesAfterMutation(adminText(nextLocale, "设置已保存"), nextLocale);
+        return data;
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "管理员凭证或会话已更新，请重新登录后继续。",
+            errorType: "expired",
+          });
         }
+        throw error;
+      } finally {
+        setSavingPage(null);
       }
-      return data;
-    } finally {
-      setSavingPage(null);
-    }
-  }
+    },
+    [handleLogout, refreshNodesAfterMutation],
+  );
 
-  async function handleRefreshNodes() {
-    setRefreshingNodes(true);
-    const requestID = loadAllRequestRef.current;
-    try {
-      const snapshot = await fetchNodes();
-      if (loadAllRequestRef.current !== requestID) {
+  const handleExport = useCallback(async () => {
+    const data = await exportConfig();
+    triggerDownload(data.blob, parseDownloadFilename(data.disposition));
+  }, []);
+
+  const handleImport = useCallback(
+    async (payload: Record<string, unknown>): Promise<ConfigImportResponse> => {
+      setSavingPage("settings");
+      try {
+        const data = await importConfig(payload);
+        let nextLocale = locale;
+        if (data.settings) {
+          setSettings(data.settings);
+          setPublicSettings((current) => mergePublicSettings(data.settings || null, current));
+          nextLocale = normalizeAdminLocale(data.settings.locale);
+          setLocale(nextLocale);
+          writeStoredAdminLocale(nextLocale);
+        }
+        setStoredAdminToken("session");
+        setToken("session");
+        void refreshNodesAfterMutation(adminText(nextLocale, "配置已导入"), nextLocale);
+        if (data.settings?.admin_path) {
+          const nextAdminPath = adminAppLocation(data.settings.admin_path);
+          if (nextAdminPath) {
+            window.history.replaceState({}, "", nextAdminPath);
+          }
+        }
+        return data;
+      } finally {
+        setSavingPage(null);
+      }
+    },
+    [locale, refreshNodesAfterMutation],
+  );
+
+  const handleRefreshNodes = useCallback(
+    async () => {
+      setRefreshingNodes(true);
+      const requestID = loadAllRequestRef.current;
+      try {
+        const snapshot = await fetchNodes();
+        if (loadAllRequestRef.current !== requestID) {
+          return;
+        }
+        setNodes(snapshot.nodes || []);
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "节点数据拉取失败，当前登录态已失效，请重新登录。",
+            errorType: "expired",
+          });
+        }
+        throw error;
+      } finally {
+        setRefreshingNodes(false);
+      }
+    },
+    [handleLogout],
+  );
+
+  const refreshSystemUpdate = useCallback(
+    async (force = false) => {
+      if (!token) {
+        setSystemUpdateInfo(null);
         return;
       }
-      setNodes(snapshot.nodes || []);
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "节点数据拉取失败，当前登录态已失效，请重新登录。",
-          errorType: "expired",
-        });
+      setRefreshingSystemUpdate(true);
+      try {
+        const data = await fetchSystemUpdateInfo();
+        setSystemUpdateInfo(data);
+        if (data.current_version) {
+          setSettings((current) => (current ? { ...current, version: data.current_version } : current));
+          setPublicSettings((current) =>
+            current ? { ...current, version: data.current_version } : current,
+          );
+        }
+        if (force && data.message) {
+          toast.message(data.message);
+        }
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "服务端更新状态查询失败，当前登录态已失效，请重新登录。",
+            errorType: "expired",
+          });
+        }
+        throw error;
+      } finally {
+        setRefreshingSystemUpdate(false);
       }
-      throw error;
-    } finally {
-      setRefreshingNodes(false);
-    }
-  }
+    },
+    [handleLogout, token],
+  );
 
-  async function refreshSystemUpdate(force = false) {
-    if (!token) {
-      setSystemUpdateInfo(null);
-      return;
-    }
-    setRefreshingSystemUpdate(true);
-    try {
-      const data = await fetchSystemUpdateInfo();
-      setSystemUpdateInfo(data);
-      if (data.current_version) {
-        setSettings((current) => (current ? { ...current, version: data.current_version } : current));
-        setPublicSettings((current) =>
-          current ? { ...current, version: data.current_version } : current,
-        );
+  const handleSystemUpdate = useCallback(
+    async () => {
+      if (!token) {
+        return;
       }
-      if (force && data.message) {
-        toast.message(data.message);
+      setStartingSystemUpdate(true);
+      try {
+        const data = await triggerSystemUpdate();
+        if (data.status === "up_to_date") {
+          toast.success("当前服务端已经是最新正式版");
+          await refreshSystemUpdate(true);
+        } else {
+          toast.success(`服务端更新已开始，目标版本 ${data.target_version || "latest"}`);
+          setSystemUpdateInfo((current) => ({
+            current_version: current?.current_version || settings?.version || publicSettings?.version || "",
+            latest_version: data.target_version || current?.latest_version || "",
+            available: true,
+            updating: true,
+            supported: current?.supported ?? true,
+            mode: current?.mode || "binary",
+            message: current?.message,
+            html_url: current?.html_url,
+            published_at: current?.published_at,
+            last_checked_at: current?.last_checked_at,
+            last_started_at: Math.floor(Date.now() / 1000),
+            last_finished_at: current?.last_finished_at,
+          }));
+          await refreshSystemUpdate(true);
+        }
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "服务端更新失败，当前登录态已失效，请重新登录。",
+            errorType: "expired",
+          });
+        }
+        throw error;
+      } finally {
+        setStartingSystemUpdate(false);
       }
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "服务端更新状态查询失败，当前登录态已失效，请重新登录。",
-          errorType: "expired",
-        });
-      }
-      throw error;
-    } finally {
-      setRefreshingSystemUpdate(false);
-    }
-  }
+    },
+    [handleLogout, publicSettings, refreshSystemUpdate, settings, token],
+  );
 
-  async function handleSystemUpdate() {
-    if (!token) {
-      return;
-    }
-    setStartingSystemUpdate(true);
-    try {
-      const data = await triggerSystemUpdate();
-      if (data.status === "up_to_date") {
-        toast.success("当前服务端已经是最新正式版");
-        await refreshSystemUpdate(true);
-      } else {
-        toast.success(`服务端更新已开始，目标版本 ${data.target_version || "latest"}`);
-        setSystemUpdateInfo((current) => ({
-          current_version: current?.current_version || settings?.version || publicSettings?.version || "",
-          latest_version: data.target_version || current?.latest_version || "",
-          available: true,
-          updating: true,
-          supported: current?.supported ?? true,
-          mode: current?.mode || "binary",
-          message: current?.message,
-          html_url: current?.html_url,
-          published_at: current?.published_at,
-          last_checked_at: current?.last_checked_at,
-          last_started_at: Math.floor(Date.now() / 1000),
-          last_finished_at: current?.last_finished_at,
-        }));
-        await refreshSystemUpdate(true);
+  const handleSaveNode = useCallback(
+    async (nodeID: string, payload: NodeProfilePayload) => {
+      try {
+        await saveNodeProfile(nodeID, payload);
+        void refreshNodesAfterMutation(t("节点配置已保存并下发"));
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "节点配置保存失败，当前登录态已失效，请重新登录。",
+            errorType: "expired",
+          });
+        }
+        throw error;
       }
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "服务端更新失败，当前登录态已失效，请重新登录。",
-          errorType: "expired",
-        });
-      }
-      throw error;
-    } finally {
-      setStartingSystemUpdate(false);
-    }
-  }
+    },
+    [handleLogout, refreshNodesAfterMutation, t],
+  );
 
-  async function handleSaveNode(nodeID: string, payload: NodeProfilePayload) {
-    try {
-      await saveNodeProfile(nodeID, payload);
-      void refreshNodesAfterMutation(t("节点配置已保存并下发"));
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "节点配置保存失败，当前登录态已失效，请重新登录。",
-          errorType: "expired",
-        });
+  const handleDeleteNode = useCallback(
+    async (nodeID: string): Promise<NodeDeleteResponse> => {
+      try {
+        const result = await deleteNodeProfile(nodeID);
+        void refreshNodesAfterMutation(t("节点已删除"));
+        if (result.history_error) {
+          toast.warning(
+            locale === "en-US"
+              ? `${t("节点已删除")}, but history cleanup failed: ${result.history_error}`
+              : `${t("节点已删除")}，但历史数据清理失败：${result.history_error}`,
+          );
+        }
+        return result;
+      } catch (error) {
+        if (error instanceof AdminApiError && error.status === 401) {
+          handleLogout({
+            errorMessage: "节点删除失败，当前登录态已失效，请重新登录。",
+            errorType: "expired",
+          });
+        }
+        throw error;
       }
-      throw error;
-    }
-  }
+    },
+    [handleLogout, locale, refreshNodesAfterMutation, t],
+  );
 
-  async function handleDeleteNode(nodeID: string): Promise<NodeDeleteResponse> {
-    try {
-      const result = await deleteNodeProfile(nodeID);
-      void refreshNodesAfterMutation(t("节点已删除"));
-      if (result.history_error) {
-        toast.warning(
-          locale === "en-US"
-            ? `${t("节点已删除")}, but history cleanup failed: ${result.history_error}`
-            : `${t("节点已删除")}，但历史数据清理失败：${result.history_error}`,
-        );
-      }
-      return result;
-    } catch (error) {
-      if (error instanceof AdminApiError && error.status === 401) {
-        handleLogout({
-          errorMessage: "节点删除失败，当前登录态已失效，请重新登录。",
-          errorType: "expired",
-        });
-      }
-      throw error;
-    }
-  }
-
-  const pageContent = useMemo(() => {
+  // 节点依赖页（dashboard/servers/groups/alerts）：WS nodes 快照变化时
+  // 重建是预期行为（页面内容本身依赖节点数据）。
+  const nodePageContent = useMemo(() => {
     switch (currentPage) {
       case "dashboard":
         return (
@@ -1351,6 +1380,43 @@ export default function App() {
             />
           </Suspense>
         );
+      case "alerts":
+        return (
+          <Suspense fallback={<SectionLoader label={t("正在加载通知告警…")} />}>
+            <NotificationAlertPage
+              nodes={nodes}
+              onDirtyChange={setHasUnsavedPageChanges}
+              onSave={(payload) => updateSettings("alerts", payload)}
+              onTest={(payload: AlertTestPayload) =>
+                testAlertChannels(payload).then(() => undefined)
+              }
+              saving={savingPage === "alerts"}
+              settings={settings}
+            />
+          </Suspense>
+        );
+      default:
+        return null;
+    }
+  }, [
+    currentPage,
+    handleDeleteNode,
+    handleRefreshNodes,
+    handleSaveNode,
+    loading,
+    navigateToPage,
+    nodes,
+    refreshingNodes,
+    savingPage,
+    settings,
+    t,
+    updateSettings,
+  ]);
+
+  // 非节点页（probes/settings/ai/logs）：依赖不含 nodes，WS 快照到达时
+  // 元素引用保持稳定，React 跳过这些页的重渲染。
+  const staticPageContent = useMemo(() => {
+    switch (currentPage) {
       case "probes":
         return (
           <Suspense fallback={<SectionLoader label={t("正在加载探测设置…")} />}>
@@ -1376,21 +1442,6 @@ export default function App() {
               settings={settings}
               startingSystemUpdate={startingSystemUpdate}
               systemUpdateInfo={systemUpdateInfo}
-            />
-          </Suspense>
-        );
-      case "alerts":
-        return (
-          <Suspense fallback={<SectionLoader label={t("正在加载通知告警…")} />}>
-            <NotificationAlertPage
-              nodes={nodes}
-              onDirtyChange={setHasUnsavedPageChanges}
-              onSave={(payload) => updateSettings("alerts", payload)}
-              onTest={(payload: AlertTestPayload) =>
-                testAlertChannels(payload).then(() => undefined)
-              }
-              saving={savingPage === "alerts"}
-              settings={settings}
             />
           </Suspense>
         );
@@ -1422,18 +1473,19 @@ export default function App() {
     }
   }, [
     currentPage,
-    hasUnsavedPageChanges,
-    loading,
-    nodes,
-    refreshingNodes,
+    handleExport,
+    handleImport,
+    handleSystemUpdate,
     refreshingSystemUpdate,
     savingPage,
     settings,
     startingSystemUpdate,
     systemUpdateInfo,
-    token,
-    locale,
+    t,
+    updateSettings,
   ]);
+
+  const pageContent = nodePageContent ?? staticPageContent;
 
   if (!token) {
     return (

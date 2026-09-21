@@ -229,7 +229,7 @@ export function resolveNodeSelectionValues(
   );
 }
 
-export function resolveSelectionValues(values: string[]) {
+function resolveSelectionValues(values: string[]) {
   const seenSelections = new Set<string>();
 
   return normalizeSelectionValues(values)
@@ -287,7 +287,13 @@ export function adminPageHref(page: AdminPage) {
   if (typeof window === "undefined") {
     return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
   }
-  const nextURL = new URL(window.location.href);
+  let nextURL: URL;
+  try {
+    nextURL = new URL(window.location.href);
+  } catch {
+    // location.href 理论上恒可解析；解析失败时退回与无 window 分支一致的相对路径。
+    return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+  }
   if (page === "dashboard") {
     nextURL.searchParams.delete(ADMIN_PAGE_QUERY_KEY);
   } else {

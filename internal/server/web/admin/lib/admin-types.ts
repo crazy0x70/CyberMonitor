@@ -19,7 +19,7 @@ export interface OAuthLoginProvider {
   type: string;
 }
 
-export interface OAuth2ProviderSettings {
+interface OAuth2ProviderSettings {
   enabled?: boolean;
   display_name?: string;
   client_id?: string;
@@ -31,7 +31,7 @@ export interface OAuth2ProviderSettings {
   require_verified_email?: boolean;
 }
 
-export interface OIDCProviderSettings {
+interface OIDCProviderSettings {
   enabled?: boolean;
   display_name?: string;
   issuer_url?: string;
@@ -76,12 +76,12 @@ export interface AIProviderConfig {
   model?: string;
 }
 
-export interface AIProviderProfile extends AIProviderConfig {
+interface AIProviderProfile extends AIProviderConfig {
   id?: string;
   name?: string;
 }
 
-export interface AISettings {
+interface AISettings {
   command_provider?: string;
   prompt?: string;
   openai?: AIProviderConfig;
@@ -113,7 +113,6 @@ export interface SettingsView {
   alert_telegram_token?: string;
   alert_telegram_token_set?: boolean;
   alert_telegram_user_ids?: number[];
-  alert_telegram_user_id?: number;
   login_fail_limit?: number;
   login_fail_window_sec?: number;
   login_lock_sec?: number;
@@ -148,7 +147,6 @@ export interface SettingsUpdate {
   alert_offline_sec?: number;
   alert_telegram_token?: string;
   alert_telegram_user_ids?: number[];
-  alert_telegram_user_id?: number;
   login_fail_limit?: number;
   login_fail_window_sec?: number;
   login_lock_sec?: number;
@@ -185,7 +183,7 @@ export interface NodeDeleteResponse {
   history_error?: string;
 }
 
-export interface NetworkTestResult {
+interface NetworkTestResult {
   name: string;
   type: string;
   host: string;
@@ -197,7 +195,7 @@ export interface NetworkTestResult {
   checked_at: number;
 }
 
-export interface CPUInfo {
+interface CPUInfo {
   usage_percent: number;
   load1: number;
   load5: number;
@@ -206,14 +204,14 @@ export interface CPUInfo {
   cores?: number;
 }
 
-export interface MemInfo {
+interface MemInfo {
   total: number;
   used: number;
   free: number;
   used_percent: number;
 }
 
-export interface DiskPartition {
+interface DiskPartition {
   device: string;
   mountpoint: string;
   fstype: string;
@@ -223,21 +221,21 @@ export interface DiskPartition {
   used_percent: number;
 }
 
-export interface DiskIO {
+interface DiskIO {
   read_bytes: number;
   write_bytes: number;
   read_bytes_per_sec: number;
   write_bytes_per_sec: number;
 }
 
-export interface NetworkIO {
+interface NetworkIO {
   bytes_sent: number;
   bytes_recv: number;
   tx_bytes_per_sec: number;
   rx_bytes_per_sec: number;
 }
 
-export interface GPUInfo {
+interface GPUInfo {
   index: number;
   id?: string;
   name?: string;
@@ -252,7 +250,7 @@ export interface GPUInfo {
   power_w?: number;
 }
 
-export interface NodeStats {
+interface NodeStats {
   node_id: string;
   node_name: string;
   node_alias?: string;

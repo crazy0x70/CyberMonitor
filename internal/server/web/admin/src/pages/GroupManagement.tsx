@@ -111,18 +111,15 @@ type DraftTreeAnalysis = {
   };
 };
 
-const statCardLabelClass = adminStatEyebrowClass;
 
 const panelCardClass = `overflow-hidden ${adminSurfaceCardClass}`;
 
-const panelHeaderClass = adminSectionHeaderClass;
 
 const groupCardClass = `${adminDetailCardClass} !rounded-[1.5rem]`;
 
 const groupCardHeaderClass =
   `${adminDetailHeaderClass} flex flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between`;
 
-const outlineActionClass = adminActionButtonClass;
 
 const compactOutlineActionClass = `${adminOutlineButtonClass} h-9 px-4`;
 
@@ -619,7 +616,7 @@ export default function GroupManagement({
             >
               <CardHeader className={adminStatCardHeaderClass}>
                 <div>
-                  <CardDescription className={statCardLabelClass}>
+                  <CardDescription className={adminStatEyebrowClass}>
                     {item.label}
                   </CardDescription>
                   <CardTitle
@@ -638,7 +635,7 @@ export default function GroupManagement({
       </section>
 
       <Card className={panelCardClass}>
-        <CardHeader className={panelHeaderClass}>
+        <CardHeader className={adminSectionHeaderClass}>
           <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
             <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700 dark:bg-sky-900 dark:text-sky-100">
               <FolderTree className="h-5 w-5" />
@@ -659,7 +656,7 @@ export default function GroupManagement({
             <div className={adminEmptyStateClass}>
               <p className="text-sm font-medium text-slate-700 dark:text-slate-200">还没有一级分组</p>
               <Button
-                className={`mt-5 ${outlineActionClass}`}
+                className={`mt-5 ${adminActionButtonClass}`}
                 variant="outline"
                 onClick={addGroup}
                 disabled={isBusy}
@@ -764,7 +761,7 @@ function SortableGroupCard({
               <FolderTree className="h-4 w-4" />
             </div>
             <div className="flex-1 space-y-2">
-              <p className={statCardLabelClass}>一级分组名称</p>
+              <p className={adminStatEyebrowClass}>一级分组名称</p>
               <Input
                 id={`group-name-${groupIndex}`}
                 name={`group-name-${groupIndex}`}

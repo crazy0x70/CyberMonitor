@@ -4,6 +4,17 @@ import { AdminApiError } from "@/lib/admin-api";
 import { getErrorMessage } from "@/lib/admin-format";
 
 /**
+ * 草稿/源签名：settings 页 reconcile 用的签名统一为 JSON 序列化。
+ * draftSignature 接受草稿本身或已投影的可序列化形式；
+ * sourceSignature 组合“从服务端源重建草稿”的工厂，避免各页复制
+ * `draftSignature(makeDraft(src))` 对。
+ */
+export const draftSignature = (serializable: unknown): string => JSON.stringify(serializable);
+
+export const sourceSignature = <T>(make: (src: T) => unknown, src: T): string =>
+  JSON.stringify(make(src));
+
+/**
  * 页面层 busy/try/catch/toast 样板的收敛点：busy 状态由调用点注入 setter
  * （页面 busy 多为派生值或实体级标记，不由 hook 持有），hook 只拥有
  * try/catch/toast 骨架。成功后依次执行 onSuccess；successToast 为函数时

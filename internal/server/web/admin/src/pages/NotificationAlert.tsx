@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import { useMemo, useState, type ChangeEvent } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -21,7 +21,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { AlertTriangle, Bell, Send, ShieldAlert } from "lucide-react";
-import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
+import {
+  draftSignature,
+  sourceSignature,
+  useAsyncAction,
+  useDirtyNotification,
+  useDraftReconcile,
+} from "@/lib/admin-hooks";
 import { cn } from "@/lib/utils";
 import { parseTelegramUserIds } from "@/lib/admin-format";
 import {
@@ -103,9 +109,7 @@ function isValidHTTPURL(value: string) {
 function makeAlertSettingsDraft(settings: SettingsView | null): AlertSettingsDraft {
   const userIds = Array.isArray(settings?.alert_telegram_user_ids)
     ? settings?.alert_telegram_user_ids
-    : typeof settings?.alert_telegram_user_id === "number" && settings.alert_telegram_user_id > 0
-      ? [settings.alert_telegram_user_id]
-      : [];
+    : [];
 
   return {
     webhook: settings?.alert_webhook || "",
@@ -116,14 +120,6 @@ function makeAlertSettingsDraft(settings: SettingsView | null): AlertSettingsDra
         ? String(Math.round(settings.alert_offline_sec / 60))
         : "5",
   };
-}
-
-function alertSettingsDraftSignature(draft: AlertSettingsDraft) {
-  return JSON.stringify(draft);
-}
-
-function alertSettingsSourceSignature(settings: SettingsView | null) {
-  return alertSettingsDraftSignature(makeAlertSettingsDraft(settings));
 }
 
 export default function NotificationAlert({
@@ -145,7 +141,7 @@ export default function NotificationAlert({
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<AlertField, string>>>({});
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const isBusy = isSaving || saving || testingChannel !== null;
-  const currentDraftSignature = alertSettingsDraftSignature({
+  const currentDraftSignature = draftSignature({
     webhook,
     telegramToken,
     telegramUserIds,
@@ -154,7 +150,7 @@ export default function NotificationAlert({
 
   const [, absorbSourceSignature] = useDraftReconcile({
     draftSignature: currentDraftSignature,
-    nextSourceSignature: alertSettingsSourceSignature(settings),
+    nextSourceSignature: sourceSignature(makeAlertSettingsDraft, settings),
     isBusy,
     resetDraft: () => {
       const draft = makeAlertSettingsDraft(settings);
@@ -325,7 +321,7 @@ export default function NotificationAlert({
         setTelegramToken(canonicalDraft.telegramToken);
         setTelegramUserIds(canonicalDraft.telegramUserIds);
         setOfflineMinutes(canonicalDraft.offlineMinutes);
-        absorbSourceSignature(alertSettingsDraftSignature(canonicalDraft));
+        absorbSourceSignature(draftSignature(canonicalDraft));
         setIsDirty(false);
         setFieldErrors({});
       },

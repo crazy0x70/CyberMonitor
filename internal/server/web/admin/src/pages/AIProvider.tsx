@@ -25,7 +25,12 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Bot, CheckCircle2, FileText, HelpCircle, Layers3, Loader2, Plus, Trash2, XCircle } from "lucide-react";
-import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
+import {
+  draftSignature,
+  useAsyncAction,
+  useDirtyNotification,
+  useDraftReconcile,
+} from "@/lib/admin-hooks";
 import { toast } from "sonner";
 import {
   adminActionButtonClass,
@@ -167,8 +172,8 @@ function makeAISettingsDraft(settings: SettingsView | null): AISettingsDraft {
   };
 }
 
-function aiSettingsDraftSignature(draft: AISettingsDraft) {
-  return JSON.stringify({
+function projectAISettingsDraft(draft: AISettingsDraft) {
+  return {
     commandProvider: draft.commandProvider,
     prompt: draft.prompt,
     providers: draft.providers.map((item) => ({
@@ -179,11 +184,7 @@ function aiSettingsDraftSignature(draft: AISettingsDraft) {
       baseURL: item.baseURL,
       model: item.model,
     })),
-  });
-}
-
-function aiSettingsSourceSignature(settings: SettingsView | null) {
-  return aiSettingsDraftSignature(makeAISettingsDraft(settings));
+  };
 }
 
 function renderStatusBadge(status: ProviderStatus) {
@@ -226,13 +227,13 @@ export default function AIProvider({
   const isBusy = isSaving || externalSaving || testingId !== null || fetchingModelsId !== null;
 
   const currentDraftSignature = useMemo(
-    () => aiSettingsDraftSignature({ providers, commandProvider, prompt }),
+    () => draftSignature(projectAISettingsDraft({ providers, commandProvider, prompt })),
     [commandProvider, prompt, providers],
   );
 
   const [sourceSignature, absorbSourceSignature] = useDraftReconcile({
     draftSignature: currentDraftSignature,
-    nextSourceSignature: aiSettingsSourceSignature(settings),
+    nextSourceSignature: draftSignature(projectAISettingsDraft(makeAISettingsDraft(settings))),
     isBusy,
     resetDraft: () => {
       const draft = makeAISettingsDraft(settings);
@@ -459,7 +460,7 @@ export default function AIProvider({
         setProviders(canonicalDraft.providers);
         setCommandProvider(canonicalDraft.commandProvider);
         setPrompt(canonicalDraft.prompt);
-        absorbSourceSignature(aiSettingsDraftSignature(canonicalDraft));
+        absorbSourceSignature(draftSignature(projectAISettingsDraft(canonicalDraft)));
       },
       setBusy: setIsSaving,
     });

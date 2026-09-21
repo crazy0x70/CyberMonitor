@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,7 +94,6 @@ type SettingsView struct {
 	AlertTelegramToken    string            `json:"alert_telegram_token,omitempty"`
 	AlertTelegramTokenSet bool              `json:"alert_telegram_token_set,omitempty"`
 	AlertTelegramUserIDs  []int64           `json:"alert_telegram_user_ids,omitempty"`
-	AlertTelegramUserID   int64             `json:"alert_telegram_user_id,omitempty"`
 	LoginFailLimit        int               `json:"login_fail_limit,omitempty"`
 	LoginFailWindowSec    int64             `json:"login_fail_window_sec,omitempty"`
 	LoginLockSec          int64             `json:"login_lock_sec,omitempty"`
@@ -125,7 +125,6 @@ type SettingsUpdate struct {
 	AlertOfflineSec      *int64             `json:"alert_offline_sec"`
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`
 	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
-	AlertTelegramUserID  *int64             `json:"alert_telegram_user_id"`
 	LoginFailLimit       *int               `json:"login_fail_limit"`
 	LoginFailWindowSec   *int64             `json:"login_fail_window_sec"`
 	LoginLockSec         *int64             `json:"login_lock_sec"`
@@ -720,9 +719,9 @@ func cloneNodeProfileValue(profile *NodeProfile) NodeProfile {
 		return NodeProfile{}
 	}
 	copyProfile := *profile
-	copyProfile.Tags = cloneStringSlice(profile.Tags)
-	copyProfile.Groups = cloneStringSlice(profile.Groups)
-	copyProfile.TestSelections = cloneTestSelections(profile.TestSelections)
+	copyProfile.Tags = slices.Clone(profile.Tags)
+	copyProfile.Groups = slices.Clone(profile.Groups)
+	copyProfile.TestSelections = slices.Clone(profile.TestSelections)
 	copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
 	if profile.AlertEnabled != nil {
 		value := *profile.AlertEnabled
@@ -757,8 +756,8 @@ func configTransferProfilesFromNodeProfiles(profiles map[string]*NodeProfile) ma
 		transfer := ConfigTransferProfile{
 			Alias:            profile.Alias,
 			Group:            profile.Group,
-			Tags:             cloneStringSlice(profile.Tags),
-			Groups:           cloneStringSlice(profile.Groups),
+			Tags:             slices.Clone(profile.Tags),
+			Groups:           slices.Clone(profile.Groups),
 			Region:           profile.Region,
 			DiskType:         profile.DiskType,
 			NetSpeedMbps:     profile.NetSpeedMbps,
@@ -766,7 +765,7 @@ func configTransferProfilesFromNodeProfiles(profiles map[string]*NodeProfile) ma
 			AutoRenew:        profile.AutoRenew,
 			RenewIntervalSec: profile.RenewIntervalSec,
 			TestIntervalSec:  profile.TestIntervalSec,
-			TestSelections:   cloneTestSelections(profile.TestSelections),
+			TestSelections:   slices.Clone(profile.TestSelections),
 		}
 		if profile.AlertEnabled != nil {
 			value := *profile.AlertEnabled
@@ -790,8 +789,8 @@ func configTransferProfilesToNodeProfiles(profiles map[string]*ConfigTransferPro
 		profile := NodeProfile{
 			Alias:            transfer.Alias,
 			Group:            transfer.Group,
-			Tags:             cloneStringSlice(transfer.Tags),
-			Groups:           cloneStringSlice(transfer.Groups),
+			Tags:             slices.Clone(transfer.Tags),
+			Groups:           slices.Clone(transfer.Groups),
 			Region:           transfer.Region,
 			DiskType:         transfer.DiskType,
 			NetSpeedMbps:     transfer.NetSpeedMbps,
@@ -799,7 +798,7 @@ func configTransferProfilesToNodeProfiles(profiles map[string]*ConfigTransferPro
 			AutoRenew:        transfer.AutoRenew,
 			RenewIntervalSec: transfer.RenewIntervalSec,
 			TestIntervalSec:  transfer.TestIntervalSec,
-			TestSelections:   cloneTestSelections(transfer.TestSelections),
+			TestSelections:   slices.Clone(transfer.TestSelections),
 		}
 		if transfer.AlertEnabled != nil {
 			value := *transfer.AlertEnabled
@@ -888,7 +887,6 @@ func initSettings(cfg Config) (Settings, error) {
 		AlertOfflineSec:      defaultAlertOfflineSec,
 		AlertTelegramToken:   "",
 		AlertTelegramUserIDs: []int64{},
-		AlertTelegramUserID:  0,
 		LoginFailLimit:       defaultLoginFailLimit,
 		LoginFailWindowSec:   defaultLoginFailWindow,
 		LoginLockSec:         defaultLoginLockSec,

@@ -48,7 +48,7 @@ import type {
   AdminAuthSettings,
   SettingsUpdate,
 } from "@/lib/admin-types";
-import { useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
+import { draftSignature, useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
 import { AdminApiError, adminAppLocation } from "@/lib/admin-api";
 import {
   adminActionButtonClass,
@@ -103,7 +103,6 @@ function parseJSONFile(file: File) {
   return file.text().then((text) => JSON.parse(text) as Record<string, unknown>);
 }
 
-const overviewLabelClass = adminStatEyebrowClass;
 
 const panelCardClass = cn("overflow-hidden gap-0 py-0", adminSurfaceCardClass);
 
@@ -221,56 +220,9 @@ function basicSettingsDraft(settings: SettingsView | null) {
 
 type BasicSettingsDraft = ReturnType<typeof basicSettingsDraft>;
 
-function basicSettingsDraftSignature(draft: BasicSettingsDraft) {
-  return JSON.stringify(draft);
-}
-
-function basicSettingsSourceSignature(settings: SettingsView | null) {
-  return basicSettingsDraftSignature(basicSettingsDraft(settings));
-}
-
-function applyBasicSettingsDraft(
-  draft: BasicSettingsDraft,
-  setters: {
-    setAdminPath: (value: string) => void;
-    setAdminUser: (value: string) => void;
-    setAdminPass: (value: string) => void;
-    setTurnstileSiteKey: (value: string) => void;
-    setTurnstileSecretKey: (value: string) => void;
-    setAgentToken: (value: string) => void;
-    setAgentEndpoint: (value: string) => void;
-    setSiteTitle: (value: string) => void;
-    setSiteIcon: (value: string) => void;
-    setSiteBackgroundImage: (value: string) => void;
-    setHomeTitle: (value: string) => void;
-    setHomeSubtitle: (value: string) => void;
-    setLocale: (value: string) => void;
-    setRegionGroupEnabled: (value: boolean) => void;
-    setLoginFailLimit: (value: string) => void;
-    setLoginFailWindow: (value: string) => void;
-    setLoginLockMinutes: (value: string) => void;
-    setAdminAuthDraft: (value: AdminAuthDraft) => void;
-  },
-) {
-  setters.setAdminPath(draft.adminPath);
-  setters.setAdminUser(draft.adminUser);
-  setters.setAdminPass("");
-  setters.setTurnstileSiteKey(draft.turnstileSiteKey);
-  setters.setTurnstileSecretKey(draft.turnstileSecretKey);
-  setters.setAgentToken(draft.agentToken);
-  setters.setAgentEndpoint(draft.agentEndpoint);
-  setters.setSiteTitle(draft.siteTitle);
-  setters.setSiteIcon(draft.siteIcon);
-  setters.setSiteBackgroundImage(draft.siteBackgroundImage);
-  setters.setHomeTitle(draft.homeTitle);
-  setters.setHomeSubtitle(draft.homeSubtitle);
-  setters.setLocale(draft.locale);
-  setters.setRegionGroupEnabled(draft.regionGroupEnabled);
-  setters.setLoginFailLimit(draft.loginFailLimit);
-  setters.setLoginFailWindow(draft.loginFailWindow);
-  setters.setLoginLockMinutes(draft.loginLockMinutes);
-  setters.setAdminAuthDraft(draft.adminAuth);
-}
+type BasicSettingsStringField = {
+  [K in keyof BasicSettingsDraft]: BasicSettingsDraft[K] extends string ? K : never;
+}[keyof BasicSettingsDraft];
 
 export default function BasicSettings({
   settings,
@@ -284,33 +236,11 @@ export default function BasicSettings({
   onRefreshSystemUpdate,
   onTriggerSystemUpdate,
 }: BasicSettingsProps) {
-  const [adminPath, setAdminPath] = useState("");
-  const [adminUser, setAdminUser] = useState("");
+  // 草稿对象模式：18 个字段的单一 state；adminPass 不入草稿/签名
+  // （保存前不可回显，dirty 判定需排除），保持独立 state。
+  const [basicDraft, setBasicDraft] = useState<BasicSettingsDraft>(() => basicSettingsDraft(settings));
   const [adminPass, setAdminPass] = useState("");
-  const [turnstileSiteKey, setTurnstileSiteKey] = useState("");
-  const [turnstileSecretKey, setTurnstileSecretKey] = useState("");
-  const [agentToken, setAgentToken] = useState("");
-  const [agentEndpoint, setAgentEndpoint] = useState("");
-  const [siteTitle, setSiteTitle] = useState("");
-  const [siteIcon, setSiteIcon] = useState("");
-  const [siteBackgroundImage, setSiteBackgroundImage] = useState("");
-  const [homeTitle, setHomeTitle] = useState("");
-  const [homeSubtitle, setHomeSubtitle] = useState("");
-  const [locale, setLocale] = useState("zh-CN");
-  const [regionGroupEnabled, setRegionGroupEnabled] = useState(true);
-  const [loginFailLimit, setLoginFailLimit] = useState("0");
-  const [loginFailWindow, setLoginFailWindow] = useState("");
-  const [loginLockMinutes, setLoginLockMinutes] = useState("");
-  const [adminAuthDraftValue, setAdminAuthDraftValue] = useState<AdminAuthDraft>(() => adminAuthDraft(null));
-  const [isDirty, setIsDirty] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
-  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
-  const [isImporting, setIsImporting] = useState(false);
-  const [sourceSignature, setSourceSignature] = useState("");
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const isBusy = isSaving || isImporting;
-
-  const currentDraftSignature = basicSettingsDraftSignature({
+  const {
     adminPath,
     adminUser,
     turnstileSiteKey,
@@ -328,13 +258,22 @@ export default function BasicSettings({
     loginFailWindow,
     loginLockMinutes,
     adminAuth: adminAuthDraftValue,
-  });
+  } = basicDraft;
+  const [isDirty, setIsDirty] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [sourceSignature, setSourceSignature] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isBusy = isSaving || isImporting;
+
+  const currentDraftSignature = draftSignature(basicDraft);
 
   useEffect(() => {
     if (isBusy) {
       return;
     }
-    const nextSourceSignature = basicSettingsSourceSignature(settings);
+    const nextSourceSignature = draftSignature(basicSettingsDraft(settings));
     const currentDraftMatchesIncoming = !adminPass.trim() && currentDraftSignature === nextSourceSignature;
     if (isDirty && currentDraftMatchesIncoming) {
       setSourceSignature(nextSourceSignature);
@@ -350,33 +289,35 @@ export default function BasicSettings({
       toast.warning("服务端基础设置已更新，当前未保存修改已保留。");
       return;
     }
-    const draft = basicSettingsDraft(settings);
-    applyBasicSettingsDraft(draft, {
-      setAdminPath,
-      setAdminUser,
-      setAdminPass,
-      setTurnstileSiteKey,
-      setTurnstileSecretKey,
-      setAgentToken,
-      setAgentEndpoint,
-      setSiteTitle,
-      setSiteIcon,
-      setSiteBackgroundImage,
-      setHomeTitle,
-      setHomeSubtitle,
-      setLocale,
-      setRegionGroupEnabled,
-      setLoginFailLimit,
-      setLoginFailWindow,
-      setLoginLockMinutes,
-      setAdminAuthDraft: setAdminAuthDraftValue,
-    });
+    setBasicDraft(basicSettingsDraft(settings));
+    setAdminPass("");
     setSourceSignature(nextSourceSignature);
     setIsDirty(false);
     setIsConfirmOpen(false);
   }, [adminPass, currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
 
   useDirtyNotification(onDirtyChange, isDirty);
+
+  const updateBasicDraft = <TField extends keyof BasicSettingsDraft>(
+    field: TField,
+    value: BasicSettingsDraft[TField],
+  ) => {
+    if (isBusy) {
+      return;
+    }
+    setBasicDraft((current) => ({ ...current, [field]: value }));
+    setIsDirty(true);
+  };
+
+  const handleTextFieldChange =
+    (field: BasicSettingsStringField) =>
+    (event: ChangeEvent<HTMLInputElement>) => {
+      if (isBusy) {
+        return;
+      }
+      updateBasicDraft(field, event.target.value);
+      setIsDirty(true);
+    };
 
   const handleTextInputChange =
     (setter: (value: string) => void) =>
@@ -392,7 +333,7 @@ export default function BasicSettings({
     if (isBusy) {
       return;
     }
-    setAdminAuthDraftValue((current) => ({ ...current, [field]: value }));
+    setBasicDraft((current) => ({ ...current, adminAuth: { ...current.adminAuth, [field]: value } }));
     setIsDirty(true);
   };
 
@@ -477,27 +418,9 @@ export default function BasicSettings({
       },
       onSuccess: (next) => {
         const canonicalDraft = basicSettingsDraft(next);
-        applyBasicSettingsDraft(canonicalDraft, {
-          setAdminPath,
-          setAdminUser,
-          setAdminPass,
-          setTurnstileSiteKey,
-          setTurnstileSecretKey,
-          setAgentToken,
-          setAgentEndpoint,
-          setSiteTitle,
-          setSiteIcon,
-          setSiteBackgroundImage,
-          setHomeTitle,
-          setHomeSubtitle,
-          setLocale,
-          setRegionGroupEnabled,
-          setLoginFailLimit,
-          setLoginFailWindow,
-          setLoginLockMinutes,
-          setAdminAuthDraft: setAdminAuthDraftValue,
-        });
-        setSourceSignature(basicSettingsDraftSignature(canonicalDraft));
+        setBasicDraft(canonicalDraft);
+        setAdminPass("");
+        setSourceSignature(draftSignature(canonicalDraft));
         resetDirtyState(true);
         if (next.admin_path && next.admin_path !== previousPath) {
           const nextAdminPath = adminAppLocation(next.admin_path);
@@ -620,7 +543,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={adminPath}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setAdminPath)}
+                    onChange={handleTextFieldChange("adminPath")}
                     placeholder="例如：/cm-admin…"
                   />
                 </div>
@@ -634,7 +557,7 @@ export default function BasicSettings({
                       autoComplete="username"
                       value={adminUser}
                       disabled={isBusy}
-                      onChange={handleTextInputChange(setAdminUser)}
+                      onChange={handleTextFieldChange("adminUser")}
                     />
                   </div>
                   <div className="grid gap-2">
@@ -962,7 +885,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={loginFailLimit}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setLoginFailLimit)}
+                    onChange={handleTextFieldChange("loginFailLimit")}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -976,7 +899,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={loginFailWindow}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setLoginFailWindow)}
+                    onChange={handleTextFieldChange("loginFailWindow")}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -990,7 +913,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={loginLockMinutes}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setLoginLockMinutes)}
+                    onChange={handleTextFieldChange("loginLockMinutes")}
                   />
                 </div>
               </CardContent>
@@ -1013,7 +936,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={turnstileSiteKey}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setTurnstileSiteKey)}
+                    onChange={handleTextFieldChange("turnstileSiteKey")}
                     placeholder="0x4AAAAA…"
                   />
                 </div>
@@ -1027,7 +950,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={turnstileSecretKey}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setTurnstileSecretKey)}
+                    onChange={handleTextFieldChange("turnstileSecretKey")}
                     placeholder="0x4AAAAA…"
                   />
                 </div>
@@ -1058,7 +981,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={agentEndpoint}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setAgentEndpoint)}
+                    onChange={handleTextFieldChange("agentEndpoint")}
                     placeholder="例如：https://monitor.example.com…"
                   />
                 </div>
@@ -1072,7 +995,7 @@ export default function BasicSettings({
                     className={cn(adminInputClass, "font-mono")}
                     value={agentToken}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setAgentToken)}
+                    onChange={handleTextFieldChange("agentToken")}
                     placeholder={settings?.agent_token_set ? "已配置（输入新值可更换）" : "例如：cm-agent-token-abc123…"}
                   />
                   <p className="text-xs text-slate-500 dark:text-slate-400">
@@ -1105,7 +1028,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={siteTitle}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setSiteTitle)}
+                    onChange={handleTextFieldChange("siteTitle")}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -1120,7 +1043,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={siteIcon}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setSiteIcon)}
+                    onChange={handleTextFieldChange("siteIcon")}
                     placeholder="https://…"
                   />
                 </div>
@@ -1136,7 +1059,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={siteBackgroundImage}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setSiteBackgroundImage)}
+                    onChange={handleTextFieldChange("siteBackgroundImage")}
                     placeholder="https://…"
                   />
                 </div>
@@ -1149,7 +1072,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={homeTitle}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setHomeTitle)}
+                    onChange={handleTextFieldChange("homeTitle")}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -1161,7 +1084,7 @@ export default function BasicSettings({
                     className={adminInputClass}
                     value={homeSubtitle}
                     disabled={isBusy}
-                    onChange={handleTextInputChange(setHomeSubtitle)}
+                    onChange={handleTextFieldChange("homeSubtitle")}
                   />
                 </div>
                 <div className="grid gap-2">
@@ -1173,7 +1096,7 @@ export default function BasicSettings({
                       if (isBusy) {
                         return;
                       }
-                      setLocale(normalizeLocaleValue(value || undefined));
+                      updateBasicDraft("locale", normalizeLocaleValue(value || undefined));
                       setIsDirty(true);
                     }}
                   >
@@ -1208,7 +1131,7 @@ export default function BasicSettings({
                       if (isBusy) {
                         return;
                       }
-                      setRegionGroupEnabled(Boolean(checked));
+                      updateBasicDraft("regionGroupEnabled", Boolean(checked));
                       setIsDirty(true);
                     }}
                   />
@@ -1230,13 +1153,13 @@ export default function BasicSettings({
               <CardContent className="space-y-5 px-6 py-6">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className={adminPreviewPanelClass}>
-                    <p className={overviewLabelClass}>当前版本</p>
+                    <p className={adminStatEyebrowClass}>当前版本</p>
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                       {formatVersionLabel(systemUpdateInfo?.current_version || settings?.version)}
                     </p>
                   </div>
                   <div className={adminPreviewPanelClass}>
-                    <p className={overviewLabelClass}>最新版本</p>
+                    <p className={adminStatEyebrowClass}>最新版本</p>
                     <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                       {refreshingSystemUpdate && !systemUpdateInfo
                         ? "检查中…"

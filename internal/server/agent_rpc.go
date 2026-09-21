@@ -236,7 +236,7 @@ func (a *agentAPI) broadcastNodeDelta(nodeID string) {
 	if !a.hub.HasVariant(publicVariantBalanced) && !a.hub.HasVariant(adminVariant) {
 		return
 	}
-	delta, ok := a.store.PublicNodeDelta(nodeID)
+	delta, ok := a.store.PublicNodeDeltaIfChanged(nodeID)
 	if !ok {
 		return
 	}

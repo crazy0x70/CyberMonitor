@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG GO_IMAGE_VERSION=1.27.1
-ARG NODE_IMAGE_VERSION=26.8.1
+ARG NODE_IMAGE_VERSION=26.9.0
 
 FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
 

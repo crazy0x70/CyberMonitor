@@ -160,13 +160,10 @@ function normalizeRegionInput(value: string): string {
   return /^[A-Z]{2}$/.test(upper) ? upper : "";
 }
 
-const statCardLabelClass = adminStatEyebrowClass;
 
 const sectionCardClass = `overflow-hidden ${adminSurfaceCardClass}`;
 
-const sectionHeaderClass = adminSectionHeaderClass;
 
-const formInputClass = adminInputClass;
 
 const outlineActionClass = `${adminOutlineButtonClass} h-11 px-5`;
 
@@ -1273,7 +1270,7 @@ export default function ServerManagement({
       </section>
 
       <Card className={sectionCardClass}>
-        <CardHeader className={sectionHeaderClass}>
+        <CardHeader className={adminSectionHeaderClass}>
           <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
             <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100">
               <Terminal className="h-5 w-5" />
@@ -1342,7 +1339,7 @@ export default function ServerManagement({
             <Card key={item.label} className={`${adminStatCardClass} ${adminStatSurfaceClassByTone[item.tone]}`}>
               <CardHeader className={adminStatCardHeaderClass}>
                 <div>
-                  <CardDescription className={statCardLabelClass}>
+                  <CardDescription className={adminStatEyebrowClass}>
                     {item.label}
                   </CardDescription>
                   <CardTitle className={`mt-3 text-3xl font-black tracking-tighter ${adminStatValueToneClassByTone[item.tone]}`}>
@@ -1359,7 +1356,7 @@ export default function ServerManagement({
       </section>
 
       <Card className={sectionCardClass}>
-        <CardHeader className={sectionHeaderClass}>
+        <CardHeader className={adminSectionHeaderClass}>
           <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
             <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700 dark:bg-sky-900 dark:text-sky-100">
               <Server className="h-5 w-5" />
@@ -1513,13 +1510,13 @@ export default function ServerManagement({
                     <CardContent className="space-y-5 p-6">
                       <div className="grid gap-4 md:grid-cols-2">
                         <div className={adminPreviewPanelClass}>
-                          <p className={statCardLabelClass}>当前版本</p>
+                          <p className={adminStatEyebrowClass}>当前版本</p>
                           <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                             {formatVersionLabel(editingAgentVersion)}
                           </p>
                         </div>
                         <div className={adminPreviewPanelClass}>
-                          <p className={statCardLabelClass}>最新版本</p>
+                          <p className={adminStatEyebrowClass}>最新版本</p>
                           <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
                             {agentLatestVersionLabel}
                           </p>
@@ -1576,7 +1573,7 @@ export default function ServerManagement({
                               name="node-alias"
                               autoComplete="off"
                               maxLength={120}
-                              className={formInputClass}
+                              className={adminInputClass}
                               value={form.alias}
                               disabled={editorInputDisabled}
                               onChange={(event) => updateFormField("alias", event.target.value)}
@@ -1590,7 +1587,7 @@ export default function ServerManagement({
                               name="node-region"
                               autoComplete="off"
                               maxLength={2}
-                              className={formInputClass}
+                              className={adminInputClass}
                               value={form.region}
                               disabled={editorInputDisabled}
                               onChange={(event) =>
@@ -1626,7 +1623,7 @@ export default function ServerManagement({
                               id="node-disk-type"
                               name="node-disk-type"
                               autoComplete="off"
-                              className={formInputClass}
+                              className={adminInputClass}
                               value={form.diskType}
                               disabled={editorInputDisabled}
                               onChange={(event) => updateFormField("diskType", event.target.value)}
@@ -1638,7 +1635,7 @@ export default function ServerManagement({
                             <Input
                               id="node-net-speed"
                               name="node-net-speed"
-                              className={formInputClass}
+                              className={adminInputClass}
                               type="number"
                               min={0}
                               autoComplete="off"
@@ -1772,7 +1769,7 @@ export default function ServerManagement({
                             <Input
                               id="node-expire-at"
                               name="node-expire-at"
-                              className={formInputClass}
+                              className={adminInputClass}
                               type="datetime-local"
                               autoComplete="off"
                               value={form.expireAt}
