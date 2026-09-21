@@ -3356,7 +3356,19 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
       );
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
-      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
+      // 顶部短刻度标记被截断的尖峰：钳制后的平线区分不了“贴近上限”
+      // 与“被截断”，刻度让截断可见（真值见 tooltip；tick 对非均匀
+      // 缩放的容忍优于圆点）。恰好等于上限的点不标（未被钳制）。
+      const clipTicks = series
+        .map((value, i) => {
+          if (!Number.isFinite(value) || value <= maxValue) return "";
+          const x = (padding.left + i * stepX).toFixed(1);
+          return `<line x1="${x}" y1="${padding.top}" x2="${x}" y2="${
+            padding.top + 3
+          }" stroke="${color}" stroke-width="1.5" />`;
+        })
+        .join("");
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />${clipTicks}`;
     })
     .join("");
 
