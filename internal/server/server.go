@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"html"
 	"io"
 	"io/fs"
 	"log"
@@ -266,8 +265,7 @@ type Store struct {
 	configRefresh      map[string]struct{}
 	agentIngestRate    map[string]agentRateWindow
 	agentRegisterRate  map[string]agentRateWindow
-	// nodeID → 上次广播的 node delta 内容摘要（已中和每报必变字段），
-	// 用于 ingest 增量去重；受 s.mu 保护，节点删除时同步清理。
+
 	deltaDigests map[string]uint64
 }
 
@@ -290,10 +288,7 @@ type NodeProfile struct {
 	Group          string   `json:"group,omitempty"`
 	Tags           []string `json:"tags,omitempty"`
 	Groups         []string `json:"groups,omitempty"`
-	// GroupSeeded：分组自动播种（agent 上报 NodeGroup → 选择）已消费过一次。
-	// 置位后 reconcile 不再从 agent 上报重建选择——管理员清空分组是最终
-	// 裁决，不再被每 tick 复活（r82 用户报障）；管理员编辑分组字段时同样
-	// 置位（所有权断言）。旧持久化文件缺字段按 false 加载，最多再播种一次。
+
 	GroupSeeded              bool                    `json:"group_seeded,omitempty"`
 	Region                   string                  `json:"region,omitempty"`
 	HideFromCR               bool                    `json:"hide_from_cr,omitempty"`
@@ -601,797 +596,18 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	publicMux := http.NewServeMux()
-	adminMux := publicMux
-	if splitMode {
-		adminMux = http.NewServeMux()
-	}
-
-	adminMux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req struct {
-			Username       string `json:"username"`
-			Password       string `json:"password"`
-			TurnstileToken string `json:"turnstile_token"`
-		}
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		req.Username = strings.TrimSpace(req.Username)
-		now := time.Now()
-		creds := store.Credentials()
-		if !normalizeAdminAuthSettings(creds.AdminAuth).PasswordLoginEnabled {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password login disabled"})
-			return
-		}
-		attemptKey := loginAttemptKey(req.Username, r.RemoteAddr)
-		if allowed, retryAfter := store.allowLoginAttempt(attemptKey, now); !allowed {
-			writeLoginRateLimit(w, retryAfter)
-			return
-		}
-		if turnstileConfigured(creds.TurnstileSiteKey, creds.TurnstileSecretKey) {
-			if err := verifyTurnstileToken(r.Context(), creds.TurnstileSecretKey, req.TurnstileToken, clientIPFromRemoteAddr(r.RemoteAddr)); err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-		if req.Username != creds.AdminUser || !store.VerifyAdminPassword(req.Password) {
-			if req.Username != creds.AdminUser {
-				verifyAdminPasswordDummy(req.Password)
-			}
-			if locked, retryAfter := store.recordLoginFailure(attemptKey, now); locked {
-				writeLoginRateLimit(w, retryAfter)
-				return
-			}
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
-			return
-		}
-		store.clearLoginAttempts(attemptKey)
-		exp, err := issueAdminSession(w, r, cfg.JWTSecret, store, trustedProxyHeaders)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token error"})
-			return
-		}
-		log.Printf("管理员登录: %s (%s)", req.Username, r.RemoteAddr)
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"expires_at": exp,
-		})
+	publicMux, adminMux, err := newRouteMuxes(routeDeps{
+		cfg:                 cfg,
+		store:               store,
+		hub:                 hub,
+		agentAPI:            agentAPI,
+		systemUpdater:       systemUpdater,
+		splitMode:           splitMode,
+		trustedProxyHeaders: trustedProxyHeaders,
+		webRoot:             webRoot,
 	})
-
-	adminMux.HandleFunc("/api/v1/login/oauth/start", handleAdminOAuthStart(store, cfg.JWTSecret, trustedProxyHeaders))
-	adminMux.HandleFunc("/api/v1/login/oauth/callback", handleAdminOAuthCallback(store, cfg.JWTSecret, trustedProxyHeaders))
-
-	adminMux.HandleFunc("/api/v1/logout", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		if extractToken(r) != "" && isSameOrigin(r) {
-			if err := validateAdminJWT(store, cfg.JWTSecret, r); err == nil {
-				if err := store.RotateAdminTokenSalt(); err != nil {
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session revoke failed"})
-					return
-				}
-				hub.CloseAdminClients()
-			}
-		}
-		clearAdminSessionCookie(w, r, trustedProxyHeaders)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	adminMux.HandleFunc("/api/v1/login/config", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		view := store.SettingsView()
-		settings := store.Credentials()
-		enabled := turnstileConfigured(settings.TurnstileSiteKey, settings.TurnstileSecretKey)
-		payload := map[string]interface{}{
-			"turnstile_enabled": enabled,
-		}
-		for key, value := range buildAdminLoginConfig(store) {
-			payload[key] = value
-		}
-		if enabled {
-			payload["turnstile_site_key"] = strings.TrimSpace(view.TurnstileSiteKey)
-		}
-		writeJSON(w, http.StatusOK, payload)
-	})
-
-	healthHandler := withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	publicMux.HandleFunc("/api/v1/health", healthHandler)
-	if splitMode {
-		adminMux.HandleFunc("/api/v1/health", healthHandler)
-	}
-
-	publicSnapshotHandler := withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
-		if !isPublicReadMethod(r) {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		snapshot := storeSnapshot(store)
-		writeJSON(w, http.StatusOK, snapshot)
-	})
-	publicMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
-	if splitMode {
-		adminMux.HandleFunc("/api/v1/public/snapshot", publicSnapshotHandler)
-	}
-
-	publicHistorySem := make(chan struct{}, 4)
-	publicHistoryQueryTimeout := 30 * time.Second
-	publicMux.HandleFunc("/api/v1/public/nodes/", withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
-		if !isPublicReadMethod(r) {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-
-		path := strings.TrimPrefix(r.URL.Path, "/api/v1/public/nodes/")
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		if len(parts) != 2 || parts[1] != "history" {
-			http.NotFound(w, r)
-			return
-		}
-		nodeID, err := url.PathUnescape(parts[0])
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid node id"})
-			return
-		}
-		nodeID = strings.TrimSpace(nodeID)
-		if nodeID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node id required"})
-			return
-		}
-
-		rangeKey, from, to, err := parsePublicHistoryRange(r.URL.Query().Get("range"), time.Now())
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if !store.HasNode(nodeID) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
-			return
-		}
-
-		select {
-		case publicHistorySem <- struct{}{}:
-		case <-r.Context().Done():
-			return
-		}
-		queryCtx, cancelQuery := context.WithTimeout(r.Context(), publicHistoryQueryTimeout)
-		tests, err := store.QueryPublicNodeHistory(queryCtx, nodeID, from, to)
-		cancelQuery()
-		<-publicHistorySem
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "query public node history failed"})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, PublicNodeHistoryResponse{
-			NodeID:   nodeID,
-			RangeKey: rangeKey,
-			From:     from.Unix(),
-			To:       to.Unix(),
-			Tests:    tests,
-		})
-	}))
-
-	publicMux.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-
-		var payload metrics.NodeStats
-		if err := decodeJSON(w, r, &payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		refreshConfig, err := agentAPI.ingest(payload, r.Header.Get("X-AGENT-TOKEN"))
-		if err != nil {
-			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":         "ok",
-			"refresh_config": refreshConfig,
-		})
-	})
-
-	agentUpdateAdminHandler := adminAgentUpdateHandler(store, hub, defaultAgentReleaseChecker)
-	adminMux.HandleFunc("/api/v1/admin/nodes", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			snapshot := adminStoreSnapshot(store)
-			writeJSON(w, http.StatusOK, snapshot)
-		case http.MethodDelete:
-			handleAdminClearNodesRequest(w, r, store, hub)
-		default:
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		}
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/nodes/", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/nodes/")
-		if strings.HasSuffix(path, "/agent/update") {
-			agentUpdateAdminHandler(w, r)
-			return
-		}
-		nodeID, ok := adminNodeIDFromPath(w, path)
-		if !ok {
-			return
-		}
-		switch r.Method {
-		case http.MethodPut, http.MethodPatch:
-			handleAdminUpdateNodeProfileRequest(w, r, store, hub, nodeID)
-		case http.MethodDelete:
-			handleAdminDeleteNodeRequest(w, r, store, hub, nodeID)
-		default:
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		}
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/session", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		authenticated := validateAdminJWT(store, cfg.JWTSecret, r) == nil
-		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": authenticated})
-	})
-
-	adminMux.HandleFunc("/api/v1/admin/logs", requireAdminJWT(store, cfg.JWTSecret, handleAdminLogsRequest))
-
-	adminMux.HandleFunc("/api/v1/admin/settings", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			view := store.SettingsView()
-			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-				view.AgentEndpoint = cfg.PublicAddr
-			}
-			writeJSON(w, http.StatusOK, view)
-		case http.MethodPatch, http.MethodPut:
-			var update SettingsUpdate
-			if err := decodeJSON(w, r, &update); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-				return
-			}
-			view, err := store.UpdateSettings(update)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-				view.AgentEndpoint = cfg.PublicAddr
-			}
-			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
-				log.Printf("更新设置后刷新会话 cookie 失败: %v", err)
-			}
-			broadcastStoreSnapshot(hub, store)
-			writeJSON(w, http.StatusOK, view)
-		default:
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		}
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/system/update", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			viewCtx, cancelView := releaseCheckContext(r)
-			writeJSON(w, http.StatusOK, systemUpdater.View(viewCtx, false))
-			cancelView()
-		case http.MethodPost:
-			if !updater.CanCurrentDeployUpdate() {
-				message := updater.DefaultUnsupportedUpdateMessage()
-				if strings.TrimSpace(message) == "" {
-					message = "当前平台暂不支持服务端自更新"
-				}
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
-				return
-			}
-			reservation, err := systemUpdater.ReserveStart()
-			if err != nil {
-				if errors.Is(err, errSystemUpdateInProgress) {
-					writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
-					return
-				}
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-			started := false
-			defer func() {
-				if !started {
-					reservation.Cancel()
-				}
-			}()
-			checkCtx, cancelCheck := releaseCheckContext(r)
-			releaseInfo, err := systemUpdater.CheckLatest(checkCtx)
-			cancelCheck()
-			if err != nil {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-				return
-			}
-			if err := validateReleaseTargetVersion(releaseInfo); err != nil {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-				return
-			}
-			if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
-				writeJSON(w, http.StatusOK, map[string]string{
-					"status":         "up_to_date",
-					"target_version": releaseInfo.LatestVersion,
-				})
-				return
-			}
-			dockerManaged := updater.CanDockerManagedUpdate()
-			if message := systemUpdateReleaseAssetError(releaseInfo, dockerManaged); message != "" {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": message})
-				return
-			}
-			err = reservation.Start(releaseInfo, dockerManaged, func() error {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				defer cancel()
-				if dockerManaged {
-					dockerUpdater, err := updater.NewDockerManagedUpdaterContext(ctx)
-					if err != nil {
-						return err
-					}
-					targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
-					if err != nil {
-						return fmt.Errorf("解析 Docker 目标镜像失败: %w", err)
-					}
-					return dockerUpdater.LaunchSelfContainerUpdate(ctx, targetImage, "")
-				}
-				if err := systemUpdater.client.ApplyReleaseAsset(ctx, releaseInfo.LatestVersion, releaseInfo.DownloadURL, releaseInfo.ChecksumURL); err != nil {
-					return err
-				}
-				time.Sleep(700 * time.Millisecond)
-				return updater.RestartSelf()
-			})
-			if err != nil {
-				if errors.Is(err, errSystemUpdateInProgress) {
-					writeJSON(w, http.StatusConflict, map[string]string{"error": "当前已有服务端更新任务正在执行"})
-					return
-				}
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-			started = true
-			writeJSON(w, http.StatusAccepted, map[string]string{
-				"status":         "started",
-				"target_version": releaseInfo.LatestVersion,
-			})
-		default:
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		}
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/config/export", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		payload := store.ExportConfig()
-		if splitMode && strings.TrimSpace(payload.Settings.AgentEndpoint) == "" {
-			payload.Settings.AgentEndpoint = cfg.PublicAddr
-		}
-		data, err := json.MarshalIndent(payload, "", "  ")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "export failed"})
-			return
-		}
-		filename := fmt.Sprintf("cybermonitor-config-%s.json", time.Now().Format("20060102-150405"))
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/config/import", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var payload ConfigTransferData
-		if err := decodeJSON(w, r, &payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		view, err := store.ImportConfig(payload)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-			view.AgentEndpoint = cfg.PublicAddr
-		}
-		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
-			log.Printf("导入配置后刷新会话 cookie 失败: %v", err)
-		}
-		broadcastStoreSnapshot(hub, store)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"settings": view,
-		})
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/alerts/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req struct {
-			Webhook         string  `json:"webhook"`
-			TelegramToken   string  `json:"telegram_token"`
-			TelegramUserIDs []int64 `json:"telegram_user_ids"`
-			TelegramUserID  int64   `json:"telegram_user_id"`
-		}
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		webhook := strings.TrimSpace(req.Webhook)
-		telegramToken := strings.TrimSpace(req.TelegramToken)
-		telegramUserIDs := normalizeTelegramUserIDs(req.TelegramUserIDs)
-		if len(telegramUserIDs) == 0 && req.TelegramUserID > 0 {
-			telegramUserIDs = []int64{req.TelegramUserID}
-		}
-		if webhook == "" {
-			webhook = store.AlertWebhook()
-		}
-		if telegramToken == "" || len(telegramUserIDs) == 0 {
-			cfgToken, cfgUserIDs := store.TelegramSettings()
-			if telegramToken == "" {
-				telegramToken = cfgToken
-			}
-			if len(telegramUserIDs) == 0 {
-				telegramUserIDs = cfgUserIDs
-			}
-		}
-		if webhook == "" && (telegramToken == "" || len(telegramUserIDs) == 0) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请先配置飞书或 Telegram 告警"})
-			return
-		}
-		siteTitle := store.SiteTitle()
-		var errs []string
-		if webhook != "" {
-			if err := sendFeishuTest(webhook, siteTitle); err != nil {
-				errs = append(errs, err.Error())
-			}
-		}
-		if telegramToken != "" && len(telegramUserIDs) > 0 {
-			errs = append(errs, sendTelegramTest(telegramToken, telegramUserIDs, siteTitle)...)
-		}
-		if len(errs) > 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": strings.Join(errs, "; ")})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/ai/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req struct {
-			Provider string            `json:"provider"`
-			Config   *AIProviderConfig `json:"config"`
-		}
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		if strings.TrimSpace(req.Provider) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
-			return
-		}
-		settings, err := store.AISettings()
-		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-			return
-		}
-		selection, err := resolveAIProviderSelection(settings, req.Provider, req.Config)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
-		defer cancel()
-		if err := testAIProvider(ctx, selection.Provider, selection.Config); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}))
-
-	adminMux.HandleFunc("/api/v1/admin/ai/models", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		var req struct {
-			Provider string            `json:"provider"`
-			Config   *AIProviderConfig `json:"config"`
-		}
-		if err := decodeJSON(w, r, &req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-			return
-		}
-		if strings.TrimSpace(req.Provider) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
-			return
-		}
-		settings, err := store.AISettings()
-		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-			return
-		}
-		selection, err := resolveAIProviderSelection(settings, req.Provider, req.Config)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
-		defer cancel()
-		models, err := listAIModels(ctx, selection.Provider, selection.Config)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"models": models})
-	}))
-
-	publicMux.HandleFunc("/api/v1/agent/config", agentConfigHTTPHandler(agentAPI))
-
-	publicMux.HandleFunc("/api/v1/agent/register", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
-		}
-		nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
-		agentToken, err := agentAPI.register(nodeID, r.Header.Get("X-AGENT-TOKEN"))
-		if err != nil {
-			writeJSON(w, err.statusCode, map[string]string{"error": err.message})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{
-			"node_id":     nodeID,
-			"agent_token": agentToken,
-		})
-	})
-
-	publicMux.HandleFunc("/api/v1/agent/update/report", agentUpdateReportHTTPHandler(agentAPI))
-
-	type wsAuthMode int
-	const (
-		wsAuthPublic wsAuthMode = iota
-		wsAuthRequired
-		wsAuthMixed
-	)
-
-	wsHandler := func(mode wsAuthMode) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			audience := "public"
-			adminTokenSalt := ""
-			switch mode {
-			case wsAuthRequired:
-				if extractToken(r) == "" {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				if !isSameOrigin(r) {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				if err := validateAdminJWT(store, cfg.JWTSecret, r); err != nil {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				audience = "admin"
-				adminTokenSalt = store.Credentials().TokenSalt
-			case wsAuthPublic:
-			case wsAuthMixed:
-				if extractToken(r) == "" {
-					break
-				}
-				if !isSameOrigin(r) {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				if err := validateAdminJWT(store, cfg.JWTSecret, r); err != nil {
-					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-					return
-				}
-				audience = "admin"
-				adminTokenSalt = store.Credentials().TokenSalt
-			}
-			upgrader := websocket.Upgrader{
-				EnableCompression: true,
-				CheckOrigin: func(request *http.Request) bool {
-					if audience == "admin" {
-						return isSameOrigin(request)
-					}
-					return true
-				},
-			}
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				return
-			}
-			configureWSConn(conn)
-			variant := publicVariantBalanced
-			snapshot := storeSnapshot(store)
-			if audience == "admin" {
-				variant = adminVariant
-				snapshot = adminStoreSnapshot(store)
-			}
-			payload, err := json.Marshal(snapshot)
-			if err != nil {
-				log.Printf("序列化初始节点快照失败: %v", err)
-				_ = conn.Close()
-				return
-			}
-			client, err := hub.Add(conn, variant, adminTokenSalt, payload)
-			if err != nil {
-				log.Printf("WebSocket 初始入队失败: %v", err)
-				_ = conn.Close()
-				return
-			}
-
-			go heartbeatLoop(client, hub)
-			go writeLoop(client, hub)
-			go readLoop(client, hub)
-		}
-	}
-
-	if splitMode {
-		publicMux.HandleFunc("/ws", wsHandler(wsAuthPublic))
-		adminMux.HandleFunc("/ws", wsHandler(wsAuthRequired))
-	} else {
-		publicMux.HandleFunc("/ws", wsHandler(wsAuthMixed))
-	}
-
-	assetsRoot, err := fs.Sub(webRoot, "public/assets")
 	if err != nil {
 		return err
-	}
-	assetsHandler := withNoStore(http.StripPrefix("/assets/", http.FileServer(http.FS(assetsRoot))))
-
-	adminDistRoot, err := fs.Sub(webRoot, "dist/admin")
-	if err != nil {
-		return err
-	}
-	adminDistFileServer := http.FileServer(http.FS(adminDistRoot))
-	publicMux.Handle("/assets/", assetsHandler)
-	if splitMode {
-		adminMux.Handle("/assets/", assetsHandler)
-	}
-
-	if !splitMode {
-		publicMux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/dashboard" {
-				http.NotFound(w, r)
-				return
-			}
-			http.Redirect(w, r, "/", http.StatusFound)
-		})
-	}
-
-	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
-		data, err := webFS.ReadFile("web/public/index.html")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
-			return
-		}
-		htmlText := string(data)
-		if prefix := forwardedPrefix(r, trustedProxyHeaders); prefix != "" {
-			baseTag := `<base href="` + html.EscapeString(prefix+"/") + `" />`
-			if strings.Contains(htmlText, "<head>") {
-				htmlText = strings.Replace(htmlText, "<head>", "<head>"+baseTag, 1)
-			} else {
-				htmlText = baseTag + htmlText
-			}
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(htmlText))
-	}
-
-	writeAdminAppHTML := func(w http.ResponseWriter, r *http.Request) {
-		data, err := webFS.ReadFile("web/dist/admin/index.html")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
-			return
-		}
-		htmlText := string(data)
-		htmlText = strings.Replace(htmlText, "<title>CyberMonitor 管理后台</title>", "<title>"+html.EscapeString(adminDocumentTitle(store.SiteTitle()))+"</title>", 1)
-		bootPayload, err := buildAdminBootPayload(store, r, trustedProxyHeaders)
-		if err == nil {
-			bootMeta := `<meta name="cm-admin-boot" content="` + bootPayload + `" />`
-			if strings.Contains(htmlText, "</head>") {
-				htmlText = strings.Replace(htmlText, "</head>", bootMeta+"</head>", 1)
-			} else {
-				htmlText = bootMeta + htmlText
-			}
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(htmlText))
-	}
-
-	serveAdminDistAt := func(w http.ResponseWriter, r *http.Request, prefix string) {
-		trimmedPath := strings.TrimPrefix(r.URL.Path, prefix)
-		if trimmedPath == r.URL.Path {
-			http.NotFound(w, r)
-			return
-		}
-		next := r.Clone(r.Context())
-		next.URL.Path = "/" + strings.TrimPrefix(trimmedPath, "/")
-		if r.URL.RawPath != "" {
-			trimmedRawPath := strings.TrimPrefix(r.URL.RawPath, prefix)
-			next.URL.RawPath = "/" + strings.TrimPrefix(trimmedRawPath, "/")
-		}
-		withNoStore(adminDistFileServer).ServeHTTP(w, next)
-	}
-
-	handleAdminRequest := func(w http.ResponseWriter, r *http.Request) bool {
-		adminPath := store.AdminPath()
-		adminPrefix := adminPath + "/"
-
-		switch r.URL.Path {
-		case adminPath:
-			http.Redirect(w, r, forwardedPrefixedPath(r, adminPrefix, trustedProxyHeaders), http.StatusFound)
-			return true
-		case adminPrefix:
-			writeAdminAppHTML(w, r)
-			return true
-		}
-
-		if strings.HasPrefix(r.URL.Path, adminPrefix) {
-			serveAdminDistAt(w, r, adminPrefix)
-			return true
-		}
-
-		return false
-	}
-
-	if splitMode {
-		adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if handleAdminRequest(w, r) {
-				return
-			}
-			http.NotFound(w, r)
-		})
-
-		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/", "/dashboard":
-				writePublicIndexHTML(w, r)
-				return
-			default:
-				http.NotFound(w, r)
-			}
-		})
-	} else {
-		publicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if handleAdminRequest(w, r) {
-				return
-			}
-			if r.URL.Path != "/" {
-				http.NotFound(w, r)
-				return
-			}
-			writePublicIndexHTML(w, r)
-		})
 	}
 
 	grpcServer := newAgentRPCServer(agentAPI)
@@ -1518,8 +734,7 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 					lastRateSweep = now
 				}
 				if hub.HasVariant(adminVariant) {
-					// 每变体只编码一次：digest 直接取自 payload 字节，
-					// 变化时复用同一份 payload 广播（原先编码两次）。
+
 					payload, err := json.Marshal(adminStoreSnapshot(store))
 					if err != nil {
 						log.Printf("序列化管理端节点快照失败: %v", err)
@@ -1808,9 +1023,7 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	s.mu.Lock()
 
 	prev := s.nodes[stats.NodeID]
-	// ServerID 分配（randomToken 失败）是唯一的错误路径：提前到任何状态
-	// 变更之前，失败直接返回，无需回滚快照。生成只读 s.profiles，判定与
-	// 原 ensureServerIDLocked 一致（profile 缺失或 ServerID 为空才生成）。
+
 	var newServerID string
 	if profile := s.profiles[stats.NodeID]; profile == nil || strings.TrimSpace(profile.ServerID) == "" {
 		id, err := s.generateServerIDLocked()
@@ -1863,10 +1076,7 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 		}
 	}
 	if storedStats.NodeGroup != "" && !profile.GroupSeeded {
-		// r85：只播种当前分组树里真实存在的组——agent 配置常残留已删除
-		// 的旧组名，升级后旧数据无播种标记，首次上报会把悬空选择写回
-		//（启动自愈刚清掉又被复活），双隐藏节点因此永久隐藏。未知组
-		// 不消耗播种机会：管理员建同名组后仍可自动物化。
+
 		groupNames, _, _ := groupSelectionSets(s.settings)
 		if _, known := groupNames[normalizeGroupName(strings.TrimSpace(storedStats.NodeGroup))]; known {
 			if profile.Group == "" {
@@ -1880,8 +1090,7 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 				}
 				profile.Tags = tags
 			}
-			// 一次性消费：此后不再从 agent 上报重建（管理员所有权优先，
-			// r82 报障③）。
+
 			profile.GroupSeeded = true
 			persist = true
 		}
@@ -2876,10 +2085,6 @@ func broadcastStoreSnapshot(hub *Hub, store *Store) {
 	hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
 }
 
-// snapshotPayloadDigest 对已序列化的快照 payload 计算 FNV-1a 摘要，跳过
-// 每秒必变的 generated_at 数值段，保持"内容未变不广播"的门控语义。
-// 依赖 Snapshot 的字段顺序（type, generated_at, nodes…）；结构变化时
-// 退化为全量摘要——只多广播，不影响正确性。
 func snapshotPayloadDigest(payload []byte) string {
 	const prefix = `{"type":"snapshot","generated_at":`
 	digest := fnv.New64a()
@@ -2981,7 +2186,7 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 func (s *Store) Snapshot() []NodeView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// 分组集合在过滤前算一次，逐节点复用（原先每节点重建两份 map）。
+
 	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
 	all := s.snapshotLocked(false)
 	visible := all[:0]
@@ -2995,18 +2200,11 @@ func (s *Store) Snapshot() []NodeView {
 	return visible
 }
 
-// nodePublicVisibleLocked 判定节点在公开页的可见性，调用方须持 s.mu（读或写）。
-// HideFromDisplay=完全隐藏；仅双开关（CR∧All）隐藏时，若节点仍挂着
-// 任一有效自建分组（选择 ∈ settings 分组集合，与展示页分组 tab 归属
-// 同口径）则保留——它在分组视图可见且计入总数，ALL/C&R 视图由前端
-// hidden_from_* 过滤剔除。悬空选择不算（与 collectGroupNames 一致）。
 func (s *Store) nodePublicVisibleLocked(hideDisplay, hideCR, hideAll bool, groups []string) bool {
 	groupNames, tagKeys, treeMode := groupSelectionSets(s.settings)
 	return nodePublicVisibleSetsLocked(groupNames, tagKeys, treeMode, hideDisplay, hideCR, hideAll, groups)
 }
 
-// nodePublicVisibleSetsLocked 是 nodePublicVisibleLocked 的预计算版本：
-// 分组集合由调用方一次算好后传入，避免快照逐节点重建。调用方须持 s.mu。
 func nodePublicVisibleSetsLocked(groupNames, tagKeys map[string]struct{}, treeMode, hideDisplay, hideCR, hideAll bool, groups []string) bool {
 	if hideDisplay {
 		return false
@@ -3023,7 +2221,6 @@ func (s *Store) AdminSnapshot() []NodeView {
 	return s.snapshotLocked(true)
 }
 
-// snapshotLocked 要求调用方已持 s.mu 读锁。
 func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 	views := make([]NodeView, 0, len(s.nodes))
 	now := time.Now()
@@ -3131,10 +2328,6 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 	}, true
 }
 
-// PublicNodeDeltaIfChanged 构建该节点的 node_delta，但先做内容去重：
-// 中和每报必变字段（LastSeen/Timestamp/UptimeSec）后取 FNV-1a 摘要与
-// 上次广播比对，未变化则不再推送——完整的 tick 快照仍会携带新鲜
-// LastSeen，UI 新鲜度不受影响。需持锁写摘要，故取写锁（临界区内无 I/O）。
 func (s *Store) PublicNodeDeltaIfChanged(nodeID string) (NodeDelta, bool) {
 	now := time.Now()
 	s.mu.Lock()
@@ -3159,9 +2352,6 @@ func (s *Store) PublicNodeDeltaIfChanged(nodeID string) (NodeDelta, bool) {
 	}, true
 }
 
-// nodeDeltaContentDigest 对 NodeView 取内容摘要。Type 恒定、
-// GeneratedAt 每次必变，均不参与；LastSeen/Timestamp/UptimeSec 属于
-// 每报必变的时钟字段，中和后仅真正的指标/配置变化才会改变摘要。
 func nodeDeltaContentDigest(node NodeView) uint64 {
 	node.LastSeen = 0
 	node.Stats.Timestamp = 0
@@ -3195,8 +2385,7 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 	updateSupported, updateMode, updateState, updateTargetVersion, updateMessage := resolveAgentUpdateView(profile, node.Stats)
 
 	stats := cloneNodeStats(node.Stats)
-	// 视图侧 stats.node_group 镜像选择解析出的组（而非 agent 原始上报），
-	// 清空后为空——否则 admin 表单/公开页的回退链会重新勾回。
+
 	stats.NodeGroup = group
 	if status == nodeStatusOffline {
 		stats.Network.TxBytesPerSec = 0
@@ -3239,16 +2428,11 @@ func resolveProfileGroupTags(profile *NodeProfile) (string, []string) {
 	return resolveProfileGroupTagsSelections(profile, normalizeGroupSelections(profile.Groups))
 }
 
-// resolveProfileGroupTagsSelections 允许调用方复用已算好的规范化选择，
-// 避免同一 profile 在一次视图构建里重复跑 normalizeGroupSelections。
 func resolveProfileGroupTagsSelections(profile *NodeProfile, selections []string) (string, []string) {
 	if len(selections) == 0 {
 		selections = selectionsFromGroupTags(profile.Group, profile.Tags)
 	}
-	// r84：不再从 stats.NodeGroup（agent 上报组）兑底回填——否则管理员
-	// 清空分组后视图 group 仍非空，admin 表单初始化回退链会把它重新勾
-	// 回（无法移除/强制一级的复活闭环）。agent 组名的唯一物化路径是
-	// updateNodeStats 的一次性播种（GroupSeeded，管理员所有权优先）。
+
 	group, tags := primaryGroupTagsFromSelections(selections)
 	return group, tags
 }
@@ -4539,10 +3723,7 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 		if rawProfile != nil {
 			*profile = *rawProfile
 		}
-		// r85 迁移：旧版在双开关保存时无条件派生 HideFromDisplay（UI 无
-		// 该开关，存量 true 均为派生残渣）——加载即清零，双隐藏+有效分组
-		// 节点按 r80 语义在分组页可见。display 转为纯显式 API 字段，重启
-		// 即失效的完整隐藏应改用双开关+不挂分组表达。
+
 		profile.HideFromDisplay = false
 		profile.Alias = strings.TrimSpace(profile.Alias)
 		profile.Group = strings.TrimSpace(profile.Group)
@@ -4801,13 +3982,13 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 			profile.AlertEnabled = boolPointer(true)
 		}
 		id := strings.TrimSpace(profile.ServerID)
-		if id == "" || containsKey(used, id) {
+		if _, exists := used[id]; id == "" || exists {
 			generatedID, err := randomToken(10)
 			if err != nil {
 				return err
 			}
 			id = generatedID
-			for containsKey(used, id) {
+			for _, exists := used[id]; exists; _, exists = used[id] {
 				generatedID, err := randomToken(10)
 				if err != nil {
 					return err
@@ -4819,11 +4000,6 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 		used[id] = struct{}{}
 	}
 	return nil
-}
-
-func containsKey(seen map[string]struct{}, key string) bool {
-	_, ok := seen[key]
-	return ok
 }
 
 func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProfile, bool) {
@@ -4869,7 +4045,7 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		profile.Groups = normalizeGroupSelections(profile.Groups)
 	}
 	if update.Group != nil || update.Tags != nil || update.Groups != nil {
-		// 管理员显式编辑分组字段：断言所有权，后续不再自动播种。
+
 		profile.GroupSeeded = true
 	}
 	if update.Region != nil {
@@ -4892,10 +4068,7 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 		if update.HideFromAll != nil {
 			profile.HideFromAll = *update.HideFromAll
 		}
-		// r85：双开关保存不再派生完全隐藏——旧派生把“双隐藏+挂有效组”
-		// 节点整体剔除，击穿 r80 分组页可见性（用户三轮报障真根因）。
-		// 两开关是可见性的完整契约；编辑即清除历史派生的 display 残留，
-		// 仅显式携带该字段时才true。
+
 		profile.HideFromDisplay = update.HideFromDisplay != nil && *update.HideFromDisplay
 	} else if update.HideFromDisplay != nil {
 		profile.HideFromCR = *update.HideFromDisplay
@@ -6303,9 +5476,17 @@ func isPrivateCallbackIP(ip net.IP) bool {
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(payload); err != nil {
+		log.Printf("序列化 JSON 响应失败: %v", err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("{\"error\":\"encode failed\"}\n"))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request, store *Store, hub *Hub, nodeID string) {

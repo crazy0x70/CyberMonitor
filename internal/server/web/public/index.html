@@ -12,13 +12,15 @@
     <meta
       name="theme-color"
       media="(prefers-color-scheme: dark)"
-      content="#0b1220"
+      content="#0b0b0d"
       id="theme-color-dark"
     />
-    <!-- 静态托管部署时填监控服务端地址（如 https://monitor.example.com），留空则使用同源 -->
+    
     <meta name="cm-api-base" content="" />
     <title>CyberMonitor</title>
     <link rel="icon" id="site-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="preload" as="font" type="font/woff2" href="./assets/inter-latin.woff2" crossorigin />
+    <link rel="preload" as="font" type="font/woff2" href="./assets/geist-mono-latin.woff2" crossorigin />
     <link rel="stylesheet" href="./assets/styles.css" />
   </head>
   <body>
@@ -33,7 +35,7 @@
           <p class="subtitle" id="brand-subtitle" data-i18n="brandSubtitle">主机监控</p>
         </div>
         <div class="topbar-right">
-          <div class="topbar-actions" aria-label="展示偏好">
+          <div class="topbar-actions" role="group" aria-label="展示偏好">
             <div class="control-menu">
               <button
                 class="control-toggle language-toggle"
@@ -72,9 +74,15 @@
               >
                 <span class="control-icon" id="theme-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3" y="4" width="18" height="12" rx="2"></rect>
-                    <path d="M8 20h8"></path>
-                    <path d="M12 16v4"></path>
+                    <circle cx="12" cy="12" r="4"></circle>
+                    <path d="M12 2v2"></path>
+                    <path d="M12 20v2"></path>
+                    <path d="m4.93 4.93 1.41 1.41"></path>
+                    <path d="m17.66 17.66 1.41 1.41"></path>
+                    <path d="M2 12h2"></path>
+                    <path d="M20 12h2"></path>
+                    <path d="m6.34 17.66-1.41 1.41"></path>
+                    <path d="m19.07 4.93-1.41 1.41"></path>
                   </svg>
                 </span>
               </button>

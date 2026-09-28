@@ -299,7 +299,7 @@ func releaseUpdateAssetError(kind updater.Kind, dockerManaged bool, missingAsset
 	if strings.TrimSpace(info.ChecksumURL) == "" {
 		return "Release 缺少 SHA256SUMS 校验文件"
 	}
-	if err := updater.ValidateReleaseAssetURLs(kind, info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
+	if err := updater.NewClient(updater.DefaultRepo, kind, "").ValidateReleaseAssetURLs(info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
 		return err.Error()
 	}
 	return ""

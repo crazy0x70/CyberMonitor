@@ -53,7 +53,7 @@ export function setStoredAdminToken(token: string) {
     }
     window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
   } catch {
-    // session cookie remains the source of truth when sessionStorage is unavailable
+
   }
 }
 
@@ -77,7 +77,7 @@ async function parseErrorMessage(resp: Response, fallback: string) {
       return payload.error;
     }
   } catch {
-    // ignore
+
   }
   return fallback;
 }
@@ -223,7 +223,7 @@ export function readAdminBootPayload(): AdminBootPayload {
     try {
       return JSON.parse(window.atob(encoded)) as AdminBootPayload;
     } catch {
-      // ignore malformed boot payload
+
     }
   }
   const payload = window.__CM_ADMIN_BOOT__;
@@ -406,12 +406,6 @@ interface AdminSocketOptions {
   staleTimeoutMs?: number;
 }
 
-// 半开连接（休眠/NAT 超时）不会触发 close 事件：超过 staleTimeoutMs 没有
-// 任何消息就主动断开，让既有 close 处理器走重连。阈值须大于服务端 ping
-// 周期（54s，server.go wsPingPeriod）——浏览器 JS 层看不到 ping/pong 控制
-// 帧，全部 agent 静默时数据广播也停，此前 15s 阈值会每 ~16s 误判重连。
-// 注意阈值大于周期只是把保底重连拉长到 ~70s 一次（静默期无消息可重置
-// 计时器），并非消除；半开场景下服务端 60s 读超时先断，close 事件更早到达。
 const DEFAULT_STALE_TIMEOUT_MS = 70000;
 
 export function connectAdminSocket(
@@ -453,7 +447,7 @@ export function connectAdminSocket(
       try {
         activeSocket?.close();
       } catch {
-        // close 处理器负责重连
+
       }
     }, staleTimeoutMs);
   };
@@ -468,7 +462,7 @@ export function connectAdminSocket(
         onNodeDelta?.(payload.node);
       }
     } catch {
-      // ignore invalid frames
+
     }
   };
 

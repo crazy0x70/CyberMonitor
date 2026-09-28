@@ -342,7 +342,10 @@ func normalizeAICompatibles(items []AIProviderProfile) ([]AIProviderProfile, err
 		if item.Name == "" && item.APIKey == "" && item.BaseURL == "" && item.Model == "" {
 			continue
 		}
-		for item.ID == "" || containsKey(seen, item.ID) {
+		for {
+			if _, exists := seen[item.ID]; item.ID != "" && !exists {
+				break
+			}
 			id, err := randomToken(8)
 			if err != nil {
 				return nil, err

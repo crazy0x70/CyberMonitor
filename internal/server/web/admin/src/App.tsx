@@ -109,7 +109,6 @@ import {
   adminSidebarIconButtonClass,
   adminSidebarNavItemClass,
   adminSidebarNavLabelClass,
-  adminSidebarLogoChipClass,
   adminSidebarSecondaryButtonClass,
   adminThemeToggleButtonClass,
 } from "@/lib/admin-ui";
@@ -218,7 +217,14 @@ function syncPageToURL(page: Page, replace = false) {
   if (typeof window === "undefined") {
     return;
   }
-  const nextURL = new URL(window.location.href);
+  // new URL() 对畸形输入会抛 TypeError：这里只是同步查询串，解析失败就跳过同步，
+  // 不能让它冒泡成未捕获异常打断导航。
+  let nextURL: URL;
+  try {
+    nextURL = new URL(window.location.href);
+  } catch {
+    return;
+  }
   if (page === "dashboard") {
     nextURL.searchParams.delete(PAGE_QUERY_KEY);
   } else {
@@ -235,7 +241,6 @@ function syncPageToURL(page: Page, replace = false) {
     window.history.pushState({}, "", nextLocation);
   }
 }
-
 
 function resolveBrandTitle(settings: SettingsView | null, publicSettings: PublicSettings | null) {
   return (
@@ -379,13 +384,13 @@ function AdminDropdownSwitcher<T extends string>({
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1.5 text-popover-foreground shadow-xl"
+          className="absolute right-0 top-full z-[90] mt-2 max-h-[min(320px,calc(100vh-5rem))] min-w-[9rem] overflow-y-auto rounded-xl border border-[var(--cm-control-border)] bg-popover p-1 text-popover-foreground shadow-[var(--cm-elev-2)]"
         >
           {options.map((item) => (
             <button
               key={item.value}
               aria-checked={item.value === activeValue}
-              className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
+              className="flex min-h-9 w-full cursor-pointer items-center justify-between rounded-lg px-2 py-2 text-left text-sm font-semibold outline-none hover:bg-accent focus-visible:bg-accent"
               role="menuitemradio"
               type="button"
               onClick={() => {
@@ -394,7 +399,7 @@ function AdminDropdownSwitcher<T extends string>({
               }}
             >
               <span>{optionLabel(item.label)}</span>
-              {item.value === activeValue ? <Icon className="h-4 w-4 text-sky-500" /> : null}
+              {item.value === activeValue ? <Icon className="h-4 w-4 text-primary" /> : null}
             </button>
           ))}
         </div>
@@ -484,7 +489,8 @@ function BrandIcon({
       />
     );
   }
-  return <Activity className={sizeClass} />;
+
+  return null;
 }
 
 function NavContent({
@@ -509,36 +515,30 @@ function NavContent({
   const monitorHref = publicMonitorPath();
 
   return (
-    <div className="m-4 flex h-[calc(100vh-2rem)] flex-col rounded-[2.5rem] border border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] text-sidebar-foreground shadow-[var(--cm-panel-shadow)] backdrop-blur-3xl">
-      <div className="border-b border-[var(--cm-sidebar-border)] px-6 py-8">
+    <div className="flex h-full flex-col text-sidebar-foreground">
+      <div className="px-5 pt-6 pb-6">
         <a
           aria-label={t("打开监控页")}
-          className="flex items-center gap-4 rounded-2xl text-[18px] font-black tracking-tighter text-sidebar-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+          className="flex min-w-0 items-center gap-2.5 rounded-lg text-[15px] font-semibold tracking-tight text-foreground outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)]"
           href={monitorHref}
         >
-          <div className={`${adminSidebarLogoChipClass} h-12 w-12 shrink-0 overflow-hidden shadow-lg`}>
-            <BrandIcon siteIcon={siteIcon} siteTitle={siteTitle} sizeClass="h-7 w-7" />
-          </div>
-          <div className="min-w-0 flex-1 leading-tight overflow-hidden">
-            <div className="truncate whitespace-nowrap bg-gradient-to-br from-slate-900 to-slate-500 bg-clip-text text-transparent dark:from-white dark:to-slate-400 italic">
-              {siteTitle}
-            </div>
-            <div className="mt-1">
-              <span className="inline-flex h-5 items-center rounded-full border border-slate-200 bg-slate-100/50 px-2.5 text-[8px] font-black tracking-[0.18em] text-slate-500 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-400">
-                {deployedVersionLabel}
-              </span>
-            </div>
-          </div>
+          <span className="h-5 w-5 shrink-0 overflow-hidden">
+            <BrandIcon siteIcon={siteIcon} siteTitle={siteTitle} sizeClass="h-5 w-5" />
+          </span>
+          <span className="min-w-0 truncate">{siteTitle}</span>
         </a>
+        <div className="data-text mt-2 pl-8 text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--label-3)]">
+          {deployedVersionLabel}
+        </div>
       </div>
-      <ScrollArea className="flex-1 px-5 py-8">
-        <div className="space-y-9 pb-8">
+      <ScrollArea className="min-h-0 flex-1">
+        <nav className="px-3 pb-6">
           {navigation.map((group) => (
-            <div key={group.title}>
-              <h4 className="mb-4 px-4 text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 dark:text-slate-500">
+            <div key={group.title} className="pb-5">
+              <h4 className="px-3 pb-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-[var(--label-3)]">
                 {group.title}
               </h4>
-              <div className="space-y-1.5">
+              <div className="space-y-0.5">
                 {group.items.map((item) => {
                   const Icon = item.icon;
                   const active = currentPage === item.id;
@@ -546,39 +546,39 @@ function NavContent({
                     <a
                       key={item.id}
                       href={adminPageHref(item.id)}
-                      className={`${adminSidebarNavItemClass} relative overflow-hidden ${
-                        active
-                          ? "border-transparent bg-[#1f5dff] text-white shadow-[0_14px_32px_-14px_rgba(31,93,255,0.55)] dark:bg-[#2563eb] dark:text-white"
-                          : "border-transparent text-slate-500 hover:bg-[var(--cm-control-bg)] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-[var(--cm-control-bg)] dark:hover:text-slate-100"
+                      aria-current={active ? "page" : undefined}
+                      className={`${adminSidebarNavItemClass} ${
+                        active ? "text-primary dark:text-primary" : ""
                       }`}
                       onClick={(event) => {
                         onNavLinkClick(event, item.id);
                       }}
                     >
-                      <span className={adminSidebarNavLabelClass}>
-                        <Icon
-                          className={`h-4 w-4 ${active ? "text-white" : "text-slate-400 group-hover:text-current"}`}
-                        />
-                        <span className="tracking-tight">{item.label}</span>
-                      </span>
                       {active ? (
-                        <div className="h-1.5 w-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]" />
+                        <span
+                          aria-hidden
+                          className="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-primary"
+                        />
                       ) : null}
+                      <span className={adminSidebarNavLabelClass}>
+                        <Icon className="h-4 w-4 shrink-0" />
+                        <span className="truncate tracking-tight">{item.label}</span>
+                      </span>
                     </a>
                   );
                 })}
               </div>
             </div>
           ))}
-        </div>
+        </nav>
       </ScrollArea>
-      <div className="mt-auto border-t border-[var(--cm-sidebar-border)] p-5">
+      <div className="mt-auto border-t border-[var(--cm-sidebar-border)] p-3">
         <Button
           className={`${adminSidebarSecondaryButtonClass} group`}
-          variant="outline"
+          variant="ghost"
           onClick={onLogout}
         >
-          <LogOut className="mr-3 h-4 w-4" />
+          <LogOut className="h-4 w-4" />
           <span className="tracking-tight">{t("退出登录")}</span>
         </Button>
       </div>
@@ -593,8 +593,7 @@ export default function App() {
   const [token, setToken] = useState(() => getStoredAdminToken());
   const [settings, setSettings] = useState<SettingsView | null>(null);
   const [loginConfig, setLoginConfig] = useState<LoginConfigResponse | null>(null);
-  // 加载完成（含失败）前不下发 passwordLoginEnabled 判定：避免"密码登录
-  // 已禁用"的部署在配置到达前闪现密码表单。
+
   const [loginConfigLoaded, setLoginConfigLoaded] = useState(false);
   const [publicSettings, setPublicSettings] = useState<BootPublicSettings | null>(() => BOOT_PAYLOAD.settings || null);
   const [systemUpdateInfo, setSystemUpdateInfo] = useState<SystemUpdateInfo | null>(null);
@@ -615,7 +614,7 @@ export default function App() {
   const loadAllRequestRef = useRef(0);
   const systemUpdatePollErrorToastAtRef = useRef(0);
   const localeChangeSeqRef = useRef(0);
-  // 401 已由登出流程展示过期提示，其余错误才弹 toast。
+
   const reportActionError = (error: unknown, fallback: string) => {
     if (error instanceof AdminApiError && error.status === 401) {
       return;
@@ -627,6 +626,7 @@ export default function App() {
   const siteIcon = normalizePublicIconURL(settings?.site_icon || publicSettings?.site_icon || "");
   const siteTitle = resolveBrandTitle(settings, publicSettings);
   const deployedVersion = (settings?.version || publicSettings?.version || "").trim();
+
   const deployedVersionLabel = formatVersionLabel(deployedVersion);
   const activeThemeOption = ADMIN_THEME_OPTIONS.find((item) => item.value === themeMode) || ADMIN_THEME_OPTIONS[0];
   const t = useCallback((text: string) => adminText(locale, text), [locale]);
@@ -640,7 +640,7 @@ export default function App() {
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
     } catch {
-      // storage may be disabled by browser policy
+
     }
   }, [isDark, theme, themeMode]);
 
@@ -678,8 +678,6 @@ export default function App() {
       return;
     }
 
-    // zh-CN 是源语言，翻译扫描是纯开销：只做一次初始归位，不再挂观察器。
-    // 其余语言用 150ms 尾随去抖，避免高频 WS 增量触发逐帧全树遍历。
     translateAdminDOM(root, locale);
     if (locale === "zh-CN") {
       return;
@@ -806,10 +804,9 @@ export default function App() {
       }
       proceedToPage(page);
     },
-    // proceedToPage 只触发 setter/URL 同步，无状态读取，不需入依赖。
+
     [currentPage, hasUnsavedPageChanges],
   );
-
 
   function handleNavLinkClick(event: MouseEvent<HTMLAnchorElement>, page: Page) {
     if (!shouldHandleAdminNavigation(event)) {
@@ -989,7 +986,7 @@ export default function App() {
     }
     systemUpdatePollRef.current = window.setInterval(() => {
       refreshSystemUpdate().catch((error) => {
-        // 1.5s 轮询下网络抖动会连续失败，30s 节流避免连环弹窗。
+
         const now = Date.now();
         if (now - systemUpdatePollErrorToastAtRef.current < 30_000) {
           return;
@@ -1342,8 +1339,6 @@ export default function App() {
     [handleLogout, locale, refreshNodesAfterMutation, t],
   );
 
-  // 节点依赖页（dashboard/servers/groups/alerts）：WS nodes 快照变化时
-  // 重建是预期行为（页面内容本身依赖节点数据）。
   const nodePageContent = useMemo(() => {
     switch (currentPage) {
       case "dashboard":
@@ -1413,8 +1408,6 @@ export default function App() {
     updateSettings,
   ]);
 
-  // 非节点页（probes/settings/ai/logs）：依赖不含 nodes，WS 快照到达时
-  // 元素引用保持稳定，React 跳过这些页的重渲染。
   const staticPageContent = useMemo(() => {
     switch (currentPage) {
       case "probes":
@@ -1531,11 +1524,11 @@ export default function App() {
     <div className="flex min-h-screen font-sans text-foreground">
       <a
         href="#admin-main-content"
-        className="sr-only fixed left-4 top-4 z-[70] rounded-full bg-slate-950 px-4 py-2 text-sm font-medium text-white shadow-lg focus:not-sr-only focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 dark:bg-white dark:text-slate-950"
+        className="sr-only fixed left-4 top-4 z-[70] rounded-full bg-slate-950 px-4 py-2 text-sm font-medium text-white shadow-[var(--cm-elev-2)] focus:not-sr-only focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] dark:bg-[var(--surface-3)] dark:text-[var(--label-1)]"
       >
         {t("跳转到主要内容")}
       </a>
-      <aside className="fixed inset-y-0 z-50 hidden w-72 flex-col md:flex">
+      <aside className="fixed inset-y-0 z-50 hidden w-64 flex-col border-r border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] md:flex">
         <NavContent
           currentPage={currentPage}
           deployedVersionLabel={deployedVersionLabel}
@@ -1550,7 +1543,7 @@ export default function App() {
         />
       </aside>
 
-      <header className="fixed left-0 right-0 top-0 z-50 flex h-16 items-center border-b border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] px-6 backdrop-blur-3xl md:hidden">
+      <header className="fixed left-0 right-0 top-0 z-50 flex h-16 items-center border-b border-[var(--cm-sidebar-border)] bg-[var(--cm-sidebar-bg)] px-4 backdrop-blur-3xl md:hidden">
         <Sheet open={isMobileMenuOpen} onOpenChange={setIsMobileMenuOpen}>
           <SheetTrigger
             render={(
@@ -1581,19 +1574,17 @@ export default function App() {
         </Sheet>
         <a
           aria-label={t("打开监控页")}
-          className="ml-4 flex min-w-0 items-center gap-3 rounded-xl font-black tracking-tighter text-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+          className="ml-4 flex min-w-0 items-center gap-2.5 rounded-lg font-semibold tracking-tight text-foreground transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)]"
           href={publicMonitorPath()}
         >
-          <div className={`${adminSidebarLogoChipClass} h-10 w-10 rounded-xl overflow-hidden shadow-lg`}>
+          <span className="h-5 w-5 shrink-0 overflow-hidden">
             <BrandIcon siteIcon={siteIcon} siteTitle={siteTitle} sizeClass="h-5 w-5" />
-          </div>
-          <div className="min-w-0 leading-tight">
-            <div className="truncate text-[17px] italic">{siteTitle}</div>
-            <div className="mt-0.5 text-[8px] font-black tracking-[0.18em] text-muted-foreground">
-              {deployedVersionLabel}
-            </div>
-          </div>
+          </span>
+          <span className="min-w-0 truncate text-[15px]">{siteTitle}</span>
         </a>
+        <span className="data-text ml-1 text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--label-3)]">
+          {deployedVersionLabel}
+        </span>
         <div className="ml-auto flex items-center gap-2">
           <AdminLocaleSwitcher
 
@@ -1613,9 +1604,12 @@ export default function App() {
         </div>
       </header>
 
-      <main id="admin-main-content" className="relative flex min-h-screen flex-1 flex-col pt-20 md:pl-72 md:pt-4">
-        <ScrollArea className="flex-1">
-          <div className="w-full p-6 md:p-10 md:pt-10">
+      <main
+        id="admin-main-content"
+        className="relative flex h-screen min-w-0 flex-1 flex-col overflow-hidden pt-20 md:pl-64 md:pt-0"
+      >
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="w-full p-4 md:p-8">
             <div className="mb-8 hidden justify-end gap-2 md:flex">
               <AdminLocaleSwitcher
 
@@ -1636,9 +1630,7 @@ export default function App() {
             {loading ? (
               <SectionLoader label={t("正在加载数据…")} minHeightClass="min-h-[50vh]" />
             ) : (
-              <div className="animate-in fade-in slide-in-from-bottom-6 duration-1000 ease-out fill-mode-both">
-                {pageContent}
-              </div>
+              pageContent
             )}
           </div>
         </ScrollArea>

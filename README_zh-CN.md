@@ -1,90 +1,85 @@
-<div align="center">
-  <h1>CyberMonitor</h1>
-  <p>一个极简、优雅且轻量级的自托管服务器监控系统。</p>
+# CyberMonitor
 
-  <p>
-    <a href="https://github.com/crazy0x70/CyberMonitor/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
-    <img src="https://img.shields.io/badge/Go-1.27.1-blue" alt="Go Version">
-    <img src="https://img.shields.io/badge/React-19-61dafb" alt="React">
-  </p>
-</div>
+自托管的服务器监控。一个 32MB 的 Go 二进制把状态页和管理后台都嵌进去了，无需外置数据库——配置和节点状态落在数据目录的 JSON 文件里，连通性历史存在内嵌的时序存储里。Agent 装在被监控的机器上，每秒上报资源；Server 聚合后推给浏览器。
 
-## 🚀 快速上手
+[English](./README.md) · 简体中文
 
-### 1. 快速安装
+## 你会得到什么
 
-单文件入口 `one-click.sh` 同时覆盖 Linux（systemd）与 macOS（launchd），支持主控与探针的安装和卸载：
+**状态页**（访客看的那个）：节点在线状态、CPU/内存/磁盘用量、上下行速率、每个节点的连通性曲线（TCP/ICMP 延迟 + 丢包率，1 小时/1 天/1 周三档）。深浅色主题，中英双语，可以换自定义背景图。
+
+**管理后台**（路径随机生成，比如 `/uGXfuIMrjdzJ`）：九个页面——首页、节点管理、分组管理、探测设置、通知告警、基础设置、AI 服务商、日志。能做的事：
+
+- 给节点分组打标签、标注到期时间和续费周期
+- 配置探测目标（TCP 端口或 ICMP）下发到指定节点，或让 Agent 启动参数自带
+- Telegram / 飞书告警，节点离线时推送
+- 接入 OpenAI 或任何兼容端点做运维提示词
+- GitHub OAuth / OIDC 登录、Cloudflare Turnstile 人机验证、防爆破（15 分钟内错 5 次密码锁 15 分钟）
+
+## 装 Server
+
+一条命令，Linux 走 systemd，macOS 走 launchd：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
 sudo bash /tmp/one-click.sh
 ```
 
-非交互用法：
+装完监听 `:25012`，浏览器打开 `http://<ip>:25012` 是公开状态页。管理后台的入口路径、账号、密码都在首次启动时随机生成。一键脚本装的：密码由安装器生成并打印在**安装终端输出的末尾**（服务日志只显示「已设置（不回显）」）；手动二进制或 Docker 装的：账号和密码在**首次启动日志**里打印一次（systemd 服务名为 `cyber-monitor-server`，看 `journalctl -u cyber-monitor-server`）。入口路径存在数据目录 `state.json` 的 `settings.admin_path` 字段（一键安装默认数据目录 `/opt/CyberMonitor/data`）。登录后第一件事改密码。备份就是备份整个数据目录。
 
-```bash
-bash /tmp/one-click.sh install-server  [--listen 25012] [--data-dir 目录] [--version V]
-bash /tmp/one-click.sh install-agent   --server-url http://<主控IP>:25012 --agent-token <你的Token> [--node-id N] [--disable-update]
-bash /tmp/one-click.sh uninstall-agent
-bash /tmp/one-click.sh uninstall-server [--keep-data]
-```
-
-Linux 需要 `sudo`（systemd）。macOS 以 `sudo` 运行安装系统级 LaunchDaemon（开机自启）；普通用户运行安装用户级 LaunchAgent（登录自启）。
-
-### 2. Docker 部署主控 (Server)
+Docker 也行：
 
 ```bash
 mkdir -p ./data
-docker run -d \
-  -p 25012:25012 \
-  -e CM_DATA_DIR=/data \
-  -v "$(pwd)/data:/data" \
-  --name cyber-monitor-server \
-  --restart=always \
+docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" \
+  --name cyber-monitor-server --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
 
-默认 Server 命令不会挂载 Docker socket。若确实需要在管理后台一键更新 Docker Server，请设置 `CM_ENABLE_DOCKER_UPDATE=1` 并挂载 `/var/run/docker.sock`；否则应手动拉取最新镜像并重建容器。
+注意：默认的 Docker 命令不挂 docker.sock，管理面板里的一键更新对 Docker 部署不可用；要开就设 `CM_ENABLE_DOCKER_UPDATE=1` 并挂 `/var/run/docker.sock`，不开就自己 pull 新镜像重建容器。
 
-### 3. Docker 部署探针 (Agent)
+## 装 Agent
+
+后台「节点管理」页有现成命令，填好 Server 地址和 Token 复制执行即可。手动装：
+
+#### Linux / macOS
 
 ```bash
-mkdir -p ./agent-state
-docker run -d \
-  --name cyber-monitor-agent \
-  --network host \
-  --restart always \
-  --cap-add NET_RAW \
-  -e CM_SERVER_URL="http://<主控IP>:25012" \
-  -e CM_AGENT_TOKEN="<你的Token>" \
-  -e CM_NODE_ID_FILE="/state/.cybermonitor-node-id" \
-  -e CM_AGENT_TOKEN_FILE="/state/.cybermonitor-agent-token" \
-  -e CM_INTERVAL="5s" \
-  -e CM_DISABLE_UPDATE="1" \
-  -v "$(pwd)/agent-state:/state" \
-  -v /:/host:ro \
-  -v /proc:/host/proc:ro \
-  -v /sys:/host/sys:ro \
-  -v /etc:/host/etc:ro \
-  ghcr.io/crazy0x70/cyber-monitor-agent:latest
+curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
+sudo bash /tmp/one-click.sh install-agent --server-url http://<server-ip>:25012 --agent-token <你的token>
 ```
 
-**配置说明**：`CM_SERVER_URL` 是探针的统一接入地址。Agent 启动后会优先尝试建立 `gRPC` 控制链路；若环境（如反向代理或 CDN）仅支持 `HTTP/1.1`，Agent 会自动回退至 `HTTP` 模式。若需长期保持 `gRPC` 模式，请确保 Agent 直连 Server 或使用支持 `HTTP/2` / `h2c` 的代理。此外，若服务端启用了 `CM_PUBLIC_LISTEN` 分离接口，请务必填写该公网端口。
+macOS 不加 sudo 装成用户级 LaunchAgent（登录时启动），加 sudo 装系统级 LaunchDaemon（开机启动）。日志在 `/var/log/cybermonitor-agent.log`（root）或 `~/Library/Logs/`（用户）。
 
-**本地网络测试（`CM_NET_TESTS` / `-net-tests`）**：逗号分隔的目标列表，服务端未在管理后台为该节点配置探测项时生效。单项支持以下形式（`名称` 可选）：
+#### Windows
 
-| 形式 | 示例 | 说明 |
-| --- | --- | --- |
-| `host[:port]` | `1.1.1.1`、`example.com:443` | 有端口按 TCP，无端口按 ICMP |
-| `icmp:host` / `tcp:host[:port]` | `tcp:example.com:443` | 显式指定协议 |
-| `名称@目标` | `DNS@tcp:1.1.1.1:443` | 自定义展示名称 |
-| `名称 目标` | `DNS tcp:1.1.1.1:443` | 名称与目标以空格分隔 |
+```powershell
+$script = Join-Path $env:TEMP 'one-click.ps1'
+Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
+& $script install-agent -ServerUrl 'http://<server-ip>:25012' -AgentToken '<你的token>'
+```
 
-IPv6 地址必须使用方括号：`icmp:[2001:db8::1]`、`tcp:[2001:db8::1]:443`。无法解析的单项会在 Agent 日志中提示并跳过，不影响其余目标。
+卸载把 `install-agent` 换成 `uninstall-agent`；Server 同理 `uninstall-server`，加 `--keep-data` 保留数据。
 
-Docker 部署应持久化 `/state`。`CM_NODE_ID_FILE` 保存节点身份，`CM_AGENT_TOKEN_FILE` 保存注册后的专属凭据。不要在多台服务器上复用同一个 `CM_NODE_ID`。
+### Agent 上报什么
 
-HTTPS 地址未显式写端口时，Agent 的 gRPC 连接会使用 `443`；HTTP 地址会使用 `80`。反向代理 gRPC 时不要改写为 `/grpc/`，应转发真实服务前缀：
+CPU（使用率、1/5/15 分钟负载、型号、核数）、内存、每个挂载点的磁盘、磁盘读写速率、网络上下行速率和累计流量、进程数、运行时长。ICMP 探测需要 raw socket，Linux 上 root 或 `CAP_NET_RAW`，容器里记得 `--cap-add NET_RAW`。
+
+### 本地探测目标（可选）
+
+后台没给节点配探测时，Agent 可以用 `-net-tests` 自带目标，逗号分隔：
+
+```text
+1.1.1.1  tcp:example.com:443  DNS@tcp:1.1.1.1:443
+```
+
+带端口走 TCP，不带走 ICMP；`名称@` 可选。IPv6 要加方括号：`icmp:[2001:db8::1]`。解析不了的目标会被跳过并记日志，不影响其余项。
+
+注意：`-net-tests` 的结果只进实时展示，不进服务端历史（曲线和丢包统计只统计后台下发的探测目标）。
+
+## 网络与代理
+
+Agent 优先走 gRPC，环境只支持 HTTP/1.1 时自动回退 HTTP。HTTPS 地址不带端口时 gRPC 用 443，HTTP 用 80。代理 gRPC 时不要改写成 `/grpc/`，按真实服务前缀转发：
 
 ```nginx
 location /cyber_monitor.agentrpc.AgentService/ {
@@ -92,67 +87,16 @@ location /cyber_monitor.agentrpc.AgentService/ {
 }
 ```
 
-如果节点到 CDN 的 IPv6 路由异常，HTTP/gRPC 都可能超时。此时应优先修复宿主机 IPv6；临时方案是在 `docker run` 中添加 `--add-host <域名>:<可用IPv4>`，让该节点固定走 IPv4。
+某个节点到 CDN 的 IPv6 路由坏了会导致 HTTP 和 gRPC 都超时——优先修宿主机路由；临时办法是 `--add-host <域名>:<可用IPv4>` 让它走 IPv4。
 
-上面的默认命令已禁用后台远程更新。若确实需要后台一键更新 Docker Agent，请同时设置 `CM_DISABLE_UPDATE=0`、`CM_ENABLE_DOCKER_UPDATE=1`，并挂载 `/var/run/docker.sock`。
+## 分离部署与静态托管
 
-### 4. 安装探针 (Agent)
+- 默认一个端口（25012）同时服务状态页、后台和 Agent 上报。
+- 想把管理入口和公开页分开：设 `CM_PUBLIC_LISTEN`，公开页走独立端口。
+- 状态页也能整个丢到 Cloudflare Pages / Netlify / 任意静态空间：上传 `internal/server/web/public/` 目录，改 `index.html` 里的 `<meta name="cm-api-base">` 指向你的 Server（Server 自带公开 API 的 CORS）。
 
-初次安装时，系统会自动生成并持久化 `Node ID`。如需统一资产管理，也可在安装时手动指定。探针的握手过程使用 `HTTP` 完成，随后运行态优先尝试 `gRPC`。
+## 性能与已知限制
 
-**Linux / macOS**
+快照聚合 + JSON 序列化的实测成本（Apple M5 Pro，含构建快照、编码、摘要）：10 个节点约 54µs / 39KB，100 个约 535µs / 530KB，1000 个约 5.7ms / 12MB——每秒一次，千节点规模约占单核 1%。资源**历史**不落盘（只有连通性探测有 1H/1D/1W 历史），状态页看到的资源数字是当前值，重启后不回放。这是刻意的：资源历史写盘的 IO 和体积对这个体量的工具不划算。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
-sudo bash /tmp/one-click.sh install-agent --server-url http://<主控IP>:25012 --agent-token <你的Token>
-```
-
-macOS 不加 `sudo` 则安装为用户级 LaunchAgent；加 `sudo` 为系统级 LaunchDaemon。日志位于 `/var/log/cybermonitor-agent.log`（root）或 `~/Library/Logs/cybermonitor-agent.log`（用户）。自定义参数：`--node-id`、`--net-iface`、`--disable-update`、`--version`。
-
-**Windows**
-
-```powershell
-$script = Join-Path $env:TEMP 'one-click.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
-& $script install-agent -ServerUrl 'http://<主控IP>:25012' -AgentToken '<你的Token>'
-```
-
-Windows 自定义参数使用 `-NodeId`、`-DisableUpdate` 等 PowerShell 参数。
-
-### 5. 卸载探针 (Agent)
-
-**Linux / macOS**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o /tmp/one-click.sh
-sudo bash /tmp/one-click.sh uninstall-agent
-```
-
-系统级（sudo）安装的卸载同样需要加 `sudo`；用户级安装无需 root 直接卸载。
-
-**Windows**
-
-```powershell
-$script = Join-Path $env:TEMP 'one-click.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.ps1' -OutFile $script
-& $script uninstall-agent
-```
-
-卸载将自动清理 Agent 二进制文件、配置文件及系统服务。主控卸载使用 `uninstall-server`（加 `--keep-data` / `-KeepData` 保留数据目录）。
-
-## 📖 架构说明
-
-CyberMonitor 采用“探针采集 -> 服务端聚合”的架构模式，支持一体化部署与前后端分离部署。
-
-### 混合模式与协议支持
-
-- **一体化架构**：默认 `25012` 端口同时负载前台展示、管理后台及 Agent 上报。
-- **前后端分离**：利用 `CM_PUBLIC_LISTEN` 环境变量（如 `25013`）可以将展示接口与管理端口隔离。公开页面固定单源部署——始终连接当前站点自身的 WebSocket 与 API 接口，前端无需额外部署 `config.json`。
-
-### 静态托管
-
-公开页面也可托管到 Cloudflare Pages / Netlify 等任意静态空间：上传 `internal/server/web/public/` 目录，编辑 `index.html` 里的 `<meta name="cm-api-base">` 填入监控服务端地址（如 `https://monitor.example.com`）。服务端需允许该公开 API 跨源访问（新版已内置 CORS）。
-
-<div align="center">
-  如果 CyberMonitor 对你有帮助，欢迎点亮 ⭐️ <b>Star</b> 支持！
-</div>
+License: MIT。

@@ -51,6 +51,20 @@ const PUBLIC_I18N = {
     downloadTotal: "累计下载",
     firstReport: "首次上报",
     lastReport: "末次上报",
+    detailGroupBasic: "基本信息",
+    detailGroupHardware: "硬件",
+    detailGroupLoadNet: "负载与网络",
+    detailGroupMeta: "记录",
+    hostname: "主机名",
+    publicIP: "公网 IP",
+    cpuUsage: "CPU 使用率",
+    uploadRate: "上传速率",
+    downloadRate: "下载速率",
+    bootTime: "开机时间",
+    agentVersion: "Agent 版本",
+    deployMode: "部署模式",
+    deployModeBinary: "二进制",
+    deployModeDocker: "Docker",
     process: "进程",
     connection: "连接",
     smooth: "平滑",
@@ -78,7 +92,7 @@ const PUBLIC_I18N = {
     minutes: "分钟",
     remainingPrefix: "剩余",
     unnamedNode: "未命名节点",
-    totalSuffix: "total",
+    totalSuffix: "总计",
     networkCardFocus: "点击仅显示该探测曲线",
     networkCardReset: "点击恢复全部曲线",
   },
@@ -117,6 +131,20 @@ const PUBLIC_I18N = {
     downloadTotal: "Total download",
     firstReport: "First report",
     lastReport: "Last report",
+    detailGroupBasic: "Basic info",
+    detailGroupHardware: "Hardware",
+    detailGroupLoadNet: "Load & network",
+    detailGroupMeta: "Records",
+    hostname: "Hostname",
+    publicIP: "Public IP",
+    cpuUsage: "CPU usage",
+    uploadRate: "Upload speed",
+    downloadRate: "Download speed",
+    bootTime: "Boot time",
+    agentVersion: "Agent version",
+    deployMode: "Deploy mode",
+    deployModeBinary: "Binary",
+    deployModeDocker: "Docker",
     process: "Processes",
     connection: "Connections",
     smooth: "Smooth",
@@ -187,11 +215,11 @@ const fallbackRegionNames = {
 };
 
 const DEFAULT_GROUP = "ALL";
-// 国家地区虚拟分组：tag 存地区代码（ISO 两位码），显示层经 formatRegion
-// 按 locale 出名（zh: 新加坡 / en: Singapore）。
+
 const REGION_GROUP = "C&R";
 const DEFAULT_STATUS_FILTER = "all";
 const DEFAULT_TEST_RANGE_KEY = "1h";
+const HISTORY_FETCH_STALE_MS = 10 * 60 * 1000;
 const STATUS_FILTERS = new Set(["all", "online", "offline"]);
 
 function readViewStateFromURL() {
@@ -350,7 +378,7 @@ function applySiteBackground(image) {
 function safeLocalStorage() {
   try {
     return window.localStorage || null;
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -369,7 +397,13 @@ function syncViewStateToURL(replace = false) {
 }
 
 function buildViewURL(group = state.selectedGroup, status = state.statusFilter) {
-  const nextURL = new URL(window.location.href);
+
+  let nextURL;
+  try {
+    nextURL = new URL(window.location.href);
+  } catch {
+    return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  }
   if (!group || group === DEFAULT_GROUP) {
     nextURL.searchParams.delete("group");
   } else {
@@ -529,7 +563,7 @@ function resolveAPIBaseOverride() {
     raw = String(
       document.querySelector('meta[name="cm-api-base"]')?.content || ""
     ).trim();
-  } catch (error) {
+  } catch {
     raw = "";
   }
   if (!raw) {
@@ -544,7 +578,7 @@ function resolveAPIBaseOverride() {
       return null;
     }
     return parsed;
-  } catch (error) {
+  } catch {
     return null;
   }
 }
@@ -560,7 +594,13 @@ function resolveOriginTarget(currentLocation = document.baseURI || location.href
       apiBase,
     };
   }
-  const currentURL = new URL(currentLocation);
+
+  let currentURL;
+  try {
+    currentURL = new URL(currentLocation);
+  } catch {
+    return { socketURL: "", apiBase: "" };
+  }
   const fallbackBase = new URL("./", currentURL);
   const socketURL = new URL("ws", fallbackBase);
   socketURL.protocol = currentURL.protocol === "https:" ? "wss:" : "ws:";
@@ -571,8 +611,7 @@ function resolveOriginTarget(currentLocation = document.baseURI || location.href
 }
 
 async function fetchPublicSnapshot() {
-  // 所有调用方（onopen/onclose/watchdog/轮询/启动）共享同一个在途请求，
-  // 避免重叠请求乱序返回互相覆盖。
+
   if (state.snapshotFetchInflight) {
     return state.snapshotFetchInflight;
   }
@@ -591,7 +630,7 @@ async function fetchPublicSnapshot() {
         handleSnapshot(payload);
         return true;
       }
-    } catch (error) {
+    } catch {
       return false;
     }
     return false;
@@ -719,12 +758,10 @@ function resolveNodeFreshness(node) {
   return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
 }
 
-// nodeSignature 生成节点内容签名，用于跨快照判断"数据是否真的变化"。
-// 序列化失败时返回空串，退回逐 tick 重合并（正确性不受影响）。
 function nodeSignature(node) {
   try {
     return JSON.stringify(node);
-  } catch (error) {
+  } catch {
     return "";
   }
 }
@@ -854,8 +891,7 @@ function mergeSnapshotNodes(nodes) {
         mergedNodes.push(provenance.merged);
         return;
       }
-      // 每次广播都会重新序列化，src 引用必然不同；内容一致时复用旧
-      // 合并对象，保持下游身份比较有效，未变化节点不再整卡重渲染。
+
       const srcKey = nodeSignature(entry.src);
       if (provenance.srcKey === srcKey) {
         provenance.src = entry.src;
@@ -984,8 +1020,7 @@ function handleSnapshot(payload) {
   if (!payload || typeof payload !== "object") {
     return;
   }
-  // WS 增量可能先于在途 HTTP 快照到达：更旧的完整快照直接丢弃，
-  // 避免节点状态/CPU 等被回退造成闪烁。
+
   const generatedAt = Number(payload.generated_at || 0);
   const currentAt = Number((state.snapshot && state.snapshot.generated_at) || 0);
   if (generatedAt && currentAt && generatedAt < currentAt) {
@@ -1023,8 +1058,7 @@ function render() {
   renderGroupTabs(groups);
   const groupNodes = filterNodesByGroup(state.lastNodes, state.selectedGroup);
   const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
-  // 统计卡取全快照口径：仅剩自建分组的双隐藏节点也计入总数/在线/离线
-  //（当前 tab 的可见性过滤不影响总量，三个计数同源保持自洽）。
+
   updateStats(state.lastNodes);
   updateEmptyState(visibleNodes.length, groupNodes.length);
   const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
@@ -1107,8 +1141,7 @@ function applyPublicIdentitySettings(settings) {
 function applyPublicSettings(settings) {
   if (!settings) return;
   currentPublicSettings = settings || {};
-  // 每个 tick 的快照都会携带 settings，引用必变；按内容签名门控，
-  // 避免每 2s 重写站点标识 DOM。签名含 publicLocale：手动切换语言后仍会刷新。
+
   const signature = [
     currentPublicSettings.site_title || "",
     currentPublicSettings.site_icon || "",
@@ -1145,7 +1178,7 @@ function loadTestHistoryCache() {
     if (!nodes || typeof nodes !== "object") return;
     state.historyCacheLoading = true;
     applyTestHistory(nodes);
-  } catch (error) {
+  } catch {
     return;
   } finally {
     state.historyCacheLoading = false;
@@ -1170,7 +1203,7 @@ function persistHistoryCache() {
     const serializedRanges = {};
     ranges.forEach((tests, rangeKey) => {
       if (!tests || tests.size === 0) return;
-      // 旧版本可能缓存过 30d/1y 数据，序列化时一并淘汰。
+
       if (!RANGE_OPTIONS.some((item) => item.key === rangeKey)) return;
       const entries = {};
       tests.forEach((entry, key) => {
@@ -1196,7 +1229,7 @@ function persistHistoryCache() {
   };
   try {
     storage.setItem(HISTORY_CACHE_KEY, JSON.stringify(payload));
-  } catch (error) {
+  } catch {
     return;
   }
 }
@@ -1360,6 +1393,14 @@ function isHistoryRangeFetched(nodeId, rangeKey) {
   return state.testHistoryFetched.has(
     historyRequestKey(nodeId, rangeKey)
   );
+}
+
+function isHistoryFetchMarkerFresh(requestKey) {
+  const markedAt = state.testHistoryFetched.get(requestKey);
+  if (!Number.isFinite(markedAt) || markedAt <= 0) {
+    return false;
+  }
+  return Date.now() - markedAt < HISTORY_FETCH_STALE_MS;
 }
 
 function isNodeHistoryInflight(nodeId, rangeKey) {
@@ -1563,7 +1604,7 @@ function applyTestHistory(history) {
       return;
     }
     Object.entries(rangeBuckets).forEach(([rangeKey, tests]) => {
-      // 只合并在当前 range 白名单内的数据（历史上曾有 30d/1y，服务端已不再提供）。
+
       if (!RANGE_OPTIONS.some((item) => item.key === rangeKey)) return;
       if (mergeHistoryRangeByKey(cacheKey, rangeKey, tests)) {
         updated = true;
@@ -1599,8 +1640,7 @@ function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
   Object.entries(tests).forEach(([key, raw]) => {
     const existing = map.get(key);
     if (existing && existing.lastAt > 0) {
-      // 廉价预检：lastAt 未推进（含同刻且点数不增）的数据直接跳过，
-      // 避免每个广播 tick 对未变化序列做全量数组 normalize。
+
       const rawTimes = Array.isArray(raw?.times) ? raw.times : null;
       const rawLast = Number(
         raw?.last_at ??
@@ -1661,8 +1701,7 @@ function replaceHistoryRangeByKey(cacheKey, rangeKey, tests) {
   });
   const ranges = ensureNodeHistoryRangesByKey(cacheKey);
   ranges.set(normalizeHistoryRangeKey(rangeKey), map);
-  // 缓存语义是"该节点全部 range 的最大 lastAt"：replace 只覆盖单个 range，
-  // 取并集最大值避免把其他 range 的较新时间戳抹掉。
+
   const cachedMax = state.historyMaxLastAt.get(cacheKey) || 0;
   state.historyMaxLastAt.set(cacheKey, Math.max(cachedMax, maxLastAt));
   return true;
@@ -1746,7 +1785,10 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
   const requestKey = historyRequestKey(nodeId, normalizedRange);
   const requestGeneration = historyGeneration(cacheKey);
   if (state.testHistoryFetched.has(requestKey)) {
-    return getNodeHistoryRange(nodeId, normalizedRange);
+    if (isHistoryFetchMarkerFresh(requestKey)) {
+      return getNodeHistoryRange(nodeId, normalizedRange);
+    }
+    state.testHistoryFetched.delete(requestKey);
   }
   if (state.testHistoryInflight.has(requestKey)) {
     return state.testHistoryInflight.get(requestKey);
@@ -1801,7 +1843,7 @@ async function fetchNodeHistory(nodeId, rangeKey = DEFAULT_TEST_RANGE_KEY) {
       clearNodeHistoryFailure(historyRequestKey(nodeId, resolvedRange));
       state.testHistoryFetched.set(
         historyRequestKey(nodeId, resolvedRange),
-        true
+        Date.now()
       );
       forceRefreshOpenNodeHistoryViews(nodeId);
       return getNodeHistoryRange(nodeId, resolvedRange);
@@ -1928,9 +1970,7 @@ function collectGroupNames(nodes, settingsGroups) {
   known.forEach((group) => set.add(group));
   nodes.forEach((node) => {
     getGroupSelections(node).forEach((item) => {
-      // C&R 是固定 tab（受公开设置门控），不作为普通分组名参与收集；
-      // 节点上指向已删除分组的悬空选择同样不收集（纵深防御：后端级联
-      // 清理之外的旧缓存/旧版本快照兜底）。
+
       if (item.group && item.group !== REGION_GROUP && known.has(item.group)) {
         set.add(item.group);
       }
@@ -1970,7 +2010,7 @@ function extractGroupSelections(node) {
   }
   const selections = [];
   const seen = new Set();
-  // 地区代码作为 C&R 虚拟分组的 tag（存 code，显示层 formatRegion）。
+
   const regionCode = String(node?.region || "").trim().toUpperCase();
   if (/^[A-Z]{2}$/.test(regionCode)) {
     selections.push({ group: REGION_GROUP, tag: regionCode });
@@ -2100,8 +2140,7 @@ function renderGroupTabs(groups) {
 }
 
 function filterNodesByGroup(nodes, group) {
-  // 固定视图独立隐藏开关：ALL（平铺）视图剔除 hidden_from_all，C&R
-  // （地区分组）视图剔除 hidden_from_cr；用户分组视图不受影响。
+
   if (!group || group === DEFAULT_GROUP) {
     return nodes.filter((node) => node?.hidden_from_all !== true);
   }
@@ -2165,10 +2204,9 @@ function updateStats(nodes) {
   statTotal.textContent = String(total);
   statOnline.textContent = String(online);
   statOffline.textContent = String(offline);
-  statNetUsage.textContent = `${t("traffic")} ↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(
-    totalDown
-  )}`;
-  statNetRate.textContent = `${t("bandwidth")} ↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
+
+  statNetUsage.textContent = `↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(totalDown)}`;
+  statNetRate.textContent = `↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
     totalDownRate
   )}`;
 }
@@ -2330,8 +2368,6 @@ function groupNodesByTag(nodes, group) {
   return sorted;
 }
 
-// ==== createCard 数据驱动模板：结构与字段一一对应，改动只需更新数据表 ====
-
 function summaryMetricsHTML() {
   const items = [
     { key: "cpu", label: "CPU", boxClass: " cpu" },
@@ -2375,7 +2411,7 @@ function detailInfoRowsHTML() {
     ["firstReport", "detail-first"],
     ["lastReport", "detail-last"],
   ];
-  // CPU 行无翻译键（品牌缩写），插在 os 之后与历史布局一致。
+
   rows.splice(8, 0, ["CPU", "detail-cpu", "raw"]);
   return rows
     .map(
@@ -2385,10 +2421,15 @@ function detailInfoRowsHTML() {
     .join("");
 }
 
+function parseMarkup(markup) {
+  const doc = new DOMParser().parseFromString(`<template>${markup}</template>`, "text/html");
+  return doc.querySelector("template").content;
+}
+
 function createCard() {
   const card = document.createElement("details");
   card.className = "node-card";
-  card.innerHTML = `
+  card.replaceChildren(parseMarkup(`
     <summary class="node-summary">
       <div class="node-summary-left">
         <div class="node-title">
@@ -2438,10 +2479,8 @@ function createCard() {
         <div data-field="last-seen">--</div>
       </div>
     </div>
-  `;
+  `));
 
-  // data-field 自动收集：键名规则为 kebab→camel，os/cpu/gpu 缩写保持全大写。
-  // 模板与消费方（updateCard/renderCardDetails）都在本文件内，字段同步改。
   const fields = {};
   card.querySelectorAll("[data-field]").forEach((el) => {
     fields[
@@ -2459,7 +2498,6 @@ function createCard() {
   });
   fields.networkSection = card.querySelector(".network-section");
 
-  // range tabs 只构建一次（展开卡每 tick 重渲染时仅切 active class）。
   fields.rangeButtons = new Map();
   RANGE_OPTIONS.forEach((item) => {
     const button = document.createElement("button");
@@ -2503,7 +2541,6 @@ function updateCard(card, node, nodeId) {
   const cpu = stats.cpu || {};
   const mem = stats.memory || {};
   const diskList = stats.disk || [];
-  const diskIO = stats.disk_io || {};
   const net = stats.network || {};
   const tests = stats.network_tests || [];
 
@@ -2552,7 +2589,8 @@ function updateCard(card, node, nodeId) {
   if (fields.netMini) {
     fields.netMini.style.width = `${hasNetSpeed ? netPercent : 0}%`;
   }
-  fields.cpuMeta.textContent = formatCPUModel(cpu);
+
+  fields.cpuMeta.textContent = "";
   fields.memMeta.textContent = formatBytes(mem.total || 0);
   fields.diskMeta.textContent = formatDiskMeta(node, stats, diskAgg.total);
   fields.netMeta.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
@@ -2645,21 +2683,20 @@ function clearNetworkSection(fields) {
 
 function renderNetworkLoadingState(fields) {
   resetNetworkChartInteractions(fields);
-  fields.testChart.innerHTML = `
+  fields.testChart.replaceChildren(parseMarkup(`
     <div class="network-loading-state">
       <span></span>
       <span></span>
       <span></span>
       <strong>${t("networkLoading")}</strong>
     </div>
-  `;
+  `));
   fields.testCards.innerHTML = "";
 }
 
 function resetNetworkChartInteractions(fields) {
   if (fields.testChart) {
-    // 加载/错误/空态会整体替换图表内容，必须先拆掉挂在旧内容上的
-    // hover 监听与 onmousemove，避免窗口级捕获监听残留。
+
     if (typeof fields.testChart.__latencyHoverCleanup === "function") {
       fields.testChart.__latencyHoverCleanup();
     }
@@ -2680,15 +2717,15 @@ function resetNetworkChartInteractions(fields) {
 
 function renderNetworkHistoryErrorChart(fields) {
   resetNetworkChartInteractions(fields);
-  fields.testChart.innerHTML = `
+  fields.testChart.replaceChildren(parseMarkup(`
     <div class="network-empty-state" role="status" aria-live="polite" aria-label="${t("historyErrorLabel")}">
       <strong>${t("historyErrorTitle")}</strong>
       <span>${t("historyErrorBody")}</span>
     </div>
-  `;
+  `));
 }
 
-function renderNetworkHistoryErrorState(fields, nodeId, activeRange) {
+function renderNetworkHistoryErrorState(fields, activeRange) {
   renderRangeTabs(fields, activeRange);
   renderNetworkHistoryErrorChart(fields);
   fields.testCards.innerHTML = "";
@@ -2719,7 +2756,7 @@ function updateNetworkTests(fields, node, tests, nodeId) {
   const hasHistory = hasActiveRangeHistory || hasAnyHistoryForNode(nodeId);
   if (activeRangeFailed) {
     if (!tests.length && !hasActiveRangeHistory) {
-      renderNetworkHistoryErrorState(fields, nodeId, activeRange);
+      renderNetworkHistoryErrorState(fields, activeRange);
       return;
     }
     renderNetworkSection(fields, nodeId);
@@ -2771,7 +2808,6 @@ function resolveNetworkRenderContext(
   };
 }
 
-// 历史签名：仅在网络历史变化时触发探测区整段重渲染。
 function buildCardHistorySignature(node, nodeId) {
   const stats = node?.stats || {};
   const { activeRange, latestHistoryAt } = resolveNetworkRenderContext(nodeId);
@@ -2919,12 +2955,16 @@ function renderNetworkSection(fields, nodeId) {
     fields.testCards.appendChild(card);
   });
 
-  const chart = buildLatencyChart(seriesList, colors, timeSeries, rangeSec);
-  fields.testChart.innerHTML = chart.svg;
+  const chart = buildLatencyChart(
+    seriesList,
+    colors,
+    timeSeries,
+    fields.testChart ? Math.max(320, Math.round(fields.testChart.clientWidth)) : 680,
+  );
+  fields.testChart.replaceChildren(parseMarkup(chart.svg));
   setupLatencyHover(fields, chart.meta, labels);
 }
 
-// 点击探测卡片：选中后仅显示该曲线，再次点击恢复全部（会话级状态）。
 function toggleTestFocus(fields, nodeId, key) {
   if (state.selectedTests.get(nodeId) === key) {
     state.selectedTests.delete(nodeId);
@@ -3020,7 +3060,7 @@ function filterHistoryByRange(history, rangeSec, nowSec) {
   }
   const filtered = { latency: [], loss: [], times: [] };
   const minTime = nowSec - rangeSec;
-  // times 升序：二分定位首个 >= minTime 的下标，7d 大窗口避免全量线性扫。
+
   let lo = 0;
   let hi = times.length;
   while (lo < hi) {
@@ -3223,6 +3263,8 @@ function updateTestHistory(nodeId, tests) {
   }
   let updated = false;
   targetRanges.forEach((rangeKey) => {
+    const requestKey = historyRequestKey(nodeId, rangeKey);
+    let rangeUpdated = false;
     const map = ensureHistoryRangeMap(nodeId, rangeKey);
     tests.forEach((test) => {
       const key = testKey(test);
@@ -3275,17 +3317,22 @@ function updateTestHistory(nodeId, tests) {
         state.historyMaxLastAt.set(cacheKey, checkedAt);
       }
       updated = true;
+      rangeUpdated = true;
     });
+    if (rangeUpdated && isHistoryFetchMarkerFresh(requestKey)) {
+      state.testHistoryFetched.set(requestKey, Date.now());
+    }
   });
   if (updated) {
     scheduleHistoryCacheSave();
   }
 }
 
-function buildLatencyChart(seriesList, colors, times, rangeSec) {
-  const width = 680;
+function buildLatencyChart(seriesList, colors, times, chartWidth) {
+
+  const width = chartWidth > 0 ? chartWidth : 680;
   const height = 220;
-  const padding = { top: 20, right: 18, bottom: 18, left: 46 };
+  const padding = { top: 20, right: 18, bottom: 18, left: 52 };
   const normalized = seriesList
     .map((series) => (Array.isArray(series) ? series : []))
     .filter((series) => series.length > 0);
@@ -3293,26 +3340,20 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
     return { svg: '<div class="sparkline-empty">--</div>', meta: null };
   }
 
-  const maxLen = Math.max(...normalized.map((series) => series.length));
+  let maxLen = 0;
+  for (const series of normalized) {
+    if (series.length > maxLen) maxLen = series.length;
+  }
   const paddedSeries = normalized.map((series) => padSeries(series, maxLen));
   const paddedTimes = padSeries(Array.isArray(times) ? times : [], maxLen);
   const flatValues = paddedSeries
     .flatMap((series) => series)
     .filter((value) => value !== null && value !== undefined && Number.isFinite(value));
-  // 尖峰抑制：Y 轴按 P95 定标（留 25% 顶部余量），偶发高延迟点在顶部
-  // 截断绘制（悬停 tooltip 仍展示真实值）；点数稀少时 P95≈max，退化
-  // 为旧的全量定标行为。持续高位（>5% 点都高）时轴自然放大。
-  const sortedValues = [...flatValues].sort((a, b) => a - b);
-  const percentile = (q) =>
-    sortedValues.length
-      ? sortedValues[
-          Math.min(sortedValues.length - 1, Math.floor(sortedValues.length * q))
-        ]
-      : 1;
-  const axisBase = Math.max(percentile(0.95), 1);
-  const paddedMax = axisBase * 1.25;
-  const stepValue = niceStep(paddedMax / 4 || 1);
-  const maxValue = Math.max(stepValue * 4, paddedMax, 1);
+  const yScale = computeLatencyYTicks(flatValues);
+  if (!yScale) {
+    return { svg: '<div class="sparkline-empty">--</div>', meta: null };
+  }
+  const { ticks: yTicks, maxValue } = yScale;
 
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
@@ -3320,34 +3361,32 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
 
   const gridLines = [];
   const yLabels = [];
-  for (let i = 0; i <= 4; i += 1) {
-    const value = stepValue * i;
+  yTicks.forEach((value) => {
     const y = padding.top + plotHeight - (value / maxValue) * plotHeight;
     gridLines.push(
       `<line x1="${padding.left}" x2="${width - padding.right}" y1="${y.toFixed(
         1
       )}" y2="${y.toFixed(1)}" />`
     );
+
     yLabels.push(
-      `<text x="${padding.left - 4}" y="${y.toFixed(
+      `<text x="${padding.left - 8}" y="${y.toFixed(
         1
-      )}" text-anchor="end" dominant-baseline="middle">${formatLatency(
-        value
-      )}</text>`
+      )}" text-anchor="end" dominant-baseline="middle">${value}\u00a0ms</text>`
     );
-  }
+  });
+
+  const finiteTimes = paddedTimes.filter((value) => Number.isFinite(value));
+  const xLabels = finiteTimes.length
+    ? `<text x="${width - padding.right}" y="${height - 5}" text-anchor="end">${formatLatencyAxisTime(
+        finiteTimes[finiteTimes.length - 1]
+      )}</text>`
+    : "";
 
   const lines = paddedSeries
     .map((series, idx) => {
-      // 超出 Y 轴上限的尖峰钳到顶部绘制，避免拉高整张图；tooltip 与
-      // 悬停取值用 meta 中的原始序列，不受钳制影响。
-      const clampedSeries = series.map((value) =>
-        value === null || value === undefined || !Number.isFinite(value)
-          ? value
-          : Math.min(value, maxValue)
-      );
       const path = buildLinePath(
-        clampedSeries,
+        series,
         stepX,
         padding,
         plotWidth,
@@ -3356,26 +3395,14 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
       );
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
-      // 顶部短刻度标记被截断的尖峰：钳制后的平线区分不了“贴近上限”
-      // 与“被截断”，刻度让截断可见（真值见 tooltip；tick 对非均匀
-      // 缩放的容忍优于圆点）。恰好等于上限的点不标（未被钳制）。
-      const clipTicks = series
-        .map((value, i) => {
-          if (!Number.isFinite(value) || value <= maxValue) return "";
-          const x = (padding.left + i * stepX).toFixed(1);
-          return `<line x1="${x}" y1="${padding.top}" x2="${x}" y2="${
-            padding.top + 3
-          }" stroke="${color}" stroke-width="1.5" />`;
-        })
-        .join("");
-      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />${clipTicks}`;
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
     })
     .join("");
 
   const svg = `
     <svg class="latency-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
       <g class="latency-grid">${gridLines.join("")}</g>
-      <g class="latency-axis">${yLabels.join("")}</g>
+      <g class="latency-axis">${yLabels.join("")}${xLabels}</g>
       <g class="latency-lines">${lines}</g>
     </svg>
   `;
@@ -3388,6 +3415,7 @@ function buildLatencyChart(seriesList, colors, times, rangeSec) {
       padding,
       plotWidth,
       plotHeight,
+      width,
       colors: colors.slice(),
     },
   };
@@ -3459,7 +3487,7 @@ function setupLatencyHover(fields, meta, labels) {
     const rect = svg.getBoundingClientRect();
     const hostRect = (host || fields.testChart).getBoundingClientRect();
     const offsetX = rect.left - hostRect.left;
-    const scaleX = rect.width / 680;
+    const scaleX = rect.width / (meta.width || 680);
     const paddingLeft = meta.padding.left * scaleX;
     const paddingRight = meta.padding.right * scaleX;
     const plotWidth = rect.width - paddingLeft - paddingRight;
@@ -3712,6 +3740,39 @@ function niceStep(value) {
   return niceFraction * pow;
 }
 
+function computeLatencyYTicks(values) {
+
+  const finite = (Array.isArray(values) ? values : []).filter(
+    (value) =>
+      value !== null &&
+      value !== undefined &&
+      Number.isFinite(value) &&
+      value >= 0
+  );
+  if (!finite.length) return null;
+  let max = finite[0];
+  for (let i = 1; i < finite.length; i++) {
+    if (finite[i] > max) max = finite[i];
+  }
+  if (!(max > 0)) {
+    return { ticks: [0, 10, 20, 30, 40], step: 10, maxValue: 40 };
+  }
+  const step = niceStep(max / 4);
+  return {
+    ticks: [0, step, step * 2, step * 3, step * 4],
+    step,
+    maxValue: step * 4,
+  };
+}
+
+function formatLatencyAxisTime(timestamp) {
+  const date = new Date(timestamp * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}`;
+}
+
 function formatTimeFull(timestamp) {
   if (!timestamp) return "--";
   const date = new Date(timestamp * 1000);
@@ -3838,7 +3899,7 @@ function formatGPUDetails(gpus) {
           ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
           : "";
       const driver = String(gpu.driver_version || "").trim();
-      // 顺序：显卡类型 · 驱动 · 占用率 · 显存详情。
+
       return [name, driver ? `${t("gpuDriver")} ${driver}` : "", usage, memory]
         .filter(Boolean)
         .join(" · ");
@@ -3976,11 +4037,11 @@ function formatRemaining(expireAt, autoRenew, renewIntervalSec) {
 
 function formatRemainingSummary(expireAt, autoRenew, renewIntervalSec) {
   if (!expireAt) {
-    return "--";
+    return "";
   }
   const value = formatRemaining(expireAt, autoRenew, renewIntervalSec);
   if (value === t("unset")) {
-    return "--";
+    return "";
   }
   if (value === t("expired") || value === t("renewing")) {
     return value;

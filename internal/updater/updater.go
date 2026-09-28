@@ -226,10 +226,6 @@ type releaseAssetRef struct {
 	asset string
 }
 
-func ValidateReleaseAssetURLs(kind Kind, expectedVersion, downloadURL, checksumURL string) error {
-	return NewClient(DefaultRepo, kind, "").ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL)
-}
-
 func (c *Client) ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL string) error {
 	download, err := c.parseGitHubReleaseAssetURL(downloadURL, AssetName(c.Kind))
 	if err != nil {

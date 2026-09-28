@@ -1,19 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  closestCenter,
-  DndContext,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from "@dnd-kit/core";
-import {
-  arrayMove,
-  SortableContext,
-  useSortable,
-  verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
+import { useMemo, useState } from "react";
+import { AdminPageHeader } from "@/components/admin-page-header";
+import { AdminPanel } from "@/components/admin-panel";
+import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
+import { AdminDrawer } from "@/components/admin-drawer";
+import { AdminKVField } from "@/components/admin-kv-field";
+import { AdminMetricStrip } from "@/components/admin-metric-strip";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,27 +17,17 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
-  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   FolderTree,
-  GripVertical,
   Plus,
-  Tag,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   adminActionButtonClass,
-  adminDetailCardClass,
-  adminDetailHeaderClass,
   adminDirtyBadgeClass,
   adminDangerIconButtonClass,
   adminDialogCancelClass,
@@ -54,31 +35,16 @@ import {
   adminDialogDangerActionClass,
   adminDialogFooterClass,
   adminDialogHeaderClass,
-  adminEmptyStateClass,
-  adminInlineEmptyStateClass,
-  adminMutedTextClass,
   adminNeutralBadgeClass,
   adminOutlineButtonClass,
-  adminPageActionsClass,
-  adminPageHeaderClass,
   adminPageShellClass,
-  adminPageTitleClass,
   adminPrimaryButtonClass,
-  adminSectionHeaderClass,
-  adminStatCardClass,
-  adminStatCardHeaderClass,
   adminStatEyebrowClass,
-  adminStatIconChipClass,
-  adminStatIconChipClassByTone,
-  adminStatSurfaceClassByTone,
-  adminStatValueToneClassByTone,
   adminSubtleOutlineBadgeClass,
-  adminSurfaceCardClass,
   adminWideInputClass,
-  adminWorkspaceHeaderClass,
 } from "@/lib/admin-ui";
 import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
-import { getErrorMessage, resolveNodeSelections } from "@/lib/admin-format";
+import { resolveNodeSelections } from "@/lib/admin-format";
 import type { GroupNode, NodeView, SettingsView } from "@/lib/admin-types";
 
 export interface GroupManagementProps {
@@ -110,18 +76,6 @@ type DraftTreeAnalysis = {
     totalTags: number;
   };
 };
-
-
-const panelCardClass = `overflow-hidden ${adminSurfaceCardClass}`;
-
-
-const groupCardClass = `${adminDetailCardClass} !rounded-[1.5rem]`;
-
-const groupCardHeaderClass =
-  `${adminDetailHeaderClass} flex flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between`;
-
-
-const compactOutlineActionClass = `${adminOutlineButtonClass} h-9 px-4`;
 
 type EditableTagNode = {
   id: string;
@@ -166,6 +120,17 @@ function removeItemAt<T>(items: T[], index: number): T[] {
   return items.filter((_, currentIndex) => currentIndex !== index);
 }
 
+function moveItemAt<T>(items: T[], index: number, offset: -1 | 1): T[] {
+  const target = index + offset;
+  if (target < 0 || target >= items.length) {
+    return items;
+  }
+  const next = [...items];
+  const [moved] = next.splice(index, 1);
+  next.splice(target, 0, moved);
+  return next;
+}
+
 function updateGroupChildren(
   tree: EditableGroupNode[],
   groupIndex: number,
@@ -175,19 +140,6 @@ function updateGroupChildren(
     ...group,
     children: updater(group.children || []),
   }));
-}
-
-function reorderGroupsByID(
-  tree: EditableGroupNode[],
-  activeID: string,
-  overID: string,
-): EditableGroupNode[] {
-  const oldIndex = tree.findIndex((group) => group.id === activeID);
-  const newIndex = tree.findIndex((group) => group.id === overID);
-  if (oldIndex === -1 || newIndex === -1) {
-    return tree;
-  }
-  return arrayMove(tree, oldIndex, newIndex);
 }
 
 function toEditableTree(tree: GroupNode[]): EditableGroupNode[] {
@@ -248,8 +200,6 @@ function serializeEditableTree(tree: EditableGroupNode[]) {
   );
 }
 
-// 展示页固定标签（ALL/全部 为平铺视图、C&R 为地区分组），用户分组
-// 与之同名会在展示页被虚拟分组吸收。
 const RESERVED_GROUP_NAMES = new Set(["全部", "ALL", "C&R"]);
 
 function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
@@ -292,7 +242,7 @@ function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
       });
       groupErrors[String(groupIndex)] = message;
     } else if (groupName.includes(":") || groupName.includes("/")) {
-      // 冒号与斜杠是 group:tag / group/tag 选择编码的分隔符，会让分组解析错乱。
+
       const message = "一级分组名称不能包含“:”或“/”。";
       validationIssues.push({
         key: `group-separator-${groupIndex}`,
@@ -368,6 +318,26 @@ function analyzeDraftTree(tree: EditableGroupNode[]): DraftTreeAnalysis {
   };
 }
 
+type GroupLedgerRow =
+  | {
+      kind: "group";
+      id: string;
+      groupIndex: number;
+      group: EditableGroupNode;
+      tagCount: number;
+      nodeCount: number;
+      order: number;
+    }
+  | {
+      kind: "tag";
+      id: string;
+      groupIndex: number;
+      tagIndex: number;
+      tag: EditableTagNode;
+      groupName: string;
+      nodeCount: number;
+    };
+
 export default function GroupManagement({
   groupTree,
   nodes,
@@ -379,17 +349,13 @@ export default function GroupManagement({
   const incomingSignature = useMemo(() => serializeEditableTree(incomingTree), [incomingTree]);
   const [draftTree, setDraftTree] = useState<EditableGroupNode[]>(incomingTree);
   const [isSaving, setIsSaving] = useState(false);
+
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [editingTagId, setEditingTagId] = useState<string | null>(null);
   const isBusy = isSaving || saving;
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: {
-        distance: 8,
-      },
-    }),
-  );
 
   const draftSignature = useMemo(() => serializeEditableTree(draftTree), [draftTree]);
-  // dirty 为派生值：由 hook 返回的已吸收 source 签名与草稿签名比较得出。
+
   const [absorbedSignature, absorbSourceSignature] = useDraftReconcile({
     draftSignature,
     nextSourceSignature: incomingSignature,
@@ -446,26 +412,119 @@ export default function GroupManagement({
     };
   }, [nodes]);
 
-  const statCards = [
-    {
-      label: "一级分组",
-      value: summary.totalGroups,
-      icon: FolderTree,
-      tone: "neutral",
-    },
-    {
-      label: "二级标签",
-      value: summary.totalTags,
-      icon: Tag,
-      tone: "info",
-    },
-    {
-      label: "节点归属",
-      value: usageStats.assignedNodes,
-      icon: AlertTriangle,
-      tone: usageStats.ungroupedNodes > 0 ? "warning" : "success",
-    },
+  const metricItems = [
+    { label: "一级分组", value: summary.totalGroups },
+    { label: "二级标签", value: summary.totalTags },
+    { label: "节点归属", value: usageStats.assignedNodes },
   ] as const;
+
+  const ledgerRows = useMemo<GroupLedgerRow[]>(() => {
+    const rows: GroupLedgerRow[] = [];
+    draftTree.forEach((group, groupIndex) => {
+      const groupName = String(group.name || "").trim();
+      const tags = group.children || [];
+      rows.push({
+        kind: "group",
+        id: group.id,
+        groupIndex,
+        group,
+        tagCount: tags.filter((tag) => String(tag.name || "").trim()).length,
+        nodeCount: groupName ? usageStats.groupCount.get(groupName) || 0 : 0,
+        order: groupIndex + 1,
+      });
+      tags.forEach((tag, tagIndex) => {
+        const tagName = String(tag.name || "").trim();
+        rows.push({
+          kind: "tag",
+          id: tag.id,
+          groupIndex,
+          tagIndex,
+          tag,
+          groupName,
+          nodeCount:
+            groupName && tagName
+              ? usageStats.tagCount.get(`${groupName}::${tagName}`) || 0
+              : 0,
+        });
+      });
+    });
+    return rows;
+  }, [draftTree, usageStats]);
+
+  const ledgerColumns: ReadonlyArray<AdminDataTableColumn<GroupLedgerRow>> = [
+    {
+      key: "name",
+      label: "名称",
+      render: (row) =>
+        row.kind === "group" ? (
+          <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">
+            {String(row.group.name || "").trim() || "未命名分组"}
+          </span>
+        ) : (
+          <span className="pl-5 text-sm text-slate-600 dark:text-neutral-300">
+            {String(row.tag.name || "").trim() || "未命名标签"}
+          </span>
+        ),
+    },
+    {
+      key: "type",
+      label: "类型",
+      render: (row) =>
+        row.kind === "group" ? (
+          <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
+            一级分组
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className={adminNeutralBadgeClass}>
+            二级标签
+          </Badge>
+        ),
+    },
+    {
+      key: "tags",
+      label: "标签数",
+      align: "right",
+      mono: true,
+      width: "12%",
+      render: (row) => (row.kind === "group" ? row.tagCount : "--"),
+    },
+    {
+      key: "nodes",
+      label: "节点数",
+      align: "right",
+      mono: true,
+      width: "12%",
+      render: (row) => row.nodeCount,
+    },
+    {
+      key: "order",
+      label: "排序",
+      align: "right",
+      mono: true,
+      width: "10%",
+      render: (row) => (row.kind === "group" ? row.order : "--"),
+    },
+  ];
+
+  const editingGroupIndex = editingGroupId
+    ? draftTree.findIndex((group) => group.id === editingGroupId)
+    : -1;
+  const editingGroup = editingGroupIndex >= 0 ? draftTree[editingGroupIndex] : null;
+  const editingTagGroupIndex = editingTagId
+    ? draftTree.findIndex((group) =>
+        (group.children || []).some((tag) => tag.id === editingTagId),
+      )
+    : -1;
+  const editingTagGroup =
+    editingTagGroupIndex >= 0 ? draftTree[editingTagGroupIndex] : null;
+  const editingTagIndex =
+    editingTagGroup && editingTagId
+      ? (editingTagGroup.children || []).findIndex((tag) => tag.id === editingTagId)
+      : -1;
+  const editingTag =
+    editingTagGroup && editingTagIndex >= 0
+      ? editingTagGroup.children[editingTagIndex]
+      : null;
 
   const updateDraftTree = (updater: (current: EditableGroupNode[]) => EditableGroupNode[]) => {
     if (isBusy) {
@@ -513,7 +572,10 @@ export default function GroupManagement({
   };
 
   const addGroup = () => {
-    updateDraftTree((current) => [...current, createEmptyEditableGroup()]);
+    const group = createEmptyEditableGroup();
+    updateDraftTree((current) => [...current, group]);
+    setEditingGroupId(group.id);
+    setEditingTagId(null);
   };
 
   const addTag = (groupIndex: number) => {
@@ -522,21 +584,15 @@ export default function GroupManagement({
 
   const removeGroup = (groupIndex: number) => {
     updateDraftTree((current) => removeItemAt(current, groupIndex));
+    setEditingGroupId(null);
   };
 
   const removeTag = (groupIndex: number, tagIndex: number) => {
     updateDraftTags(groupIndex, (children) => removeItemAt(children, tagIndex));
   };
 
-  const handleDragEnd = (event: DragEndEvent) => {
-    if (isBusy) {
-      return;
-    }
-    const { active, over } = event;
-    if (!over || active.id === over.id) {
-      return;
-    }
-    updateDraftTree((current) => reorderGroupsByID(current, String(active.id), String(over.id)));
+  const moveGroup = (groupIndex: number, offset: -1 | 1) => {
+    updateDraftTree((current) => moveItemAt(current, groupIndex, offset));
   };
 
   const runAction = useAsyncAction();
@@ -547,23 +603,33 @@ export default function GroupManagement({
     }
     if (validationIssues.length > 0) {
       const firstIssue = validationIssues[0];
-      if (firstIssue.target) {
-        const targetID =
-          typeof firstIssue.target.tagIndex === "number"
-            ? `group-tag-name-${firstIssue.target.groupIndex}-${firstIssue.target.tagIndex}`
-            : `group-name-${firstIssue.target.groupIndex}`;
-        const element = document.getElementById(targetID);
-        if (element instanceof HTMLElement) {
-          element.focus();
+      const target = firstIssue.target;
+      if (target) {
+
+        const targetGroup = draftTree[target.groupIndex];
+        if (targetGroup) {
+          const tagIndex = typeof target.tagIndex === "number" ? target.tagIndex : null;
+          const targetTag =
+            tagIndex !== null ? targetGroup.children?.[tagIndex] : undefined;
+          setEditingTagId(targetTag?.id ?? null);
+          setEditingGroupId(targetTag ? null : targetGroup.id);
+          window.setTimeout(() => {
+            const targetID =
+              typeof target.tagIndex === "number"
+                ? `group-tag-name-${target.groupIndex}-${target.tagIndex}`
+                : `group-name-${target.groupIndex}`;
+            const element = document.getElementById(targetID);
+            if (element instanceof HTMLElement) {
+              element.focus();
+            }
+          }, 250);
         }
       }
       return;
     }
 
     const nextTree = normalizeGroupTree(draftTree);
-    // 空树合法（用户删光全部分组：保存后服务端级联清空节点选择）；
-    // 仅当草稿非空但规范化后为空（全部条目无效/重名/保留名）时报错，
-    // 不再静默丢弃——否则最后一个分组永远删不掉，节点侧选择悬空。
+
     if (nextTree.length === 0 && draftTree.length > 0) {
       toast.error("分组条目无效：请检查空白、重名或保留名（如“全部”）。");
       return;
@@ -577,347 +643,390 @@ export default function GroupManagement({
     });
   };
 
+  const editingGroupUsage = editingGroup
+    ? usageStats.groupCount.get(String(editingGroup.name || "").trim()) || 0
+    : 0;
+  const editingTagUsage =
+    editingTag && editingTagGroup
+      ? usageStats.tagCount.get(
+          `${String(editingTagGroup.name || "").trim()}::${String(editingTag.name || "").trim()}`,
+        ) || 0
+      : 0;
+
   return (
     <div className={adminPageShellClass}>
-      <section className={adminPageHeaderClass}>
-        <div>
-          <h1 className={adminPageTitleClass}>分组管理</h1>
-        </div>
-        <div className={adminPageActionsClass}>
-          {isDirty ? (
-            <span className={adminDirtyBadgeClass}>有未保存的修改</span>
-          ) : null}
-          <Button
-            variant="outline"
-            className={`${adminActionButtonClass} h-11 min-w-[140px] px-5 font-bold`}
-            onClick={addGroup}
-            disabled={isBusy}
-          >
-            <Plus className="mr-2 h-4 w-4" />
-            新建分组
-          </Button>
-          <Button
-            className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
-            onClick={handleSave}
-            disabled={!isDirty || isBusy}
-          >
-            {isBusy ? "保存中…" : "保存更改"}
-          </Button>
-        </div>
-      </section>
-
-      <section className="grid auto-rows-fr gap-4 md:grid-cols-3">
-        {statCards.map((item) => {
-          const Icon = item.icon;
-          return (
-            <Card
-              key={item.label}
-              className={`${adminStatCardClass} ${adminStatSurfaceClassByTone[item.tone]}`}
+      <AdminPageHeader
+        as="section"
+        title="分组管理"
+        actions={
+          <>
+            {isDirty ? (
+              <span className={adminDirtyBadgeClass}>有未保存的修改</span>
+            ) : null}
+            <Button
+              variant="outline"
+              className={`${adminActionButtonClass} h-9 min-w-[140px] px-4 font-medium`}
+              onClick={addGroup}
+              disabled={isBusy}
             >
-              <CardHeader className={adminStatCardHeaderClass}>
-                <div>
-                  <CardDescription className={adminStatEyebrowClass}>
-                    {item.label}
-                  </CardDescription>
-                  <CardTitle
-                    className={`mt-3 text-4xl ${adminStatValueToneClassByTone[item.tone]}`}
-                  >
-                    {item.value}
-                  </CardTitle>
-                </div>
-                <div className={`${adminStatIconChipClass} ${adminStatIconChipClassByTone[item.tone]}`}>
-                  <Icon className="h-5 w-5" />
-                </div>
-              </CardHeader>
-            </Card>
-          );
-        })}
-      </section>
+              <Plus className="mr-2 h-4 w-4" />
+              新建分组
+            </Button>
+            <Button
+              className={`${adminPrimaryButtonClass} h-9 px-4 font-medium`}
+              onClick={handleSave}
+              disabled={!isDirty || isBusy}
+            >
+              {isBusy ? "保存中…" : "保存更改"}
+            </Button>
+          </>
+        }
+      />
 
-      <Card className={panelCardClass}>
-        <CardHeader className={adminSectionHeaderClass}>
-          <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
-            <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700 dark:bg-sky-900 dark:text-sky-100">
-              <FolderTree className="h-5 w-5" />
-            </span>
-            <span>分组编辑</span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-5 p-5">
-          {generalValidationMessage ? (
+      <AdminMetricStrip ariaLabel="分组统计" items={metricItems} />
+
+      <AdminPanel
+        title="分组列表"
+        icon={<FolderTree className="h-4 w-4 text-[var(--label-3)]" />}
+      >
+        { }
+        {generalValidationMessage && draftTree.length > 0 ? (
+          <div className="pb-4">
             <div
-              className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
+              className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-600 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
               aria-live="polite"
             >
               {generalValidationMessage}
             </div>
-          ) : null}
-          {draftTree.length === 0 ? (
-            <div className={adminEmptyStateClass}>
-              <p className="text-sm font-medium text-slate-700 dark:text-slate-200">还没有一级分组</p>
+          </div>
+        ) : null}
+        <AdminDataTable
+          ariaLabel="分组列表"
+          columns={ledgerColumns}
+          rows={ledgerRows}
+          rowKey={(row) => row.id}
+          onRowClick={(row) => {
+            if (row.kind === "group") {
+              setEditingGroupId(row.id);
+              setEditingTagId(null);
+            } else {
+              setEditingTagId(row.id);
+              setEditingGroupId(null);
+            }
+          }}
+          emptyLabel="还没有一级分组，点击右上角「新建分组」开始。"
+        />
+      </AdminPanel>
+
+      {editingGroup && editingGroupIndex >= 0 ? (
+        <AdminDrawer
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              setEditingGroupId(null);
+            }
+          }}
+          title={
+            String(editingGroup.name || "").trim() || "未命名分组"
+          }
+          description={`一级分组 · 第 ${editingGroupIndex + 1} 位 / 共 ${draftTree.length} 个分组`}
+          footer={
+            <div className="flex items-center justify-between gap-2">
+              <AlertDialog>
+                <AlertDialogTrigger
+                  className={adminDangerIconButtonClass}
+                  disabled={isBusy}
+                  type="button"
+                  aria-label="删除一级分组"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </AlertDialogTrigger>
+                <AlertDialogContent className={adminDialogContentClass}>
+                  <AlertDialogHeader className={adminDialogHeaderClass}>
+                    <AlertDialogTitle>确认删除一级分组？</AlertDialogTitle>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter className={adminDialogFooterClass}>
+                    <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      className={adminDialogDangerActionClass}
+                      disabled={isBusy}
+                      onClick={() => removeGroup(editingGroupIndex)}
+                    >
+                      确认删除
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
               <Button
-                className={`mt-5 ${adminActionButtonClass}`}
                 variant="outline"
-                onClick={addGroup}
+                className={adminOutlineButtonClass}
+                onClick={() => setEditingGroupId(null)}
                 disabled={isBusy}
               >
-                <Plus className="mr-2 h-4 w-4" />
-                新建分组
+                关闭
               </Button>
             </div>
-          ) : null}
-
-          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-            <SortableContext items={draftTree.map((group) => group.id)} strategy={verticalListSortingStrategy}>
-              {draftTree.map((group, groupIndex) => (
-                <SortableGroupCard
-                  key={group.id}
-                  group={group}
-                  groupIndex={groupIndex}
-                  groupUsageCount={String(group.name || "").trim() ? usageStats.groupCount.get(String(group.name || "").trim()) || 0 : 0}
-                  tagUsageStats={usageStats.tagCount}
-                  groupCardClass={groupCardClass}
-                  groupCardHeaderClass={groupCardHeaderClass}
-                  isBusy={isBusy}
-                  validationLookup={validationLookup}
-                  onAddTag={addTag}
-                  onRemoveGroup={removeGroup}
-                  onRemoveTag={removeTag}
-                  onUpdateGroupName={updateGroupName}
-                  onUpdateTagName={updateTagName}
-                />
-              ))}
-            </SortableContext>
-          </DndContext>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-function SortableGroupCard({
-  group,
-  groupIndex,
-  groupUsageCount,
-  tagUsageStats,
-  groupCardClass,
-  groupCardHeaderClass,
-  isBusy,
-  validationLookup,
-  onAddTag,
-  onRemoveGroup,
-  onRemoveTag,
-  onUpdateGroupName,
-  onUpdateTagName,
-}: {
-  group: EditableGroupNode;
-  groupIndex: number;
-  groupUsageCount: number;
-  tagUsageStats: Map<string, number>;
-  groupCardClass: string;
-  groupCardHeaderClass: string;
-  isBusy: boolean;
-  validationLookup: {
-    groupErrors: Record<string, string>;
-    tagErrors: Record<string, string>;
-  };
-  onAddTag: (groupIndex: number) => void;
-  onRemoveGroup: (groupIndex: number) => void;
-  onRemoveTag: (groupIndex: number, tagIndex: number) => void;
-  onUpdateGroupName: (groupIndex: number, value: string) => void;
-  onUpdateTagName: (groupIndex: number, tagIndex: number, value: string) => void;
-}) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: group.id,
-    disabled: isBusy,
-  });
-  const groupName = String(group.name || "").trim();
-  const tags = group.children || [];
-  const effectiveTagCount = tags.filter((tag) => String(tag.name || "").trim()).length;
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-  };
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className={`${groupCardClass} ${isDragging ? "opacity-80 shadow-[0_24px_48px_-28px_rgba(14,116,214,0.28)]" : ""}`}
-    >
-      <div className={groupCardHeaderClass}>
-        <div className={`${adminWorkspaceHeaderClass} flex-1`}>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400 transition-colors hover:border-sky-200 hover:text-sky-600 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-500 dark:hover:border-sky-800 dark:hover:text-sky-300"
-              aria-label="拖动排序"
-              disabled={isBusy}
-              {...attributes}
-              {...listeners}
-            >
-              <GripVertical className="h-4 w-4" />
-            </button>
-            <div className="rounded-2xl bg-sky-100 p-2.5 text-sky-700 dark:bg-sky-900 dark:text-sky-100">
-              <FolderTree className="h-4 w-4" />
-            </div>
-            <div className="flex-1 space-y-2">
-              <p className={adminStatEyebrowClass}>一级分组名称</p>
-              <Input
-                id={`group-name-${groupIndex}`}
-                name={`group-name-${groupIndex}`}
-                autoComplete="off"
-                value={group.name}
-                placeholder="例如：美国、香港、日本…"
-                className={adminWideInputClass}
-                aria-invalid={Boolean(validationLookup.groupErrors[String(groupIndex)])}
-                aria-describedby={
-                  validationLookup.groupErrors[String(groupIndex)]
-                    ? `group-name-${groupIndex}-error`
-                    : undefined
-                }
-                disabled={isBusy}
-                onChange={(event) => onUpdateGroupName(groupIndex, event.target.value)}
-              />
-              {validationLookup.groupErrors[String(groupIndex)] ? (
-                <p
-                  id={`group-name-${groupIndex}-error`}
-                  className="text-xs font-medium text-rose-500"
-                  aria-live="polite"
-                >
-                  {validationLookup.groupErrors[String(groupIndex)]}
-                </p>
-              ) : null}
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                <Badge variant="secondary" className={adminNeutralBadgeClass}>
-                  {`${groupUsageCount} 个节点`}
-                </Badge>
-                <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
-                  {`${effectiveTagCount} 个标签`}
-                </Badge>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className={compactOutlineActionClass}
-            onClick={() => onAddTag(groupIndex)}
-            disabled={isBusy}
-          >
-            <Plus className="mr-1 h-4 w-4" />
-            添加标签
-          </Button>
-          <AlertDialog>
-            <AlertDialogTrigger
-              className={adminDangerIconButtonClass}
-              disabled={isBusy}
-              type="button"
-              aria-label="删除一级分组"
-            >
-              <Trash2 className="h-4 w-4" />
-            </AlertDialogTrigger>
-            <AlertDialogContent className={adminDialogContentClass}>
-              <AlertDialogHeader className={adminDialogHeaderClass}>
-                <AlertDialogTitle>确认删除一级分组？</AlertDialogTitle>
-              </AlertDialogHeader>
-              <AlertDialogFooter className={adminDialogFooterClass}>
-                <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
-                <AlertDialogAction
-                  className={adminDialogDangerActionClass}
+          }
+        >
+          <section>
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              分组信息
+            </h3>
+            <AdminKVField label="名称" htmlFor={`group-name-${editingGroupIndex}`}>
+              <div className="space-y-2">
+                <Input
+                  id={`group-name-${editingGroupIndex}`}
+                  name={`group-name-${editingGroupIndex}`}
+                  autoComplete="off"
+                  value={editingGroup.name}
+                  placeholder="例如：美国、香港、日本…"
+                  className={adminWideInputClass}
+                  aria-invalid={Boolean(validationLookup.groupErrors[String(editingGroupIndex)])}
+                  aria-describedby={
+                    validationLookup.groupErrors[String(editingGroupIndex)]
+                      ? `group-name-${editingGroupIndex}-error`
+                      : undefined
+                  }
                   disabled={isBusy}
-                  onClick={() => onRemoveGroup(groupIndex)}
+                  onChange={(event) => updateGroupName(editingGroupIndex, event.target.value)}
+                />
+                {validationLookup.groupErrors[String(editingGroupIndex)] ? (
+                  <p
+                    id={`group-name-${editingGroupIndex}-error`}
+                    className="text-xs font-medium text-rose-500"
+                    aria-live="polite"
+                  >
+                    {validationLookup.groupErrors[String(editingGroupIndex)]}
+                  </p>
+                ) : null}
+              </div>
+            </AdminKVField>
+            <AdminKVField label="类型">
+              <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
+                一级分组
+              </Badge>
+            </AdminKVField>
+            <AdminKVField label="上级分组">
+              <span className="text-sm text-[var(--label-3)]">—（顶级）</span>
+            </AdminKVField>
+            <AdminKVField label="节点归属">
+              <span className="data-text text-sm text-slate-700 dark:text-neutral-200">
+                {`${editingGroupUsage} 个节点`}
+              </span>
+            </AdminKVField>
+            <AdminKVField label="排序">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="data-text text-sm text-slate-700 dark:text-neutral-200">
+                  {`第 ${editingGroupIndex + 1} / ${draftTree.length} 位`}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={compactOutlineActionClass}
+                  onClick={() => moveGroup(editingGroupIndex, -1)}
+                  disabled={isBusy || editingGroupIndex === 0}
                 >
-                  确认删除
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </div>
-      </div>
-
-      <div className="space-y-4 px-6 py-5">
-        <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-          <h4 className="text-sm font-medium text-slate-900 dark:text-slate-100">二级标签</h4>
-          <Badge variant="outline" className={`w-fit ${adminSubtleOutlineBadgeClass}`}>
-            {`共 ${effectiveTagCount} 个有效标签`}
-          </Badge>
-        </div>
-
-        {tags.length === 0 ? (
-          <div className={adminInlineEmptyStateClass}>
-            暂无二级标签
-          </div>
-        ) : null}
-
-        {tags.length > 0 ? (
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-            {tags.map((tag, tagIndex) => {
-              const tagName = String(tag.name || "").trim();
-              const tagKey = groupName && tagName ? `${groupName}::${tagName}` : "";
-              const tagUsageCount = tagKey ? tagUsageStats.get(tagKey) || 0 : 0;
-
-              return (
-                <div
-                  key={tag.id}
-                  className="flex items-center gap-3 rounded-[1.15rem] border border-slate-200 bg-white px-3 py-3 dark:border-slate-800 dark:bg-slate-900"
+                  <ArrowUp className="mr-1 h-4 w-4" />
+                  上移
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={compactOutlineActionClass}
+                  onClick={() => moveGroup(editingGroupIndex, 1)}
+                  disabled={isBusy || editingGroupIndex === draftTree.length - 1}
                 >
-                  <div className="rounded-xl bg-emerald-50 p-2 text-emerald-600 dark:bg-emerald-950 dark:text-emerald-200">
-                    <Tag className="h-4 w-4" />
-                  </div>
+                  <ArrowDown className="mr-1 h-4 w-4" />
+                  下移
+                </Button>
+              </div>
+            </AdminKVField>
+          </section>
 
-                  <div className="min-w-0 flex-1 space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <Badge variant="outline" className={adminSubtleOutlineBadgeClass}>
+          <section>
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              二级标签
+            </h3>
+            {(editingGroup.children || []).length === 0 ? (
+              <p className="text-sm text-[var(--label-3)]">暂无二级标签</p>
+            ) : (
+              <div className="divide-y divide-[var(--separator)]">
+                {(editingGroup.children || []).map((tag, tagIndex) => {
+                  const tagName = String(tag.name || "").trim();
+                  const tagKey =
+                    String(editingGroup.name || "").trim() && tagName
+                      ? `${String(editingGroup.name || "").trim()}::${tagName}`
+                      : "";
+                  const tagUsageCount = tagKey ? usageStats.tagCount.get(tagKey) || 0 : 0;
+
+                  return (
+                    <div key={tag.id} className="flex items-center gap-3 py-2 first:pt-0 last:pb-0">
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <Input
+                          id={`group-tag-name-${editingGroupIndex}-${tagIndex}`}
+                          name={`group-tag-name-${editingGroupIndex}-${tagIndex}`}
+                          autoComplete="off"
+                          value={tag.name}
+                          placeholder="例如：CN2、BGP、GIA…"
+                          className="h-9 w-full rounded-xl border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] text-sm text-slate-900 placeholder:text-slate-500 dark:placeholder:text-neutral-400 dark:text-neutral-100"
+                          aria-invalid={Boolean(
+                            validationLookup.tagErrors[`${editingGroupIndex}-${tagIndex}`],
+                          )}
+                          aria-describedby={
+                            validationLookup.tagErrors[`${editingGroupIndex}-${tagIndex}`]
+                              ? `group-tag-name-${editingGroupIndex}-${tagIndex}-error`
+                              : undefined
+                          }
+                          disabled={isBusy}
+                          onChange={(event) =>
+                            updateTagName(editingGroupIndex, tagIndex, event.target.value)
+                          }
+                        />
+                        {validationLookup.tagErrors[`${editingGroupIndex}-${tagIndex}`] ? (
+                          <p
+                            id={`group-tag-name-${editingGroupIndex}-${tagIndex}-error`}
+                            className="text-xs font-medium text-rose-500"
+                            aria-live="polite"
+                          >
+                            {validationLookup.tagErrors[`${editingGroupIndex}-${tagIndex}`]}
+                          </p>
+                        ) : null}
+                      </div>
+
+                      <Badge
+                        variant="outline"
+                        className={`${adminSubtleOutlineBadgeClass} data-text shrink-0`}
+                      >
                         {`${tagUsageCount} 个节点`}
                       </Badge>
-                    </div>
 
-                    <Input
-                      id={`group-tag-name-${groupIndex}-${tagIndex}`}
-                      name={`group-tag-name-${groupIndex}-${tagIndex}`}
-                      autoComplete="off"
-                      value={tag.name}
-                      placeholder="例如：CN2、BGP、GIA…"
-                      className="h-10 w-full rounded-xl border-slate-300 bg-white text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                      aria-invalid={Boolean(validationLookup.tagErrors[`${groupIndex}-${tagIndex}`])}
-                      aria-describedby={
-                        validationLookup.tagErrors[`${groupIndex}-${tagIndex}`]
-                          ? `group-tag-name-${groupIndex}-${tagIndex}-error`
-                          : undefined
-                      }
-                      disabled={isBusy}
-                      onChange={(event) => onUpdateTagName(groupIndex, tagIndex, event.target.value)}
-                    />
-                    {validationLookup.tagErrors[`${groupIndex}-${tagIndex}`] ? (
-                      <p
-                        id={`group-tag-name-${groupIndex}-${tagIndex}-error`}
-                        className="text-xs font-medium text-rose-500"
-                        aria-live="polite"
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className={`${adminDangerIconButtonClass} h-9 w-9 shrink-0`}
+                        onClick={() => removeTag(editingGroupIndex, tagIndex)}
+                        disabled={isBusy}
+                        aria-label="删除标签"
                       >
-                        {validationLookup.tagErrors[`${groupIndex}-${tagIndex}`]}
-                      </p>
-                    ) : null}
-                  </div>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div>
+              <Button
+                variant="outline"
+                size="sm"
+                className={compactOutlineActionClass}
+                onClick={() => addTag(editingGroupIndex)}
+                disabled={isBusy}
+              >
+                <Plus className="mr-1 h-4 w-4" />
+                添加标签
+              </Button>
+            </div>
+          </section>
+        </AdminDrawer>
+      ) : null}
 
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={`${adminDangerIconButtonClass} h-9 w-9 shrink-0`}
-                    onClick={() => onRemoveTag(groupIndex, tagIndex)}
-                    disabled={isBusy}
-                    aria-label="删除标签"
+      {editingTag && editingTagGroup && editingTagGroupIndex >= 0 && editingTagIndex >= 0 ? (
+        <AdminDrawer
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              setEditingTagId(null);
+            }
+          }}
+          title={String(editingTag.name || "").trim() || "未命名标签"}
+          description={`二级标签 · 所属分组 ${
+            String(editingTagGroup.name || "").trim() || "未命名分组"
+          }`}
+          footer={
+            <div className="flex items-center justify-between gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                className={adminDangerIconButtonClass}
+                disabled={isBusy}
+                type="button"
+                aria-label="删除标签"
+                onClick={() => removeTag(editingTagGroupIndex, editingTagIndex)}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="outline"
+                className={adminOutlineButtonClass}
+                onClick={() => setEditingTagId(null)}
+                disabled={isBusy}
+              >
+                关闭
+              </Button>
+            </div>
+          }
+        >
+          <section>
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              标签信息
+            </h3>
+            <AdminKVField label="名称" htmlFor={`group-tag-name-${editingTagGroupIndex}-${editingTagIndex}`}>
+              <div className="space-y-2">
+                <Input
+                  id={`group-tag-name-${editingTagGroupIndex}-${editingTagIndex}`}
+                  name={`group-tag-name-${editingTagGroupIndex}-${editingTagIndex}`}
+                  autoComplete="off"
+                  value={editingTag.name}
+                  placeholder="例如：CN2、BGP、GIA…"
+                  className={adminWideInputClass}
+                  aria-invalid={Boolean(
+                    validationLookup.tagErrors[`${editingTagGroupIndex}-${editingTagIndex}`],
+                  )}
+                  aria-describedby={
+                    validationLookup.tagErrors[`${editingTagGroupIndex}-${editingTagIndex}`]
+                      ? `group-tag-name-${editingTagGroupIndex}-${editingTagIndex}-error`
+                      : undefined
+                  }
+                  disabled={isBusy}
+                  onChange={(event) =>
+                    updateTagName(editingTagGroupIndex, editingTagIndex, event.target.value)
+                  }
+                />
+                {validationLookup.tagErrors[`${editingTagGroupIndex}-${editingTagIndex}`] ? (
+                  <p
+                    id={`group-tag-name-${editingTagGroupIndex}-${editingTagIndex}-error`}
+                    className="text-xs font-medium text-rose-500"
+                    aria-live="polite"
                   >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
-      </div>
+                    {validationLookup.tagErrors[`${editingTagGroupIndex}-${editingTagIndex}`]}
+                  </p>
+                ) : null}
+              </div>
+            </AdminKVField>
+            <AdminKVField label="类型">
+              <Badge variant="secondary" className={adminNeutralBadgeClass}>
+                二级标签
+              </Badge>
+            </AdminKVField>
+            <AdminKVField label="上级分组">
+              <span className="text-sm text-slate-700 dark:text-neutral-200">
+                {String(editingTagGroup.name || "").trim() || "未命名分组"}
+              </span>
+            </AdminKVField>
+            <AdminKVField label="节点归属">
+              <span className="data-text text-sm text-slate-700 dark:text-neutral-200">
+                {`${editingTagUsage} 个节点`}
+              </span>
+            </AdminKVField>
+            <p className={`${adminStatEyebrowClass} text-xs leading-relaxed`}>
+              标签的增删与排序请在所属分组的抽屉中完成。
+            </p>
+          </section>
+        </AdminDrawer>
+      ) : null}
     </div>
   );
 }
+
+const compactOutlineActionClass = `${adminOutlineButtonClass} h-9 px-4`;

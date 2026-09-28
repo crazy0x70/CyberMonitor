@@ -95,6 +95,24 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["管理", "Manage"],
   ["配置", "Configure"],
   ["未配置", "Not configured"],
+  ["已配置", "Configured"],
+  ["节点列表", "Node list"],
+  ["节点概览", "Node overview"],
+  ["节点统计", "Node statistics"],
+  ["统计摘要", "Summary"],
+  ["状态", "Status"],
+  ["内存", "Memory"],
+  ["磁盘", "Disk"],
+  ["网速", "Network"],
+  ["系统", "OS"],
+  ["续期", "Renewal"],
+  ["当前值", "Current value"],
+  ["操作", "Actions"],
+  ["前往", "Open"],
+  ["接入地址", "Endpoint"],
+  ["未设置", "Not set"],
+  ["复制 Windows Agent 接入命令", "Copy Windows agent install command"],
+  ["复制 Linux / macOS Agent 接入命令", "Copy Linux and macOS agent install command"],
   ["兼容服务商", "Compatible provider"],
   ["TG 已配", "TG configured"],
   ["TG 未配", "TG not configured"],
@@ -297,7 +315,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["当前 Agent 已禁用远程更新", "Remote Agent updates are disabled"],
   ["当前节点还没有上报 Agent 版本", "This node has not reported an Agent version"],
   ["当前 Agent 已是最新版", "Agent is already latest"],
-  // 历史变体：不同页面用过两种中文措辞，en→zh 回翻统一到前者。
+
   ["当前 Agent 已是最新版本", "The agent is already up to date"],
   ["已禁用更新", "Updates disabled"],
   ["节点配置有未保存修改，请先保存或使用放弃修改。", "Node configuration has unsaved changes. Save or discard them first."],
@@ -341,6 +359,23 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["识别信息", "Identity"],
   ["地区代码", "Region code"],
   ["当前主机名", "Current hostname"],
+
+  ["/ 主机名：", "/ Hostname: "],
+  ["配置文件不是有效的 JSON", "The configuration file is not valid JSON"],
+  ["服务商配置", "Providers"],
+  ["编辑服务商", "Edit provider"],
+  ["接入参数", "Connection parameters"],
+  ["连接验证", "Connection test"],
+  ["探测目标", "Probe targets"],
+  ["地址", "Address"],
+  ["TCP 参数", "TCP parameters"],
+  ["确认登录", "Sign in"],
+  ["AI 服务商配置已保存", "AI provider configuration saved"],
+  ["尚未获取模型列表", "No model list fetched yet"],
+  ["验证失败", "Test failed"],
+  ["获取模型列表失败", "Failed to fetch model list"],
+  ["端点或模型有未保存修改，请先保存后再测试。", "Endpoint or model has unsaved changes. Save before testing."],
+  ["端点或模型有未保存修改，请先保存后再获取模型。", "Endpoint or model has unsaved changes. Save before fetching models."],
   ["资源标注", "Resource labels"],
   ["磁盘类型", "Disk type"],
   ["带宽（Mbps）", "Bandwidth (Mbps)"],
@@ -445,6 +480,30 @@ const ADMIN_TEXT_PATTERNS: Array<{
   en: RegExp;
   toZh: (match: RegExpMatchArray) => string;
 }> = [
+  {
+    zh: /^编辑服务商\s+(.+)$/,
+    toEn: (match) => `Edit provider ${match[1]}`,
+    en: /^Edit provider\s+(.+)$/,
+    toZh: (match) => `编辑服务商 ${match[1]}`,
+  },
+  {
+    zh: /^(.+?)\s+验证成功$/,
+    toEn: (match) => `${match[1]} verified successfully`,
+    en: /^(.+?)\s+verified successfully$/,
+    toZh: (match) => `${match[1]} 验证成功`,
+  },
+  {
+    zh: /^(.+?)\s+模型列表已刷新$/,
+    toEn: (match) => `Model list refreshed for ${match[1]}`,
+    en: /^Model list refreshed for\s+(.+)$/,
+    toZh: (match) => `${match[1]} 模型列表已刷新`,
+  },
+  {
+    zh: /^已缓存\s+(\d+)\s+个模型候选$/,
+    toEn: (match) => `${match[1]} model candidates cached`,
+    en: /^(\d+)\s+model candidates cached$/,
+    toZh: (match) => `已缓存 ${match[1]} 个模型候选`,
+  },
   {
     zh: /^实时同步\s+(.+)$/,
     toEn: (match) => `Live sync ${match[1]}`,
@@ -686,7 +745,7 @@ export function writeStoredAdminLocale(locale: AdminLocale) {
   try {
     window.localStorage.setItem(ADMIN_LOCALE_STORAGE_KEY, locale);
   } catch {
-    // storage may be disabled by browser policy
+
   }
 }
 
@@ -725,12 +784,11 @@ function shouldSkipElement(element: Element | null) {
   return (
     tag === "SCRIPT" ||
     tag === "STYLE" ||
-    // INPUT/TEXTAREA 不在此跳过：属性翻译（placeholder 等）需要处理它们。
+
     element.closest("[data-admin-i18n-skip]") != null
   );
 }
 
-// 文本节点遍历专用的跳过判定：不进入表单控件与代码块。
 function shouldSkipTextNodeElement(element: HTMLElement | null): boolean {
   if (!element) {
     return false;

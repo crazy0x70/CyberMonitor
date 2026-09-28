@@ -1,16 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AdminPageHeader } from "@/components/admin-page-header";
+import { AdminPanel } from "@/components/admin-panel";
+import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
+import { AdminDrawer } from "@/components/admin-drawer";
+import { AdminKVField } from "@/components/admin-kv-field";
+import { AdminMetricStrip } from "@/components/admin-metric-strip";
 import {
-  Activity,
-  AlertTriangle,
   Check,
   ChevronsUpDown,
-  Edit2,
   FolderTree,
   Loader2,
   RefreshCw,
+  Rocket,
   Search,
-  Server,
-  Terminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -30,27 +32,11 @@ import { useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -58,7 +44,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
+import { cn } from "@/lib/utils";
 import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type AgentUpdateInfo,
   NodeDeleteResponse,
   NodeProfilePayload,
@@ -68,10 +54,9 @@ import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type AgentUpdateInfo,
   TestSelection, } from "@/lib/admin-types";
 import {
   flattenGroupTree,
-  formatBytes,
-  formatDateTime,
-  formatMbps,
-  formatRelativeTime,
+  formatMainDiskUsedPercent,
+  formatNetRate,
+  formatNodeRenewal,
   formatVersionLabel,
   getErrorMessage,
   normalizeSelectionValues,
@@ -81,7 +66,6 @@ import {
   parseSelectionValue,
   resolveNodeId,
   resolveNodeName,
-  resolveProbeLabel,
   toDateTimeLocalValue,
   upsertSelectionValue,
 } from "@/lib/admin-format";
@@ -91,54 +75,26 @@ import {
 } from "@/lib/agent-install";
 import {
   adminActionButtonClass,
-  adminAccentBadgeClass,
   adminCodeBlockPanelClass,
-  adminDetailCardClass,
-  adminDetailGroupClass,
-  adminDetailHeaderClass,
-  adminDetailHintPanelClass,
   adminDialogCancelClass,
   adminDialogContentClass,
   adminDangerBadgeClass,
+  adminDangerOutlineButtonClass,
   adminDialogDangerActionClass,
   adminDialogFooterClass,
   adminDialogHeaderClass,
-  adminEmptyStateClass,
-  adminInlineEmptyStateClass,
   adminInputClass,
   adminOutlineButtonClass,
-  adminPageHeaderClass,
   adminPageShellClass,
-  adminPageTitleClass,
   adminPrimaryButtonClass,
-  adminNeutralBadgeClass,
-  adminPreviewPanelClass,
-  adminSectionHeaderClass,
-  adminSectionIntroPanelClass,
   adminSelectContentClass,
   adminSelectTriggerClass,
   adminSuccessBadgeClass,
-  adminStatCardClass,
-  adminStatCardHeaderClass,
-  adminStatEyebrowClass,
-  adminStatIconChipClass,
-  adminStatIconChipClassByTone,
-  adminStatSurfaceClassByTone,
-  adminStatValueToneClassByTone,
-  adminSurfaceCardClass,
   adminWarningBadgeClass,
-  adminWorkspaceActionChipClass,
-  adminWorkspaceHeaderClass,
-  adminWorkspaceItemClass,
-  adminWorkspaceListClass,
-  adminWorkspaceMetaCardClass,
-  adminWorkspaceMetaGridClass,
-  adminWorkspaceMetaLabelClass,
 } from "@/lib/admin-ui";
 
-// 与后端 maxNetworkTestsPerNode 对齐（超限静默截断）。
 const maxTestsPerNode = 128;
-// 常见地区名→两位码映射（与后端 regionAliases 同内容，键小写）。
+
 const REGION_ALIASES: Record<string, string> = {
   新加坡: "SG", 日本: "JP", 香港: "HK", 中国香港: "HK", 台湾: "TW",
   中国台湾: "TW", 美国: "US", 英国: "UK", 加拿大: "CA", 德国: "DE",
@@ -160,12 +116,7 @@ function normalizeRegionInput(value: string): string {
   return /^[A-Z]{2}$/.test(upper) ? upper : "";
 }
 
-
-const sectionCardClass = `overflow-hidden ${adminSurfaceCardClass}`;
-
-
-
-const outlineActionClass = `${adminOutlineButtonClass} h-11 px-5`;
+const outlineActionClass = `${adminOutlineButtonClass} h-9 px-4`;
 
 const agentInstallLinuxId = "server-management-agent-install-linux";
 
@@ -248,25 +199,6 @@ export interface ServerManagementProps {
   onTriggerAgentUpdate: (nodeID: string) => Promise<{ status: string; target_version?: string }>;
 }
 
-function formatGPUSummary(node: NodeView | null | undefined) {
-  const gpus = Array.isArray(node?.stats?.gpu) ? node.stats.gpu : [];
-  if (gpus.length === 0) {
-    return "--";
-  }
-  return gpus
-    .map((gpu) => {
-      const name = (gpu.name || gpu.vendor || `GPU ${Number(gpu.index || 0) + 1}`).trim();
-      const usage = Number.isFinite(gpu.utilization_percent)
-        ? `${Math.round(Math.max(0, Math.min(100, gpu.utilization_percent)))}%`
-        : "--";
-      const memory =
-        Number.isFinite(gpu.memory_used) && Number.isFinite(gpu.memory_total) && gpu.memory_total > 0
-          ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
-          : "";
-      return [name, usage, memory].filter(Boolean).join(" / ");
-    })
-    .join("；");
-}
 
 function planToSeconds(plan: RenewPlan) {
   switch (plan) {
@@ -280,21 +212,6 @@ function planToSeconds(plan: RenewPlan) {
       return 365 * 86400;
     default:
       return 0;
-  }
-}
-
-function renewPlanLabel(plan: RenewPlan) {
-  switch (plan) {
-    case "month":
-      return "按月续费";
-    case "quarter":
-      return "按季度续费";
-    case "half":
-      return "按半年续费";
-    case "year":
-      return "按年续费";
-    default:
-      return "不自动续费";
   }
 }
 
@@ -503,7 +420,6 @@ function buildPayload(form: FormState, catalog: TestCatalogItem[]): NodeProfileP
     test_selections: selections,
   };
 
-  // 始终携带：后端是指针契约，缺省=不变；清空输入框时传 0 才能真正清除。
   payload.expire_at = expireAt;
   if (renewIntervalSec > 0) {
     payload.renew_interval_sec = renewIntervalSec;
@@ -543,6 +459,78 @@ function renderStatusBadge(status: string) {
     </Badge>
   );
 }
+
+const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
+  {
+    key: "name",
+    label: "名称",
+    render: (entry) => (
+      <span className="inline-flex min-w-0 max-w-[300px] items-center gap-2">
+        <span className="truncate text-sm font-medium text-slate-900 dark:text-neutral-50">
+          {entry.nodeName}
+        </span>
+        {renderStatusBadge(entry.node.status)}
+        {entry.node.alert_enabled === false ? (
+          <Badge variant="outline" className={adminWarningBadgeClass}>
+            告警已关闭
+          </Badge>
+        ) : null}
+      </span>
+    ),
+  },
+  {
+    key: "cpu",
+    label: "CPU",
+    align: "right",
+    mono: true,
+    render: (entry) => `${Math.round(entry.node.stats.cpu?.usage_percent || 0)}%`,
+  },
+  {
+    key: "memory",
+    label: "内存",
+    align: "right",
+    mono: true,
+    render: (entry) => `${Math.round(entry.node.stats.memory?.used_percent || 0)}%`,
+  },
+  {
+    key: "disk",
+    label: "磁盘",
+    align: "right",
+    mono: true,
+    render: (entry) => formatMainDiskUsedPercent(entry.node),
+  },
+  {
+    key: "net",
+    label: "网速",
+    align: "right",
+    mono: true,
+    render: (entry) =>
+      entry.node.status === "online"
+        ? `↑${formatNetRate(entry.node.stats.network?.tx_bytes_per_sec)} ↓${formatNetRate(
+            entry.node.stats.network?.rx_bytes_per_sec,
+          )}`
+        : "--",
+  },
+  {
+    key: "os",
+    label: "系统",
+    render: (entry) => `${entry.node.stats.os} ／ ${entry.node.stats.arch}`,
+  },
+  {
+    key: "agent",
+    label: "Agent",
+    align: "right",
+    mono: true,
+    render: (entry) => formatVersionLabel(entry.node.stats.agent_version),
+  },
+  {
+    key: "renew",
+    label: "续期",
+    align: "right",
+    mono: true,
+    render: (entry) => formatNodeRenewal(entry.node),
+  },
+];
 
 function escapeSelectorValue(value: string) {
   if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
@@ -699,19 +687,19 @@ export default function ServerManagement({
     const entries: NodeListEntry[] = [];
     const lookup = new Map<string, NodeView>();
     let online = 0;
-    let alertDisabled = 0;
+    let ungrouped = 0;
 
     nodes.forEach((node) => {
       if (node.status === "online") {
         online += 1;
       }
-      if (node.alert_enabled === false) {
-        alertDisabled += 1;
-      }
 
       const nodeId = resolveNodeId(node);
       const nodeName = resolveNodeName(node);
       const nodeGroups = resolveNodeSelectionValues(node);
+      if (nodeGroups.length === 0) {
+        ungrouped += 1;
+      }
       entries.push({
         node,
         nodeGroups,
@@ -730,7 +718,8 @@ export default function ServerManagement({
       metrics: {
         total: nodes.length,
         online,
-        alertDisabled,
+        offline: nodes.length - online,
+        ungrouped,
       },
       nodeListEntries: entries,
       nodeLookup: lookup,
@@ -753,25 +742,11 @@ export default function ServerManagement({
     [nodeListEntries],
   );
 
-  const metricCards = [
-    {
-      label: "节点总数",
-      value: metrics.total,
-      icon: Server,
-      tone: "neutral",
-    },
-    {
-      label: "在线节点",
-      value: metrics.online,
-      icon: Activity,
-      tone: "success",
-    },
-    {
-      label: "已关闭告警",
-      value: metrics.alertDisabled,
-      icon: AlertTriangle,
-      tone: "warning",
-    },
+  const metricItems = [
+    { label: "节点总数", value: metrics.total },
+    { label: "在线节点", value: metrics.online },
+    { label: "离线节点", value: metrics.offline },
+    { label: "未分组节点", value: metrics.ungrouped },
   ] as const;
 
   const filteredNodes = useMemo(() => {
@@ -884,7 +859,6 @@ export default function ServerManagement({
     [form?.testSelections, testCatalog],
   );
   const hasExpireAt = Boolean(form?.expireAt.trim());
-  const alertStatusLabel = form?.alertEnabled ? "已启用离线告警" : "已关闭离线告警";
   const editingAgentVersion = editingNode?.stats.agent_version?.trim() || "";
   const agentUpdateDisabledReason = !editingNode
     ? "请选择节点后再执行更新"
@@ -911,6 +885,13 @@ export default function ServerManagement({
           : editingNode.agent_update_target_version
             ? formatVersionLabel(editingNode.agent_update_target_version)
             : "未检查";
+  // 只有真正渲染版本号时才用数据字体；「检查中…/未检查/已禁用更新」是说明文案，必须留在 UI 字体。
+  const agentLatestVersionIsValue =
+    !!editingNode &&
+    editingNode.agent_update_supported &&
+    !(refreshingAgentUpdate && !agentUpdateInfo) &&
+    !agentAlreadyLatest &&
+    !!(agentUpdateInfo?.latest_version || editingNode.agent_update_target_version);
 
   const handleOpen = (node: NodeView) => {
     const nodeID = resolveNodeId(node);
@@ -1190,908 +1171,666 @@ export default function ServerManagement({
 
   return (
     <div className={adminPageShellClass}>
-      <section className={adminPageHeaderClass}>
-        <div>
-          <h1 className={adminPageTitleClass}>节点管理</h1>
-        </div>
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <div className="relative min-w-[320px]">
-            <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-            <Input
-              aria-label="搜索节点"
-              type="search"
-              className={`rounded-full pl-11 ${adminInputClass}`}
-              name="node-search"
-              autoComplete="off"
-              placeholder="例如：搜索节点名、Node ID、主机名、地区…"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-            />
-          </div>
-          <Button
-            variant="outline"
-            className={outlineActionClass}
-            onClick={handleRefresh}
-            disabled={refreshing || loading || editorBusy || isEditingDraftDirty}
-          >
-            {refreshing || loading ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <RefreshCw className="mr-2 h-4 w-4" />
-            )}
-            刷新节点
-          </Button>
-          <AlertDialog
-            open={updateAllDialogOpen}
-            onOpenChange={(open) => {
-              if (updatingAllAgents && !open) {
-                return;
-              }
-              setUpdateAllDialogOpen(open);
-            }}
-          >
-            <AlertDialogTrigger
-              render={(
-                <Button
-                  type="button"
-                  variant="outline"
-                  className={outlineActionClass}
-                  disabled={updatingAllAgents || loading || nodes.length === 0}
-                >
-                  {updatingAllAgents ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <RefreshCw className="mr-2 h-4 w-4" />
-                  )}
-                  全部更新
-                </Button>
+      <AdminPageHeader
+        as="section"
+        title="节点管理"
+        actionsClassName="flex flex-col gap-2 sm:flex-row sm:items-center"
+        actions={
+          <>
+            <div className="relative min-w-[320px]">
+              <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500 dark:text-neutral-400" />
+              <Input
+                aria-label="搜索节点"
+                type="search"
+                className={`rounded-full pl-11 ${adminInputClass}`}
+                name="node-search"
+                autoComplete="off"
+                placeholder="例如：搜索节点名、Node ID、主机名、地区…"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+              />
+            </div>
+            <Button
+              variant="outline"
+              className={outlineActionClass}
+              onClick={handleRefresh}
+              disabled={refreshing || loading || editorBusy || isEditingDraftDirty}
+            >
+              {refreshing || loading ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="mr-2 h-4 w-4" />
               )}
-            />
-            <AlertDialogContent className={adminDialogContentClass}>
-              <AlertDialogHeader className={adminDialogHeaderClass}>
-                <AlertDialogTitle>
-                  确认对全部 {nodes.length} 台节点下发 Agent 更新？
-                </AlertDialogTitle>
-              </AlertDialogHeader>
-              <AlertDialogFooter className={adminDialogFooterClass}>
-                <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
-                <AlertDialogAction
-                  className={adminPrimaryButtonClass}
-                  disabled={updatingAllAgents}
-                  onClick={handleTriggerAllAgentUpdates}
-                >
-                  {updatingAllAgents ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                  确认下发
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </div>
-      </section>
-
-      <Card className={sectionCardClass}>
-        <CardHeader className={adminSectionHeaderClass}>
-          <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
-            <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-100">
-              <Terminal className="h-5 w-5" />
-            </span>
-            <span>Agent 快速接入</span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4 p-5">
-          {installReady ? (
-            <div className="grid gap-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className={`${
-                    installPlatform === "unix" ? adminPrimaryButtonClass : adminActionButtonClass
-                  } h-11 min-w-[148px] px-5`}
-                  onClick={() => setInstallPlatform("unix")}
-                >
-                  Linux / macOS
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className={`${
-                    installPlatform === "windows" ? adminPrimaryButtonClass : adminActionButtonClass
-                  } h-11 min-w-[148px] px-5`}
-                  onClick={() => setInstallPlatform("windows")}
-                >
-                  Windows
-                </Button>
-              </div>
-
-              <div className="grid gap-2">
-                <button
-                  aria-label={`复制${installPlatform === "windows" ? " Windows " : " Linux / macOS "}Agent 接入命令`}
-                  id={installPlatform === "windows" ? agentInstallWindowsId : agentInstallLinuxId}
-                  type="button"
-                  className={`${adminCodeBlockPanelClass} w-full select-text whitespace-pre-wrap break-all text-left transition-colors hover:border-sky-200 hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-400 dark:hover:border-sky-800 dark:hover:bg-slate-900`}
-                  onClick={() => copyInstallCommand(activeInstallCommand)}
-                  title="单击复制完整命令，拖拽可自由选择局部内容"
-                >
-                  <code className="block w-full select-text whitespace-pre-wrap break-all text-left font-inherit">
-                    {activeInstallCommand}
-                  </code>
-                </button>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  {agentToken
-                    ? "命令已内嵌当前配置的 Agent Token，复制后即可直接执行。"
-                    : "尚未配置 Agent Token：请先在基础设置的 Agent 配置中填写，命令占位符将自动替换为真实 Token。"}
-                </p>
-              </div>
-            </div>
-          ) : (
-            <div className={adminSectionIntroPanelClass}>
-              请先在基础设置的 Agent 配置中填写 Agent 对接地址。
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      <section className="grid auto-rows-fr gap-4 md:grid-cols-3">
-        {metricCards.map((item) => {
-          const Icon = item.icon;
-          return (
-            <Card key={item.label} className={`${adminStatCardClass} ${adminStatSurfaceClassByTone[item.tone]}`}>
-              <CardHeader className={adminStatCardHeaderClass}>
-                <div>
-                  <CardDescription className={adminStatEyebrowClass}>
-                    {item.label}
-                  </CardDescription>
-                  <CardTitle className={`mt-3 text-3xl font-black tracking-tighter ${adminStatValueToneClassByTone[item.tone]}`}>
-                    {item.value}
-                  </CardTitle>
-                </div>
-                <div className={`${adminStatIconChipClass} ${adminStatIconChipClassByTone[item.tone]}`}>
-                  <Icon className="h-5 w-5" />
-                </div>
-              </CardHeader>
-            </Card>
-          );
-        })}
-      </section>
-
-      <Card className={sectionCardClass}>
-        <CardHeader className={adminSectionHeaderClass}>
-          <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-50">
-            <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-sky-100 text-sky-700 dark:bg-sky-900 dark:text-sky-100">
-              <Server className="h-5 w-5" />
-            </span>
-            <span>服务器管理</span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4 p-5">
-          <div className={adminWorkspaceListClass}>
-            {filteredNodes.length === 0 ? (
-              <div className={`${adminEmptyStateClass} text-sm text-slate-500 dark:text-slate-400`}>
-                {nodes.length === 0 ? "当前还没有节点接入。" : "没有匹配的节点，请调整搜索条件。"}
-              </div>
-            ) : (
-              filteredNodes.map((entry) => {
-                const { node, nodeGroups, nodeId, nodeName } = entry;
-                const renewSummary =
-                  node.auto_renew && node.renew_interval_sec
-                    ? ` ／ ${renewPlanLabel(resolveRenewPlan(node.auto_renew, node.renew_interval_sec))}`
-                    : "";
-
-                return (
-                  <button
-                    key={nodeId}
-                    data-node-card-id={nodeId}
-                    type="button"
-                    onClick={() => handleOpen(node)}
-                    className={adminWorkspaceItemClass}
-                    style={{ contentVisibility: "auto", containIntrinsicSize: "296px" }}
-                  >
-                    <div className={adminWorkspaceHeaderClass}>
-                      <div className="space-y-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-base font-semibold text-slate-900 dark:text-slate-50">{nodeName}</span>
-                          {renderStatusBadge(node.status)}
-                          {node.alert_enabled === false ? (
-                            <Badge variant="outline" className={adminWarningBadgeClass}>
-                              告警已关闭
-                            </Badge>
-                          ) : null}
-                        </div>
-                        <div className="text-xs text-slate-500 dark:text-slate-400">
-                          {`Node ID: ${nodeId} / 主机名：${node.stats.hostname || "--"} / Agent: ${node.stats.agent_version || "--"}`}
-                        </div>
-                      </div>
-                      <div className={adminWorkspaceActionChipClass}>
-                        <Edit2 className="h-4 w-4" />
-                        编辑配置
-                      </div>
-                    </div>
-
-                    <div className={adminWorkspaceMetaGridClass}>
-                      <div className={adminWorkspaceMetaCardClass}>
-                        <div className={adminWorkspaceMetaLabelClass}>最近状态</div>
-                        <div className="mt-1 font-medium">{formatRelativeTime(node.last_seen)}</div>
-                        <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                          {node.status === "online" ? "当前在线，可直接下发配置" : "当前离线，配置会在恢复后生效"}
-                        </div>
-                      </div>
-                      <div className={adminWorkspaceMetaCardClass}>
-                        <div className={adminWorkspaceMetaLabelClass}>资源快照</div>
-                        <div className="mt-1 font-medium">
-                          {`CPU ${Math.round(node.stats.cpu.usage_percent || 0)}% / 内存 ${Math.round(node.stats.memory.used_percent || 0)}%`}
-                        </div>
-                        <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                          {`带宽：${formatMbps(node.net_speed_mbps)}`}
-                        </div>
-                        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                          GPU: {formatGPUSummary(node)}
-                        </div>
-                      </div>
-                      <div className={adminWorkspaceMetaCardClass}>
-                        <div className={adminWorkspaceMetaLabelClass}>运行环境</div>
-                        <div className="mt-1 font-medium">
-                          {node.stats.os} ／ {node.stats.arch}
-                        </div>
-                        <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                          地区：{(node.region || "--").toUpperCase()}
-                        </div>
-                      </div>
-                      <div className={adminWorkspaceMetaCardClass}>
-                        <div className={adminWorkspaceMetaLabelClass}>归属与续费</div>
-                        <div className="mt-1 line-clamp-2 font-medium">
-                          {nodeGroups.length > 0 ? nodeGroups.join("，") : "未分组"}
-                        </div>
-                        <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                          {node.expire_at ? formatDateTime(node.expire_at) : "未设置到期时间"}
-                          {renewSummary}
-                        </div>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
-        </CardContent>
-      </Card>
-
-      <Dialog open={Boolean(editingNode && form)} onOpenChange={(open) => !open && closeEditor()}>
-        <DialogContent
-          className={`flex max-h-[min(92vh,960px)] w-[min(100vw-2rem,70rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-[min(100vw-2rem,70rem)] ${adminDialogContentClass}`}
-        >
-          <DialogHeader className={adminDialogHeaderClass}>
-            <div className="space-y-2">
-              <DialogTitle className="text-xl font-semibold text-slate-900 dark:text-slate-50">
-                节点配置编辑
-              </DialogTitle>
-              <DialogDescription className="text-sm text-slate-500 dark:text-slate-400">
-                {editingNode
-                  ? `${resolveNodeName(editingNode)} ／ ${resolveNodeIdentitySummary(editingNode)}`
-                  : "选择节点后编辑"}
-              </DialogDescription>
-            </div>
-          </DialogHeader>
-
-          {editingNode && form ? (
-            <div className="flex min-h-0 flex-1 flex-col">
-              <div className="flex-1 overflow-y-auto px-6 py-6">
-                <div className="space-y-6">
-                  <div className={`grid gap-3 md:grid-cols-3 ${adminSectionIntroPanelClass}`}>
-                    <div className={adminWorkspaceMetaCardClass}>
-                      <div className={adminWorkspaceMetaLabelClass}>编辑目标</div>
-                      <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
-                        {resolveNodeName(editingNode)}
-                      </div>
-                    </div>
-                    <div className={adminWorkspaceMetaCardClass}>
-                      <div className={adminWorkspaceMetaLabelClass}>资源快照</div>
-                      <div className="mt-2 text-sm font-medium text-slate-700 dark:text-slate-200">
-                        {`CPU ${Math.round(editingNode.stats.cpu.usage_percent || 0)}% / 内存 ${Math.round(editingNode.stats.memory.used_percent || 0)}%`}
-                      </div>
-                    </div>
-                    <div className={adminWorkspaceMetaCardClass}>
-                      <div className={adminWorkspaceMetaLabelClass}>运行环境</div>
-                      <div className="mt-2 text-sm font-medium text-slate-700 dark:text-slate-200">
-                        {editingNode.stats.os} ／ {editingNode.stats.arch}
-                      </div>
-                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                        GPU: {formatGPUSummary(editingNode)}
-                      </div>
-                    </div>
-                  </div>
-                  <Card className={adminDetailCardClass}>
-                    <CardHeader className={adminDetailHeaderClass}>
-                      <CardTitle className="flex items-center gap-2 text-base text-slate-900 dark:text-slate-50">
-                        <RefreshCw className="h-4 w-4 text-sky-500 dark:text-sky-300" />
-                        Agent 更新
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-5 p-6">
-                      <div className="grid gap-4 md:grid-cols-2">
-                        <div className={adminPreviewPanelClass}>
-                          <p className={adminStatEyebrowClass}>当前版本</p>
-                          <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
-                            {formatVersionLabel(editingAgentVersion)}
-                          </p>
-                        </div>
-                        <div className={adminPreviewPanelClass}>
-                          <p className={adminStatEyebrowClass}>最新版本</p>
-                          <p className="mt-3 text-2xl font-semibold text-slate-900 dark:text-slate-100">
-                            {agentLatestVersionLabel}
-                          </p>
-                        </div>
-                      </div>
-                      {editingNode.agent_update_supported ? (
-                        <div className="flex flex-wrap items-center gap-3">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className={`${adminActionButtonClass} h-11 px-5`}
-                            onClick={handleCheckAgentUpdate}
-                            disabled={Boolean(agentUpdateDisabledReason) || editorInputDisabled}
-                            title={agentUpdateDisabledReason || undefined}
-                          >
-                            {refreshingAgentUpdate ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-                            检查更新
-                          </Button>
-                          <Button
-                            type="button"
-                            className={`${adminPrimaryButtonClass} h-11 px-5`}
-                            onClick={handleAgentUpdate}
-                            disabled={Boolean(agentUpdateActionDisabledReason) || editorInputDisabled}
-                            title={agentUpdateActionDisabledReason || undefined}
-                          >
-                            {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                            {updatingAgent ? "更新中" : "立即更新"}
-                          </Button>
-                        </div>
-                      ) : (
-                        <div className={adminDetailHintPanelClass}>
-                          {agentUpdateDisabledReason || "当前 Agent 已禁用远程更新"}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                  <Card className={adminDetailCardClass}>
-                    <CardHeader className={adminDetailHeaderClass}>
-                      <CardTitle className="flex items-center gap-2 text-base text-slate-900 dark:text-slate-50">
-                        <Server className="h-4 w-4 text-sky-500 dark:text-sky-300" />
-                        节点资料
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-5 p-6">
-                      <div className={adminDetailGroupClass}>
-                        <div className="space-y-1">
-                          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">识别信息</h4>
-                        </div>
-                        <div className="grid gap-4 md:grid-cols-2">
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-alias">显示名称</Label>
-                            <Input
-                              id="node-alias"
-                              name="node-alias"
-                              autoComplete="off"
-                              maxLength={120}
-                              className={adminInputClass}
-                              value={form.alias}
-                              disabled={editorInputDisabled}
-                              onChange={(event) => updateFormField("alias", event.target.value)}
-                              placeholder={editingNode.stats.node_name || editingNode.stats.hostname}
-                            />
-                          </div>
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-region">地区代码</Label>
-                            <Input
-                              id="node-region"
-                              name="node-region"
-                              autoComplete="off"
-                              maxLength={2}
-                              className={adminInputClass}
-                              value={form.region}
-                              disabled={editorInputDisabled}
-                              onChange={(event) =>
-                                updateFormField(
-                                  "region",
-                                  event.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase()
-                                )
-                              }
-                              placeholder="两位代码，如 SG / JP / HK"
-                            />
-                          </div>
-                        </div>
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <div className={adminWorkspaceMetaCardClass}>
-                            <div className={adminWorkspaceMetaLabelClass}>当前主机名</div>
-                            <div className="mt-1 font-medium">{editingNode.stats.hostname || "--"}</div>
-                          </div>
-                          <div className={adminWorkspaceMetaCardClass}>
-                            <div className={adminWorkspaceMetaLabelClass}>Node ID</div>
-                            <div className="mt-1 font-medium">{resolveNodeId(editingNode)}</div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className={adminDetailGroupClass}>
-                        <div className="space-y-1">
-                          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">资源标注</h4>
-                        </div>
-                        <div className="grid gap-4 md:grid-cols-2">
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-disk-type">磁盘类型</Label>
-                            <Input
-                              id="node-disk-type"
-                              name="node-disk-type"
-                              autoComplete="off"
-                              className={adminInputClass}
-                              value={form.diskType}
-                              disabled={editorInputDisabled}
-                              onChange={(event) => updateFormField("diskType", event.target.value)}
-                              placeholder="NVMe / SSD / HDD"
-                            />
-                          </div>
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-net-speed">带宽（Mbps）</Label>
-                            <Input
-                              id="node-net-speed"
-                              name="node-net-speed"
-                              className={adminInputClass}
-                              type="number"
-                              min={0}
-                              autoComplete="off"
-                              value={form.netSpeedMbps}
-                              disabled={editorInputDisabled}
-                              onChange={(event) =>
-                                updateFormField("netSpeedMbps", event.target.value)
-                              }
-                              placeholder="1000"
-                            />
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card className={adminDetailCardClass}>
-                    <CardHeader className={adminDetailHeaderClass}>
-                      <CardTitle className="flex items-center gap-2 text-base text-slate-900 dark:text-slate-50">
-                        <Activity className="h-4 w-4 text-emerald-500 dark:text-emerald-300" />
-                        探测下发策略
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-5 p-6">
-                      <div className={adminDetailHintPanelClass}>
-                        {`已选 ${testDraftState.summary.selected} 个探测节点。${
-                          testDraftState.summary.tcpCustom > 0
-                            ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
-                            : ""
-                        }`}
-                      </div>
-
-                      {testCatalog.length === 0 ? (
-                        <div className={adminInlineEmptyStateClass}>
-                          请先在“探测设置”页配置探测节点。
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          {testDraftState.items.map((entry) => {
-                            const { item, itemId, active, isTCP, intervalValue, defaultIntervalSec } =
-                              entry;
-                            return (
-                              <div
-                                key={item.id || resolveProbeLabel(item)}
-                                className={`rounded-[1.25rem] border px-4 py-4 transition-colors ${
-                                  active
-                                    ? "border-sky-200 bg-sky-50/70 dark:border-sky-800 dark:bg-sky-950/30"
-                                    : "border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950"
-                                }`}
-                              >
-                                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                                  <label className="flex flex-1 items-start gap-3">
-                                    <input
-                                      type="checkbox"
-                                      className="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                                      checked={active}
-                                      disabled={!itemId || editorInputDisabled}
-                                      onChange={() => handleToggleTest(entry)}
-                                    />
-                                    <div className="min-w-0 space-y-1">
-                                      <div className="flex flex-wrap items-center gap-2">
-                                        <span className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-                                          {item.name || item.host || "未命名探测节点"}
-                                        </span>
-                                        <span
-                                          className={
-                                            isTCP ? adminAccentBadgeClass : adminNeutralBadgeClass
-                                          }
-                                        >
-                                          {isTCP ? "TCP" : "ICMP"}
-                                        </span>
-                                      </div>
-                                      <div className="text-xs text-slate-500 dark:text-slate-400">
-                                        {resolveProbeLabel(item)}
-                                      </div>
-                                    </div>
-                                  </label>
-
-                                  <div className="flex items-center gap-3 lg:pl-6">
-                                    {isTCP ? (
-                                      <>
-                                        <span className="text-xs font-medium uppercase tracking-[0.18em] text-slate-400 dark:text-slate-500">
-                                          Interval
-                                        </span>
-                                        <Input
-                                          name={itemId ? `probe-interval-${itemId}` : "probe-interval"}
-                                          className="h-10 w-[148px] rounded-xl border-slate-300 bg-white text-sm dark:border-slate-700 dark:bg-slate-950"
-                                          type="number"
-                                          min={0}
-                                          max={MAX_TCP_INTERVAL}
-                                          autoComplete="off"
-                                          disabled={!active || !itemId || editorInputDisabled}
-                                          value={intervalValue}
-                                          onChange={(event) =>
-                                            handleTestIntervalChange(itemId, event.target.value)
-                                          }
-                                          placeholder={`默认 ${defaultIntervalSec} 秒`}
-                                        />
-                                      </>
-                                    ) : (
-                                      <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-                                        固定执行
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                    </CardContent>
-                  </Card>
-
-                  <Card className={adminDetailCardClass}>
-                    <CardHeader className={adminDetailHeaderClass}>
-                      <CardTitle className="flex items-center gap-2 text-base text-slate-900 dark:text-slate-50">
-                        <AlertTriangle className="h-4 w-4 text-amber-500 dark:text-amber-300" />
-                        生命周期与告警
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-5 p-6">
-                      <div className={adminDetailGroupClass}>
-                        <div className="space-y-1">
-                          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">到期与续费</h4>
-                        </div>
-                        <div className="grid gap-4 md:grid-cols-2">
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-expire-at">到期时间</Label>
-                            <Input
-                              id="node-expire-at"
-                              name="node-expire-at"
-                              className={adminInputClass}
-                              type="datetime-local"
-                              autoComplete="off"
-                              value={form.expireAt}
-                              disabled={editorInputDisabled}
-                              onChange={(event) => updateFormField("expireAt", event.target.value)}
-                            />
-                          </div>
-                          <div className="grid gap-2">
-                            <Label htmlFor="node-renew-plan">自动续费方案</Label>
-                            <Select
-                              value={form.renewPlan}
-                              onValueChange={(value) => {
-                                if (editorInputDisabled || value === null) {
-                                  return;
-                                }
-                                updateFormField("renewPlan", value as RenewPlan);
-                              }}
-                              disabled={!hasExpireAt || editorInputDisabled}
-                            >
-                              <SelectTrigger id="node-renew-plan" className={adminSelectTriggerClass}>
-                                <SelectValue placeholder="选择续费方案…" />
-                              </SelectTrigger>
-                              <SelectContent className={adminSelectContentClass}>
-                                <SelectItem value="none">不自动续费</SelectItem>
-                                <SelectItem value="month">按月续费（30 天）</SelectItem>
-                                <SelectItem value="quarter">按季度续费（90 天）</SelectItem>
-                                <SelectItem value="half">按半年续费（180 天）</SelectItem>
-                                <SelectItem value="year">按年续费（365 天）</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className={adminDetailGroupClass}>
-                        <div className="flex items-center justify-between gap-4">
-                          <div className="space-y-1">
-                            <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">离线告警</h4>
-                            <div className="flex items-center gap-2">
-                              <span className={`h-2 w-2 rounded-full ${form.alertEnabled ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" : "bg-slate-300"}`} />
-                              <span className="text-sm font-medium text-slate-600 dark:text-slate-400">{alertStatusLabel}</span>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-3 bg-white/50 dark:bg-slate-950/50 p-1.5 rounded-full border border-slate-200 dark:border-slate-800">
-                            <button
-                              type="button"
-                              disabled={editorInputDisabled}
-                              onClick={() => updateFormField("alertEnabled", true)}
-                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
-                            >
-                              开启
-                            </button>
-                            <button
-                              type="button"
-                              disabled={editorInputDisabled}
-                              onClick={() => updateFormField("alertEnabled", false)}
-                              className={`px-4 py-1.5 rounded-full text-xs font-bold transition-[background-color,color,box-shadow] ${!form.alertEnabled ? "bg-slate-900 text-white shadow-lg dark:bg-white dark:text-slate-900" : "text-slate-500 hover:text-slate-900 dark:hover:text-slate-100"}`}
-                            >
-                              关闭
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card className={adminDetailCardClass}>
-                    <CardHeader className={adminDetailHeaderClass}>
-                      <CardTitle className="flex items-center gap-2 text-base text-slate-900 dark:text-slate-50">
-                        <FolderTree className="h-4 w-4 text-indigo-500 dark:text-indigo-300" />
-                        分组与标签
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4 p-6">
-                      {groupCatalog.length === 0 ? (
-                        <div className={adminInlineEmptyStateClass}>
-                          当前还没有分组树，请先在“分组管理”页维护结构。
-                        </div>
-                      ) : (
-                        <div className="grid gap-2">
-                          <DropdownMenu>
-                            <DropdownMenuTrigger
-                              render={(
-                                <Button
-                                  id="node-group-selection-trigger"
-                                  type="button"
-                                  variant="outline"
-                                  className="h-11 w-full justify-between rounded-[1.1rem] border-slate-200 bg-white px-4 text-left text-sm font-medium text-slate-700 shadow-none hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-                                  disabled={editorInputDisabled}
-                                >
-                                  <span
-                                    className={`truncate ${
-                                      selectedGroupCount === 0
-                                        ? "text-slate-400 dark:text-slate-500"
-                                        : "text-slate-700 dark:text-slate-200"
-                                    }`}
-                                  >
-                                    {selectedGroupState.label}
-                                  </span>
-                                  <ChevronsUpDown className="ml-3 h-4 w-4 shrink-0 text-slate-400" />
-                                </Button>
-                              )}
-                            />
-                            <DropdownMenuContent
-                              align="start"
-                              className="w-[min(26rem,calc(100vw-3rem))] rounded-[1.3rem] border border-slate-200/90 bg-white/98 p-2 shadow-[0_24px_56px_-36px_rgba(15,23,42,0.32)] dark:border-slate-800 dark:bg-slate-950/98"
-                              sideOffset={10}
-                            >
-                              <div className="border-b border-slate-200/80 px-2 pb-2 text-xs leading-5 text-slate-500 dark:border-slate-800 dark:text-slate-400">
-                                点击一级分组或其下方标签即可选择；同一一级分组下会在分组与标签之间互斥。
-                              </div>
-                              <div className="mt-2 max-h-[22rem] space-y-2 overflow-y-auto pr-1">
-                                {groupCatalog.map((item) => {
-                                  const currentSelection = selectedGroupState.stats.get(item.group);
-                                  const groupSelected = currentSelection?.groupSelected || false;
-                                  const tagSelectedCount =
-                                    currentSelection?.selectedTags.size || 0;
-                                  return (
-                                    <div
-                                      key={item.group}
-                                      className="rounded-[1.1rem] border border-slate-200/80 bg-slate-50/70 p-2 dark:border-slate-800 dark:bg-slate-900/70"
-                                    >
-                                      <button
-                                        type="button"
-                                        className={`flex w-full items-center justify-between gap-3 rounded-[0.95rem] px-3 py-2 text-left text-sm font-medium transition ${
-                                          groupSelected
-                                            ? "bg-sky-600 text-white"
-                                            : "text-slate-700 hover:bg-white dark:text-slate-200 dark:hover:bg-slate-950"
-                                        }`}
-                                        disabled={tagSelectedCount > 0 || editorInputDisabled}
-                                        onClick={() => handleToggleGroupSelection(item.group)}
-                                      >
-                                        <span className="flex items-center gap-2">
-                                          <FolderTree className="h-4 w-4" />
-                                          <span>{item.group}</span>
-                                        </span>
-                                        <span className="flex items-center gap-2">
-                                          {tagSelectedCount > 0 ? (
-                                            <span
-                                              className={`rounded-full px-2 py-0.5 text-[11px] ${
-                                                groupSelected
-                                                  ? "bg-white/20 text-white"
-                                                  : "bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                                              }`}
-                                            >
-                                              {`${tagSelectedCount} 个标签`}
-                                            </span>
-                                          ) : null}
-                                          {groupSelected ? <Check className="h-4 w-4" /> : null}
-                                        </span>
-                                      </button>
-                                      {item.tags.length > 0 ? (
-                                        <div className="ml-5 mt-2 space-y-1 border-l border-slate-200 pl-3 dark:border-slate-800">
-                                          {item.tags.map((tag) => {
-                                            const value = `${item.group}:${tag}`;
-                                            const tagSelected =
-                                              currentSelection?.selectedTags.has(tag) || false;
-                                            return (
-                                              <button
-                                                key={value}
-                                                type="button"
-                                                className={`flex w-full items-center justify-between gap-3 rounded-[0.9rem] px-3 py-2 text-left text-sm transition ${
-                                                  tagSelected
-                                                    ? "bg-indigo-600 text-white"
-                                                    : "text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-950"
-                                                }`}
-                                                disabled={groupSelected || editorInputDisabled}
-                                                onClick={() => handleToggleGroupSelection(value)}
-                                              >
-                                                <span className="truncate">{tag}</span>
-                                                {tagSelected ? <Check className="h-4 w-4" /> : null}
-                                              </button>
-                                            );
-                                          })}
-                                        </div>
-                                      ) : (
-                                        <div className="ml-5 mt-2 border-l border-dashed border-slate-200 pl-3 text-xs text-slate-400 dark:border-slate-800 dark:text-slate-500">
-                                          暂无二级标签
-                                        </div>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
-                      )}
-
-                      {selectedGroupState.items.length > 0 ? (
-                        <div className="flex flex-wrap gap-2">
-                          {selectedGroupState.items.map((item) => (
-                            <button
-                              key={item.value}
-                              type="button"
-                              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-white dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-700"
-                              disabled={editorInputDisabled}
-                              onClick={() => handleRemoveGroupSelection(item.value)}
-                            >
-                              <span>{item.label}</span>
-                              <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                                {item.level}
-                              </span>
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <div className="flex items-center justify-between gap-4">
-                          <Label htmlFor="node-visible-cr" className="text-sm font-semibold">
-                            在 C&R 视图显示
-                          </Label>
-                          <Switch
-                            id="node-visible-cr"
-                            checked={form.visibleInCR}
-                            disabled={editorBusy || sourceConflict}
-                            onCheckedChange={(checked: boolean) => {
-                              if (editorBusy || sourceConflict) {
-                                return;
-                              }
-                              updateFormField("visibleInCR", Boolean(checked));
-                            }}
-                          />
-                        </div>
-                        <div className="flex items-center justify-between gap-4">
-                          <Label htmlFor="node-visible-all" className="text-sm font-semibold">
-                            在 ALL 视图显示
-                          </Label>
-                          <Switch
-                            id="node-visible-all"
-                            checked={form.visibleInAll}
-                            disabled={editorBusy || sourceConflict}
-                            onCheckedChange={(checked: boolean) => {
-                              if (editorBusy || sourceConflict) {
-                                return;
-                              }
-                              updateFormField("visibleInAll", Boolean(checked));
-                            }}
-                          />
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-
-              </div>
-              </div>
-
-              <Separator className="bg-slate-200 dark:bg-slate-800" />
-
-              <DialogFooter className={`${adminDialogFooterClass} flex-col-reverse gap-3 sm:flex-row sm:justify-between items-center px-8 py-6`}>
-                <AlertDialog
-                  open={deleteDialogOpen}
-                  onOpenChange={(open) => {
-                    if (deleting && !open) {
-                      return;
-                    }
-                    setDeleteDialogOpen(open);
-                  }}
-                >
-                  <AlertDialogTrigger
-                    render={(
-                      <Button
-                        type="button"
-                        variant="destructive"
-                        className={`${adminDialogDangerActionClass} h-12 min-w-[140px] px-6 font-bold`}
-                        disabled={editorInputDisabled}
-                      >
-                        {deleting ? (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
-                          <Trash2 className="mr-2 h-4 w-4" />
-                        )}
-                        删除节点
-                      </Button>
-                    )}
-                  />
-                  <AlertDialogContent className={adminDialogContentClass}>
-                    <AlertDialogHeader className={adminDialogHeaderClass}>
-                      <AlertDialogTitle>
-                        {editingNode ? `确认删除节点“${resolveNodeName(editingNode)}”？` : "确认删除节点？"}
-                      </AlertDialogTitle>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter className={adminDialogFooterClass}>
-                      <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
-                      <AlertDialogAction
-                        className={adminDialogDangerActionClass}
-                        disabled={deleting || saving || refreshingAgentUpdate || updatingAgent}
-                        onClick={handleDelete}
-                      >
-                        {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                        确认删除
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
-                <div className="flex gap-3 w-full sm:w-auto">
+              刷新节点
+            </Button>
+            <AlertDialog
+              open={updateAllDialogOpen}
+              onOpenChange={(open) => {
+                if (updatingAllAgents && !open) {
+                  return;
+                }
+                setUpdateAllDialogOpen(open);
+              }}
+            >
+              <AlertDialogTrigger
+                render={(
                   <Button
                     type="button"
                     variant="outline"
-                    className={`${adminOutlineButtonClass} h-12 flex-1 sm:flex-none min-w-[100px] px-8 font-bold`}
-                    onClick={() => closeEditor(isEditingDraftDirty)}
-                    disabled={editorBusy}
+                    className={outlineActionClass}
+                    disabled={updatingAllAgents || loading || nodes.length === 0}
                   >
-                    {isEditingDraftDirty ? "放弃修改" : "取消"}
+                    {updatingAllAgents ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Rocket className="mr-2 h-4 w-4" />
+                    )}
+                    全部更新
                   </Button>
-                  <Button
-                    type="button"
-                    className={`${adminPrimaryButtonClass} h-12 flex-1 sm:flex-none min-w-[140px] px-8 font-bold`}
-                    onClick={handleSave}
-                    disabled={!isEditingDraftDirty || editorInputDisabled}
+                )}
+              />
+              <AlertDialogContent className={adminDialogContentClass}>
+                <AlertDialogHeader className={adminDialogHeaderClass}>
+                  <AlertDialogTitle>
+                    确认对全部 {nodes.length} 台节点下发 Agent 更新？
+                  </AlertDialogTitle>
+                </AlertDialogHeader>
+                <AlertDialogFooter className={adminDialogFooterClass}>
+                  <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                  <AlertDialogAction
+                    className={adminPrimaryButtonClass}
+                    disabled={updatingAllAgents}
+                    onClick={handleTriggerAllAgentUpdates}
                   >
-                    {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                    保存配置
-                  </Button>
-                </div>
-              </DialogFooter>
+                    {updatingAllAgents ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    确认下发
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </>
+        }
+      />
+
+      <AdminMetricStrip ariaLabel="节点统计" items={metricItems} />
+
+      {/* 快速接入在节点列表之上（用户第 17 轮：新建节点时第一眼要能复制命令）。 */}
+      <AdminPanel title="Agent 快速接入">
+        {installReady ? (
+          <div className="space-y-4">
+            {/* 地址已配置时不再单独展示：命令内已内嵌，重复行只增加噪音（用户第 18 轮）。 */}
+            {/* 平台切换与日志筛选同款：内容宽、方角、选中墨色（用户第 20 轮：不要胶囊主按钮那么大）。 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className={
+                  installPlatform === "unix"
+                    ? "h-9 min-w-0 px-3 text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+                    : `${adminActionButtonClass} h-9 min-w-0 rounded-lg px-3 text-xs font-medium`
+                }
+                onClick={() => setInstallPlatform("unix")}
+              >
+                Linux/macOS
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className={
+                  installPlatform === "windows"
+                    ? "h-9 min-w-0 px-3 text-xs font-medium bg-slate-900 text-white hover:bg-slate-800 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+                    : `${adminActionButtonClass} h-9 min-w-0 rounded-lg px-3 text-xs font-medium`
+                }
+                onClick={() => setInstallPlatform("windows")}
+              >
+                Windows
+              </Button>
             </div>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+            <code
+              id={installPlatform === "windows" ? agentInstallWindowsId : agentInstallLinuxId}
+              className={`${adminCodeBlockPanelClass} block w-full cursor-pointer select-text whitespace-pre-wrap break-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]`}
+              tabIndex={0}
+              role="button"
+              aria-label="点击复制完整接入命令，也可拖选部分文本手动复制"
+              onClick={() => {
+                const selection = window.getSelection();
+                if (selection && selection.toString().length > 0) {
+                  return;
+                }
+                copyInstallCommand(activeInstallCommand);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") {
+                  return;
+                }
+                event.preventDefault();
+                copyInstallCommand(activeInstallCommand);
+              }}
+            >
+              {activeInstallCommand}
+            </code>
+          </div>
+        ) : (
+          <p className="text-[13px] text-slate-500 dark:text-neutral-400">
+            请先在基础设置的 Agent 配置中填写 Agent 对接地址。
+          </p>
+        )}
+      </AdminPanel>
+
+      <AdminPanel title="节点列表">
+        <AdminDataTable
+          ariaLabel="节点列表"
+          columns={nodeTableColumns}
+          rows={filteredNodes}
+          rowKey={(entry) => entry.nodeId}
+          rowAttributes={(entry) => ({ "data-node-card-id": entry.nodeId })}
+          onRowClick={(entry) => handleOpen(entry.node)}
+          emptyLabel={
+            nodes.length === 0 ? "当前还没有节点接入。" : "没有匹配的节点，请调整搜索条件。"
+          }
+        />
+      </AdminPanel>
+
+      <AdminDrawer
+        open={Boolean(editingNode && form)}
+        onOpenChange={(open) => {
+          if (!open) {
+            closeEditor();
+          }
+        }}
+        title={editingNode ? resolveNodeName(editingNode) : "节点配置编辑"}
+        description={editingNode ? resolveNodeIdentitySummary(editingNode) : undefined}
+        footer={
+          editingNode && form ? (
+            <div className="flex items-center justify-between gap-2">
+              <AlertDialog
+                open={deleteDialogOpen}
+                onOpenChange={(open) => {
+                  if (deleting && !open) {
+                    return;
+                  }
+                  setDeleteDialogOpen(open);
+                }}
+              >
+                <AlertDialogTrigger
+                  render={(
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      className={cn(adminDangerOutlineButtonClass, "h-9 min-w-[92px] px-4")}
+                      disabled={editorInputDisabled}
+                    >
+                      {deleting ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="mr-2 h-4 w-4" />
+                      )}
+                      删除节点
+                    </Button>
+                  )}
+                />
+                <AlertDialogContent className={adminDialogContentClass}>
+                  <AlertDialogHeader className={adminDialogHeaderClass}>
+                    <AlertDialogTitle>
+                      {editingNode
+                        ? `确认删除节点“${resolveNodeName(editingNode)}”？`
+                        : "确认删除节点？"}
+                    </AlertDialogTitle>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter className={adminDialogFooterClass}>
+                    <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      className={adminDialogDangerActionClass}
+                      disabled={deleting || saving || refreshingAgentUpdate || updatingAgent}
+                      onClick={handleDelete}
+                    >
+                      {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                      确认删除
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className={cn(adminOutlineButtonClass, "h-9 min-w-[84px] px-4")}
+                  onClick={() => closeEditor(isEditingDraftDirty)}
+                  disabled={editorBusy}
+                >
+                  {isEditingDraftDirty ? "放弃修改" : "取消"}
+                </Button>
+                <Button
+                  type="button"
+                  className={cn(adminPrimaryButtonClass, "h-9 min-w-[100px] px-4")}
+                  onClick={handleSave}
+                  disabled={!isEditingDraftDirty || editorInputDisabled}
+                >
+                  {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  保存配置
+                </Button>
+              </div>
+            </div>
+          ) : null
+        }
+      >
+        {editingNode && form ? (
+          <>
+            <section>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+                Agent 更新
+              </h3>
+              {editingNode.agent_update_supported ? (
+                <>
+                  <AdminKVField label="当前版本">
+                    <span className="data-text text-sm font-medium text-slate-800 dark:text-neutral-200">
+                      {formatVersionLabel(editingAgentVersion)}
+                    </span>
+                  </AdminKVField>
+                  <AdminKVField label="最新版本">
+                    <span
+                      className={cn(
+                        "text-sm font-medium text-slate-800 dark:text-neutral-200",
+                        agentLatestVersionIsValue && "data-text",
+                      )}
+                    >
+                      {agentLatestVersionLabel}
+                    </span>
+                  </AdminKVField>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className={cn(adminActionButtonClass, "h-9 min-w-[104px] px-4")}
+                      onClick={handleCheckAgentUpdate}
+                      disabled={Boolean(agentUpdateDisabledReason) || editorInputDisabled}
+                      title={agentUpdateDisabledReason || undefined}
+                    >
+                      {refreshingAgentUpdate ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-2 h-4 w-4" />
+                      )}
+                      检查更新
+                    </Button>
+                    <Button
+                      type="button"
+                      className={cn(adminPrimaryButtonClass, "h-9 min-w-[104px] px-4")}
+                      onClick={handleAgentUpdate}
+                      disabled={Boolean(agentUpdateActionDisabledReason) || editorInputDisabled}
+                      title={agentUpdateActionDisabledReason || undefined}
+                    >
+                      {updatingAgent ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                      {updatingAgent ? "更新中" : "立即更新"}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs leading-relaxed text-slate-500 dark:text-neutral-400">
+                  {agentUpdateDisabledReason || "当前 Agent 已禁用远程更新"}
+                </p>
+              )}
+            </section>
+
+            <section>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+                显示与标注
+              </h3>
+              <AdminKVField label="显示名称" htmlFor="node-alias">
+                <Input
+                  id="node-alias"
+                  name="node-alias"
+                  autoComplete="off"
+                  maxLength={120}
+                  className={adminInputClass}
+                  value={form.alias}
+                  disabled={editorInputDisabled}
+                  onChange={(event) => updateFormField("alias", event.target.value)}
+                  placeholder={editingNode.stats.node_name || editingNode.stats.hostname}
+                />
+              </AdminKVField>
+              <AdminKVField label="地区代码" htmlFor="node-region">
+                <Input
+                  id="node-region"
+                  name="node-region"
+                  autoComplete="off"
+                  maxLength={2}
+                  className={adminInputClass}
+                  value={form.region}
+                  disabled={editorInputDisabled}
+                  onChange={(event) =>
+                    updateFormField(
+                      "region",
+                      event.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase(),
+                    )
+                  }
+                  placeholder="两位代码，如 SG / JP / HK"
+                />
+              </AdminKVField>
+              <AdminKVField label="磁盘类型" htmlFor="node-disk-type">
+                <Input
+                  id="node-disk-type"
+                  name="node-disk-type"
+                  autoComplete="off"
+                  className={adminInputClass}
+                  value={form.diskType}
+                  disabled={editorInputDisabled}
+                  onChange={(event) => updateFormField("diskType", event.target.value)}
+                  placeholder="NVMe / SSD / HDD"
+                />
+              </AdminKVField>
+              <AdminKVField label="带宽（Mbps）" htmlFor="node-net-speed">
+                <Input
+                  id="node-net-speed"
+                  name="node-net-speed"
+                  className={`${adminInputClass} data-text`}
+                  type="number"
+                  min={0}
+                  autoComplete="off"
+                  value={form.netSpeedMbps}
+                  disabled={editorInputDisabled}
+                  onChange={(event) => updateFormField("netSpeedMbps", event.target.value)}
+                  placeholder="1000"
+                />
+              </AdminKVField>
+            </section>
+
+            <section>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+                探测下发策略
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-neutral-400">
+                {`已选 ${testDraftState.summary.selected} 个探测节点。${
+                  testDraftState.summary.tcpCustom > 0
+                    ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
+                    : ""
+                }`}
+              </p>
+              {testCatalog.length === 0 ? (
+                <p className="text-sm text-[var(--label-3)]">请先在“探测设置”页配置探测节点。</p>
+              ) : (
+                <div>
+                  {testDraftState.items.map((entry) => {
+                    const { item, itemId, active, isTCP, intervalValue, defaultIntervalSec } =
+                      entry;
+                    const host = item.host || "--";
+                    const endpoint = item.port ? `${host}:${item.port}` : host;
+                    return (
+                      <label
+                        key={item.id || endpoint}
+                        className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-[var(--separator)] py-2.5 last:border-b-0"
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-[var(--primary-ring)] dark:border-neutral-700 dark:bg-[var(--surface-2)]"
+                          checked={active}
+                          disabled={!itemId || editorInputDisabled}
+                          onChange={() => handleToggleTest(entry)}
+                        />
+                        <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2">
+                          <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">
+                            {item.name || host || "未命名探测节点"}
+                          </span>
+                          <span className="data-text truncate text-xs text-[var(--label-3)]">
+                            {endpoint}
+                          </span>
+                        </span>
+                        <span className="text-xs text-[var(--label-3)]">{isTCP ? "TCP" : "ICMP"}</span>
+                        {isTCP ? (
+                          <span className="flex items-center gap-1.5">
+                            <Input
+                              name={itemId ? `probe-interval-${itemId}` : "probe-interval"}
+                              className="h-9 w-20 rounded-lg border-slate-300 bg-white text-sm dark:border-neutral-700 dark:bg-[var(--surface-2)]"
+                              type="number"
+                              min={0}
+                              max={MAX_TCP_INTERVAL}
+                              autoComplete="off"
+                              disabled={!active || !itemId || editorInputDisabled}
+                              value={intervalValue}
+                              onChange={(event) =>
+                                handleTestIntervalChange(itemId, event.target.value)
+                              }
+                              placeholder={String(defaultIntervalSec)}
+                            />
+                            <span className="text-xs text-[var(--label-3)]">秒</span>
+                          </span>
+                        ) : null}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            <section>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+                生命周期与告警
+              </h3>
+              <AdminKVField label="到期时间" htmlFor="node-expire-at">
+                <Input
+                  id="node-expire-at"
+                  name="node-expire-at"
+                  className={adminInputClass}
+                  type="datetime-local"
+                  autoComplete="off"
+                  value={form.expireAt}
+                  disabled={editorInputDisabled}
+                  onChange={(event) => updateFormField("expireAt", event.target.value)}
+                />
+              </AdminKVField>
+              <AdminKVField label="自动续费方案" htmlFor="node-renew-plan">
+                <Select
+                  value={form.renewPlan}
+                  onValueChange={(value) => {
+                    if (editorInputDisabled || value === null) {
+                      return;
+                    }
+                    updateFormField("renewPlan", value as RenewPlan);
+                  }}
+                  disabled={!hasExpireAt || editorInputDisabled}
+                >
+                  <SelectTrigger id="node-renew-plan" className={adminSelectTriggerClass}>
+                    <SelectValue placeholder="选择续费方案…" />
+                  </SelectTrigger>
+                  <SelectContent className={adminSelectContentClass}>
+                    <SelectItem value="none">不自动续费</SelectItem>
+                    <SelectItem value="month">按月续费（30 天）</SelectItem>
+                    <SelectItem value="quarter">按季度续费（90 天）</SelectItem>
+                    <SelectItem value="half">按半年续费（180 天）</SelectItem>
+                    <SelectItem value="year">按年续费（365 天）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </AdminKVField>
+              <AdminKVField label="离线告警">
+                <div className="inline-flex items-center gap-1 rounded-full border border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] p-1">
+                  <button
+                    type="button"
+                    disabled={editorInputDisabled}
+                    onClick={() => updateFormField("alertEnabled", true)}
+                    className={`rounded-full px-3.5 py-1 text-xs font-medium transition-[background-color,color] ${
+                      form.alertEnabled
+                        ? "bg-slate-900 text-white dark:bg-[var(--surface-3)] dark:text-[var(--label-1)]"
+                        : "text-slate-500 hover:text-slate-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+                    }`}
+                  >
+                    开启
+                  </button>
+                  <button
+                    type="button"
+                    disabled={editorInputDisabled}
+                    onClick={() => updateFormField("alertEnabled", false)}
+                    className={`rounded-full px-3.5 py-1 text-xs font-medium transition-[background-color,color] ${
+                      !form.alertEnabled
+                        ? "bg-slate-900 text-white dark:bg-[var(--surface-3)] dark:text-[var(--label-1)]"
+                        : "text-slate-500 hover:text-slate-900 dark:text-neutral-400 dark:hover:text-neutral-100"
+                    }`}
+                  >
+                    关闭
+                  </button>
+                </div>
+              </AdminKVField>
+              <AdminKVField label="在 C&R 视图显示" htmlFor="node-visible-cr">
+                <Switch
+                  id="node-visible-cr"
+                  checked={form.visibleInCR}
+                  disabled={editorBusy || sourceConflict}
+                  onCheckedChange={(checked: boolean) => {
+                    if (editorBusy || sourceConflict) {
+                      return;
+                    }
+                    updateFormField("visibleInCR", Boolean(checked));
+                  }}
+                />
+              </AdminKVField>
+              <AdminKVField label="在 ALL 视图显示" htmlFor="node-visible-all">
+                <Switch
+                  id="node-visible-all"
+                  checked={form.visibleInAll}
+                  disabled={editorBusy || sourceConflict}
+                  onCheckedChange={(checked: boolean) => {
+                    if (editorBusy || sourceConflict) {
+                      return;
+                    }
+                    updateFormField("visibleInAll", Boolean(checked));
+                  }}
+                />
+              </AdminKVField>
+            </section>
+
+            <section>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+                分组与标签
+              </h3>
+              {groupCatalog.length === 0 ? (
+                <p className="text-sm text-[var(--label-3)]">当前还没有分组树，请先在“分组管理”页维护结构。</p>
+              ) : (
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={(
+                      <Button
+                        id="node-group-selection-trigger"
+                        type="button"
+                        variant="outline"
+                        className="h-9 w-full justify-between rounded-xl border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] px-3 text-left text-sm font-medium text-slate-700 shadow-none hover:bg-[var(--cm-control-hover)] dark:text-neutral-200"
+                        disabled={editorInputDisabled}
+                      >
+                        <span
+                          className={`truncate ${
+                            selectedGroupCount === 0
+                              ? "text-slate-500 dark:text-neutral-400"
+                              : "text-slate-700 dark:text-neutral-200"
+                          }`}
+                        >
+                          {selectedGroupState.label}
+                        </span>
+                        <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 text-slate-500 dark:text-neutral-400" />
+                      </Button>
+                    )}
+                  />
+                  <DropdownMenuContent
+                    align="start"
+                    className="w-[min(26rem,calc(100vw-3rem))] rounded-[1.3rem] border border-slate-200/90 bg-white/98 p-2 shadow-[var(--cm-elev-2)] dark:border-neutral-800 dark:bg-[var(--surface-3)]"
+                    sideOffset={10}
+                  >
+                    <div className="border-b border-slate-200/80 px-2 pb-2 text-xs leading-5 text-slate-500 dark:border-neutral-800 dark:text-neutral-400">
+                      点击一级分组或其下方标签即可选择；同一一级分组下会在分组与标签之间互斥。
+                    </div>
+                    <div className="mt-2 max-h-[22rem] space-y-2 overflow-y-auto pr-1">
+                      {groupCatalog.map((item) => {
+                        const currentSelection = selectedGroupState.stats.get(item.group);
+                        const groupSelected = currentSelection?.groupSelected || false;
+                        const tagSelectedCount = currentSelection?.selectedTags.size || 0;
+                        return (
+                          <div
+                            key={item.group}
+                            className="rounded-[1.1rem] border border-slate-200/80 bg-slate-50/70 p-2 dark:border-neutral-800 dark:bg-[var(--surface-2)]"
+                          >
+                            <button
+                              type="button"
+                              className={`flex w-full items-center justify-between gap-2 rounded-[0.95rem] px-2 py-2 text-left text-sm font-medium transition-colors ${
+                                groupSelected
+                                  ? "bg-primary text-primary-foreground"
+                                  : "text-slate-700 hover:bg-white dark:text-neutral-200 dark:hover:bg-neutral-950"
+                              }`}
+                              disabled={tagSelectedCount > 0 || editorInputDisabled}
+                              onClick={() => handleToggleGroupSelection(item.group)}
+                            >
+                              <span className="flex items-center gap-2">
+                                <FolderTree className="h-4 w-4" />
+                                <span>{item.group}</span>
+                              </span>
+                              <span className="flex items-center gap-2">
+                                {tagSelectedCount > 0 ? (
+                                  <span
+                                    className={`rounded-full px-2 py-1 text-[11px] data-text ${
+                                      groupSelected
+                                        ? "bg-primary-foreground/15 text-primary-foreground"
+                                        : "bg-slate-200 text-slate-600 dark:bg-neutral-800 dark:text-neutral-300"
+                                    }`}
+                                  >
+                                    {`${tagSelectedCount} 个标签`}
+                                  </span>
+                                ) : null}
+                                {groupSelected ? <Check className="h-4 w-4" /> : null}
+                              </span>
+                            </button>
+                            {item.tags.length > 0 ? (
+                              <div className="ml-4 mt-2 space-y-1 border-l border-slate-200 pl-2 dark:border-neutral-800">
+                                {item.tags.map((tag) => {
+                                  const value = `${item.group}:${tag}`;
+                                  const tagSelected =
+                                    currentSelection?.selectedTags.has(tag) || false;
+                                  return (
+                                    <button
+                                      key={value}
+                                      type="button"
+                                      className={`flex w-full items-center justify-between gap-2 rounded-[0.9rem] px-2 py-2 text-left text-sm transition-colors ${
+                                        tagSelected
+                                          ? "bg-primary text-primary-foreground"
+                                          : "text-slate-600 hover:bg-white dark:text-neutral-300 dark:hover:bg-neutral-950"
+                                      }`}
+                                      disabled={groupSelected || editorInputDisabled}
+                                      onClick={() => handleToggleGroupSelection(value)}
+                                    >
+                                      <span className="truncate">{tag}</span>
+                                      {tagSelected ? <Check className="h-4 w-4" /> : null}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="ml-4 mt-2 border-l border-dashed border-slate-200 pl-2 text-xs text-slate-500 dark:border-neutral-800 dark:text-neutral-400">
+                                暂无二级标签
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+
+              {selectedGroupState.items.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {selectedGroupState.items.map((item) => (
+                    <button
+                      key={item.value}
+                      type="button"
+                      className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:bg-white dark:border-neutral-800 dark:bg-[var(--surface-2)] dark:text-neutral-200 dark:hover:bg-neutral-800"
+                      disabled={editorInputDisabled}
+                      onClick={() => handleRemoveGroupSelection(item.value)}
+                    >
+                      <span>{item.label}</span>
+                      <X className="h-3 w-3" />
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          </>
+        ) : null}
+      </AdminDrawer>
     </div>
   );
 }

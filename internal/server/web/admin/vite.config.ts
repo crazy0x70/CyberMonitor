@@ -44,7 +44,7 @@ export default defineConfig({
     },
   },
   server: {
-    // Keep HMR switchable in local automation runs to avoid UI flicker during repeated edits.
+
     hmr: process.env.DISABLE_HMR !== 'true',
   },
 });

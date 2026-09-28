@@ -1198,29 +1198,29 @@ write_launchd_plist() {
     <string>${MACOS_AGENT_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${bin}</string>
+        <string>$(plist_escape "${bin}")</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>CM_SERVER_URL</key>
         <string>$(plist_escape "${server_url}")</string>
         <key>CM_NODE_ID_FILE</key>
-        <string>${INSTALL_DIR}/.cybermonitor-node-id</string>
+        <string>$(plist_escape "${INSTALL_DIR}/.cybermonitor-node-id")</string>
         <key>CM_AGENT_TOKEN_FILE</key>
-        <string>${INSTALL_DIR}/.cybermonitor-agent-token</string>
+        <string>$(plist_escape "${INSTALL_DIR}/.cybermonitor-agent-token")</string>
         <key>CM_NET_IFACE</key>
         <string>$(plist_escape "${net_iface}")</string>
         <key>CM_DISABLE_UPDATE</key>
-        <string>${disable_update}</string>
+        <string>$(plist_escape "${disable_update}")</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${log_path}</string>
+    <string>$(plist_escape "${log_path}")</string>
     <key>StandardErrorPath</key>
-    <string>${log_path}</string>
+    <string>$(plist_escape "${log_path}")</string>
 </dict>
 </plist>
 EOF
@@ -1283,7 +1283,7 @@ write_server_launchd_plist() {
     <string>${MACOS_SERVER_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${bin}</string>
+        <string>$(plist_escape "${bin}")</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -1297,9 +1297,9 @@ write_server_launchd_plist() {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>${log_path}</string>
+    <string>$(plist_escape "${log_path}")</string>
     <key>StandardErrorPath</key>
-    <string>${log_path}</string>
+    <string>$(plist_escape "${log_path}")</string>
 </dict>
 </plist>
 EOF

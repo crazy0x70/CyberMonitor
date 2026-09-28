@@ -43,8 +43,10 @@ export function formatMbps(value?: number) {
 
 export function formatVersionLabel(value?: string | null) {
   const normalized = String(value || "").trim();
+
   if (!normalized) return "--";
-  return normalized.startsWith("v") ? normalized : `v${normalized}`;
+  if (normalized.startsWith("v")) return normalized;
+  return /^\d/.test(normalized) ? `v${normalized}` : normalized;
 }
 
 export function toDateTimeLocalValue(value?: number) {
@@ -219,9 +221,7 @@ export function normalizeSelectionValues(values: string[]) {
 export function resolveNodeSelectionValues(
   node: Pick<NodeView, "group" | "groups" | "tags">,
 ) {
-  // r84：不再回退 node.stats.node_group（agent 上报组）——否则管理员清
-  // 空分组后重开表单会重新勾回（无法移除/强制一级的复活闭环）。node.group
-  // 保留：它是视图从选择/存量 legacy 解析出的组，用于旧数据迁移展示。
+
   return normalizeSelectionValues(
     Array.isArray(node.groups) && node.groups.length > 0
       ? node.groups
@@ -269,8 +269,6 @@ export function resolveProbeLabel(item: TestCatalogItem) {
   return `${type} ${host}${port}`;
 }
 
-// ==== 管理端页面导航（App 与 Dashboard 共用） ====
-
 export type AdminPage =
   | "dashboard"
   | "servers"
@@ -291,7 +289,7 @@ export function adminPageHref(page: AdminPage) {
   try {
     nextURL = new URL(window.location.href);
   } catch {
-    // location.href 理论上恒可解析；解析失败时退回与无 window 分支一致的相对路径。
+
     return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
   }
   if (page === "dashboard") {
@@ -313,4 +311,49 @@ export function shouldHandleAdminNavigation(
     event.shiftKey ||
     event.altKey
   );
+}
+
+export function formatNetRate(value?: number) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) {
+    return "0 B/s";
+  }
+  return `${formatBytes(num)}/s`;
+}
+
+export function formatMainDiskUsedPercent(node: NodeView) {
+  const partitions = Array.isArray(node.stats.disk) ? node.stats.disk : [];
+  let bestTotal = 0;
+  let bestPercent = Number.NaN;
+  partitions.forEach((part) => {
+    const total = Number(part.total || 0);
+    const percent = Number(part.used_percent);
+    if (total >= bestTotal && Number.isFinite(percent)) {
+      bestTotal = total;
+      bestPercent = percent;
+    }
+  });
+  return Number.isFinite(bestPercent) ? `${Math.round(bestPercent)}%` : "--";
+}
+
+export function formatNodeRenewal(node: NodeView) {
+  if (!node.expire_at) {
+    return "未设置";
+  }
+  const date = new Date(node.expire_at * 1000).toLocaleDateString("zh-CN");
+  if (!node.auto_renew || !node.renew_interval_sec) {
+    return date;
+  }
+  const seconds = node.renew_interval_sec;
+  const short =
+    seconds === 30 * 86400
+      ? "月"
+      : seconds === 90 * 86400
+        ? "季"
+        : seconds === 180 * 86400
+          ? "半年"
+          : seconds === 365 * 86400
+            ? "年"
+            : "";
+  return short ? `${date} · ${short}` : date;
 }

@@ -1735,7 +1735,8 @@ func detectDiskType(partitions []disk.PartitionStat, hostRoot string) string {
 	if hasHDD {
 		return "HDD"
 	}
-	return "未知"
+
+	return ""
 }
 
 func detectDiskTypeFromSysfs(hostRoot string) (bool, bool, bool) {

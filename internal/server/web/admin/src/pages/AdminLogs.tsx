@@ -1,26 +1,25 @@
 import { useEffect, useMemo, useState } from "react";
+import { AdminPageHeader } from "@/components/admin-page-header";
+import { AdminPanel } from "@/components/admin-panel";
+import { AdminMetricStrip } from "@/components/admin-metric-strip";
+import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
+import { AdminDrawer } from "@/components/admin-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { fetchAdminLogs } from "@/lib/admin-api";
 import type { AdminLogEntry, AdminLogLevel } from "@/lib/admin-types";
 import { getErrorMessage } from "@/lib/admin-format";
 import {
-  adminActionButtonClass,
+  adminCompactActionButtonClass,
   adminDangerBadgeClass,
   adminMutedTextClass,
   adminNeutralBadgeClass,
-  adminPageHeaderClass,
   adminPageShellClass,
-  adminPageTitleClass,
-  adminPrimaryButtonClass,
-  adminStatEyebrowClass,
   adminSuccessBadgeClass,
-  adminSurfaceCardClass,
   adminWarningBadgeClass,
 } from "@/lib/admin-ui";
 import { cn } from "@/lib/utils";
-import { Bug, Info, ScrollText, TriangleAlert } from "lucide-react";
+import { Radio } from "lucide-react";
 import { toast } from "sonner";
 
 const LOG_LIMIT = 300;
@@ -56,19 +55,6 @@ function levelBadgeClass(level: AdminLogEntry["level"]) {
   }
 }
 
-function levelIcon(level: AdminLogEntry["level"]) {
-  switch (level) {
-    case "error":
-      return <TriangleAlert className="h-4 w-4 text-rose-500 dark:text-rose-300" />;
-    case "warning":
-      return <TriangleAlert className="h-4 w-4 text-amber-500 dark:text-amber-300" />;
-    case "debug":
-      return <Bug className="h-4 w-4 text-slate-500 dark:text-slate-300" />;
-    default:
-      return <Info className="h-4 w-4 text-sky-500 dark:text-sky-300" />;
-  }
-}
-
 function formatLogTime(entry: AdminLogEntry) {
   const date = new Date(entry.timestamp * 1000);
   if (Number.isNaN(date.getTime())) {
@@ -77,8 +63,44 @@ function formatLogTime(entry: AdminLogEntry) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
+  {
+    key: "time",
+    label: "时间",
+    width: "180px",
+    mono: true,
+    render: (entry) => (
+      <span className="text-xs text-slate-500 dark:text-neutral-400">
+        {formatLogTime(entry)}
+      </span>
+    ),
+  },
+  {
+    key: "source",
+    label: "来源",
+    width: "120px",
+    render: (entry) => entry.source || "server",
+  },
+  {
+    key: "level",
+    label: "等级",
+    width: "110px",
+    render: (entry) => <Badge className={levelBadgeClass(entry.level)}>{levelLabels[entry.level]}</Badge>,
+  },
+  {
+    key: "message",
+    label: "消息",
+    render: (entry) => (
+      <span className="block max-w-[520px] truncate" title={entry.message}>
+        {entry.message}
+      </span>
+    ),
+  },
+];
+
 export default function AdminLogs() {
   const [level, setLevel] = useState<AdminLogLevel>("all");
+  const [detailEntry, setDetailEntry] = useState<AdminLogEntry | null>(null);
   const [entries, setEntries] = useState<AdminLogEntry[]>([]);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
 
@@ -90,8 +112,6 @@ export default function AdminLogs() {
     return counts;
   }, [entries]);
 
-  // 最新日志置顶：轮询刷新后新条目立刻出现在视口顶部，无需自动滚动；
-  // 手动上滚回看历史时，底部内容变化也不会推动视口。
   const orderedEntries = useMemo(() => [...entries].reverse(), [entries]);
 
   useEffect(() => {
@@ -132,83 +152,85 @@ export default function AdminLogs() {
     };
   }, [level]);
 
+  const metricItems = (["info", "warning", "error", "debug"] as const).map((item) => ({
+    label: levelLabels[item],
+    value: levelCounts[item] || 0,
+  }));
+
   return (
     <div className={adminPageShellClass}>
-      <div className={adminPageHeaderClass}>
-        <div>
-          <h1 className={adminPageTitleClass}>日志查看</h1>
-          <p className={cn("mt-2 text-sm", adminMutedTextClass)}>
-            {loadedAt ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}` : "实时同步中"}
-          </p>
-        </div>
-      </div>
+      <AdminPageHeader
+        title="日志查看"
+        description={
+          loadedAt ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}` : "实时同步中"
+        }
+      />
 
-      <Card className={adminSurfaceCardClass}>
-        <CardHeader className="border-b px-6 py-5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <CardTitle className="flex items-center gap-2">
-              <ScrollText className="h-5 w-5 text-sky-500 dark:text-sky-300" />
-              运行日志
-            </CardTitle>
-            <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap sm:justify-end">
-              {levelOptions.map((item) => (
-                <Button
-                  key={item.value}
-                  className={cn(
-                    "h-9 px-3 text-xs font-bold",
-                    level === item.value ? adminPrimaryButtonClass : adminActionButtonClass,
-                  )}
-                  onClick={() => setLevel(item.value)}
-                  type="button"
-                  variant={level === item.value ? "default" : "outline"}
-                >
-                  {item.label}
-                </Button>
-              ))}
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="px-0 py-0">
-          <div className="grid grid-cols-2 gap-px border-b bg-border sm:grid-cols-4">
-            {(["info", "warning", "error", "debug"] as const).map((item) => (
-              <div key={item} className="bg-background px-6 py-4">
-                <p className={adminStatEyebrowClass}>{levelLabels[item]}</p>
-                <p className="mt-2 text-2xl font-semibold text-foreground">{levelCounts[item] || 0}</p>
-              </div>
+      <AdminMetricStrip ariaLabel="等级统计" items={metricItems} />
+
+      <AdminPanel
+        title="运行日志"
+        icon={<Radio className="h-4 w-4 text-[var(--label-3)]" />}
+        actions={
+          <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap">
+            {levelOptions.map((item) => (
+              <Button
+                key={item.value}
+                className={cn(
+                  "h-9 min-w-[76px] px-3 text-xs font-medium",
+                  level === item.value
+                    ? "bg-slate-900 text-white hover:bg-slate-800 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+                    : adminCompactActionButtonClass,
+                )}
+                onClick={() => setLevel(item.value)}
+                type="button"
+                variant={level === item.value ? "default" : "outline"}
+              >
+                {item.label}
+              </Button>
             ))}
           </div>
+        }
+      >
+        <p className={cn("pb-4 text-xs", adminMutedTextClass)}>
+          仅展示最近 {LOG_LIMIT} 条日志；计数为当前过滤窗口内的分布。
+        </p>
+        <AdminDataTable
+          ariaLabel="运行日志"
+          columns={logTableColumns}
+          rows={orderedEntries}
+          rowKey={(entry) => String(entry.id)}
+          onRowClick={(entry) => setDetailEntry(entry)}
+          emptyLabel="暂无日志"
 
-          <p className="border-b px-6 py-2 text-xs text-muted-foreground">
-            仅展示最近 {LOG_LIMIT} 条日志；计数为当前过滤窗口内的分布。
-          </p>
+          className="[&>table>tbody>tr]:[content-visibility:auto] [&>table>tbody>tr]:[contain-intrinsic-size:auto_41px]"
+        />
+      </AdminPanel>
 
-          {entries.length === 0 ? (
-            <div className="flex min-h-[280px] items-center justify-center px-6 py-12 text-sm text-muted-foreground">
-              暂无日志
-            </div>
-          ) : (
-            <div className="max-h-[62vh] overflow-auto">
-              <div className="min-w-[760px] divide-y divide-border">
-                {orderedEntries.map((entry) => (
-                  <div key={entry.id} className="grid grid-cols-[180px_92px_110px_1fr] gap-4 px-6 py-4 text-sm">
-                    <div className="font-mono text-xs text-muted-foreground">{formatLogTime(entry)}</div>
-                    <div>
-                      <Badge className={levelBadgeClass(entry.level)}>{levelLabels[entry.level]}</Badge>
-                    </div>
-                    <div className="font-mono text-xs uppercase tracking-[0.14em] text-muted-foreground">
-                      {entry.source || "server"}
-                    </div>
-                    <div className="flex min-w-0 items-start gap-3">
-                      <span className="mt-0.5 shrink-0">{levelIcon(entry.level)}</span>
-                      <p className="min-w-0 break-words leading-6 text-foreground">{entry.message}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      { }
+      <AdminDrawer
+        open={detailEntry !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDetailEntry(null);
+          }
+        }}
+        title={detailEntry ? levelLabels[detailEntry.level] || "日志" : "日志"}
+        description={
+          detailEntry
+            ? `${new Date(detailEntry.timestamp * 1000).toLocaleString("zh-CN", { hour12: false })} · ${detailEntry.source}`
+            : undefined
+        }
+      >
+        {detailEntry ? (
+          <section>
+            <h3 className="text-sm font-medium text-slate-900 dark:text-neutral-50">完整消息</h3>
+            <p className="data-text mt-3 select-text break-words whitespace-pre-wrap text-sm leading-relaxed text-slate-700 dark:text-neutral-200">
+              {detailEntry.message}
+            </p>
+          </section>
+        ) : null}
+      </AdminDrawer>
     </div>
   );
 }

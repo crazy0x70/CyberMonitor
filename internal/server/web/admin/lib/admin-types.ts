@@ -92,10 +92,10 @@ export interface SettingsView {
   admin_path: string;
   admin_user: string;
   turnstile_site_key?: string;
-  /** 服务端恒脱敏回传空串，仅 turnstile_*_set 类布尔可信（下同）。 */
+
   turnstile_secret_key?: string;
   agent_endpoint?: string;
-  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
+
   agent_token?: string;
   agent_token_set?: boolean;
   site_title?: string;
@@ -105,11 +105,11 @@ export interface SettingsView {
   home_subtitle?: string;
   locale?: string;
   region_group_enabled?: boolean;
-  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
+
   alert_webhook?: string;
   alert_webhook_set?: boolean;
   alert_offline_sec?: number;
-  /** 服务端恒脱敏回传空串，仅 *_set 布尔可信。 */
+
   alert_telegram_token?: string;
   alert_telegram_token_set?: boolean;
   alert_telegram_user_ids?: number[];
@@ -125,9 +125,6 @@ export interface SettingsView {
   test_catalog?: TestCatalogItem[];
 }
 
-/** PATCH /api/v1/admin/settings 的更新载荷：字段省略=保留（指针语义）；
- *  密钥类字段留空/显式空值语义见各页注释。键集与 Go 侧 SettingsUpdate
- *  严格对齐（服务端 DisallowUnknownFields，不得携带视图专属键如 *_set）。 */
 export interface SettingsUpdate {
   admin_path?: string;
   admin_user?: string;
@@ -314,8 +311,6 @@ export interface NodeView {
   agent_update_message?: string;
 }
 
-/** /api/v1/public/snapshot 的 settings 形状（镜像 Go PublicSettings：
- *  含 region_group_enabled，不含 version/commit）。 */
 export interface PublicSettings {
   site_title?: string;
   site_icon?: string;
@@ -326,9 +321,6 @@ export interface PublicSettings {
   region_group_enabled?: boolean;
 }
 
-/** 管理端 boot 载荷与 SettingsView 派生路径的 settings：公开快照形状
- *  + 构建/版本信息（version/commit 仅 boot 与 SettingsView 携带，公开
- *  快照不含——运行时快照替换后这两键回退 undefined）。 */
 export interface BootPublicSettings extends PublicSettings {
   version?: string;
   commit?: string;
@@ -379,8 +371,6 @@ export interface NodeDelta {
   node: NodeView;
 }
 
-// 探测间隔边界，与后端 defaultTestIntervalSec（server.go）/ 目录间隔
-// 上限钳制（persist.go）对齐。
 export const DEFAULT_TCP_INTERVAL = 5;
 export const MAX_TCP_INTERVAL = 3600;
 

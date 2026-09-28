@@ -1,4 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AdminPageHeader } from "@/components/admin-page-header";
+import { AdminPanel } from "@/components/admin-panel";
+import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
+import { AdminDrawer } from "@/components/admin-drawer";
+import { AdminKVField } from "@/components/admin-kv-field";
+import { AdminMetricStrip } from "@/components/admin-metric-strip";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -7,47 +13,30 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
+  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Edit2, Plus, Trash2 } from "lucide-react";
+import { Plus, Radio, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type SettingsView, type TestCatalogItem } from "@/lib/admin-types";
-import { getErrorMessage } from "@/lib/admin-format";
 import {
   adminActionButtonClass,
   adminAccentBadgeClass,
   adminDialogCancelClass,
-  adminDangerIconButtonClass,
+  adminDangerOutlineButtonClass,
   adminDialogContentClass,
   adminDialogFooterClass,
   adminDialogHeaderClass,
-  adminEmptyStateClass,
   adminDirtyBadgeClass,
   adminInputClass,
   adminPageActionsClass,
-  adminPageHeaderClass,
   adminPageShellClass,
-  adminPageTitleClass,
   adminPrimaryButtonClass,
   adminNeutralBadgeClass,
   adminOutlineButtonClass,
-  adminWorkspaceHeaderClass,
-  adminWorkspaceItemClass,
-  adminWorkspaceListClass,
-  adminWorkspaceMetaCardClass,
-  adminWorkspaceMetaGridClass,
-  adminWorkspaceMetaLabelClass,
 } from "@/lib/admin-ui";
 import { cn } from "@/lib/utils";
 
@@ -82,10 +71,6 @@ const probeFieldIDMap: Record<ProbeField, string> = {
   intervalSec: "probe-interval",
 };
 
-// 草稿条目的本地行身份：弹窗打开期间若服务端目录更新触发草稿重置，
-// 下标会指向错位条目，稳定 uid 保证编辑/删除永远命中原行。计数器放
-// 组件 useRef（随实例存活）：模块级计数器在 HMR 重求值后会归零并与
-// 保留的 hooks 状态撞号。
 type ProbeDraft = { uid: string; item: TestCatalogItem };
 
 export interface ProbeSettingsProps {
@@ -165,9 +150,6 @@ function toFormState(item?: TestCatalogItem): ProbeFormState {
   };
 }
 
-// 与后端 persist.go isValidTestHost 对称：歧义 IPv4 字面量（缩写段/
-// 前导零/hex 段）与非法 IP 一律弹窗字段级拒绝，避免拖到整页保存被
-// 后端整体 400 且不定位条目。
 const STRICT_IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 const IPV4_LITERAL_PART_RE = /^(0x[0-9a-f]+|\d+)$/;
 const IPV6_GROUP_RE = /^[0-9a-fA-F]{1,4}$/;
@@ -202,7 +184,7 @@ function isValidIPv6(value: string) {
   if (!/^[0-9a-fA-F:.]+$/.test(value) || !value.includes(":")) {
     return false;
   }
-  // ::: （三连冒号）对 net.ParseIP 非法，但省略号计数会漏掉它。
+
   if (value.includes(":::")) {
     return false;
   }
@@ -218,8 +200,7 @@ function isValidIPv6(value: string) {
   if (doubleColonCount > 1) {
     return false;
   }
-  // 孤立前导/尾随单冒号（":1:2:..."）非合法 IPv6，filter 空段后组数
-  // 会碰巧凑满，需显式拒绝（:: 场景 doubleColonCount>=1 不受影响）。
+
   if (doubleColonCount === 0 && (value.startsWith(":") || value.endsWith(":"))) {
     return false;
   }
@@ -227,8 +208,7 @@ function isValidIPv6(value: string) {
   if (!groups.every((group) => IPV6_GROUP_RE.test(group))) {
     return false;
   }
-  // net.ParseIP 对齐：无 :: 必须满组（8 组；v4 尾段占 2 组故 6 组 hex），
-  // 有 :: 可省 1..7 组（v4 尾段时 hex 上限 5）。
+
   if (doubleColonCount === 0) {
     return groups.length === (v4Tail ? 6 : 8);
   }
@@ -329,6 +309,56 @@ function formatProbeInterval(item: TestCatalogItem) {
   return interval > 0 ? `${interval} 秒` : `默认 ${DEFAULT_TCP_INTERVAL} 秒`;
 }
 
+// 探测目标账本列：地址等宽、间隔数字右对齐；无逐条启停数据，删除
+// 动作收进抽屉底栏（与 ServerManagement 的删除位一致）。
+const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
+  {
+    key: "name",
+    label: "名称",
+    render: (draft) => (
+      <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">
+        {draft.item.name || "未命名探测节点"}
+      </span>
+    ),
+  },
+  {
+    key: "target",
+    label: "目标地址",
+    mono: true,
+    render: (draft) => (
+      <span className="text-slate-700 dark:text-neutral-200">
+        {formatProbeTarget(draft.item)}
+      </span>
+    ),
+  },
+  {
+    key: "type",
+    label: "协议",
+    width: "14%",
+    render: (draft) => {
+      const type = resolveProbeType(draft.item);
+      return (
+        <span className="-ml-1.5 inline-block">
+          <Badge
+            variant="secondary"
+            className={type === "icmp" ? adminNeutralBadgeClass : adminAccentBadgeClass}
+          >
+            {type.toUpperCase()}
+          </Badge>
+        </span>
+      );
+    },
+  },
+  {
+    key: "interval",
+    label: "间隔",
+    align: "right",
+    mono: true,
+    width: "20%",
+    render: (draft) => formatProbeInterval(draft.item),
+  },
+];
+
 export default function ProbeSettings({
   testCatalog,
   onDirtyChange,
@@ -347,7 +377,7 @@ export default function ProbeSettings({
   const [drafts, setDrafts] = useState<ProbeDraft[]>(() => normalizedCatalog.map(attachUid));
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [editingUid, setEditingUid] = useState<string | null>(null);
   const [pendingDeleteUid, setPendingDeleteUid] = useState<string | null>(null);
   const [formState, setFormState] = useState<ProbeFormState>(() => toFormState());
@@ -390,27 +420,20 @@ export default function ProbeSettings({
     toast.info("已放弃本地修改，已重置为服务端当前配置。");
   };
 
-  const openDialog = (draft?: ProbeDraft) => {
+  const openDrawer = (draft?: ProbeDraft) => {
     if (isBusy) {
       return;
     }
     setEditingUid(draft ? draft.uid : null);
     setFormState(toFormState(draft?.item));
     setFormError(null);
-    setIsDialogOpen(true);
+    setIsDrawerOpen(true);
   };
 
-  const closeDialog = () => {
+  const closeDrawer = () => {
     setFormError(null);
-    setIsDialogOpen(false);
-  };
-
-  const openCreateDialog = () => {
-    openDialog();
-  };
-
-  const openEditDialog = (draft: ProbeDraft) => {
-    openDialog(draft);
+    setIsDrawerOpen(false);
+    setEditingUid(null);
   };
 
   const updateFormField = <TField extends ProbeField>(
@@ -435,7 +458,7 @@ export default function ProbeSettings({
     }
   };
 
-  const handleDialogSave = () => {
+  const handleDrawerSave = () => {
     if (isBusy) {
       return;
     }
@@ -447,8 +470,8 @@ export default function ProbeSettings({
     }
 
     if (editingUid !== null && !drafts.some((draft) => draft.uid === editingUid)) {
-      // 弹窗打开期间草稿被服务端更新重置：uid 失效，明确提示而非静默错写。
-      toast.warning("该条目已被服务端更新重置，请关闭弹窗后重新编辑。");
+      // 抽屉打开期间草稿被服务端更新重置：uid 失效，明确提示而非静默错写。
+      toast.warning("该条目已被服务端更新重置，请关闭抽屉后重新编辑。");
       return;
     }
     setDrafts((current) => {
@@ -460,7 +483,7 @@ export default function ProbeSettings({
       );
     });
     setIsDirty(true);
-    closeDialog();
+    closeDrawer();
     toast.success(editingUid === null ? "探测节点已添加" : "探测节点已更新");
   };
 
@@ -506,215 +529,229 @@ export default function ProbeSettings({
     });
   };
 
-  
+  const editingDraft = editingUid ? drafts.find((draft) => draft.uid === editingUid) || null : null;
+
+  const metricItems = [
+    { label: "接入目标", value: drafts.length },
+  ] as const;
 
   return (
     <div className={adminPageShellClass}>
-      <div className={adminPageHeaderClass}>
-        <div className="space-y-2">
-          <h1 className={adminPageTitleClass}>探测设置</h1>
-        </div>
-        <div className={cn(adminPageActionsClass, "flex-col gap-2 sm:flex-row sm:items-center")}>
-          {sourceConflict ? (
-            <>
-              <span className={adminDirtyBadgeClass}>服务端配置已更新，保存已被阻止</span>
-              <Button
-                variant="outline"
-                className={`${adminActionButtonClass} h-11 px-5 font-bold`}
-                onClick={discardLocalChanges}
-                disabled={isBusy}
-              >
-                放弃本地修改
-              </Button>
-            </>
-          ) : null}
-          {isDirty && !sourceConflict ? (
-            <span className={adminDirtyBadgeClass}>有未保存的修改</span>
-          ) : null}
-          <Button
-            variant="outline"
-            className={`${adminActionButtonClass} h-11 min-w-[140px] px-5 font-bold`}
-            onClick={openCreateDialog}
-            disabled={isBusy}
-          >
-            <Plus className="mr-2 h-4 w-4" />
-            新增探测节点
-          </Button>
-          <Button
-            className={`${adminPrimaryButtonClass} h-11 px-5 font-bold`}
-            onClick={handleSave}
-            disabled={!isDirty || isBusy || sourceConflict}
-          >
-            {isBusy ? "保存中…" : "保存更改"}
-          </Button>
-        </div>
-      </div>
-
-      <div className={adminWorkspaceListClass}>
-        {drafts.length === 0 ? (
-          <div className={cn(adminEmptyStateClass, "space-y-4")}>
-            <p className="text-lg font-semibold text-slate-900 dark:text-slate-100">暂无探测节点</p>
-            <Button className={adminPrimaryButtonClass} onClick={openCreateDialog}>
+      <AdminPageHeader
+        title="探测设置"
+        actionsClassName={cn(adminPageActionsClass, "flex-col gap-2 sm:flex-row sm:items-center")}
+        actions={
+          <>
+            {sourceConflict ? (
+              <>
+                <span className={adminDirtyBadgeClass}>服务端配置已更新，保存已被阻止</span>
+                <Button
+                  variant="outline"
+                  className={`${adminActionButtonClass} h-9 px-4 font-medium`}
+                  onClick={discardLocalChanges}
+                  disabled={isBusy}
+                >
+                  放弃本地修改
+                </Button>
+              </>
+            ) : null}
+            {isDirty && !sourceConflict ? (
+              <span className={adminDirtyBadgeClass}>有未保存的修改</span>
+            ) : null}
+            <Button
+              variant="outline"
+              className={`${adminActionButtonClass} h-9 min-w-[140px] px-4 font-medium`}
+              onClick={() => openDrawer()}
+              disabled={isBusy}
+            >
               <Plus className="mr-2 h-4 w-4" />
               新增探测节点
             </Button>
-          </div>
-        ) : null}
-
-        {drafts.map((draft) => {
-          const item = draft.item;
-          const type = resolveProbeType(item);
-          return (
-            <div
-              key={draft.uid}
-              className={adminWorkspaceItemClass}
+            <Button
+              className={`${adminPrimaryButtonClass} h-9 px-4 font-medium`}
+              onClick={handleSave}
+              disabled={!isDirty || isBusy || sourceConflict}
             >
-              <div className={adminWorkspaceHeaderClass}>
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-base font-semibold text-slate-900 dark:text-slate-50">
-                      {item.name || "未命名探测节点"}
-                    </span>
-                    <Badge
-                      variant="secondary"
-                      className={
-                        type === "icmp"
-                          ? adminNeutralBadgeClass
-                          : adminAccentBadgeClass
-                      }
-                    >
-                      {type.toUpperCase()}
-                    </Badge>
-                  </div>
-                </div>
+              {isBusy ? "保存中…" : "保存更改"}
+            </Button>
+          </>
+        }
+      />
 
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className={cn(adminActionButtonClass, "h-9 w-9 px-0")}
-                    aria-label={`编辑探测节点 ${item.name || formatProbeTarget(item)}`}
-                    disabled={isBusy}
-                    onClick={() => openEditDialog(draft)}
-                  >
-                    <Edit2 className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className={adminDangerIconButtonClass}
-                    aria-label={`删除探测节点 ${item.name || formatProbeTarget(item)}`}
-                    disabled={isBusy}
-                    onClick={() => setPendingDeleteUid(draft.uid)}
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
+      <AdminMetricStrip ariaLabel="探测统计" items={metricItems} />
 
-              <div className={cn(adminWorkspaceMetaGridClass, "md:grid-cols-3 xl:grid-cols-3")}>
-                <div className={adminWorkspaceMetaCardClass}>
-                  <div className={adminWorkspaceMetaLabelClass}>目标</div>
-                  <div className="mt-1 font-mono text-sm text-slate-700 dark:text-slate-200">
-                    {formatProbeTarget(item)}
-                  </div>
-                </div>
-                <div className={adminWorkspaceMetaCardClass}>
-                  <div className={adminWorkspaceMetaLabelClass}>协议</div>
-                  <div className="mt-1 font-medium">{type.toUpperCase()}</div>
-                </div>
-                <div className={adminWorkspaceMetaCardClass}>
-                  <div className={adminWorkspaceMetaLabelClass}>间隔</div>
-                  <div className="mt-1 font-medium">{formatProbeInterval(item)}</div>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      <AdminPanel
+        title="目标列表"
+        icon={<Radio className="h-4 w-4 text-[var(--label-3)]" />}
+      >
+        <AdminDataTable
+          ariaLabel="探测目标"
+          columns={probeTableColumns}
+          rows={drafts}
+          rowKey={(draft) => draft.uid}
+          onRowClick={(draft) => openDrawer(draft)}
+          emptyLabel="暂无探测节点，点击右上角「新增探测节点」开始。"
+        />
+      </AdminPanel>
 
-      <Dialog
-        open={isDialogOpen}
+      <AdminDrawer
+        open={isDrawerOpen}
         onOpenChange={(open) => {
           if (!open) {
-            closeDialog();
+            closeDrawer();
           }
         }}
-      >
-        <DialogContent className={`sm:max-w-[620px] ${adminDialogContentClass}`}>
-          <DialogHeader className={adminDialogHeaderClass}>
-            <DialogTitle className="dark:text-slate-50">
-              {editingUid === null ? "新增探测节点" : "编辑探测节点"}
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="grid gap-4 px-6 py-6">
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="grid gap-2">
-                <Label htmlFor="probe-name">名称</Label>
-                <Input
-                  id="probe-name"
-                  name="probe-name"
-                  autoComplete="off"
-                  className={adminInputClass}
-                  aria-invalid={formError?.field === "name"}
-                  aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
-                  value={formState.name}
-                  disabled={isBusy}
-                  onChange={(event) => updateFormField("name", event.target.value)}
-                  placeholder="例如：主站 TCP 443…"
+        title={editingUid === null ? "新增探测节点" : "编辑探测节点"}
+        description={
+          editingDraft
+            ? `${resolveProbeType(editingDraft.item).toUpperCase()} · ${formatProbeTarget(
+                editingDraft.item,
+              )}`
+            : "配置探测目标的基础信息与协议参数。"
+        }
+        footer={
+          <div className="flex items-center justify-between gap-2">
+            {editingUid !== null ? (
+              <AlertDialog
+                open={pendingDeleteUid !== null}
+                onOpenChange={(open) => {
+                  if (!open) {
+                    clearPendingDelete();
+                  } else if (editingUid !== null) {
+                    // 受控打开：Trigger 只会回调 onOpenChange(true)，必须在这里落入
+                    // pendingDeleteUid，否则确认框永远打不开（迁移回归）。
+                    setPendingDeleteUid(editingUid);
+                  }
+                }}
+              >
+                <AlertDialogTrigger
+                  render={(
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      className={cn(adminDangerOutlineButtonClass, "h-9 min-w-[92px] px-4")}
+                      disabled={isBusy}
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      删除
+                    </Button>
+                  )}
                 />
-                {formError?.field === "name" ? (
-                  <p id="probe-name-error" className="text-xs font-medium text-rose-500" aria-live="polite">
-                    {formError.message}
-                  </p>
-                ) : null}
-              </div>
-
-              <div className="grid gap-2">
-                <Label>类型</Label>
-                <div className="grid grid-cols-2 gap-3 rounded-[1.25rem] border border-slate-200 bg-slate-50 p-2 dark:border-slate-800 dark:bg-slate-950">
-                  {(["icmp", "tcp"] as const).map((type) => {
-                    const active = formState.type === type;
-                    return (
-                      <Button
-                        key={type}
-                        type="button"
-                        variant="outline"
-                        className={
-                          active
-                            ? `${adminPrimaryButtonClass} h-11 w-full min-w-0 px-4`
-                            : `${adminActionButtonClass} h-11 w-full min-w-0 px-4`
+                <AlertDialogContent className={adminDialogContentClass}>
+                  <AlertDialogHeader className={adminDialogHeaderClass}>
+                    <AlertDialogTitle>确认删除探测节点？</AlertDialogTitle>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter className={adminDialogFooterClass}>
+                    <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      className={adminPrimaryButtonClass}
+                      disabled={isBusy}
+                      onClick={() => {
+                        if (pendingDeleteUid !== null) {
+                          handleDelete(pendingDeleteUid);
                         }
-                        onClick={() => {
-                          if (isBusy) {
-                            return;
-                          }
-                          setFormState((current) => ({
-                            ...current,
-                            type,
-                            port: type === "tcp" ? current.port : "",
-                            intervalSec: type === "tcp" ? current.intervalSec : "",
-                          }));
-                        }}
-                        disabled={isBusy}
-                      >
-                        {type.toUpperCase()}
-                      </Button>
-                    );
-                  })}
-                </div>
-              </div>
+                        clearPendingDelete();
+                        closeDrawer();
+                      }}
+                    >
+                      确认删除
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            ) : (
+              <span />
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className={cn(adminOutlineButtonClass, "h-9 min-w-[84px] px-4")}
+                onClick={closeDrawer}
+                disabled={isBusy}
+              >
+                取消
+              </Button>
+              <Button
+                type="button"
+                className={cn(adminPrimaryButtonClass, "h-9 min-w-[110px] px-4")}
+                onClick={handleDrawerSave}
+                disabled={isBusy}
+              >
+                {editingUid === null ? "新增探测节点" : "保存探测节点"}
+              </Button>
             </div>
+          </div>
+        }
+      >
+        <section>
+          <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">基础信息</h3>
+          <AdminKVField label="名称" htmlFor="probe-name">
+            <div className="space-y-2">
+              <Input
+                id="probe-name"
+                name="probe-name"
+                autoComplete="off"
+                className={adminInputClass}
+                aria-invalid={formError?.field === "name"}
+                aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
+                value={formState.name}
+                disabled={isBusy}
+                onChange={(event) => updateFormField("name", event.target.value)}
+                placeholder="例如：主站 TCP 443…"
+              />
+              {formError?.field === "name" ? (
+                <p id="probe-name-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                  {formError.message}
+                </p>
+              ) : null}
+            </div>
+          </AdminKVField>
+          <AdminKVField label="类型">
+            <div className="grid grid-cols-2 gap-2">
+              {(["icmp", "tcp"] as const).map((type) => {
+                const active = formState.type === type;
+                return (
+                  <Button
+                    key={type}
+                    type="button"
+                    variant="outline"
+                    className={
+                      active
+                        ? `${adminPrimaryButtonClass} h-9 w-full min-w-0 px-4`
+                        : `${adminOutlineButtonClass} h-9 w-full min-w-0 px-4`
+                    }
+                    onClick={() => {
+                      if (isBusy) {
+                        return;
+                      }
+                      setFormState((current) => ({
+                        ...current,
+                        type,
+                        port: type === "tcp" ? current.port : "",
+                        intervalSec: type === "tcp" ? current.intervalSec : "",
+                      }));
+                    }}
+                    disabled={isBusy}
+                  >
+                    {type.toUpperCase()}
+                  </Button>
+                );
+              })}
+            </div>
+          </AdminKVField>
+        </section>
 
-            <div className="grid gap-2">
-              <Label htmlFor="probe-host">目标地址</Label>
+        <section>
+          <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">目标地址</h3>
+          <AdminKVField label="地址" htmlFor="probe-host">
+            <div className="space-y-2">
               <Input
                 id="probe-host"
                 name="probe-host"
                 autoComplete="off"
                 spellCheck={false}
-                className={adminInputClass}
+                className={`${adminInputClass} data-text`}
                 aria-invalid={formError?.field === "host"}
                 aria-describedby={formError?.field === "host" ? "probe-host-error" : undefined}
                 value={formState.host}
@@ -728,114 +765,72 @@ export default function ProbeSettings({
                 </p>
               ) : null}
             </div>
+          </AdminKVField>
+        </section>
 
-            {formState.type === "tcp" ? (
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="grid gap-2">
-                  <Label htmlFor="probe-port">端口</Label>
-                  <Input
-                    id="probe-port"
-                    name="probe-port"
-                    type="number"
-                    min={1}
-                    max={MAX_TCP_PORT}
-                    autoComplete="off"
-                    inputMode="numeric"
-                    className={adminInputClass}
-                    aria-invalid={formError?.field === "port"}
-                    aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
-                    value={formState.port}
-                    disabled={isBusy}
-                    onChange={(event) => updateFormField("port", event.target.value)}
-                    placeholder="例如：443…"
-                  />
-                  {formError?.field === "port" ? (
-                    <p id="probe-port-error" className="text-xs font-medium text-rose-500" aria-live="polite">
-                      {formError.message}
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="grid gap-2">
-                  <Label htmlFor="probe-interval">默认间隔（秒）</Label>
-                  <Input
-                    id="probe-interval"
-                    name="probe-interval"
-                    type="number"
-                    min={0}
-                    max={MAX_TCP_INTERVAL}
-                    autoComplete="off"
-                    inputMode="numeric"
-                    className={adminInputClass}
-                    aria-invalid={formError?.field === "intervalSec"}
-                    aria-describedby={formError?.field === "intervalSec" ? "probe-interval-error" : undefined}
-                    value={formState.intervalSec}
-                    disabled={isBusy}
-                    onChange={(event) => updateFormField("intervalSec", event.target.value)}
-                    placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
-                  />
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    {`留空或填写 0 时，将沿用默认间隔 ${DEFAULT_TCP_INTERVAL} 秒。`}
+        {formState.type === "tcp" ? (
+          <section>
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              TCP 参数
+            </h3>
+            <AdminKVField label="端口" htmlFor="probe-port">
+              <div className="space-y-2">
+                <Input
+                  id="probe-port"
+                  name="probe-port"
+                  type="number"
+                  min={1}
+                  max={MAX_TCP_PORT}
+                  autoComplete="off"
+                  inputMode="numeric"
+                  className={`${adminInputClass} data-text`}
+                  aria-invalid={formError?.field === "port"}
+                  aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
+                  value={formState.port}
+                  disabled={isBusy}
+                  onChange={(event) => updateFormField("port", event.target.value)}
+                  placeholder="例如：443…"
+                />
+                {formError?.field === "port" ? (
+                  <p id="probe-port-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                    {formError.message}
                   </p>
-                  {formError?.field === "intervalSec" ? (
-                    <p id="probe-interval-error" className="text-xs font-medium text-rose-500" aria-live="polite">
-                      {formError.message}
-                    </p>
-                  ) : null}
-                </div>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-
-          <DialogFooter className={`${adminDialogFooterClass} px-8 py-6`}>
-            <Button
-              variant="outline"
-              className={`${adminOutlineButtonClass} h-12 px-8 font-bold`}
-              onClick={closeDialog}
-              disabled={isBusy}
-            >
-              取消
-            </Button>
-            <Button
-              className={`${adminPrimaryButtonClass} h-12 px-8 font-bold`}
-              onClick={handleDialogSave}
-              disabled={isBusy}
-            >
-              {editingUid === null ? "新增探测节点" : "保存探测节点"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <AlertDialog
-        open={pendingDeleteUid !== null}
-        onOpenChange={(open) => {
-          if (!open) {
-            clearPendingDelete();
-          }
-        }}
-      >
-        <AlertDialogContent className={adminDialogContentClass}>
-          <AlertDialogHeader className={adminDialogHeaderClass}>
-            <AlertDialogTitle>确认删除探测节点？</AlertDialogTitle>
-          </AlertDialogHeader>
-          <AlertDialogFooter className={adminDialogFooterClass}>
-            <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
-            <AlertDialogAction
-              className={adminPrimaryButtonClass}
-              disabled={isBusy}
-              onClick={() => {
-                if (pendingDeleteUid !== null) {
-                  handleDelete(pendingDeleteUid);
-                }
-                clearPendingDelete();
-              }}
-            >
-              确认删除
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </AdminKVField>
+            <AdminKVField label="默认间隔（秒）" htmlFor="probe-interval">
+              <div className="space-y-2">
+                <Input
+                  id="probe-interval"
+                  name="probe-interval"
+                  type="number"
+                  min={0}
+                  max={MAX_TCP_INTERVAL}
+                  autoComplete="off"
+                  inputMode="numeric"
+                  className={`${adminInputClass} data-text`}
+                  aria-invalid={formError?.field === "intervalSec"}
+                  aria-describedby={
+                    formError?.field === "intervalSec" ? "probe-interval-error" : undefined
+                  }
+                  value={formState.intervalSec}
+                  disabled={isBusy}
+                  onChange={(event) => updateFormField("intervalSec", event.target.value)}
+                  placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
+                />
+                <p className="text-xs text-slate-500 dark:text-neutral-400">
+                  {`留空或填写 0 时，将沿用默认间隔 ${DEFAULT_TCP_INTERVAL} 秒。`}
+                </p>
+                {formError?.field === "intervalSec" ? (
+                  <p id="probe-interval-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                    {formError.message}
+                  </p>
+                ) : null}
+              </div>
+            </AdminKVField>
+          </section>
+        ) : null}
+      </AdminDrawer>
     </div>
   );
 }

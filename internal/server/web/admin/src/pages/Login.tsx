@@ -1,22 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { AlertCircle, Lock, ShieldCheck, User } from "lucide-react";
+import { AlertCircle, Lock, ShieldCheck } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
-  adminActionButtonClass,
   adminInputClass,
+  adminOutlineButtonClass,
   adminPrimaryButtonClass,
-  adminSurfaceCardClass,
 } from "@/lib/admin-ui";
 import { getErrorMessage } from "@/lib/admin-format";
 import type { OAuthLoginProvider } from "@/lib/admin-types";
@@ -92,7 +83,7 @@ export interface LoginProps {
   homeTitle?: string;
   oauthProviders?: OAuthLoginProvider[];
   passwordLoginEnabled?: boolean;
-  /** 登录配置加载完成前为 false：不渲染"没有可用登录方式"终态告警。 */
+
   loginConfigLoaded?: boolean;
   retryAfterSec?: number;
   theme: ThemeMode;
@@ -216,69 +207,63 @@ export default function Login({
     }
   };
 
+  const labelClass = "text-xs font-medium text-slate-600 dark:text-neutral-300";
+
   return (
-    <div className="relative flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 sm:right-6 sm:top-6">
+    <div className="relative flex min-h-screen items-center justify-center px-4 py-16">
+      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 sm:right-6 sm:top-4">
         {topControls}
       </div>
-      <div className="w-full max-w-md space-y-10 animate-in fade-in slide-in-from-bottom-8 duration-1000 ease-out">
+      <div className="w-full max-w-sm space-y-10">
         <div className="flex flex-col items-center text-center">
-          <h1 className="text-5xl font-black tracking-tighter text-slate-900 dark:text-slate-100 italic">
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-neutral-100">
             {homeTitle}
           </h1>
-          <p className="mt-4 text-base font-medium tracking-wide text-slate-500 uppercase dark:text-slate-400">
-            {homeSubtitle}
-          </p>
+          <p className="mt-2 text-sm text-slate-500 dark:text-neutral-400">{homeSubtitle}</p>
         </div>
 
-        <Card className={cn("overflow-hidden border-none shadow-[0_48px_96px_-48px_rgba(15,23,42,0.3)] dark:shadow-[0_48px_96px_-48px_rgba(2,8,23,0.8)]", adminSurfaceCardClass)}>
-          <form onSubmit={handleSubmit}>
-            <CardHeader className="border-b border-slate-200/40 bg-white/40 px-8 py-8 text-center dark:border-slate-800/40 dark:bg-slate-950/40">
-              <CardTitle className="text-2xl font-black tracking-tight">欢迎回来</CardTitle>
-              <CardDescription className="mt-2 text-sm font-medium text-slate-500">验证管理员凭证以继续</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6 px-8 pt-8 pb-6">
-              {oauthProviders.length > 0 ? (
-                <div className="space-y-3">
-                  <div className="grid gap-2">
-                    {oauthProviders.map((provider) => {
-                      return (
-                        <Button
-                          key={provider.id}
-                          type="button"
-                          variant="outline"
-                          className={cn(adminActionButtonClass, "h-12 w-full justify-center gap-2 font-bold")}
-                          disabled={errorType === "locked" && lockTimeLeft > 0}
-                          onClick={() => onOAuthLogin?.(provider.id)}
-                        >
-                          <ShieldCheck className="h-4 w-4 shrink-0" />
-                          {`使用 ${provider.display_name || provider.id} 登录`}
-                        </Button>
-                      );
-                    })}
-                  </div>
-                  {passwordLoginEnabled ? (
-                    <div className="flex items-center gap-3 text-xs font-medium uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">
-                      <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
-                      <span>或使用管理员密码</span>
-                      <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
-                    </div>
-                  ) : null}
+        <div className="space-y-6">
+          {oauthProviders.length > 0 ? (
+            <div className="space-y-4">
+              <div className="grid gap-2">
+                {oauthProviders.map((provider) => {
+                  return (
+                    <Button
+                      key={provider.id}
+                      type="button"
+                      variant="outline"
+                      className={cn(adminOutlineButtonClass, "h-9 w-full justify-center gap-2 px-4 font-medium")}
+                      disabled={errorType === "locked" && lockTimeLeft > 0}
+                      onClick={() => onOAuthLogin?.(provider.id)}
+                    >
+                      <ShieldCheck className="h-4 w-4 shrink-0" />
+                      {`使用 ${provider.display_name || provider.id} 登录`}
+                    </Button>
+                  );
+                })}
+              </div>
+              {passwordLoginEnabled ? (
+                <div className="flex items-center gap-2 text-xs font-medium text-slate-500 dark:text-neutral-400">
+                  <span className="h-px flex-1 bg-slate-200 dark:bg-neutral-800" />
+                  <span>或使用管理员密码</span>
+                  <span className="h-px flex-1 bg-slate-200 dark:bg-neutral-800" />
                 </div>
               ) : null}
+            </div>
+          ) : null}
 
-              {loginConfigLoaded && !passwordLoginEnabled && oauthProviders.length === 0 ? (
-                <Alert className="border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
-                  <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-300" />
-                  <AlertTitle className="text-amber-800 dark:text-amber-100">没有可用登录方式</AlertTitle>
-                  <AlertDescription className="text-amber-700 dark:text-amber-200">
-                    请联系管理员启用密码登录或 OAuth / OIDC 登录。
-                  </AlertDescription>
-                </Alert>
-              ) : null}
+          {loginConfigLoaded && !passwordLoginEnabled && oauthProviders.length === 0 ? (
+            <Alert className="border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+              <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-300" />
+              <AlertTitle className="text-amber-800 dark:text-amber-100">没有可用登录方式</AlertTitle>
+              <AlertDescription className="text-amber-700 dark:text-amber-200">
+                请联系管理员启用密码登录或 OAuth / OIDC 登录。
+              </AlertDescription>
+            </Alert>
+          ) : null}
 
-              {passwordLoginEnabled ? (
-                <>
+          {passwordLoginEnabled ? (
+            <>
               {errorType === "invalid" && (
                 <Alert variant="destructive" className="border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-100">
                   <AlertCircle className="h-4 w-4 text-rose-600 dark:text-rose-300" />
@@ -312,74 +297,70 @@ export default function Login({
                 </Alert>
               )}
 
-              <div className="space-y-2">
-                <Label htmlFor="username">账号</Label>
-                <div className="relative">
-                  <User className="pointer-events-none absolute left-3.5 top-3 h-4 w-4 text-slate-500 dark:text-slate-300" />
+              <form onSubmit={handleSubmit} className="space-y-5">
+                <div className="space-y-2">
+                  <Label htmlFor="username" className={labelClass}>
+                    账号
+                  </Label>
                   <Input
                     id="username"
                     autoComplete="username"
                     name="username"
-                    className={cn(adminInputClass, "pl-10")}
+                    className={adminInputClass}
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
                     disabled={errorType === "locked" && lockTimeLeft > 0}
                     spellCheck={false}
                   />
                 </div>
-              </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="password">密码</Label>
-                <div className="relative">
-                  <Lock className="pointer-events-none absolute left-3.5 top-3 h-4 w-4 text-slate-500 dark:text-slate-300" />
+                <div className="space-y-2">
+                  <Label htmlFor="password" className={labelClass}>
+                    密码
+                  </Label>
                   <Input
                     id="password"
                     type="password"
                     autoComplete="current-password"
                     name="password"
-                    className={cn(adminInputClass, "pl-10")}
+                    className={`${adminInputClass} data-text`}
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
                     disabled={errorType === "locked" && lockTimeLeft > 0}
                   />
                 </div>
-              </div>
 
-              {turnstileSiteKey ? (
-                <div className="space-y-2">
-                  <Label>人机验证</Label>
-                  <div className="rounded-[1rem] border border-slate-200 bg-white/90 px-3 py-3 dark:border-slate-800 dark:bg-slate-950/90">
-                    <div ref={turnstileContainerRef} />
+                {turnstileSiteKey ? (
+                  <div className="space-y-2">
+                    <Label className={labelClass}>人机验证</Label>
+                    { }
+                    <div className="rounded-xl bg-white/90 px-2 py-2 dark:bg-[var(--surface-2)]">
+                      <div ref={turnstileContainerRef} />
+                    </div>
+                    {turnstileError ? (
+                      <p className="text-sm text-rose-600 dark:text-rose-300" aria-live="polite">{turnstileError}</p>
+                    ) : (
+                      <p className="text-xs text-slate-500 dark:text-neutral-400">
+                        完成验证后再提交管理员凭证。
+                      </p>
+                    )}
                   </div>
-                  {turnstileError ? (
-                    <p className="text-sm text-rose-600 dark:text-rose-300" aria-live="polite">{turnstileError}</p>
-                  ) : (
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      完成验证后再提交管理员凭证。
-                    </p>
+                ) : null}
+
+                <Button
+                  type="submit"
+                  className={cn(
+                    adminPrimaryButtonClass,
+                    "h-9 w-full rounded-xl font-medium tracking-tight",
                   )}
-                </div>
-              ) : null}
-                </>
-              ) : null}
-            </CardContent>
-            {passwordLoginEnabled ? (
-            <CardFooter className="border-t border-slate-200/40 bg-white/40 px-8 py-6 dark:border-slate-800/40 dark:bg-slate-950/40">
-              <Button
-                type="submit"
-                className={cn(
-                  adminPrimaryButtonClass,
-                  "h-12 w-full font-black tracking-tight shadow-xl shadow-sky-500/20 active:scale-95 transition-[background-color,color,box-shadow,transform] duration-300",
-                )}
-                disabled={submitting || (errorType === "locked" && lockTimeLeft > 0)}
-              >
-                {submitting ? "正在验证身份…" : "确 认 登 录"}
-              </Button>
-            </CardFooter>
-            ) : null}
-          </form>
-        </Card>
+                  disabled={submitting || (errorType === "locked" && lockTimeLeft > 0)}
+                >
+                  {submitting ? "正在验证身份…" : "确认登录"}
+                </Button>
+              </form>
+            </>
+          ) : null}
+        </div>
       </div>
     </div>
   );
