@@ -79,60 +79,66 @@ type sizeLimitedWriter struct {
 	path    string
 	maxSize int64
 	mu      sync.Mutex
+	file    *os.File
+	size    int64
 }
 
 var reportLogger = log.New(io.Discard, "", log.LstdFlags)
 
+// Write 保持常驻文件句柄，仅在轮转时重开；log.Logger 串行调用，这里仅防多 Logger 共享时竞争。
 func (w *sizeLimitedWriter) Write(p []byte) (int, error) {
 	if w == nil || w.path == "" || w.maxSize <= 0 {
 		return len(p), nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	dir := filepath.Dir(w.path)
-	if dir != "" {
-		_ = os.MkdirAll(dir, 0755)
-	}
-
-	file, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return len(p), err
-	}
-	defer func() {
-		if file != nil {
-			_ = file.Close()
-		}
-	}()
-
-	info, err := file.Stat()
-	if err != nil {
-		return len(p), err
-	}
-
-	if info.Size()+int64(len(p)) > w.maxSize {
-		if err := file.Close(); err != nil {
-			return len(p), err
-		}
-		file = nil
-		if err := rotateLogFile(w.path, maxLogBackupCount); err != nil {
-			return len(p), err
-		}
-		file, err = os.OpenFile(w.path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			return len(p), err
-		}
-	} else {
-		if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	if w.file == nil {
+		if err := w.openLocked(); err != nil {
 			return len(p), err
 		}
 	}
-
-	_, err = file.Write(p)
+	if w.size+int64(len(p)) > w.maxSize {
+		if err := w.rotateLocked(); err != nil {
+			return len(p), err
+		}
+	}
+	n, err := w.file.Write(p)
+	w.size += int64(n)
 	if err != nil {
 		return len(p), err
 	}
 	return len(p), nil
+}
+
+func (w *sizeLimitedWriter) openLocked() error {
+	if dir := filepath.Dir(w.path); dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	file, err := os.OpenFile(w.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	w.file = file
+	w.size = info.Size()
+	return nil
+}
+
+func (w *sizeLimitedWriter) rotateLocked() error {
+	_ = w.file.Close()
+	w.file = nil
+	if err := rotateLogFile(w.path, maxLogBackupCount); err != nil {
+		return err
+	}
+	if err := w.openLocked(); err != nil {
+		return err
+	}
+	w.size = 0
+	return nil
 }
 
 func rotateLogFile(path string, backups int) error {
@@ -248,6 +254,7 @@ type Store struct {
 	nodeMutationMu     sync.Mutex
 	nodeMutationLocks  map[string]*nodeMutationLock
 	persistMu          sync.Mutex
+	persistPending     bool // 持久化失败后置位（persistMu 内维护），成功后清除
 	nodes              map[string]NodeState
 	profiles           map[string]*NodeProfile
 	settings           Settings
@@ -753,7 +760,7 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 					}
 				}
 				if store.reconcileProfiles(now) {
-					store.persist()
+					store.persistLogged()
 				}
 				store.ReconcileOfflineTracker(now)
 				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
@@ -798,9 +805,13 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		Handler:           withGzip(handler),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    maxHTTPHeaderBytes,
+		// WriteTimeout 是绝对写截止：公开历史查询预算 30s（publicHistoryQueryTimeout）、
+		// AI/Telegram 外呼 18s、release 检查 8s，若低于最大预算，慢路径在写响应时会报
+		// i/o timeout（客户端拿到空响应、服务端白等）。取 35s = 30s 查询预算 + 编码/写回余量。
+		// 读侧无慢路径，ReadTimeout 维持 10s（slowloris 由 ReadHeaderTimeout=5s 覆盖）。
+		WriteTimeout:   35 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: maxHTTPHeaderBytes,
 	}
 }
 
@@ -1122,7 +1133,7 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	s.mu.Unlock()
 
 	if persist {
-		s.persist()
+		s.persistLogged()
 	}
 	s.mu.RLock()
 	historyManager := s.historyManager
@@ -1295,7 +1306,7 @@ func (s *Store) ReconcileOfflineTracker(now time.Time) {
 	s.mu.Unlock()
 
 	if needsPersist {
-		s.persist()
+		s.persistLogged()
 	}
 	for _, candidate := range recoveryCandidates {
 		s.completeOfflineRecovery(candidate)
@@ -1364,7 +1375,7 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 	s.mu.Unlock()
 
 	if shouldPersist {
-		s.persist()
+		s.persistLogged()
 	}
 }
 
@@ -1487,7 +1498,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 
 	s.mu.Unlock()
 	if needsPersist {
-		s.persist()
+		s.persistLogged()
 	}
 	return targets, offlineEvents, recoveredEvents
 }
@@ -1573,7 +1584,7 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bo
 	}
 	s.mu.Unlock()
 	if needsPersist {
-		s.persist()
+		s.persistLogged()
 	}
 }
 
@@ -2820,7 +2831,12 @@ func (s *Store) RotateAdminTokenSalt() error {
 	s.mu.Lock()
 	s.settings.TokenSalt = tokenSalt
 	s.mu.Unlock()
-	s.persist()
+	// 落盘失败不做回滚：mu 已释放，事后回滚会用旧盐覆盖并发提交的新状态；
+	// 内存新盐已让现有会话立即失效，磁盘恢复后由后台 persistLogged 防抖固化，
+	// 事后回滚反而制造部分回滚与并发覆盖。
+	if err := s.persist(); err != nil {
+		return fmt.Errorf("设置已生效但持久化失败，重启后可能回退；请检查磁盘后重试保存: %w", err)
+	}
 	return nil
 }
 
@@ -3039,7 +3055,7 @@ func (s *Store) upgradeAdminPasswordHash(password, stored string) {
 	}
 	s.settings.AdminPass = hash
 	s.mu.Unlock()
-	s.persist()
+	s.persistLogged()
 }
 
 func redactAISettingsForView(settings AISettings) AISettings {
@@ -3564,7 +3580,14 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	view = s.settingsViewLocked()
 	s.mu.Unlock()
 
-	s.persist()
+	// 落盘失败不做回滚（originalSettings 仅用于锁定期间的校验失败恢复）：mu 已释放，
+	// 事后回滚会用旧设置覆盖并发成功提交的新状态，且 pruneProfile*Locked 已改的
+	// profiles 无法一并还原，部分回滚只会撕裂状态。内存设置保持已生效，后台
+	// persistLogged 防抖会在磁盘恢复后固化；调用方凭 errors.Is(err, errPersistFailed)
+	// 区分 500（已生效未落盘）与 400（校验失败），因此这里返回已应用的 view。
+	if err := s.persist(); err != nil {
+		return view, err
+	}
 	return view, nil
 }
 
@@ -3614,7 +3637,9 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, error) {
 	s.profiles = normalizedProfiles
 	s.reconcileAgentConfigRefreshLocked(previousAgentConfigs, now)
 	s.mu.Unlock()
-	s.persist()
+	if err := s.persist(); err != nil {
+		return SettingsView{}, err
+	}
 
 	return s.SettingsView(), nil
 }
@@ -3824,6 +3849,14 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 		token := strings.TrimSpace(profile.AgentAuthToken)
 		if token != "" && !s.isAgentAuthTokenDuplicateLocked(nodeID, token) {
 			s.mu.Unlock()
+			// 上次签发可能已落盘失败（token 留在内存、persistPending 置位）：重试
+			// 命中本分支时必须补一次落盘，否则直接返回成功会让磁盘永远缺这个
+			// token，重启后该 Agent 凭据失效；仍失败则继续 503 让 Agent 稍后再试。
+			if s.hasPersistPending() {
+				if err := s.persist(); err != nil {
+					return "", agentServiceUnavailable("persist failed, retry later")
+				}
+			}
 			return token, nil
 		}
 	}
@@ -3864,7 +3897,9 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	token := strings.TrimSpace(profile.AgentAuthToken)
 	s.mu.Unlock()
 	if changed {
-		s.persist()
+		if err := s.persist(); err != nil {
+			return "", &agentAPIError{statusCode: http.StatusServiceUnavailable, message: "persist failed, retry later"}
+		}
 	}
 	return token, nil
 }
@@ -3882,13 +3917,9 @@ func (s *Store) validateAgentAuthToken(nodeID, token string) bool {
 		return false
 	}
 	expected := strings.TrimSpace(profile.AgentAuthToken)
-	if expected == "" {
-		return false
-	}
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(token)) != 1 {
-		return false
-	}
-	return !s.isAgentAuthTokenDuplicateLocked(nodeID, expected)
+	// Token 唯一性由写路径保证（registerAgentAuthToken 签发前查重，配置导入不携带
+	// token），读路径不做全表重复扫描——每次 ingest 都扫全 profiles 会把上报周期变成 O(n²)。
+	return expected != "" && subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
 }
 
 func isBootstrapAgentToken(expected, token string) bool {
@@ -4002,10 +4033,10 @@ func ensureServerIDsForProfiles(profiles map[string]*NodeProfile, nodes map[stri
 	return nil
 }
 
-func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProfile, bool) {
+func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProfile, bool, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
-		return NodeProfile{}, false
+		return NodeProfile{}, false, nil
 	}
 	unlock := s.lockAgentNodeRead(nodeID)
 	defer unlock()
@@ -4014,7 +4045,7 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 	if _, nodeExists := s.nodes[nodeID]; !nodeExists {
 		if _, profileExists := s.profiles[nodeID]; !profileExists {
 			s.mu.Unlock()
-			return NodeProfile{}, false
+			return NodeProfile{}, false, nil
 		}
 	}
 
@@ -4122,14 +4153,16 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 	profile.UpdatedAt = time.Now().Unix()
 	result := cloneNodeProfileValue(profile)
 	s.mu.Unlock()
-	s.persist()
-	return result, true
+	if err := s.persist(); err != nil {
+		return result, true, err
+	}
+	return result, true, nil
 }
 
-func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (string, string, bool) {
+func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (string, string, bool, error) {
 	serverID = strings.TrimSpace(serverID)
 	if serverID == "" {
-		return "", "", false
+		return "", "", false, nil
 	}
 	var nodeID string
 	var display string
@@ -4146,7 +4179,7 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 	}
 	s.mu.RUnlock()
 	if nodeID == "" {
-		return "", "", false
+		return "", "", false, nil
 	}
 
 	unlock := s.lockAgentNodeRead(nodeID)
@@ -4156,7 +4189,7 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 	profile := s.profiles[nodeID]
 	if profile == nil || strings.TrimSpace(profile.ServerID) != serverID {
 		s.mu.Unlock()
-		return "", "", false
+		return "", "", false, nil
 	}
 	profile = s.ensureProfileLocked(nodeID)
 	value := enabled
@@ -4170,8 +4203,10 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 		display = resolveAlertDisplay(profile, metrics.NodeStats{}, nodeID)
 	}
 	s.mu.Unlock()
-	s.persist()
-	return nodeID, display, true
+	if err := s.persist(); err != nil {
+		return nodeID, display, true, err
+	}
+	return nodeID, display, true, nil
 }
 
 func (s *Store) lockAgentNodeRead(nodeID string) func() {
@@ -4306,7 +4341,9 @@ func (s *Store) DeleteNode(nodeID string) (bool, error) {
 	}
 	s.mu.Unlock()
 	if shouldPersist {
-		s.persist()
+		if err := s.persist(); err != nil {
+			return false, err
+		}
 	}
 	if historyCleanupErr != nil {
 		return true, newNodeDeleteHistoryCleanupError(historyCleanupErr)
@@ -4376,7 +4413,9 @@ func (s *Store) ClearNodes() error {
 	s.pendingNodeDeletes = nil
 	s.mu.Unlock()
 	if shouldPersist {
-		s.persist()
+		if err := s.persist(); err != nil {
+			return err
+		}
 	}
 	if historyCleanupErr != nil {
 		return newClearNodesHistoryCleanupError(historyCleanupErr)
@@ -4588,17 +4627,27 @@ func (s *Store) QueueAgentUpdate(nodeID string, instruction AgentUpdateInstructi
 	s.markAgentConfigRefreshLocked(nodeID)
 	result := cloneNodeProfileValue(profile)
 	s.mu.Unlock()
-	s.persist()
+	if err := s.persist(); err != nil {
+		return result, agentUpdateQueueQueued, err
+	}
 	return result, agentUpdateQueueQueued, nil
 }
 
-func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) (NodeProfile, bool) {
+func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpdateReport) (NodeProfile, bool, error) {
 	s.mu.Lock()
 	if _, nodeExists := s.nodes[nodeID]; !nodeExists {
 		if _, profileExists := s.profiles[nodeID]; !profileExists {
 			s.mu.Unlock()
-			return NodeProfile{}, false
+			return NodeProfile{}, false, nil
 		}
+	}
+	// 进入即快照：终态报告会清空 AgentUpdate，若落盘失败直接返回 503，Agent 重试时
+	// 已无 pending instruction 会被判冲突，永远无法收敛；落盘失败时在锁内恢复快照，
+	// 让重试能重新匹配（同节点上报经 nodeMutationLock 串行，无并发覆盖风险）。
+	previousProfile, hadProfile := s.profiles[nodeID]
+	var previousSnapshot NodeProfile
+	if previousProfile != nil {
+		previousSnapshot = cloneNodeProfileValue(previousProfile)
 	}
 	profile := s.ensureProfileLocked(nodeID)
 	reportedAt := time.Now().Unix()
@@ -4606,23 +4655,33 @@ func (s *Store) applyAgentUpdateReportNodeLocked(nodeID string, report AgentUpda
 	if !validState {
 		result := cloneNodeProfileValue(profile)
 		s.mu.Unlock()
-		return result, false
+		return result, false, nil
 	}
 	if !agentUpdateReportMatchesPendingInstruction(profile, report) {
 		result := cloneNodeProfileValue(profile)
 		s.mu.Unlock()
-		return result, false
+		return result, false, nil
 	}
 	if !agentUpdateReportAllowedForCurrentState(profile.AgentUpdateState, state) {
 		result := cloneNodeProfileValue(profile)
 		s.mu.Unlock()
-		return result, false
+		return result, false, nil
 	}
 	applyAgentUpdateReport(profile, report, state, reportedAt)
 	result := cloneNodeProfileValue(profile)
 	s.mu.Unlock()
-	s.persist()
-	return result, true
+	if err := s.persist(); err != nil {
+		s.mu.Lock()
+		if hadProfile {
+			restored := previousSnapshot
+			s.profiles[nodeID] = &restored
+		} else {
+			delete(s.profiles, nodeID)
+		}
+		s.mu.Unlock()
+		return result, true, err
+	}
+	return result, true, nil
 }
 
 func applyQueuedAgentUpdate(profile *NodeProfile, instruction AgentUpdateInstruction) {
@@ -4877,24 +4936,43 @@ func applyPendingPersistIntentsToSnapshot(snapshot *PersistedData, pendingClearN
 	}
 }
 
-func (s *Store) persist() {
+func (s *Store) persist() error {
 	if s.dataPath == "" {
-		return
+		return nil
 	}
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 	s.mu.RLock()
 	data := s.snapshotPersistedLocked()
 	s.mu.RUnlock()
-	if err := s.writePersistedSnapshotLocked(data); err != nil {
+	return s.writePersistedSnapshotLocked(data)
+}
+
+// errPersistFailed 标记「内存已应用、落盘失败」：路由层据此返回 500（而非把落盘
+// 错误当校验错误返回 400）。在 writePersistedSnapshotLocked 单点包装，所有
+// persist 失败返回路径自动携带。
+var errPersistFailed = errors.New("persist failed")
+
+// hasPersistPending 供「凭内存状态直接返回成功」的路径判断是否需要补落盘。
+func (s *Store) hasPersistPending() bool {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	return s.persistPending
+}
+
+func (s *Store) persistLogged() {
+	if err := s.persist(); err != nil {
 		log.Printf("%v", err)
 	}
 }
 
 func (s *Store) writePersistedSnapshotLocked(data PersistedData) error {
 	if err := savePersistedData(s.dataPath, data); err != nil {
-		return wrapDataPathError("持久化失败", s.dataPath, err)
+		// persistPending 在 persistMu 内维护（本函数所有调用方均持有 persistMu）。
+		s.persistPending = true
+		return fmt.Errorf("%w: %v", errPersistFailed, wrapDataPathError("持久化失败", s.dataPath, err))
 	}
+	s.persistPending = false
 	s.mu.Lock()
 	s.lastPersist = time.Now()
 	s.mu.Unlock()
@@ -5501,7 +5579,10 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
-	if _, ok := store.UpdateProfile(nodeID, update); !ok {
+	if _, ok, err := store.UpdateProfile(nodeID, update); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败，落盘异常，请检查磁盘后重试"})
+		return
+	} else if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node not found"})
 		return
 	}
@@ -5529,6 +5610,25 @@ func adminNodeIDFromPath(w http.ResponseWriter, rawPath string) (string, bool) {
 
 func releaseCheckContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 8*time.Second)
+}
+
+// handleReleaseUpdateGate 是 POST 更新处理器（服务端自更新 / Agent 更新）共用的
+// release 闸门：校验目标版本，并在「已是最新」时写短路响应。返回 true 表示
+// 请求已写完响应，调用方应直接 return。检查外呼和资产校验两步在两个处理器
+// 中语义不同（checkRelease/CheckLatest、agent/system 资产规则），保留在各自调用点。
+func handleReleaseUpdateGate(w http.ResponseWriter, info updater.ReleaseInfo) bool {
+	if err := validateReleaseTargetVersion(info); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return true
+	}
+	if !info.HasUpdate && updater.VersionCurrentOrNewer(info.CurrentVersion, info.LatestVersion) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":         "up_to_date",
+			"target_version": info.LatestVersion,
+		})
+		return true
+	}
+	return false
 }
 
 const agentReleaseCacheTTL = time.Minute
@@ -5650,15 +5750,7 @@ func handleAdminPostAgentUpdate(
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := validateReleaseTargetVersion(releaseInfo); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":         "up_to_date",
-			"target_version": releaseInfo.LatestVersion,
-		})
+	if handleReleaseUpdateGate(w, releaseInfo) {
 		return
 	}
 	if message := agentUpdateReleaseAssetError(stats, releaseInfo); message != "" {

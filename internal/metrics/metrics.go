@@ -1002,23 +1002,8 @@ func readInterfaceSpeedMbps(hostRoot, name string) float64 {
 }
 
 func parseSpeedMbps(raw string) float64 {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return 0
-	}
-	lower := strings.ToLower(value)
-	var builder strings.Builder
-	for _, ch := range lower {
-		if (ch >= '0' && ch <= '9') || ch == '.' {
-			builder.WriteRune(ch)
-		}
-	}
-	numStr := builder.String()
-	if numStr == "" {
-		return 0
-	}
-	parsed, err := strconv.ParseFloat(numStr, 64)
-	if err != nil || parsed <= 0 {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 {
 		return 0
 	}
 	return parsed
@@ -1047,12 +1032,16 @@ func isPartitionOfCountedDisk(name string, counters map[string]disk.IOCountersSt
 	if i == 0 || i == len(name) {
 		return false
 	}
-	sep := name[i-1]
-	if sep != 'p' && sep != 's' {
-		return false
+	switch name[i-1] {
+	case 'p', 's': // p 分隔样式：nvme0n1p1 / mmcblk0p1
+		if _, exists := counters[name[:i-1]]; exists {
+			return true
+		}
 	}
-	base := name[:i-1]
-	_, exists := counters[base]
+	// ponytail: 数字结尾样式（sda1/vda3/xvda2）靠“基名在 counters 中”判别，
+	// md12+md126 这类多位数设备族同名碰撞会误判，容器无 /sys 场景几乎不遇，
+	// 遇到时需读 sysfs 分区属性。
+	_, exists := counters[name[:i]]
 	return exists
 }
 

@@ -146,6 +146,44 @@ func TestNewRouteMuxesSplitPort(t *testing.T) {
 	assertMuxPattern(t, adminMux, "分端口 adminMux", "/dashboard", "/")
 }
 
+// 回归：首页 HTML 包级缓存原始文本，按请求只做前缀注入；缓存副本不得被逐请求篡改。
+func TestPublicIndexHTMLCacheInjectsPrefixPerRequest(t *testing.T) {
+	settings, err := initSettings(Config{AdminPath: "/cm-admin"})
+	if err != nil {
+		t.Fatalf("initSettings 失败: %v", err)
+	}
+	publicMux, _ := buildTestMuxes(t, Config{TrustedProxyHeaders: true}, &Store{settings: settings})
+
+	serve := func(headers map[string]string) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		publicMux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET / 状态码 = %d, want %d", rec.Code, http.StatusOK)
+		}
+		return rec.Body.String()
+	}
+
+	base := `<base href="/sub/" />`
+	plain := serve(nil)
+	if strings.Contains(plain, "<base") {
+		t.Fatalf("无 X-Forwarded-Prefix 时不应注入 base 标签")
+	}
+	for i := 0; i < 2; i++ {
+		prefixed := serve(map[string]string{"X-Forwarded-Prefix": "/sub"})
+		if !strings.Contains(prefixed, base) {
+			t.Fatalf("第 %d 次带前缀请求未注入 base 标签", i+1)
+		}
+	}
+	if again := serve(nil); strings.Contains(again, "<base") {
+		t.Fatalf("前缀注入污染了缓存副本，无前缀请求不应带 base 标签")
+	}
+}
+
 func TestRouteCustomAdminPath(t *testing.T) {
 	settings, err := initSettings(Config{AdminPath: "/cm-admin"})
 	if err != nil {

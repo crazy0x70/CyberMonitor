@@ -24,6 +24,7 @@ const DefaultTestInterval = 5 * time.Second
 type dockerManagedUpdater interface {
 	CurrentImage() string
 	LaunchSelfContainerUpdate(context.Context, string, string) error
+	Close() error
 }
 
 var (
@@ -171,6 +172,7 @@ func applyDockerManagedUpdate(
 		log.Printf("%v", err)
 		return reportUpdateState(report, update, "failed", targetVersion, err.Error())
 	}
+	defer func() { _ = dockerUpdater.Close() }()
 	targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), targetVersion)
 	if err != nil {
 		err = wrapDockerManagedUpdateError("解析 Docker 目标镜像", err)

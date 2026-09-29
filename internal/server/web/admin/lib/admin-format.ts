@@ -2,44 +2,7 @@ import type {
   GroupNode,
   GroupSelection,
   NodeView,
-  TestCatalogItem,
 } from "@/lib/admin-types";
-
-export function formatDateTime(value?: number) {
-  if (!value) return "--";
-  return new Date(value * 1000).toLocaleString("zh-CN", {
-    hour12: false,
-  });
-}
-
-export function formatRelativeTime(value?: number) {
-  if (!value) return "--";
-  const diff = Math.max(0, Math.floor(Date.now() / 1000) - value);
-  if (diff < 5) return "刚刚";
-  if (diff < 60) return `${diff} 秒前`;
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  return `${Math.floor(diff / 86400)} 天前`;
-}
-
-export function formatBytes(value?: number) {
-  const num = Number(value || 0);
-  if (!Number.isFinite(num) || num <= 0) return "--";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let current = num;
-  let index = 0;
-  while (current >= 1024 && index < units.length - 1) {
-    current /= 1024;
-    index += 1;
-  }
-  return `${current.toFixed(current >= 100 || index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-export function formatMbps(value?: number) {
-  const num = Number(value || 0);
-  if (!Number.isFinite(num) || num <= 0) return "--";
-  return `${num} Mbps`;
-}
 
 export function formatVersionLabel(value?: string | null) {
   const normalized = String(value || "").trim();
@@ -262,13 +225,6 @@ export function upsertSelectionValue(currentValues: string[], nextValue: string)
   return normalizeSelectionValues([...filtered, stringifySelectionValue(nextSelection)]);
 }
 
-export function resolveProbeLabel(item: TestCatalogItem) {
-  const type = (item.type || "icmp").toUpperCase();
-  const host = item.host || "--";
-  const port = item.port ? `:${item.port}` : "";
-  return `${type} ${host}${port}`;
-}
-
 export type AdminPage =
   | "dashboard"
   | "servers"
@@ -311,29 +267,6 @@ export function shouldHandleAdminNavigation(
     event.shiftKey ||
     event.altKey
   );
-}
-
-export function formatNetRate(value?: number) {
-  const num = Number(value || 0);
-  if (!Number.isFinite(num) || num <= 0) {
-    return "0 B/s";
-  }
-  return `${formatBytes(num)}/s`;
-}
-
-export function formatMainDiskUsedPercent(node: NodeView) {
-  const partitions = Array.isArray(node.stats.disk) ? node.stats.disk : [];
-  let bestTotal = 0;
-  let bestPercent = Number.NaN;
-  partitions.forEach((part) => {
-    const total = Number(part.total || 0);
-    const percent = Number(part.used_percent);
-    if (total >= bestTotal && Number.isFinite(percent)) {
-      bestTotal = total;
-      bestPercent = percent;
-    }
-  });
-  return Number.isFinite(bestPercent) ? `${Math.round(bestPercent)}%` : "--";
 }
 
 export function formatNodeRenewal(node: NodeView) {

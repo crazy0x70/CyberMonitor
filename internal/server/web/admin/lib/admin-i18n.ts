@@ -73,7 +73,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["Turnstile 加载失败", "Turnstile failed to load"],
   ["完成验证后再提交管理员凭证。", "Complete verification before submitting administrator credentials."],
   ["正在验证身份…", "Verifying..."],
-  ["确 认 登 录", "Sign in"],
+  ["确认登录", "Sign in"],
   ["账号或密码错误，请检查后重试。", "The username or password is incorrect. Check it and try again."],
   ["您的登录状态已过期或后台凭证已被修改，请重新登录。", "Your session expired or admin credentials changed. Sign in again."],
   ["连续登录失败次数过多，触发防爆破保护。", "Too many failed login attempts triggered brute-force protection."],
@@ -463,12 +463,76 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["获取模型列表", "Fetch model list"],
   ["测试连接", "Test connection"],
   ["已放弃本地修改，已重置为服务端当前配置。", "Local changes discarded; reset to the current server configuration."],
-  ["该条目已被服务端更新重置，请关闭弹窗后重新编辑。", "This entry was reset by a server update; close the dialog and edit it again."],
+  ["该条目已被服务端更新重置，请关闭抽屉后重新编辑。", "This entry was reset by a server update; close the drawer and edit it again."],
   ["已移除", "Removed"],
   ["该条目已被服务端更新重置。", "This entry was reset by a server update."],
   ["服务端探测配置已更新，请放弃本地修改后重试，以免覆盖他人改动。", "Probe settings were updated on the server; discard local changes and retry to avoid overwriting others."],
   ["服务端配置已更新，保存已被阻止", "Server configuration changed; saving was blocked"],
   ["放弃本地修改", "Discard local changes"],
+
+  ["时间", "Time"],
+  ["来源", "Source"],
+  ["等级", "Level"],
+  ["消息", "Message"],
+  ["日志", "Logs"],
+  ["等级统计", "Level statistics"],
+  ["完整消息", "Full message"],
+  ["仅展示最近", "Showing the most recent"],
+  ["条日志；计数为当前过滤窗口内的分布。", "logs; counts reflect the current filter window."],
+  ["分组统计", "Group statistics"],
+  ["分组列表", "Group list"],
+  ["分组信息", "Group details"],
+  ["标签信息", "Tag details"],
+  ["未命名分组", "Unnamed group"],
+  ["未命名标签", "Unnamed tag"],
+  ["上级分组", "Parent group"],
+  ["—（顶级）", "— (top level)"],
+  ["标签数", "Tags"],
+  ["节点数", "Nodes"],
+  ["排序", "Order"],
+  ["上移", "Move up"],
+  ["下移", "Move down"],
+  ["标签的增删与排序请在所属分组的抽屉中完成。", "Add, remove, and reorder tags in the owning group's drawer."],
+  ["还没有一级分组，点击右上角「新建分组」开始。", "No top-level groups yet. Click \"New group\" at the top right to start."],
+  ["飞书", "Feishu"],
+  ["前往 →", "Open →"],
+  ["停用", "Disable"],
+  ["确认停用飞书告警？", "Disable Feishu alerts?"],
+  ["保存将清除已配置的 Webhook 地址，清除后需重新输入才能恢复；表单中其他未保存的修改将一并保存。", "Saving will clear the configured Webhook URL; you will need to re-enter it to restore it. Other unsaved changes in the form will be saved together."],
+  ["停用将清除已配置的 Webhook 地址，清除后需重新输入才能恢复；表单中其他未保存的修改不受影响。", "Disabling will clear the configured Webhook URL; you will need to re-enter it to restore it. Other unsaved changes in the form are unaffected."],
+  ["停用飞书告警失败", "Failed to disable Feishu alerts"],
+  ["飞书告警已停用", "Feishu alerts disabled"],
+  ["已配置（输入新值可覆盖，停用请点右上角「停用」）", "Configured (enter a new value to replace it; use Disable at the top right to turn it off)"],
+  ["告警统计", "Alert statistics"],
+  ["已启用告警的节点", "Nodes with alerts enabled"],
+  ["全局策略", "Global policy"],
+  ["指令服务商", "Command provider"],
+  ["运维提示词", "Operations prompt"],
+  ["服务商", "Providers"],
+  ["还没有服务商。", "No providers yet."],
+  ["未设置 Base URL", "No Base URL set"],
+  ["端点", "Endpoint"],
+  ["AI 服务商列表", "AI provider list"],
+  ["AI 服务商统计", "AI provider statistics"],
+  ["基础信息", "Basic information"],
+  ["完成", "Done"],
+  ["验证与获取模型使用当前抽屉内的端点与密钥；端点改动需先完成并保存后再验证存储密钥。", "Testing and fetching models use the endpoint and key currently in this drawer. Save endpoint changes before testing a stored key."],
+  ["探测统计", "Probe statistics"],
+  ["接入目标", "Onboarding targets"],
+  ["目标列表", "Target list"],
+  ["暂无探测节点，点击右上角「新增探测节点」开始。", "No probes yet. Click \"Add probe\" at the top right to start."],
+  ["配置探测目标的基础信息与协议参数。", "Configure the probe target's basic information and protocol parameters."],
+  ["允许的用户名", "Allowed usernames"],
+  ["分区导航", "Section navigation"],
+  ["启用", "Enabled"],
+  ["重置后留空 = 保留当前 Secret，不会清空。", "Leave blank after a reset to keep the current secret; it is never cleared."],
+  ["显示与标注", "Display & labels"],
+  ["全部更新", "Update all"],
+  ["确认对全部", "Dispatch Agent updates to all"],
+  ["台节点下发 Agent 更新？", "nodes?"],
+  ["确认下发", "Confirm dispatch"],
+  ["秒", "sec"],
+  ["点击复制完整接入命令，也可拖选部分文本手动复制", "Click to copy the full command, or drag to select part of the text"],
 ] as const;
 
 const zhToEn = new Map<string, string>(ADMIN_ZH_TO_EN_ENTRIES);
@@ -715,6 +779,122 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toZh: (match) => `TCP 默认间隔需为 0 - ${match[1]} 秒，留空或 0 表示默认 ${match[2]} 秒。`,
   },
   {
+    zh: /^兼容服务商\s+(\d+)$/,
+    toEn: (match) => `Compatible provider ${match[1]}`,
+    en: /^Compatible provider\s+(\d+)$/,
+    toZh: (match) => `兼容服务商 ${match[1]}`,
+  },
+  {
+    zh: /^服务商类型：(.+)$/,
+    toEn: (match) => `Provider type: ${translateSegment(match[1], "en-US")}`,
+    en: /^Provider type:\s*(.+)$/,
+    toZh: (match) => `服务商类型：${translateSegment(match[1], "zh-CN")}`,
+  },
+  {
+    zh: /^一级分组 · 第\s+(\d+)\s+位 \/ 共\s+(\d+)\s+个分组$/,
+    toEn: (match) => `Top-level group · position ${match[1]} of ${match[2]}`,
+    en: /^Top-level group · position (\d+) of (\d+)$/,
+    toZh: (match) => `一级分组 · 第 ${match[1]} 位 / 共 ${match[2]} 个分组`,
+  },
+  {
+    zh: /^二级标签 · 所属分组\s+(.+)$/,
+    toEn: (match) => `Tags · group ${translateNameSegment(match[1], "en-US")}`,
+    en: /^Tags · group\s+(.+)$/,
+    toZh: (match) => `二级标签 · 所属分组 ${translateNameSegment(match[1], "zh-CN")}`,
+  },
+  {
+    zh: /^第\s+(\d+)\s+\/\s+(\d+)\s+位$/,
+    toEn: (match) => `Position ${match[1]} of ${match[2]}`,
+    en: /^Position (\d+) of (\d+)$/,
+    toZh: (match) => `第 ${match[1]} / ${match[2]} 位`,
+  },
+  {
+    zh: /^第\s+(\d+)\s+个一级分组$/,
+    toEn: (match) => `top-level group ${match[1]}`,
+    en: /^top-level group (\d+)$/,
+    toZh: (match) => `第 ${match[1]} 个一级分组`,
+  },
+  {
+    zh: /^第\s+(\d+)\s+个一级分组\s+名称不能为空。$/,
+    toEn: (match) => `Top-level group ${match[1]}: name cannot be empty.`,
+    en: /^Top-level group (\d+): name cannot be empty\.$/,
+    toZh: (match) => `第 ${match[1]} 个一级分组 名称不能为空。`,
+  },
+  {
+    zh: /^一级分组“(.+)”重复，请保留唯一名称。$/,
+    toEn: (match) => `Top-level group "${match[1]}" is duplicated; keep names unique.`,
+    en: /^Top-level group "(.+)" is duplicated; keep names unique\.$/,
+    toZh: (match) => `一级分组“${match[1]}”重复，请保留唯一名称。`,
+  },
+  {
+    zh: /^(.+?)\s+下第\s+(\d+)\s+个标签名称不能为空。$/,
+    toEn: (match) =>
+      `Tag ${match[2]} under ${translateNameSegment(match[1], "en-US")}: name cannot be empty.`,
+    en: /^Tag\s+(\d+)\s+under\s+(.+?): name cannot be empty\.$/,
+    toZh: (match) =>
+      `${translateNameSegment(match[2], "zh-CN")} 下第 ${match[1]} 个标签名称不能为空。`,
+  },
+  {
+    zh: /^(.+?)\s+下的标签与展示页固定标签冲突，请换一个名称。$/,
+    toEn: (match) =>
+      `Tags under ${translateNameSegment(match[1], "en-US")} conflict with a fixed monitor page label; choose another name.`,
+    en: /^Tags under (.*?) conflict with a fixed monitor page label; choose another name\.$/,
+    toZh: (match) =>
+      `${translateNameSegment(match[1], "zh-CN")} 下的标签与展示页固定标签冲突，请换一个名称。`,
+  },
+  {
+    zh: /^(.+?)\s+下标签“(.+)”重复，请保留唯一名称。$/,
+    toEn: (match) =>
+      `Tag "${match[2]}" under ${translateNameSegment(match[1], "en-US")} is duplicated; keep names unique.`,
+    en: /^Tag "(.*)" under (.*?) is duplicated; keep names unique\.$/,
+    toZh: (match) =>
+      `${translateNameSegment(match[2], "zh-CN")} 下标签“${match[1]}”重复，请保留唯一名称。`,
+  },
+  {
+    zh: /^单个节点最多选择\s+(\d+)\s+个探测项。$/,
+    toEn: (match) => `A node can select at most ${match[1]} probes.`,
+    en: /^A node can select at most (\d+) probes\.$/,
+    toZh: (match) => `单个节点最多选择 ${match[1]} 个探测项。`,
+  },
+  {
+    zh: /^已下发\s+(\d+)$/,
+    toEn: (match) => `Dispatched ${match[1]}`,
+    en: /^Dispatched (\d+)$/,
+    toZh: (match) => `已下发 ${match[1]}`,
+  },
+  {
+    zh: /^已是最新\s+(\d+)$/,
+    toEn: (match) => `Up to date ${match[1]}`,
+    en: /^Up to date (\d+)$/,
+    toZh: (match) => `已是最新 ${match[1]}`,
+  },
+  {
+    zh: /^失败\s+(\d+)$/,
+    toEn: (match) => `Failed ${match[1]}`,
+    en: /^Failed (\d+)$/,
+    toZh: (match) => `失败 ${match[1]}`,
+  },
+  {
+    zh: /^批量更新完成：(.+)$/,
+    toEn: (match) =>
+      `Bulk update completed: ${match[1]
+        .split("，")
+        .map((part) => translateSegment(part.trim(), "en-US"))
+        .join(", ")}`,
+    en: /^Bulk update completed: (.+)$/,
+    toZh: (match) =>
+      `批量更新完成：${match[1]
+        .split(", ")
+        .map((part) => translateSegment(part.trim(), "zh-CN"))
+        .join("，")}`,
+  },
+  {
+    zh: /^例如：(\d+)…$/,
+    toEn: (match) => `Example: ${match[1]}...`,
+    en: /^Example: (\d+)\.\.\.$/,
+    toZh: (match) => `例如：${match[1]}…`,
+  },
+  {
     zh: /^(.+)\s+名称不能为空。$/,
     toEn: (match) => `${match[1]} name cannot be empty.`,
     en: /^(.+)\s+name cannot be empty\.$/,
@@ -745,7 +925,7 @@ export function writeStoredAdminLocale(locale: AdminLocale) {
   try {
     window.localStorage.setItem(ADMIN_LOCALE_STORAGE_KEY, locale);
   } catch {
-
+    // localStorage 不可用（隐私模式等）时放弃持久化，语言仅存于内存。
   }
 }
 
@@ -758,19 +938,47 @@ export function adminBrowserTitleForLocale(locale: AdminLocale, siteTitle: strin
   return `${normalizedTitle} ${adminText(locale, "管理后台")}`;
 }
 
+function translateSegment(segment: string, locale: AdminLocale) {
+  const exact = (locale === "en-US" ? zhToEn : enToZh).get(segment);
+  if (exact) {
+    return exact;
+  }
+  for (const pattern of ADMIN_TEXT_PATTERNS) {
+    const match = segment.match(locale === "en-US" ? pattern.zh : pattern.en);
+    if (match) {
+      return locale === "en-US" ? pattern.toEn(match) : pattern.toZh(match);
+    }
+  }
+  return segment;
+}
+
+// 分组/标签名等用户自定义名称不参与翻译；仅组件内置兑底文案（未命名分组/标签、第 N 个一级分组）允许翻译。
+const ADMIN_NAME_FALLBACK_PATTERNS = [/^未命名分组$/, /^未命名标签$/, /^第\s+\d+\s+个一级分组$/];
+
+function translateNameSegment(segment: string, locale: AdminLocale) {
+  return ADMIN_NAME_FALLBACK_PATTERNS.some((pattern) => pattern.test(segment))
+    ? translateSegment(segment, locale)
+    : segment;
+}
+
 function translateExact(value: string, locale: AdminLocale) {
   const trimmed = value.trim();
   if (!trimmed) {
     return value;
   }
-  const translated = (locale === "en-US" ? zhToEn : enToZh).get(trimmed);
-  if (translated) {
+  const translated = translateSegment(trimmed, locale);
+  if (translated !== trimmed) {
     return value.replace(trimmed, translated);
   }
-  for (const pattern of ADMIN_TEXT_PATTERNS) {
-    const match = trimmed.match(locale === "en-US" ? pattern.zh : pattern.en);
-    if (match) {
-      return value.replace(trimmed, locale === "en-US" ? pattern.toEn(match) : pattern.toZh(match));
+  // 复合 toast 用「；」拼接多个独立句子：逐段翻译后重组。
+  const listSeparator = locale === "en-US" ? "；" : "; ";
+  if (trimmed.includes(listSeparator)) {
+    const translatedList = trimmed
+      .split(listSeparator)
+      .map((segment) => translateSegment(segment.trim(), locale))
+      .join(locale === "en-US" ? "; " : "；");
+    if (translatedList !== trimmed) {
+      return value.replace(trimmed, translatedList);
     }
   }
   return value;

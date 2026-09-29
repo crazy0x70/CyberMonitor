@@ -491,7 +491,10 @@ func handleTelegramAlarmToggle(store *Store, parts []string, enabled bool) strin
 }
 
 func toggleAlertForServer(store *Store, serverID string, enabled bool) string {
-	_, display, ok := store.UpdateAlertEnabledByServerID(serverID, enabled)
+	_, display, ok, err := store.UpdateAlertEnabledByServerID(serverID, enabled)
+	if err != nil {
+		return "操作已生效但落盘失败，重启后可能回退，请检查服务端磁盘"
+	}
 	if !ok {
 		return fmt.Sprintf("未找到服务器: %s", serverID)
 	}

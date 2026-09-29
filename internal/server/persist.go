@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -361,36 +362,53 @@ func readPersistedDataFile(path string) (PersistedData, bool, error) {
 	if err := migrateLegacyAISettings(probe.Settings.AISettings, &payload); err != nil {
 		return PersistedData{}, false, err
 	}
-	nodes, err := normalizePersistedNodeStates(payload.Nodes)
-	if err != nil {
-		return PersistedData{}, false, err
-	}
-	offlineSessions, err := normalizeNodeIDMap("offline_sessions", payload.OfflineSessions)
-	if err != nil {
-		return PersistedData{}, false, err
-	}
+	nodes := normalizePersistedNodeStates(payload.Nodes)
 	payload.Nodes = nodes
-	payload.OfflineSessions = offlineSessions
-	payload.Alerted = normalizePersistedAlertedStates(payload.Alerted)
-	profiles, err := normalizePersistedProfiles(payload.Settings, payload.Nodes, payload.Profiles)
+	payload.OfflineSessions = normalizeNodeIDMap("offline_sessions", payload.OfflineSessions)
+	payload.Alerted = normalizeNodeIDMap("alerted", payload.Alerted)
+	profiles, err := normalizePersistedProfiles(payload.Settings, payload.Nodes, dropInvalidProfileKeys(payload.Profiles))
 	if err != nil {
 		return PersistedData{}, false, err
 	}
 	payload.Profiles = profiles
-	pendingClear, pendingDeletes, err := normalizePersistedHistoryCleanup(payload.PendingHistoryClear, payload.PendingHistoryDeletes)
-	if err != nil {
-		return PersistedData{}, false, err
-	}
+	pendingClear, pendingDeletes := normalizePersistedHistoryCleanup(payload.PendingHistoryClear, payload.PendingHistoryDeletes)
 	payload.PendingHistoryClear = pendingClear
 	payload.PendingHistoryDeletes = pendingDeletes
 	return payload, true, nil
 }
 
 func savePersistedData(path string, payload PersistedData) error {
+	// 先完整写 .new，再两步 rename：任意时刻 state.json 或 .bak 至少存在一份完整态，
+	// 避免“先 rename 主文件→.bak 再写新文件”窗口期内主文件缺席。
+	newPath := path + ".new"
+	if err := writeJSONFileAtomic(newPath, payload); err != nil {
+		return err
+	}
 	if err := os.Rename(path, path+".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("轮转备份 %s 失败（%v），继续写入主文件", path+".bak", err)
 	}
-	return writeJSONFileAtomic(path, payload)
+	if err := os.Rename(newPath, path); err != nil {
+		_ = os.Remove(newPath)
+		return err
+	}
+	// 最终 rename 已成功即视为提交完成：父目录 fsync 失败只记日志、不回滚——
+	// 主文件内容本身已落盘，目录未同步仅意味着极端掉电后可能回退到旧状态，不会损坏数据。
+	fsyncParentDir(path)
+	return nil
+}
+
+// fsyncParentDir 尽力把两次 rename 的目录项变更刷入磁盘，掉电后 rename 结果仍然可见。
+// Windows 无法对目录句柄 Sync，打开/同步失败时静默降级（与 history 包 syncParentDir 一致）。
+func fsyncParentDir(path string) {
+	dir := filepath.Dir(path)
+	handle, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer handle.Close()
+	if err := handle.Sync(); err != nil && runtime.GOOS != "windows" {
+		log.Printf("同步目录 %s 失败（%v），掉电后最近的持久化可能回退", dir, err)
+	}
 }
 
 func applyPersistedDataDefaults(payload PersistedData) PersistedData {
@@ -409,68 +427,66 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	return payload
 }
 
-func normalizeNodeIDMap[V any](prefix string, items map[string]V) (map[string]V, error) {
+// normalizeNodeIDMap 丢弃非法节点 ID 的条目并记录警告：单个坏 ID 不应阻止服务启动。
+// trim 冲突用确定性两遍法消解，保证结果与 map 遍历顺序无关且跨表（nodes/profiles 等）一致：
+// 第一遍收录 key 本身已等于 TrimSpace 后的条目；第二遍按原始 key 排序处理需要 trim 的条目，
+// 目标 key 已被占据则丢弃并告警。
+func normalizeNodeIDMap[V any](prefix string, items map[string]V) map[string]V {
 	normalized := make(map[string]V, len(items))
+	pending := make([]string, 0, len(items))
 	for rawNodeID, item := range items {
 		nodeID, err := history.NormalizeNodeID(rawNodeID)
-		if err != nil {
-			return nil, fmt.Errorf("%s 节点 ID invalid node id: %w", prefix, err)
-		}
-		if nodeID == "" {
-			return nil, fmt.Errorf("%s 节点 ID 不能为空", prefix)
-		}
-		if _, exists := normalized[nodeID]; exists {
-			return nil, fmt.Errorf("%s 节点 ID 重复: %s", prefix, nodeID)
-		}
-		normalized[nodeID] = item
-	}
-	return normalized, nil
-}
-
-func normalizePersistedNodeStates(nodes map[string]NodeState) (map[string]NodeState, error) {
-	normalized, err := normalizeNodeIDMap("nodes", nodes)
-	if err != nil {
-		return nil, err
-	}
-	for nodeID, node := range normalized {
-		node.Stats.NodeID = nodeID
-		normalized[nodeID] = node
-	}
-	return normalized, nil
-}
-
-func normalizePersistedAlertedStates(alerted map[string]AlertedState) map[string]AlertedState {
-	if len(alerted) == 0 {
-		return map[string]AlertedState{}
-	}
-	normalized := make(map[string]AlertedState, len(alerted))
-	for rawNodeID, state := range alerted {
-		nodeID, err := history.NormalizeNodeID(rawNodeID)
 		if err != nil || nodeID == "" {
-			log.Printf("忽略 alerted 中非法的节点 ID: %q", rawNodeID)
+			log.Printf("忽略 %s 中非法的节点 ID: %q", prefix, rawNodeID)
 			continue
 		}
-		normalized[nodeID] = state
+		if rawNodeID == nodeID {
+			normalized[nodeID] = item
+			continue
+		}
+		pending = append(pending, rawNodeID)
+	}
+	sort.Strings(pending)
+	for _, rawNodeID := range pending {
+		nodeID, _ := history.NormalizeNodeID(rawNodeID)
+		if _, exists := normalized[nodeID]; exists {
+			log.Printf("忽略 %s 中的节点 ID %q：规范化为 %q 后与既有条目冲突", prefix, rawNodeID, nodeID)
+			continue
+		}
+		normalized[nodeID] = items[rawNodeID]
 	}
 	return normalized
 }
 
-func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []string, error) {
+func normalizePersistedNodeStates(nodes map[string]NodeState) map[string]NodeState {
+	normalized := normalizeNodeIDMap("nodes", nodes)
+	for nodeID, node := range normalized {
+		node.Stats.NodeID = nodeID
+		normalized[nodeID] = node
+	}
+	return normalized
+}
+
+// dropInvalidProfileKeys 预先丢弃非法/重复节点 ID 的 profile 条目，
+// 避免 normalizePersistedProfiles 因单个坏 ID 拒绝启动。
+func dropInvalidProfileKeys(profiles map[string]*NodeProfile) map[string]*NodeProfile {
+	return normalizeNodeIDMap("profiles", profiles)
+}
+
+func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []string) {
 	if clear {
-		return true, nil, nil
+		return true, nil
 	}
 	if len(deletes) == 0 {
-		return false, nil, nil
+		return false, nil
 	}
 	seen := make(map[string]struct{}, len(deletes))
 	normalized := make([]string, 0, len(deletes))
 	for _, rawNodeID := range deletes {
 		nodeID, err := history.NormalizeNodeID(rawNodeID)
-		if err != nil {
-			return false, nil, fmt.Errorf("pending_history_deletes 节点 ID invalid node id: %w", err)
-		}
-		if nodeID == "" {
-			return false, nil, errors.New("pending_history_deletes 节点 ID 不能为空")
+		if err != nil || nodeID == "" {
+			log.Printf("忽略 pending_history_deletes 中非法的节点 ID: %q", rawNodeID)
+			continue
 		}
 		if _, ok := seen[nodeID]; ok {
 			continue
@@ -479,7 +495,7 @@ func normalizePersistedHistoryCleanup(clear bool, deletes []string) (bool, []str
 		normalized = append(normalized, nodeID)
 	}
 	sort.Strings(normalized)
-	return false, normalized, nil
+	return false, normalized
 }
 
 func migrateLegacyProfileTests(rawProfiles map[string]json.RawMessage, payload *PersistedData) error {

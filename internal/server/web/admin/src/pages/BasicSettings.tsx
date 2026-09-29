@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useRef, useState, type ChangeEvent } from "react";
 import { AdminPageHeader } from "@/components/admin-page-header";
 import { AdminPanel } from "@/components/admin-panel";
 import { AdminKVField } from "@/components/admin-kv-field";
@@ -43,7 +43,7 @@ import type {
   AdminAuthSettings,
   SettingsUpdate,
 } from "@/lib/admin-types";
-import { draftSignature, useAsyncAction, useDirtyNotification } from "@/lib/admin-hooks";
+import { draftSignature, useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
 import { AdminApiError, adminAppLocation } from "@/lib/admin-api";
 import {
   adminActionButtonClass,
@@ -274,38 +274,25 @@ export default function BasicSettings({
   const [isSaving, setIsSaving] = useState(false);
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
-  const [sourceSignature, setSourceSignature] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const isBusy = isSaving || isImporting;
 
-  const currentDraftSignature = draftSignature(basicDraft);
+  const currentDraftSignature = draftSignature({ ...basicDraft, adminPass });
 
-  useEffect(() => {
-    if (isBusy) {
-      return;
-    }
-    const nextSourceSignature = draftSignature(basicSettingsDraft(settings));
-    const currentDraftMatchesIncoming = !adminPass.trim() && currentDraftSignature === nextSourceSignature;
-    if (isDirty && currentDraftMatchesIncoming) {
-      setSourceSignature(nextSourceSignature);
+  const [, absorbSourceSignature] = useDraftReconcile({
+    draftSignature: currentDraftSignature,
+    nextSourceSignature: draftSignature({ ...basicSettingsDraft(settings), adminPass: "" }),
+    isBusy,
+    resetDraft: () => {
+      setBasicDraft(basicSettingsDraft(settings));
+      setAdminPass("");
+    },
+    warningText: "服务端基础设置已更新，当前未保存修改已保留。",
+    onCleaned: () => {
       setIsDirty(false);
       setIsConfirmOpen(false);
-      return;
-    }
-    if (nextSourceSignature === sourceSignature) {
-      return;
-    }
-    if (isDirty) {
-      setSourceSignature(nextSourceSignature);
-      toast.warning("服务端基础设置已更新，当前未保存修改已保留。");
-      return;
-    }
-    setBasicDraft(basicSettingsDraft(settings));
-    setAdminPass("");
-    setSourceSignature(nextSourceSignature);
-    setIsDirty(false);
-    setIsConfirmOpen(false);
-  }, [adminPass, currentDraftSignature, isBusy, isDirty, settings, sourceSignature]);
+    },
+  });
 
   useDirtyNotification(onDirtyChange, isDirty);
 
@@ -427,7 +414,7 @@ export default function BasicSettings({
         const canonicalDraft = basicSettingsDraft(next);
         setBasicDraft(canonicalDraft);
         setAdminPass("");
-        setSourceSignature(draftSignature(canonicalDraft));
+        absorbSourceSignature(draftSignature({ ...canonicalDraft, adminPass: "" }));
         resetDirtyState(true);
         if (next.admin_path && next.admin_path !== previousPath) {
           const nextAdminPath = adminAppLocation(next.admin_path);
@@ -462,7 +449,13 @@ export default function BasicSettings({
         }
         return messages.join("；");
       },
-      onSuccess: () => resetDirtyState(),
+      onSuccess: (response) => {
+        const canonicalDraft = basicSettingsDraft(response.settings ?? settings);
+        setBasicDraft(canonicalDraft);
+        setAdminPass("");
+        absorbSourceSignature(draftSignature({ ...canonicalDraft, adminPass: "" }));
+        resetDirtyState(true);
+      },
       setBusy: setIsImporting,
     });
   };

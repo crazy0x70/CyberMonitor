@@ -474,7 +474,6 @@ export default function NotificationAlert({
           </div>
         }
       >
-        { }
         <div className="space-y-4">
           <AdminKVField label="Bot Token" htmlFor="telegram-token">
             <div className="max-w-md space-y-2">

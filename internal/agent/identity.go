@@ -171,7 +171,7 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 		{label: "hostname", path: filepath.Join(root, "etc", "hostname")},
 	}
 
-	var readable, placeholders []string
+	var readable []string
 	for _, source := range sources {
 		value, err := readTrimmedFile(source.path)
 		if err != nil {
@@ -179,7 +179,6 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 				continue
 			}
 			log.Printf("机器指纹源 %s 不可读，指纹跳过该源: %v", source.path, err)
-			placeholders = append(placeholders, source.label+"=<unreadable>")
 			continue
 		}
 		readable = append(readable, source.label+"="+value)
@@ -187,9 +186,8 @@ func readStableHostFingerprint(hostRoot string) (string, error) {
 	if len(readable) > 0 {
 		return strings.Join(readable, "\n"), nil
 	}
-	if len(placeholders) > 0 {
-		return strings.Join(placeholders, "\n"), nil
-	}
+	// 全部指纹源不可读时不得用机器无关的占位符生成指纹（不同宿主会哈希出同一
+	// node ID），必须走 os.ErrNotExist → 随机 node id + 告警路径。
 	log.Printf("机器指纹源目录 %s 下无可读指纹源，将退回随机 node id（请检查宿主机目录挂载）", root)
 	return "", os.ErrNotExist
 }

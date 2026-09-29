@@ -152,7 +152,6 @@ export default function Dashboard({ settings, nodes, onNavigate }: DashboardProp
 
       <AdminMetricStrip ariaLabel="节点统计" items={metrics} />
 
-      { }
       <AdminPanel title="核心配置">
           <dl aria-label="核心配置" className="text-slate-700 dark:text-neutral-200">
             {configRows.map((row) => (

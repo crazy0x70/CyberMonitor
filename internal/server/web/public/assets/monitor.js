@@ -1030,7 +1030,6 @@ function handleSnapshot(payload) {
     ...payload,
     nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
   };
-  applyTestHistory(payload.test_history);
   rebuildMergedSnapshotState();
 }
 
@@ -1168,10 +1167,8 @@ function loadTestHistoryCache() {
     if (!raw) return;
     const payload = JSON.parse(raw);
     if (!payload || typeof payload !== "object") return;
-    if (payload.version !== HISTORY_CACHE_VERSION && payload.version !== undefined) {
-      storage.removeItem(HISTORY_CACHE_KEY);
-    }
     if (payload.version !== HISTORY_CACHE_VERSION) {
+      storage.removeItem(HISTORY_CACHE_KEY);
       return;
     }
     const nodes = payload.nodes;
@@ -1585,6 +1582,12 @@ function cleanupDetachedHistory(nodes) {
       changed = true;
     }
   }
+  for (const id of state.selectedTests.keys()) {
+    if (!activeNodeIDs.has(id)) {
+      state.selectedTests.delete(id);
+      changed = true;
+    }
+  }
   if (changed) {
     scheduleHistoryCacheSave();
   }
@@ -1597,12 +1600,6 @@ function applyTestHistory(history) {
     const cacheKey = String(nodeId || "").trim();
     if (!cacheKey) return;
     if (!rangeBuckets || typeof rangeBuckets !== "object") return;
-    if (isLegacyHistoryBucket(rangeBuckets)) {
-      if (mergeHistoryRangeByKey(cacheKey, DEFAULT_TEST_RANGE_KEY, rangeBuckets)) {
-        updated = true;
-      }
-      return;
-    }
     Object.entries(rangeBuckets).forEach(([rangeKey, tests]) => {
 
       if (!RANGE_OPTIONS.some((item) => item.key === rangeKey)) return;
@@ -1614,21 +1611,6 @@ function applyTestHistory(history) {
   if (updated) {
     scheduleHistoryCacheSave();
   }
-}
-
-function isLegacyHistoryBucket(value) {
-  if (!value || typeof value !== "object") return false;
-  return Object.values(value).some((entry) => looksLikeTestHistoryEntry(entry));
-}
-
-function looksLikeTestHistoryEntry(entry) {
-  return (
-    entry &&
-    typeof entry === "object" &&
-    (Array.isArray(entry.times) ||
-      Array.isArray(entry.latency) ||
-      Array.isArray(entry.loss))
-  );
 }
 
 function mergeHistoryRangeByKey(cacheKey, rangeKey, tests) {
@@ -1928,8 +1910,6 @@ const TEST_RANGE_INTERVALS = {
   "1h": 5,
   "24h": 30,
   "7d": 60 * 15,
-  "30d": 60 * 60,
-  "1y": 60 * 60 * 12,
 };
 
 function resolveTestRangeInterval(rangeKey, rangeSec) {
@@ -2600,9 +2580,10 @@ function updateCard(card, node, nodeId) {
   card._nodeId = nodeId;
   card._lastNode = node;
 
-  fields.uptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
+  const uptimeText = formatUptime(stats.uptime_sec || 0);
+  fields.uptime.textContent = `${t("runningPrefix")} ${uptimeText}`;
   fields.lastSeen.textContent = `${t("updatedPrefix")} ${formatTime(node.last_seen || 0)}`;
-  fields.summaryUptime.textContent = `${t("runningPrefix")} ${formatUptime(stats.uptime_sec || 0)}`;
+  fields.summaryUptime.textContent = `${t("runningPrefix")} ${uptimeText}`;
   fields.summaryTests.textContent = formatRemainingSummary(
     node.expire_at || 0,
     node.auto_renew,
@@ -2610,7 +2591,7 @@ function updateCard(card, node, nodeId) {
   );
 
   fields.detailStatus.textContent = status;
-  fields.detailUptime.textContent = formatUptime(stats.uptime_sec || 0);
+  fields.detailUptime.textContent = uptimeText;
   fields.detailArch.textContent = stats.arch || "--";
   fields.detailOS.textContent = stats.os || "--";
   fields.detailCPU.textContent = formatCPUModel(cpu);
@@ -2661,23 +2642,11 @@ function hasConfiguredNetworkTestPolicy(node) {
 }
 
 function clearNetworkSection(fields) {
+  resetNetworkChartInteractions(fields);
   fields.testChart.innerHTML = "";
   fields.testCards.innerHTML = "";
   if (fields.rangeButtons) {
     fields.rangeButtons.forEach((button) => button.classList.remove("active"));
-  } else if (fields.testRange) {
-    fields.testRange.innerHTML = "";
-  }
-  if (fields.testSmooth) {
-    fields.testSmooth.disabled = true;
-    fields.testSmooth.classList.remove("active");
-    fields.testSmooth.setAttribute("aria-pressed", "false");
-  }
-  if (fields.testTooltip) {
-    fields.testTooltip.classList.remove("visible");
-  }
-  if (fields.testCrosshair) {
-    fields.testCrosshair.classList.remove("visible");
   }
 }
 
@@ -3481,6 +3450,7 @@ function setupLatencyHover(fields, meta, labels) {
     window.removeEventListener("pointermove", handleGlobalPointerMove, true);
     window.removeEventListener("scroll", handleScrollOrBlur, true);
     window.removeEventListener("blur", handleScrollOrBlur);
+    container.onmousemove = null;
   };
 
   container.onmousemove = (event) => {
@@ -3764,21 +3734,21 @@ function computeLatencyYTicks(values) {
   };
 }
 
+const pad2 = (value) => String(value).padStart(2, "0");
+
 function formatLatencyAxisTime(timestamp) {
   const date = new Date(timestamp * 1000);
-  const pad = (value) => String(value).padStart(2, "0");
-  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
+  return `${pad2(date.getMonth() + 1)}/${pad2(date.getDate())} ${pad2(
     date.getHours()
-  )}:${pad(date.getMinutes())}`;
+  )}:${pad2(date.getMinutes())}`;
 }
 
 function formatTimeFull(timestamp) {
   if (!timestamp) return "--";
   const date = new Date(timestamp * 1000);
-  const pad = (num) => String(num).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(
     date.getDate()
-  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  )} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
 }
 
 function summarizeLoss(series) {
@@ -4007,14 +3977,7 @@ function regionDisplayName(code) {
 function formatRegion(code) {
   const normalized = (code || "").trim().toUpperCase();
   if (!normalized) return "--";
-  const displayNames = regionDisplayNamesFor(publicLocale);
-  const resolved =
-    (displayNames && typeof displayNames.of === "function"
-      ? displayNames.of(normalized)
-      : "") ||
-    fallbackRegionNames[normalized] ||
-    normalized;
-  return `${flagEmoji(normalized)}${resolved}`.trim();
+  return `${flagEmoji(normalized)}${regionDisplayName(normalized)}`.trim();
 }
 
 function formatRemaining(expireAt, autoRenew, renewIntervalSec) {

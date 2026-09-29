@@ -32,6 +32,11 @@ type agentRunner struct {
 	updateWG            sync.WaitGroup
 	errMu               sync.Mutex
 	errState            map[string]errorLogState
+	// 一次性预计算（部署模式探测、docker.sock 拨号、ServerURL 解析），tick 只读。
+	deployMode          string
+	dockerManagedUpdate bool
+	updateInsecure      bool
+	updateCapable       bool
 }
 
 type errorLogState struct {
@@ -161,14 +166,19 @@ func (t *remoteUpdateTracker) recordReport(updateID, state, version string) {
 var remoteUpdateNow = time.Now
 
 func newAgentRunner(cfg Config, transport agentControlPlane, collector *metrics.Collector) *agentRunner {
+	secureControlPlane := remoteUpdateControlPlaneSecure(cfg.ServerURL)
 	return &agentRunner{
-		cfg:        cfg,
-		transport:  transport,
-		collector:  collector,
-		runtimeCfg: newRuntimeConfig(cfg),
-		testCache:  make(map[string]cachedTest),
-		agentToken: strings.TrimSpace(cfg.AgentToken),
-		errState:   make(map[string]errorLogState),
+		cfg:                 cfg,
+		transport:           transport,
+		collector:           collector,
+		runtimeCfg:          newRuntimeConfig(cfg),
+		testCache:           make(map[string]cachedTest),
+		agentToken:          strings.TrimSpace(cfg.AgentToken),
+		errState:            make(map[string]errorLogState),
+		deployMode:          string(updater.DetectDeployMode()),
+		dockerManagedUpdate: canDockerManagedUpdate(),
+		updateInsecure:      !secureControlPlane,
+		updateCapable:       !cfg.DisableUpdate && secureControlPlane,
 	}
 }
 
@@ -329,9 +339,11 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 	if r.cfg.AgentVersion != "" {
 		sample.AgentVersion = r.cfg.AgentVersion
 	}
-	sample.DeployMode = string(updater.DetectDeployMode())
-	sample.DockerManagedUpdate = canDockerManagedUpdate()
-	annotateAgentUpdateCapability(&sample, r.cfg)
+	sample.DeployMode = r.deployMode
+	sample.DockerManagedUpdate = r.dockerManagedUpdate
+	sample.AgentUpdateDisabled = r.cfg.DisableUpdate
+	sample.AgentUpdateInsecure = r.updateInsecure
+	sample.AgentRemoteUpdate = r.updateCapable
 
 	alias, group, tests, interval := r.runtimeCfg.Snapshot()
 	if alias != "" {
@@ -355,15 +367,6 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 		return
 	}
 	r.logControlPlaneError("上报失败", "", nil)
-}
-
-func annotateAgentUpdateCapability(sample *metrics.NodeStats, cfg Config) {
-	if sample == nil {
-		return
-	}
-	sample.AgentUpdateDisabled = cfg.DisableUpdate
-	sample.AgentUpdateInsecure = !remoteUpdateControlPlaneSecure(cfg.ServerURL)
-	sample.AgentRemoteUpdate = remoteUpdateCapableForConfig(cfg)
 }
 
 func (r *agentRunner) reportStats(ctx context.Context, sample metrics.NodeStats) error {

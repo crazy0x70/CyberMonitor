@@ -640,7 +640,7 @@ export default function App() {
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
     } catch {
-
+      // localStorage 不可用时主题仅存内存，勿因持久化失败打断渲染。
     }
   }, [isDark, theme, themeMode]);
 
@@ -1064,7 +1064,18 @@ export default function App() {
         }
         const snapshotSettings = publicSettingsFromSnapshot(snapshot.settings);
         if (snapshotSettings) {
-          setPublicSettings((current) => ({ ...(current || {}), ...snapshotSettings }));
+          // 快照每秒全量推送：字段未变时复用 current，避免引用抖动触发无谓重渲染。
+          setPublicSettings((current) => {
+            if (!current) {
+              return snapshotSettings;
+            }
+            const changed = Object.keys(snapshotSettings).some(
+              (key) =>
+                current[key as keyof BootPublicSettings] !==
+                snapshotSettings[key as keyof PublicSettings],
+            );
+            return changed ? { ...current, ...snapshotSettings } : current;
+          });
         }
       },
       (node) => {

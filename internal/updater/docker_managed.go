@@ -117,6 +117,13 @@ func (u *DockerManagedUpdater) CurrentImage() string {
 	return strings.TrimSpace(u.currentImage)
 }
 
+func (u *DockerManagedUpdater) Close() error {
+	if u == nil || u.cli == nil {
+		return nil
+	}
+	return u.cli.Close()
+}
+
 func DetectUpdateMode() string {
 	if DetectDeployMode() == DeployModeDocker {
 		if CanDockerManagedUpdate() {
@@ -310,13 +317,16 @@ func NewDockerManagedUpdaterContext(ctx context.Context) (*DockerManagedUpdater,
 	}
 	inspect, err := cli.ContainerInspect(ctx, probe.containerID)
 	if err != nil {
+		_ = cli.Close()
 		return nil, fmt.Errorf("读取当前容器信息失败: %w", err)
 	}
 	if err := validateContainerInspect(inspect, "当前容器"); err != nil {
+		_ = cli.Close()
 		return nil, err
 	}
 	socketSource := resolveDockerSocketSource(inspect.Mounts, probe.socketPath)
 	if socketSource == "" {
+		_ = cli.Close()
 		return nil, fmt.Errorf("当前容器未挂载 docker socket: %s", probe.socketPath)
 	}
 	helperEntrypoint := append([]string{}, inspect.Config.Entrypoint...)
@@ -435,37 +445,32 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 	originalName := strings.TrimPrefix(inspect.Name, "/")
 	var rollbackReplacement atomic.Bool
 	rollbackReplacement.Store(true)
-	oldStopped := false
-	oldRenamed := false
-	connectedExtraNetworks := []string{}
 	type rollbackState struct {
 		oldStopped bool
 		oldRenamed bool
 		connected  []string
 	}
 	rollbackSnapshot := atomic.Pointer[rollbackState]{}
-	publishRollbackStateWith := func(stopped, renamed bool) {
-		oldStopped = stopped
-		oldRenamed = renamed
-		rollbackSnapshot.Store(&rollbackState{
-			oldStopped: oldStopped,
-			oldRenamed: oldRenamed,
-			connected:  append([]string{}, connectedExtraNetworks...),
-		})
+	rollbackSnapshot.Store(&rollbackState{})
+	mutateRollbackState := func(mutate func(*rollbackState)) {
+		state := *rollbackSnapshot.Load()
+		state.connected = append([]string{}, state.connected...)
+		mutate(&state)
+		rollbackSnapshot.Store(&state)
 	}
-	publishRollbackState := func() {
-		publishRollbackStateWith(oldStopped, oldRenamed)
-	}
-	publishRollbackState()
-	defer func() {
+	runRollback := func() error {
 		if !rollbackReplacement.CompareAndSwap(true, false) {
-			return
+			return nil
 		}
 		snapshot := rollbackSnapshot.Load()
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), dockerCleanupTimeout)
 		defer rollbackCancel()
-		rollbackErr := rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
-		err = appendDockerRollbackError(err, rollbackErr)
+		return rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
+	}
+	defer func() {
+		if rollbackErr := runRollback(); rollbackErr != nil {
+			err = appendDockerRollbackError(err, rollbackErr)
+		}
 	}()
 	stopSignals := make(chan os.Signal, 1)
 	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
@@ -476,12 +481,7 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 			return
 		}
 		log.Printf("Docker 更新 helper 收到 %s，执行回滚", sig)
-		if rollbackReplacement.CompareAndSwap(true, false) {
-			snapshot := rollbackSnapshot.Load()
-			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), dockerCleanupTimeout)
-			defer rollbackCancel()
-			_ = rollbackCreatedContainer(rollbackCtx, cli, created.ID, inspect.ID, originalName, snapshot.oldStopped, snapshot.oldRenamed, snapshot.connected)
-		}
+		_ = runRollback()
 		os.Exit(1)
 	}()
 	if verifyErr := verifyReplacementContainerImage(ctx, cli, created.ID, targetImageID); verifyErr != nil {
@@ -497,34 +497,41 @@ func RunDockerRecreateHelper(ctx context.Context) (err error) {
 		}
 		preConnectNetworks[networkName] = endpoint
 	}
-	for networkName, endpoint := range preConnectNetworks {
-		if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
-			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
-			return err
+	connectExtraNetworks := func(networks map[string]*network.EndpointSettings) error {
+		for networkName, endpoint := range networks {
+			if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
+				return fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
+			}
+			mutateRollbackState(func(state *rollbackState) {
+				state.connected = append(state.connected, networkName)
+			})
 		}
-		connectedExtraNetworks = append(connectedExtraNetworks, networkName)
-		publishRollbackState()
+		return nil
+	}
+	if connectErr := connectExtraNetworks(preConnectNetworks); connectErr != nil {
+		err = connectErr
+		return err
 	}
 	timeout := 20
 	if stopErr := cli.ContainerStop(ctx, inspect.ID, container.StopOptions{Timeout: &timeout}); stopErr != nil {
 		err = fmt.Errorf("停止旧容器失败: %w", stopErr)
 		return err
 	}
-	publishRollbackStateWith(true, oldRenamed)
-	for networkName, endpoint := range postConnectNetworks {
-		if connectErr := cli.NetworkConnect(ctx, networkName, created.ID, endpoint); connectErr != nil {
-			err = fmt.Errorf("连接附加网络 %s 失败: %w", networkName, connectErr)
-			return err
-		}
-		connectedExtraNetworks = append(connectedExtraNetworks, networkName)
-		publishRollbackState()
+	mutateRollbackState(func(state *rollbackState) {
+		state.oldStopped = true
+	})
+	if connectErr := connectExtraNetworks(postConnectNetworks); connectErr != nil {
+		err = connectErr
+		return err
 	}
 	backupName := fmt.Sprintf("%s-prev-%d", sanitizeContainerName(originalName), time.Now().Unix())
 	if renameErr := cli.ContainerRename(ctx, inspect.ID, backupName); renameErr != nil {
 		err = fmt.Errorf("备份旧容器名称失败: %w", renameErr)
 		return err
 	}
-	publishRollbackStateWith(oldStopped, true)
+	mutateRollbackState(func(state *rollbackState) {
+		state.oldRenamed = true
+	})
 	if renameErr := cli.ContainerRename(ctx, created.ID, originalName); renameErr != nil {
 		err = fmt.Errorf("恢复容器名称失败: %w", renameErr)
 		return err

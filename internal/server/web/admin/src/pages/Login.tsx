@@ -333,7 +333,6 @@ export default function Login({
                 {turnstileSiteKey ? (
                   <div className="space-y-2">
                     <Label className={labelClass}>人机验证</Label>
-                    { }
                     <div className="rounded-xl bg-white/90 px-2 py-2 dark:bg-[var(--surface-2)]">
                       <div ref={turnstileContainerRef} />
                     </div>

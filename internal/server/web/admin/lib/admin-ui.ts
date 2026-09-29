@@ -30,9 +30,6 @@ export const adminWarningBadgeClass =
 export const adminNeutralBadgeClass =
   "bg-slate-100/80 text-slate-700 hover:bg-slate-200 dark:bg-neutral-800/80 dark:text-neutral-300 dark:hover:bg-neutral-700";
 
-export const adminAccentBadgeClass =
-  "bg-[var(--primary-tint)] text-primary hover:bg-[var(--primary-tint-soft)]";
-
 export const adminPrimaryButtonClass =
   "inline-flex h-9 min-w-[110px] items-center justify-center rounded-full border border-transparent bg-slate-900 px-4 text-sm font-medium text-white outline-none transition-[background-color] duration-150 ease-out hover:bg-slate-800 focus-visible:border-[var(--primary-border)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] active:bg-slate-950 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white";
 

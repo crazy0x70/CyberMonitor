@@ -27,6 +27,13 @@ const (
 	maxNetTestWorkers        = 16
 )
 
+// 轮次总预算：每候选预算 = min(名义单候选预算, 轮剩余)，多候选全败时整轮时长
+// 仍有上界（服务端 12s 判离线契约内；TCP 6s = 两个完整 3s 切片）。设为 var 便于测试注入。
+var (
+	tcpRoundTimeout  = 6 * time.Second
+	icmpRoundTimeout = 10 * time.Second
+)
+
 var (
 	pingLossRegex           = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)%\s*(?:packet\s+)?loss`)
 	pingTxRxRegex           = regexp.MustCompile(`(\d+)\s+packets transmitted,\s+(\d+)\s+(?:packets\s+)?received`)
@@ -138,7 +145,11 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 		return nil
 	}
 	results := make([]metrics.NetworkTestResult, len(configs))
-	var wg sync.WaitGroup
+	type indexedResult struct {
+		index  int
+		result metrics.NetworkTestResult
+	}
+	out := make(chan indexedResult, len(configs))
 	workers := maxNetTestWorkers
 	if len(configs) < workers {
 		workers = len(configs)
@@ -147,16 +158,21 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 
 	for i, cfg := range configs {
 		sem <- struct{}{}
-		wg.Add(1)
 		go func(index int, config metrics.NetworkTestConfig) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
+			defer func() { <-sem }()
+			result := metrics.NetworkTestResult{
+				Name:   config.Name,
+				Type:   config.Type,
+				Host:   config.Host,
+				Port:   config.Port,
+				Status: "error",
+			}
+			// recover 必须在 deferred 函数内才生效；投递统一放在 defer 里，
+			// panic 与正常路径都恰好投递一次。
 			defer func() {
 				if rec := recover(); rec != nil {
 					log.Printf("网络测试 %s panic 已恢复: %v", config.Name, rec)
-					results[index] = metrics.NetworkTestResult{
+					result = metrics.NetworkTestResult{
 						Name:       config.Name,
 						Type:       config.Type,
 						Host:       config.Host,
@@ -167,12 +183,16 @@ func RunNetworkTests(ctx context.Context, configs []metrics.NetworkTestConfig) [
 						CheckedAt:  time.Now().Unix(),
 					}
 				}
+				out <- indexedResult{index: index, result: result}
 			}()
-			results[index] = runSingleNetworkTest(ctx, config, time.Now, testTCP, pingHost)
+			result = runSingleNetworkTest(ctx, config, time.Now, testTCP, pingHost)
 		}(i, cfg)
 	}
 
-	wg.Wait()
+	for range configs {
+		indexed := <-out
+		results[indexed.index] = indexed.result
+	}
 	return results
 }
 
@@ -233,7 +253,8 @@ func resolveNetworkTestProbeHost(ctx context.Context, config metrics.NetworkTest
 	return []string{host}, nil
 }
 
-func testTCP(ctx context.Context, host string, port int) (*float64, string, string) {
+// var 仅为允许测试注入 panic/故障探测函数。
+var testTCP = func(ctx context.Context, host string, port int) (*float64, string, string) {
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	start := time.Now()
 	conn, err := (&net.Dialer{Timeout: tcpTimeout}).DialContext(ctx, "tcp", address)
@@ -257,7 +278,8 @@ var pingPathOnce = sync.OnceValue(func() string {
 	return path
 })
 
-func pingHost(ctx context.Context, host string) (*float64, float64, string, string) {
+// var 仅为允许测试注入 panic/故障探测函数。
+var pingHost = func(ctx context.Context, host string) (*float64, float64, string, string) {
 	if err := validateProbeHost(host); err != nil {
 		return nil, 100, "error", err.Error()
 	}
@@ -291,14 +313,28 @@ func pingHost(ctx context.Context, host string) (*float64, float64, string, stri
 	return latency, loss, status, parseErr
 }
 
+// candidateBudget 返回当前候选的预算：名义单候选预算与轮剩余时间的较小者
+// （≤0 时 WithTimeout 立即过期，即轮预算耗尽后剩余候选快速失败）。
+func candidateBudget(ctx context.Context, nominal time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < nominal {
+			return remaining
+		}
+	}
+	return nominal
+}
+
 func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context.Context, string) (*float64, float64, string, string)) (*float64, float64, string, string) {
-	ctx, cancel := context.WithTimeout(ctx, icmpTimeout)
-	defer cancel()
+	ctx, cancelRound := context.WithTimeout(ctx, icmpRoundTimeout)
+	defer cancelRound()
 	var latency *float64
 	var loss float64
 	var status, errText string
 	for _, host := range hosts {
-		latency, loss, status, errText = probe(ctx, host)
+		// 每候选切片 = min(名义预算, 轮剩余)：v4 耗尽超时后 v6 仍有剩余可用，且整轮有上界。
+		probeCtx, cancelProbe := context.WithTimeout(ctx, candidateBudget(ctx, icmpTimeout))
+		latency, loss, status, errText = probe(probeCtx, host)
+		cancelProbe()
 		if status == "ok" {
 			return latency, loss, status, ""
 		}
@@ -307,13 +343,16 @@ func probeICMPCandidates(ctx context.Context, hosts []string, probe func(context
 }
 
 func probeTCPCandidates(ctx context.Context, hosts []string, port int, probe func(context.Context, string, int) (*float64, string, string)) (*float64, string, string) {
-	ctx, cancel := context.WithTimeout(ctx, tcpTimeout)
-	defer cancel()
+	ctx, cancelRound := context.WithTimeout(ctx, tcpRoundTimeout)
+	defer cancelRound()
 	var latency *float64
 	var status, errText string
 	var failures []string
 	for _, host := range hosts {
-		latency, status, errText = probe(ctx, host, port)
+		// 每候选切片 = min(名义预算, 轮剩余)：v4 耗尽超时后 v6 仍有剩余可用，且整轮有上界。
+		probeCtx, cancelProbe := context.WithTimeout(ctx, candidateBudget(ctx, tcpTimeout))
+		latency, status, errText = probe(probeCtx, host, port)
+		cancelProbe()
 		if status == "ok" {
 			return latency, status, ""
 		}

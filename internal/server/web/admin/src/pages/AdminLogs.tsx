@@ -120,6 +120,9 @@ export default function AdminLogs() {
     let active = true;
     let inFlight = false;
     let errorNotified = false;
+    // 2s 轮询内容未变（长度+首尾 id 一致）时跳过 setEntries/setLoadedAt，
+    // 避免每 2s 全表重渲染。id 递增且窗口固定取最新 N 条，签名足够可靠。
+    let lastSignature = "";
 
     async function loadLogs() {
       if (inFlight) {
@@ -131,9 +134,17 @@ export default function AdminLogs() {
         if (!active) {
           return;
         }
-        setEntries(data.entries || []);
-        setLoadedAt(Date.now());
         errorNotified = false;
+        const nextEntries = data.entries || [];
+        const nextSignature = `${nextEntries.length}:${nextEntries[0]?.id ?? ""}:${
+          nextEntries[nextEntries.length - 1]?.id ?? ""
+        }`;
+        if (nextSignature === lastSignature) {
+          return;
+        }
+        lastSignature = nextSignature;
+        setEntries(nextEntries);
+        setLoadedAt(Date.now());
       } catch (error) {
         if (active && !errorNotified) {
           toast.error(getErrorMessage(error, "加载日志失败"));
@@ -209,7 +220,6 @@ export default function AdminLogs() {
         />
       </AdminPanel>
 
-      { }
       <AdminDrawer
         open={detailEntry !== null}
         onOpenChange={(open) => {

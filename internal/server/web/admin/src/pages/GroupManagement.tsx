@@ -457,11 +457,17 @@ export default function GroupManagement({
       label: "名称",
       render: (row) =>
         row.kind === "group" ? (
-          <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">
+          <span
+            className="text-sm font-medium text-slate-900 dark:text-neutral-50"
+            data-admin-i18n-skip={String(row.group.name || "").trim() ? true : undefined}
+          >
             {String(row.group.name || "").trim() || "未命名分组"}
           </span>
         ) : (
-          <span className="pl-5 text-sm text-slate-600 dark:text-neutral-300">
+          <span
+            className="pl-5 text-sm text-slate-600 dark:text-neutral-300"
+            data-admin-i18n-skip={String(row.tag.name || "").trim() ? true : undefined}
+          >
             {String(row.tag.name || "").trim() || "未命名标签"}
           </span>
         ),
@@ -686,7 +692,6 @@ export default function GroupManagement({
         title="分组列表"
         icon={<FolderTree className="h-4 w-4 text-[var(--label-3)]" />}
       >
-        { }
         {generalValidationMessage && draftTree.length > 0 ? (
           <div className="pb-4">
             <div
@@ -724,7 +729,11 @@ export default function GroupManagement({
             }
           }}
           title={
-            String(editingGroup.name || "").trim() || "未命名分组"
+            <span
+              data-admin-i18n-skip={String(editingGroup.name || "").trim() ? true : undefined}
+            >
+              {String(editingGroup.name || "").trim() || "未命名分组"}
+            </span>
           }
           description={`一级分组 · 第 ${editingGroupIndex + 1} 位 / 共 ${draftTree.length} 个分组`}
           footer={
@@ -936,7 +945,13 @@ export default function GroupManagement({
               setEditingTagId(null);
             }
           }}
-          title={String(editingTag.name || "").trim() || "未命名标签"}
+          title={
+            <span
+              data-admin-i18n-skip={String(editingTag.name || "").trim() ? true : undefined}
+            >
+              {String(editingTag.name || "").trim() || "未命名标签"}
+            </span>
+          }
           description={`二级标签 · 所属分组 ${
             String(editingTagGroup.name || "").trim() || "未命名分组"
           }`}
@@ -1007,7 +1022,10 @@ export default function GroupManagement({
               </Badge>
             </AdminKVField>
             <AdminKVField label="上级分组">
-              <span className="text-sm text-slate-700 dark:text-neutral-200">
+              <span
+                className="text-sm text-slate-700 dark:text-neutral-200"
+                data-admin-i18n-skip={String(editingTagGroup.name || "").trim() ? true : undefined}
+              >
                 {String(editingTagGroup.name || "").trim() || "未命名分组"}
               </span>
             </AdminKVField>

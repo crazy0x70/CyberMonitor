@@ -180,7 +180,9 @@ func normalizeAgentNetworkTestResults(items []metrics.NetworkTestResult) []metri
 		item.Type = kind
 		item.Port = port
 		item.Status = statusText
-		item.Error = cleanAgentText(item.Error, 240)
+		// 服务端不信任 agent 侧诊断文案（含内网探测细节与本地化文本），
+		// 展示一律由 status 推导；Error 置空防止其进入公开快照。
+		item.Error = ""
 		if item.PacketLoss < 0 {
 			item.PacketLoss = 0
 		} else if item.PacketLoss > 100 || math.IsNaN(item.PacketLoss) || math.IsInf(item.PacketLoss, 0) {
@@ -306,7 +308,7 @@ func (a *agentAPI) config(nodeID, token string, remoteUpdateCapable bool) (Agent
 		return AgentConfig{}, apiErr
 	}
 	if leaseUpdated {
-		a.store.persist()
+		a.store.persistLogged()
 	}
 	return config, nil
 }
@@ -349,7 +351,10 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
 			return false, apiErr
 		}
-		_, applied := a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
+		_, applied, persistErr := a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
+		if persistErr != nil {
+			return false, &agentAPIError{statusCode: http.StatusServiceUnavailable, message: "persist failed, retry later"}
+		}
 		return applied, nil
 	}()
 	if apiErr != nil {

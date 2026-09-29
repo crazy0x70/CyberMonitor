@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -18,6 +19,10 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// publicHistoryQueryTimeout 是公开历史查询的最大处理器预算；newHTTPServer 的
+// WriteTimeout 必须≥它（见 server_test.go 的回归断言）。
+const publicHistoryQueryTimeout = 30 * time.Second
 
 type routeDeps struct {
 	cfg                 Config
@@ -30,6 +35,18 @@ type routeDeps struct {
 	webRoot             fs.FS
 }
 
+// 页面 HTML 来自 go:embed，内容固定：包级缓存原始文本，按请求只做前缀/标题/boot 注入。
+var (
+	publicIndexHTML = sync.OnceValues(func() (string, error) {
+		data, err := webFS.ReadFile("web/public/index.html")
+		return string(data), err
+	})
+	adminIndexHTML = sync.OnceValues(func() (string, error) {
+		data, err := webFS.ReadFile("web/dist/admin/index.html")
+		return string(data), err
+	})
+)
+
 func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.ServeMux, err error) {
 	cfg := deps.cfg
 	store := deps.store
@@ -39,6 +56,13 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	splitMode := deps.splitMode
 	trustedProxyHeaders := deps.trustedProxyHeaders
 	webRoot := deps.webRoot
+
+	// 分端口模式下，Agent 接入点为空时用 public 端口地址兜底（settings/export/import 统一走这里）。
+	fillAgentEndpoint := func(view *SettingsView) {
+		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
+			view.AgentEndpoint = cfg.PublicAddr
+		}
+	}
 
 	publicMux = http.NewServeMux()
 	adminMux = publicMux
@@ -165,7 +189,6 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	}
 
 	publicHistorySem := make(chan struct{}, 4)
-	publicHistoryQueryTimeout := 30 * time.Second
 	publicMux.HandleFunc("/api/v1/public/nodes/", withPublicCORS(func(w http.ResponseWriter, r *http.Request) {
 		if !isPublicReadMethod(r) {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -200,12 +223,15 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 
+		// 总预算含排队时间：先起 30s 截止再等 semaphore，避免「排队 + 查询」
+		// 叠加超过 WriteTimeout(35s) 后写回被截断。
+		queryCtx, cancelQuery := context.WithTimeout(r.Context(), publicHistoryQueryTimeout)
 		select {
 		case publicHistorySem <- struct{}{}:
-		case <-r.Context().Done():
+		case <-queryCtx.Done():
+			cancelQuery()
 			return
 		}
-		queryCtx, cancelQuery := context.WithTimeout(r.Context(), publicHistoryQueryTimeout)
 		tests, err := store.QueryPublicNodeHistory(queryCtx, nodeID, from, to)
 		cancelQuery()
 		<-publicHistorySem
@@ -293,9 +319,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 		switch r.Method {
 		case http.MethodGet:
 			view := store.SettingsView()
-			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-				view.AgentEndpoint = cfg.PublicAddr
-			}
+			fillAgentEndpoint(&view)
 			writeJSON(w, http.StatusOK, view)
 		case http.MethodPatch, http.MethodPut:
 			var update SettingsUpdate
@@ -305,12 +329,14 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			}
 			view, err := store.UpdateSettings(update)
 			if err != nil {
+				if errors.Is(err, errPersistFailed) {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存已生效但落盘失败，请检查服务端磁盘"})
+					return
+				}
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
-			if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-				view.AgentEndpoint = cfg.PublicAddr
-			}
+			fillAgentEndpoint(&view)
 			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 				log.Printf("更新设置后刷新会话 cookie 失败: %v", err)
 			}
@@ -358,15 +384,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 				return
 			}
-			if err := validateReleaseTargetVersion(releaseInfo); err != nil {
-				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-				return
-			}
-			if !releaseInfo.HasUpdate && updater.VersionCurrentOrNewer(releaseInfo.CurrentVersion, releaseInfo.LatestVersion) {
-				writeJSON(w, http.StatusOK, map[string]string{
-					"status":         "up_to_date",
-					"target_version": releaseInfo.LatestVersion,
-				})
+			if handleReleaseUpdateGate(w, releaseInfo) {
 				return
 			}
 			dockerManaged := updater.CanDockerManagedUpdate()
@@ -382,6 +400,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 					if err != nil {
 						return err
 					}
+					defer dockerUpdater.Close()
 					targetImage, err := updater.ResolveDockerTargetImage(dockerUpdater.CurrentImage(), releaseInfo.LatestVersion)
 					if err != nil {
 						return fmt.Errorf("解析 Docker 目标镜像失败: %w", err)
@@ -418,9 +437,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		payload := store.ExportConfig()
-		if splitMode && strings.TrimSpace(payload.Settings.AgentEndpoint) == "" {
-			payload.Settings.AgentEndpoint = cfg.PublicAddr
-		}
+		fillAgentEndpoint(&payload.Settings)
 		data, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "export failed"})
@@ -445,12 +462,14 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 		}
 		view, err := store.ImportConfig(payload)
 		if err != nil {
+			if errors.Is(err, errPersistFailed) {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存已生效但落盘失败，请检查服务端磁盘"})
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-			view.AgentEndpoint = cfg.PublicAddr
-		}
+		fillAgentEndpoint(&view)
 		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 			log.Printf("导入配置后刷新会话 cookie 失败: %v", err)
 		}
@@ -724,12 +743,11 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	}
 
 	writePublicIndexHTML := func(w http.ResponseWriter, r *http.Request) {
-		data, err := webFS.ReadFile("web/public/index.html")
+		htmlText, err := publicIndexHTML()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "index not found"})
 			return
 		}
-		htmlText := string(data)
 		if prefix := forwardedPrefix(r, trustedProxyHeaders); prefix != "" {
 			baseTag := `<base href="` + html.EscapeString(prefix+"/") + `" />`
 			if strings.Contains(htmlText, "<head>") {
@@ -745,12 +763,11 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	}
 
 	writeAdminAppHTML := func(w http.ResponseWriter, r *http.Request) {
-		data, err := webFS.ReadFile("web/dist/admin/index.html")
+		htmlText, err := adminIndexHTML()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "admin app not found"})
 			return
 		}
-		htmlText := string(data)
 		htmlText = strings.Replace(htmlText, "<title>CyberMonitor 管理后台</title>", "<title>"+html.EscapeString(adminDocumentTitle(store.SiteTitle()))+"</title>", 1)
 		bootPayload, err := buildAdminBootPayload(store, r, trustedProxyHeaders)
 		if err == nil {

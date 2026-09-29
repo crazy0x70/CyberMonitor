@@ -37,6 +37,8 @@ const (
 	aiHTTPTimeout               = 18 * time.Second
 )
 
+var aiHTTPClient = noRedirectHTTPClient(aiHTTPTimeout)
+
 func readResponseBodyLimited(body io.Reader) ([]byte, error) {
 	if body == nil {
 		return nil, nil
@@ -80,8 +82,7 @@ func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]s
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	client := noRedirectHTTPClient(aiHTTPTimeout)
-	resp, err := client.Do(req)
+	resp, err := aiHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
