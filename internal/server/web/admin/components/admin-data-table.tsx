@@ -26,6 +26,7 @@ type AdminDataTableProps<Row> = {
   ariaLabel: string;
   className?: string;
 
+  fixed?: boolean;
   showRowChevron?: boolean;
 };
 
@@ -38,6 +39,7 @@ export function AdminDataTable<Row>({
   emptyLabel,
   ariaLabel,
   className,
+  fixed = false,
   showRowChevron = true,
 }: AdminDataTableProps<Row>) {
   const clickable = Boolean(onRowClick);
@@ -53,7 +55,13 @@ export function AdminDataTable<Row>({
 
   return (
     <div className={cn(className)}>
-      <table aria-label={ariaLabel} className="w-full border-separate border-spacing-0 text-sm">
+      <table
+        aria-label={ariaLabel}
+        className={cn(
+          "w-full border-separate border-spacing-0 text-sm",
+          fixed && "table-fixed",
+        )}
+      >
         <thead>
           <tr>
             {columns.map((column) => (

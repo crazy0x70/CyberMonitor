@@ -463,7 +463,6 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
     key: "name",
     label: "名称",
     align: "left",
-    width: "1%",
     render: (entry) => (
       <span className="inline-flex min-w-0 max-w-[300px] items-center gap-2">
         <span className="truncate text-sm font-medium text-slate-900 dark:text-neutral-50">
@@ -481,7 +480,7 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
   {
     key: "ipv4",
     label: "IPv4",
-    width: "1%",
+    width: "160px",
     mono: true,
     render: (entry) => {
       const value = String(entry.node.stats.public_ipv4 || "").trim();
@@ -507,21 +506,15 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
     },
   },
   {
-    key: "os",
-    label: "系统",
-    render: (entry) => `${entry.node.stats.os} ／ ${entry.node.stats.arch}`,
-  },
-  {
     key: "agent",
     label: "Agent",
-    width: "1%",
     mono: true,
     render: (entry) => formatVersionLabel(entry.node.stats.agent_version),
   },
   {
     key: "renew",
     label: "续期",
-    width: "1%",
+    width: "120px",
     mono: true,
     render: (entry) => formatNodeRenewal(entry.node),
   },
@@ -1316,6 +1309,7 @@ export default function ServerManagement({
         <AdminDataTable
           ariaLabel="节点列表"
           columns={nodeTableColumns}
+        fixed
           rows={filteredNodes}
           rowKey={(entry) => entry.nodeId}
           rowAttributes={(entry) => ({ "data-node-card-id": entry.nodeId })}
