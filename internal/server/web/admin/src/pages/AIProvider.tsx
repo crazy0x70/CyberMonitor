@@ -226,7 +226,7 @@ const providerTableColumns: ReadonlyArray<AdminDataTableColumn<ProviderDraft>> =
     mono: true,
     render: (item) => (
       <span
-        className="block max-w-[320px] truncate text-slate-600 dark:text-neutral-300"
+        className="block w-full truncate text-slate-600 dark:text-neutral-300"
         title={item.baseURL || "未设置 Base URL"}
       >
         {item.baseURL || "未设置 Base URL"}
@@ -236,7 +236,6 @@ const providerTableColumns: ReadonlyArray<AdminDataTableColumn<ProviderDraft>> =
   {
     key: "model",
     label: "模型",
-    align: "right",
     mono: true,
     render: (item) => item.model || "--",
   },

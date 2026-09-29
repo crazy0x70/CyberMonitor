@@ -581,7 +581,7 @@ html[data-theme="dark"] .control-toggle:hover {
 
 .node-summary {
   display: grid;
-  grid-template-columns: minmax(0, 210px) minmax(0, 1fr) minmax(0, 180px) 12px;
+  grid-template-columns: minmax(0, 210px) minmax(0, 1fr) minmax(0, 180px);
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3);
@@ -589,22 +589,6 @@ html[data-theme="dark"] .control-toggle:hover {
   list-style: none;
   position: relative;
   border-radius: inherit;
-}
-
-.node-summary::after {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-right: 1.5px solid var(--label-3);
-  border-bottom: 1.5px solid var(--label-3);
-  transform: rotate(45deg);
-  transition: transform var(--dur-fast) var(--ease-out);
-  align-self: center;
-  justify-self: center;
-}
-
-.node-card[open] .node-summary::after {
-  transform: rotate(225deg);
 }
 
 .node-summary:focus-visible {

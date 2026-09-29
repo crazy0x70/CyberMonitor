@@ -7,8 +7,7 @@ export type AdminDataTableColumn<Row> = {
   key: string;
   label: ReactNode;
 
-  align?: "left" | "right";
-
+  align?: "left" | "center" | "right";
   width?: string;
   mono?: boolean;
   render: (row: Row, index: number) => ReactNode;
@@ -63,8 +62,7 @@ export function AdminDataTable<Row>({
                 scope="col"
                 style={column.width ? { width: column.width } : undefined}
                 className={cn(
-                  "sticky top-0 z-10 border-b border-[var(--separator-opaque)] bg-[var(--surface-base)] px-3 py-2.5 text-xs font-medium text-[var(--label-2)] first:pl-5 last:pr-5",
-                  column.align === "right" ? "text-right" : "text-left",
+                  "sticky top-0 z-10 border-b border-[var(--separator-opaque)] bg-[var(--surface-base)] px-3 py-2.5 text-center text-xs font-medium text-[var(--label-2)] first:pl-5 last:pr-5",
                   column.mono && "data-text",
                 )}
               >
@@ -109,9 +107,10 @@ export function AdminDataTable<Row>({
                   <td
                     key={column.key}
                     className={cn(
-                      "whitespace-nowrap px-3 py-2.5 text-slate-700 dark:text-neutral-200",
+                      "whitespace-nowrap px-3 py-2.5 text-center text-slate-700 dark:text-neutral-200",
                       "first:pl-5 last:pr-5",
-                      column.align === "right" ? "text-right" : "text-left",
+                      column.align === "left" && "text-left",
+                      column.align === "right" && "text-right",
                       column.mono && "data-text",
                     )}
                   >

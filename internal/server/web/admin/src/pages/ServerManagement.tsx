@@ -54,8 +54,6 @@ import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type AgentUpdateInfo,
   TestSelection, } from "@/lib/admin-types";
 import {
   flattenGroupTree,
-  formatMainDiskUsedPercent,
-  formatNetRate,
   formatNodeRenewal,
   formatVersionLabel,
   getErrorMessage,
@@ -464,6 +462,8 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
   {
     key: "name",
     label: "名称",
+    align: "left",
+    width: "1%",
     render: (entry) => (
       <span className="inline-flex min-w-0 max-w-[300px] items-center gap-2">
         <span className="truncate text-sm font-medium text-slate-900 dark:text-neutral-50">
@@ -479,37 +479,32 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
     ),
   },
   {
-    key: "cpu",
-    label: "CPU",
-    align: "right",
+    key: "ipv4",
+    label: "IPv4",
+    width: "1%",
     mono: true,
-    render: (entry) => `${Math.round(entry.node.stats.cpu?.usage_percent || 0)}%`,
+    render: (entry) => {
+      const value = String(entry.node.stats.public_ipv4 || "").trim();
+      return value ? (
+        <span className="data-text text-sm">{value}</span>
+      ) : (
+        <span className="text-sm text-[var(--label-3)]">--</span>
+      );
+    },
   },
   {
-    key: "memory",
-    label: "内存",
-    align: "right",
+    key: "ipv6",
+    label: "IPv6",
+    width: "360px",
     mono: true,
-    render: (entry) => `${Math.round(entry.node.stats.memory?.used_percent || 0)}%`,
-  },
-  {
-    key: "disk",
-    label: "磁盘",
-    align: "right",
-    mono: true,
-    render: (entry) => formatMainDiskUsedPercent(entry.node),
-  },
-  {
-    key: "net",
-    label: "网速",
-    align: "right",
-    mono: true,
-    render: (entry) =>
-      entry.node.status === "online"
-        ? `↑${formatNetRate(entry.node.stats.network?.tx_bytes_per_sec)} ↓${formatNetRate(
-            entry.node.stats.network?.rx_bytes_per_sec,
-          )}`
-        : "--",
+    render: (entry) => {
+      const value = String(entry.node.stats.public_ipv6 || "").trim();
+      return value ? (
+        <span className="data-text text-sm">{value}</span>
+      ) : (
+        <span className="text-sm text-[var(--label-3)]">--</span>
+      );
+    },
   },
   {
     key: "os",
@@ -519,14 +514,14 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
   {
     key: "agent",
     label: "Agent",
-    align: "right",
+    width: "1%",
     mono: true,
     render: (entry) => formatVersionLabel(entry.node.stats.agent_version),
   },
   {
     key: "renew",
     label: "续期",
-    align: "right",
+    width: "1%",
     mono: true,
     render: (entry) => formatNodeRenewal(entry.node),
   },
@@ -1476,6 +1471,11 @@ export default function ServerManagement({
               <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
                 显示与标注
               </h3>
+              <AdminKVField label="Node ID">
+                <span className="data-text break-all text-xs text-[var(--label-3)]">
+                  {resolveNodeId(editingNode)}
+                </span>
+              </AdminKVField>
               <AdminKVField label="显示名称" htmlFor="node-alias">
                 <Input
                   id="node-alias"

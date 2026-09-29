@@ -36,7 +36,7 @@ docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
 
-注意：默认的 Docker 命令不挂 docker.sock，管理面板里的一键更新对 Docker 部署不可用；要开就设 `CM_ENABLE_DOCKER_UPDATE=1` 并挂 `/var/run/docker.sock`，不开就自己 pull 新镜像重建容器。
+注意：默认的 Docker 命令不挂 docker.sock，管理面板里的一键更新对 Docker 部署不可用；要开就设 `CM_ENABLE_DOCKER_UPDATE=1` 并挂 `/var/run/docker.sock` —— 面板一键更新会自动重建容器并**保留节点身份**。不开就自己 pull 新镜像重建容器，重建时务必保留身份：沿用相同的卷挂载与环境变量（`CM_NODE_ID_FILE` + `/state`），或显式传 `-e CM_NODE_ID=<节点 ID>`（在后台节点抽屉里可以看到）。什么都不带的重建容器会被当成全新节点重新注册。
 
 ## 装 Agent
 
@@ -59,7 +59,23 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script install-agent -ServerUrl 'http://<server-ip>:25012' -AgentToken '<你的token>'
 ```
 
-卸载把 `install-agent` 换成 `uninstall-agent`；Server 同理 `uninstall-server`，加 `--keep-data` 保留数据。
+## 卸载
+
+卸载同样用安装脚本。Linux/macOS：
+
+```bash
+sudo bash /tmp/one-click.sh uninstall-agent     # 删除 Agent 二进制、服务注册、身份文件
+sudo bash /tmp/one-click.sh uninstall-server    # 加 --keep-data 保留数据目录
+```
+
+sudo 装的（系统级）必须用 sudo 卸；macOS 用户级安装不带 sudo 卸。Windows：
+
+```powershell
+& $script uninstall-agent
+& $script uninstall-server    # -KeepData 保留数据目录
+```
+
+卸载会删二进制、服务注册和配置/身份文件；`--keep-data` / `-KeepData` 保留数据目录（节点、设置、历史）。
 
 ### Agent 上报什么
 

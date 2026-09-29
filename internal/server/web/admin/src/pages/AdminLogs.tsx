@@ -90,8 +90,10 @@ const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
   {
     key: "message",
     label: "消息",
+    align: "left",
+    width: "auto",
     render: (entry) => (
-      <span className="block max-w-[520px] truncate" title={entry.message}>
+      <span className="block truncate text-left" title={entry.message}>
         {entry.message}
       </span>
     ),

@@ -15,7 +15,6 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Plus, Radio, Trash2 } from "lucide-react";
@@ -24,7 +23,6 @@ import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/a
 import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type SettingsView, type TestCatalogItem } from "@/lib/admin-types";
 import {
   adminActionButtonClass,
-  adminAccentBadgeClass,
   adminDialogCancelClass,
   adminDangerOutlineButtonClass,
   adminDialogContentClass,
@@ -35,7 +33,6 @@ import {
   adminPageActionsClass,
   adminPageShellClass,
   adminPrimaryButtonClass,
-  adminNeutralBadgeClass,
   adminOutlineButtonClass,
 } from "@/lib/admin-ui";
 import { cn } from "@/lib/utils";
@@ -334,25 +331,12 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
   {
     key: "type",
     label: "协议",
-    width: "14%",
-    render: (draft) => {
-      const type = resolveProbeType(draft.item);
-      return (
-        <span className="-ml-1.5 inline-block">
-          <Badge
-            variant="secondary"
-            className={type === "icmp" ? adminNeutralBadgeClass : adminAccentBadgeClass}
-          >
-            {type.toUpperCase()}
-          </Badge>
-        </span>
-      );
-    },
+    mono: true,
+    render: (draft) => resolveProbeType(draft.item).toUpperCase(),
   },
   {
     key: "interval",
     label: "间隔",
-    align: "right",
     mono: true,
     width: "20%",
     render: (draft) => formatProbeInterval(draft.item),

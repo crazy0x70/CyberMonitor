@@ -483,7 +483,6 @@ export default function GroupManagement({
     {
       key: "tags",
       label: "标签数",
-      align: "right",
       mono: true,
       width: "12%",
       render: (row) => (row.kind === "group" ? row.tagCount : "--"),
@@ -491,7 +490,6 @@ export default function GroupManagement({
     {
       key: "nodes",
       label: "节点数",
-      align: "right",
       mono: true,
       width: "12%",
       render: (row) => row.nodeCount,
@@ -499,7 +497,6 @@ export default function GroupManagement({
     {
       key: "order",
       label: "排序",
-      align: "right",
       mono: true,
       width: "10%",
       render: (row) => (row.kind === "group" ? row.order : "--"),

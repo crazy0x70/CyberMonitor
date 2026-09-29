@@ -36,7 +36,7 @@ docker run -d -p 25012:25012 -e CM_DATA_DIR=/data -v "$(pwd)/data:/data" \
   ghcr.io/crazy0x70/cyber-monitor-server:latest
 ```
 
-Note: this command does not mount the Docker socket, so one-click self-update from the admin panel is unavailable for Docker deployments. To enable it, set `CM_ENABLE_DOCKER_UPDATE=1` and mount `/var/run/docker.sock`; otherwise pull the new image and recreate the container yourself.
+Note: this command does not mount the Docker socket, so one-click self-update from the admin panel is unavailable for Docker deployments. To enable it, set `CM_ENABLE_DOCKER_UPDATE=1` and mount `/var/run/docker.sock` — the managed update recreates the container and preserves the node identity automatically. Otherwise pull the new image and recreate the container yourself; when you do, keep the identity: reuse the same `-v` volumes and env (`CM_NODE_ID_FILE`, `/state`), or pass `-e CM_NODE_ID=<node id>` (visible in the admin node drawer). A container recreated without any of these registers as a brand-new node.
 
 ## Install an agent
 
@@ -59,7 +59,23 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/crazy0x70/
 & $script install-agent -ServerUrl 'http://<server-ip>:25012' -AgentToken '<your-token>'
 ```
 
-Uninstall by swapping `install-agent` for `uninstall-agent`; same for the server via `uninstall-server`, adding `--keep-data` to keep the data directory.
+## Uninstall
+
+The same scripts handle removal. On Linux/macOS:
+
+```bash
+sudo bash /tmp/one-click.sh uninstall-agent     # removes agent binary, service, identity files
+sudo bash /tmp/one-click.sh uninstall-server    # add --keep-data to keep the data directory
+```
+
+A system-level (sudo) install must be uninstalled with `sudo`; a per-user macOS install without it. On Windows:
+
+```powershell
+& $script uninstall-agent
+& $script uninstall-server    # -KeepData keeps the data directory
+```
+
+Uninstall removes binaries, service registrations, and config/identity files; `--keep-data` / `-KeepData` preserves the data directory (nodes, settings, history).
 
 ### What the agent reports
 

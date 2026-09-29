@@ -3679,9 +3679,8 @@ function buildLinePath(series, stepX, padding, plotWidth, plotHeight, maxValue) 
       flushSegment();
       return;
     }
-    const clamped = Math.max(0, Math.min(maxValue, value));
     const x = padding.left + index * stepX;
-    const y = padding.top + plotHeight - (clamped / maxValue) * plotHeight;
+    const y = padding.top + plotHeight - (value / maxValue) * plotHeight;
     const command = segment.length
       ? `L${x.toFixed(1)},${y.toFixed(1)}`
       : `M${x.toFixed(1)},${y.toFixed(1)}`;

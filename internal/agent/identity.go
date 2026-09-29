@@ -111,12 +111,17 @@ func resolveNodeID(opts NodeIDOptions) (string, error) {
 	}
 
 	if opts.IsDocker {
-		value, err := resolveStableDockerNodeID(opts.HostRoot)
-		switch {
-		case err == nil:
-			return value, nil
-		case !errors.Is(err, os.ErrNotExist):
-			return "", err
+		if strings.TrimSpace(opts.HostRoot) == "" {
+			log.Printf("警告: Docker 部署未挂载宿主机目录(如 -v /:/host:ro)，节点身份将写入容器可写层，容器重建后会生成新节点；请挂载宿主机目录或用 CM_NODE_ID_FILE/CM_NODE_ID 固定节点 ID")
+		} else {
+			value, err := resolveStableDockerNodeID(opts.HostRoot)
+			switch {
+			case err == nil:
+				return value, nil
+			case !errors.Is(err, os.ErrNotExist):
+				return "", err
+			}
+			log.Printf("警告: 宿主机目录 %s 下无可读指纹源，容器重建后将生成新节点；请用 CM_NODE_ID_FILE/CM_NODE_ID 固定节点 ID", opts.HostRoot)
 		}
 	}
 
