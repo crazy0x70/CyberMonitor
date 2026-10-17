@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,14 @@ func (m *systemUpdateManager) View(ctx context.Context, force bool) SystemUpdate
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.snapshotLocked()
+}
+
+// systemUpdateForceRefresh 识别管理端「检查」按钮的强制刷新请求（F3）：
+// 前端 fetchSystemUpdateInfo(true) 携带 ?force=1，此时跳过 systemUpdateRefreshWindow
+// 缓存窗口立即发起一次 release 检查；并发请求由 refresh 既有的 refreshing 状态合并，
+// 同一时刻最多只有一个出站检查，其余请求等待该结果。
+func systemUpdateForceRefresh(r *http.Request) bool {
+	return r != nil && r.URL.Query().Get("force") == "1"
 }
 
 func (m *systemUpdateManager) CheckLatest(ctx context.Context) (updater.ReleaseInfo, error) {
@@ -286,7 +295,9 @@ func systemUpdateMessage(message string) string {
 	return updater.DefaultUnsupportedUpdateMessage()
 }
 
-func releaseUpdateAssetError(kind updater.Kind, dockerManaged bool, missingAssetMessage string, info updater.ReleaseInfo) string {
+// releaseUpdateAssetError 用调用方提供的 client 校验下载/校验地址；client 的目标平台
+// 决定期望的 asset 名（Agent 路径按节点平台，服务端自更新按服务端平台）。
+func releaseUpdateAssetError(client *updater.Client, dockerManaged bool, missingAssetMessage string, info updater.ReleaseInfo) string {
 	if strings.TrimSpace(info.LatestVersion) == "" {
 		return "Release 缺少目标版本"
 	}
@@ -299,18 +310,25 @@ func releaseUpdateAssetError(kind updater.Kind, dockerManaged bool, missingAsset
 	if strings.TrimSpace(info.ChecksumURL) == "" {
 		return "Release 缺少 SHA256SUMS 校验文件"
 	}
-	if err := updater.NewClient(updater.DefaultRepo, kind, "").ValidateReleaseAssetURLs(info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
+	if err := client.ValidateReleaseAssetURLs(info.LatestVersion, info.DownloadURL, info.ChecksumURL); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
 func agentUpdateReleaseAssetError(stats metrics.NodeStats, info updater.ReleaseInfo) string {
-	return releaseUpdateAssetError(updater.KindAgent, resolveAgentUpdateMode(stats) == "docker-managed", "未找到当前节点平台对应的 Agent 安装包", info)
+	// 按节点上报的 OS/Arch 挑包：平台不一致的节点（如 amd64 服务端 + arm64 Agent）
+	// 必须拿到自己平台的包，否则 Agent 侧按自身 AssetName 校验 URL 末段必然失败。
+	goos, goarch := resolveAgentPlatform(stats)
+	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, "")
+	client.GOOS = goos
+	client.GOARCH = goarch
+	return releaseUpdateAssetError(client, resolveAgentUpdateMode(stats) == "docker-managed", "未找到当前节点平台对应的 Agent 安装包", info)
 }
 
 func systemUpdateReleaseAssetError(info updater.ReleaseInfo, dockerManaged bool) string {
-	return releaseUpdateAssetError(updater.KindServer, dockerManaged, "未找到当前平台对应的服务端安装包", info)
+	// 服务端自更新继续用服务端自身平台（GOOS/GOARCH 留空 = runtime）。
+	return releaseUpdateAssetError(updater.NewClient(updater.DefaultRepo, updater.KindServer, ""), dockerManaged, "未找到当前平台对应的服务端安装包", info)
 }
 
 func buildAgentUpdateView(stats metrics.NodeStats, info updater.ReleaseInfo, message string) AgentUpdateView {

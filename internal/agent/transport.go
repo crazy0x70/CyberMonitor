@@ -276,9 +276,8 @@ func callWithFallback[T any](
 		if !shouldFallbackToHTTP(err) {
 			return zero, err
 		}
-		if st, ok := status.FromError(err); ok && st.Code() == codes.DeadlineExceeded && t.grpc.connReady() {
-			return zero, err
-		}
+		// DeadlineExceeded 也在回退码内（见 shouldFallbackToHTTP），必须走退避 + HTTP 回退：
+		// 退避是防止每个 tick 反复在 gRPC 上打满超时的唯一机制。
 		t.disableGRPCTemporarily(err)
 	}
 
@@ -431,13 +430,6 @@ func (g *grpcControlPlane) connectionStatus() (string, string) {
 		return target, "not_initialized"
 	}
 	return target, conn.GetState().String()
-}
-
-func (g *grpcControlPlane) connReady() bool {
-	g.mu.Lock()
-	conn := g.conn
-	g.mu.Unlock()
-	return conn != nil && conn.GetState() == connectivity.Ready
 }
 
 func (g *grpcControlPlane) prepareCall(ctx context.Context) (agentrpc.AgentServiceClient, context.Context, context.CancelFunc, error) {

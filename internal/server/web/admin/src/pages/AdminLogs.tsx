@@ -1,22 +1,25 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { AdminPageHeader } from "@/components/admin-page-header";
 import { AdminPanel } from "@/components/admin-panel";
 import { AdminMetricStrip } from "@/components/admin-metric-strip";
-import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
+import {
+  AdminDataTable,
+  type AdminDataTableColumn,
+  adminStatusBadgeClass,
+  type AdminStatusBadgeTone,
+} from "@/components/admin-data-table";
 import { AdminDrawer } from "@/components/admin-drawer";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { fetchAdminLogs } from "@/lib/admin-api";
 import type { AdminLogEntry, AdminLogLevel } from "@/lib/admin-types";
 import { getErrorMessage } from "@/lib/admin-format";
 import {
-  adminCompactActionButtonClass,
-  adminDangerBadgeClass,
-  adminMutedTextClass,
-  adminNeutralBadgeClass,
+  adminHelpTextClass,
   adminPageShellClass,
-  adminSuccessBadgeClass,
-  adminWarningBadgeClass,
+  adminSegmentedItemActiveClass,
+  adminSegmentedItemClass,
+  adminSegmentedItemInactiveClass,
+  adminSegmentedTrackClass,
 } from "@/lib/admin-ui";
 import { cn } from "@/lib/utils";
 import { Radio } from "lucide-react";
@@ -41,26 +44,63 @@ const levelLabels: Record<Exclude<AdminLogLevel, "all">, string> = {
   silent: "静默",
 };
 
-function levelBadgeClass(level: AdminLogEntry["level"]) {
+// A-18：日志等级徽标由 A-09 统一规格渲染（adminStatusBadgeClass，无边框 + 前置圆点），
+// 颜色映射按 A-09 第 6 条：信息 accent / 警告 warn / 错误 danger / 调试·静默中性。
+function levelBadgeTone(level: AdminLogEntry["level"]): AdminStatusBadgeTone {
   switch (level) {
     case "error":
-      return adminDangerBadgeClass;
+      return "danger";
     case "warning":
-      return adminWarningBadgeClass;
-    case "debug":
-    case "silent":
-      return adminNeutralBadgeClass;
+      return "warn";
+    case "info":
+      return "accent";
     default:
-      return adminSuccessBadgeClass;
+      return "neutral";
   }
 }
 
-function formatLogTime(entry: AdminLogEntry) {
+// A-18 第 5 条：时间列拆「日期 --label-3 / 时间 --label-1」两个 span，仅拆显示不改数据。
+// 用与旧渲染同一个 toLocaleString 的结果在最后一个空格处切分，保证字符串逐字符一致。
+function renderLogTime(entry: AdminLogEntry) {
   const date = new Date(entry.timestamp * 1000);
   if (Number.isNaN(date.getTime())) {
-    return entry.time || "--";
+    return <span className="text-[var(--label-3)]">{entry.time || "--"}</span>;
   }
-  return date.toLocaleString("zh-CN", { hour12: false });
+  const full = date.toLocaleString("zh-CN", { hour12: false });
+  const separatorIndex = full.lastIndexOf(" ");
+  if (separatorIndex < 0) {
+    return <span className="text-[var(--label-1)]">{full}</span>;
+  }
+  return (
+    <span>
+      <span className="text-[var(--label-3)]">{full.slice(0, separatorIndex)}</span>{" "}
+      <span className="text-[var(--label-1)]">{full.slice(separatorIndex + 1)}</span>
+    </span>
+  );
+}
+
+// A-18 第 4 条：node=lax-04 这类键值对用数据字体（.num 在后台的等价实现为 .data-text，
+// 见 E-06）。仅拆分显示，不改消息文本；[CyberMonitor] 前缀弱化按 0.1.2 不做。
+function renderLogMessage(message: string) {
+  const keyValuePairPattern = /[A-Za-z_][\w.-]*=(?:"[^"]*"|'[^']*'|\S+)/g;
+  const segments: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = keyValuePairPattern.exec(message)) !== null) {
+    if (match.index > cursor) {
+      segments.push(message.slice(cursor, match.index));
+    }
+    segments.push(
+      <span key={`kv-${match.index}`} className="data-text">
+        {match[0]}
+      </span>,
+    );
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < message.length) {
+    segments.push(message.slice(cursor));
+  }
+  return segments;
 }
 
 const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
@@ -69,11 +109,7 @@ const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
     label: "时间",
     width: "180px",
     mono: true,
-    render: (entry) => (
-      <span className="text-xs text-slate-500 dark:text-neutral-400">
-        {formatLogTime(entry)}
-      </span>
-    ),
+    render: (entry) => renderLogTime(entry),
   },
   {
     key: "source",
@@ -84,8 +120,12 @@ const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
   {
     key: "level",
     label: "等级",
-    width: "110px",
-    render: (entry) => <Badge className={levelBadgeClass(entry.level)}>{levelLabels[entry.level]}</Badge>,
+    width: "96px",
+    render: (entry) => (
+      <span className={adminStatusBadgeClass(levelBadgeTone(entry.level))}>
+        {levelLabels[entry.level]}
+      </span>
+    ),
   },
   {
     key: "message",
@@ -94,7 +134,7 @@ const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
     width: "auto",
     render: (entry) => (
       <span className="block truncate text-left" title={entry.message}>
-        {entry.message}
+        {renderLogMessage(entry.message)}
       </span>
     ),
   },
@@ -172,10 +212,39 @@ export default function AdminLogs() {
 
   return (
     <div className={adminPageShellClass}>
+      {/* M-05 呼吸绿点（A-18 第 2 条）：box-shadow 由 0 扩散到 6px、透明度 .35→0、2.4s 无限循环；
+          prefers-reduced-motion 下为静态点（第 7 节通用约束）。任务只允许改本文件，样式随组件内联。 */}
+      <style>{`
+@keyframes cm-log-live-dot-breath {
+  from {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 35%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 6px transparent;
+  }
+}
+.cm-log-live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full, 9999px);
+  background: var(--ok);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .cm-log-live-dot {
+    animation: cm-log-live-dot-breath 2.4s ease-out infinite;
+  }
+}
+`}</style>
       <AdminPageHeader
         title="日志查看"
         description={
-          loadedAt ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}` : "实时同步中"
+          <span className="inline-flex items-center gap-2">
+            <span aria-hidden="true" className="cm-log-live-dot shrink-0" />
+            {loadedAt
+              ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
+              : "实时同步中"}
+          </span>
         }
       />
 
@@ -185,19 +254,20 @@ export default function AdminLogs() {
         title="运行日志"
         icon={<Radio className="h-4 w-4 text-[var(--label-3)]" />}
         actions={
-          <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap">
+          <div className={cn(adminSegmentedTrackClass, "sm:w-auto")}>
             {levelOptions.map((item) => (
               <Button
                 key={item.value}
                 className={cn(
-                  "h-9 min-w-[76px] px-3 text-xs font-medium",
+                  adminSegmentedItemClass,
+                  "sm:min-w-[52px] sm:flex-none",
                   level === item.value
-                    ? "bg-slate-900 text-white hover:bg-slate-800 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
-                    : adminCompactActionButtonClass,
+                    ? adminSegmentedItemActiveClass
+                    : adminSegmentedItemInactiveClass,
                 )}
                 onClick={() => setLevel(item.value)}
                 type="button"
-                variant={level === item.value ? "default" : "outline"}
+                variant={null}
               >
                 {item.label}
               </Button>
@@ -205,7 +275,7 @@ export default function AdminLogs() {
           </div>
         }
       >
-        <p className={cn("pb-4 text-xs", adminMutedTextClass)}>
+        <p className={cn("pb-4", adminHelpTextClass)}>
           仅展示最近 {LOG_LIMIT} 条日志；计数为当前过滤窗口内的分布。
         </p>
         <AdminDataTable
@@ -215,7 +285,6 @@ export default function AdminLogs() {
           rowKey={(entry) => String(entry.id)}
           onRowClick={(entry) => setDetailEntry(entry)}
           emptyLabel="暂无日志"
-
           className="[&>table>tbody>tr]:[content-visibility:auto] [&>table>tbody>tr]:[contain-intrinsic-size:auto_41px]"
         />
       </AdminPanel>
@@ -236,8 +305,8 @@ export default function AdminLogs() {
       >
         {detailEntry ? (
           <section>
-            <h3 className="text-sm font-medium text-slate-900 dark:text-neutral-50">完整消息</h3>
-            <p className="data-text mt-3 select-text break-words whitespace-pre-wrap text-sm leading-relaxed text-slate-700 dark:text-neutral-200">
+            <h3 className="text-sm font-medium text-[var(--label-1)]">完整消息</h3>
+            <p className="data-text mt-3 select-text break-words whitespace-pre-wrap text-sm leading-relaxed text-[var(--label-1)]">
               {detailEntry.message}
             </p>
           </section>

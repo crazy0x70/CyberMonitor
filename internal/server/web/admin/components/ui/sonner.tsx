@@ -29,7 +29,8 @@ const Toaster = ({ ...props }: ToasterProps) => {
           "--normal-bg": "var(--popover)",
           "--normal-text": "var(--popover-foreground)",
           "--normal-border": "var(--border)",
-          "--border-radius": "var(--radius)",
+          // A-13：Toast 玻璃胶囊圆角 --r-full（App.tsx 的 .cn-toast 规则引用同一令牌）
+          "--border-radius": "var(--r-full)",
         } as React.CSSProperties
       }
       toastOptions={{

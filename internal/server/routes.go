@@ -30,6 +30,7 @@ type routeDeps struct {
 	hub                 *Hub
 	agentAPI            *agentAPI
 	systemUpdater       *systemUpdateManager
+	systemStatusMonitor *systemStatusMonitor
 	splitMode           bool
 	trustedProxyHeaders bool
 	webRoot             fs.FS
@@ -53,9 +54,20 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	hub := deps.hub
 	agentAPI := deps.agentAPI
 	systemUpdater := deps.systemUpdater
+	systemStatusMonitor := deps.systemStatusMonitor
 	splitMode := deps.splitMode
 	trustedProxyHeaders := deps.trustedProxyHeaders
 	webRoot := deps.webRoot
+
+	// F7：CPU 百分比采样器。Run 会传入实例并启动采样循环；未传入（测试裸建
+	// mux）时退化为恒 0 的本地实例，请求路径依旧只读缓存、不阻塞。
+	if systemStatusMonitor == nil {
+		systemStatusMonitor = newSystemStatusMonitor()
+	}
+
+	// 公开 WS 连接的进程级额度（全局 + 按真实客户端 IP）。管理端连接不占额度，
+	// 公开流量饱和时管理后台仍能建连。
+	publicWSQuota := newPublicWSQuota(publicWSPerIPLimit, publicWSGlobalLimit)
 
 	// 分端口模式下，Agent 接入点为空时用 public 端口地址兜底（settings/export/import 统一走这里）。
 	fillAgentEndpoint := func(view *SettingsView) {
@@ -85,14 +97,30 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		req.Username = strings.TrimSpace(req.Username)
+		// 在构造 loginAttempts 键之前先做长度校验：用户名直接进键，无上限时被拒的
+		// 登录可写出超长键并无限堆积。超长直接 400，且不写入 loginAttempts。
+		if len(req.Username) > maxLoginUsernameLen {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid username"})
+			return
+		}
 		now := time.Now()
 		creds := store.Credentials()
 		if !normalizeAdminAuthSettings(creds.AdminAuth).PasswordLoginEnabled {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password login disabled"})
 			return
 		}
-		attemptKey := loginAttemptKey(req.Username, r.RemoteAddr)
+		// 失败计数只按真实客户端 IP 分桶：用户名由攻击者控制，参与键会让轮换用户名
+		// 获得全新额度并反复触发 dummy bcrypt；真实 IP 经可信代理头解析（见
+		// clientIPFromRequest），避免反代下共享桶被用来锁死管理员。
+		clientIP := clientIPFromRequest(r, trustedProxyHeaders)
+		attemptKey := loginAttemptKey(clientIP)
 		if allowed, retryAfter := store.allowLoginAttempt(attemptKey, now); !allowed {
+			writeLoginRateLimit(w, retryAfter)
+			return
+		}
+		// 进程级总预算：键不含任何攻击者可控字段，为全进程每窗口的 bcrypt 次数设上界，
+		// 使换用户名/换 IP 的暴力尝试无法无限消耗 CPU。
+		if allowed, retryAfter := store.allowLoginGlobalAttempt(now); !allowed {
 			writeLoginRateLimit(w, retryAfter)
 			return
 		}
@@ -351,7 +379,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 		switch r.Method {
 		case http.MethodGet:
 			viewCtx, cancelView := releaseCheckContext(r)
-			writeJSON(w, http.StatusOK, systemUpdater.View(viewCtx, false))
+			writeJSON(w, http.StatusOK, systemUpdater.View(viewCtx, systemUpdateForceRefresh(r)))
 			cancelView()
 		case http.MethodPost:
 			if !updater.CanCurrentDeployUpdate() {
@@ -431,6 +459,14 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 		}
 	}))
 
+	// F7：后台首页「主控状态」数据源。CPU 百分比读采样缓存，请求不阻塞。
+	adminMux.HandleFunc("/api/v1/admin/system/status", requireAdminJWT(store, cfg.JWTSecret, handleAdminSystemStatus(store, hub, systemStatusMonitor)))
+
+	// F7：后台首页「网络连通性」数据源。注册在 admin mux 上，分离部署（后台
+	// 单独监听端口）时同样可用；信号量与 publicHistorySem 同规格限并发。
+	probesOverviewSem := make(chan struct{}, probesOverviewConcurrency)
+	adminMux.HandleFunc("/api/v1/admin/probes/overview", requireAdminJWT(store, cfg.JWTSecret, handleAdminProbesOverview(store, probesOverviewSem)))
+
 	adminMux.HandleFunc("/api/v1/admin/config/export", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -485,15 +521,49 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		var req struct {
-			Webhook         string  `json:"webhook"`
-			TelegramToken   string  `json:"telegram_token"`
-			TelegramUserIDs []int64 `json:"telegram_user_ids"`
-			TelegramUserID  int64   `json:"telegram_user_id"`
+			Webhook         string         `json:"webhook"`
+			TelegramToken   string         `json:"telegram_token"`
+			TelegramUserIDs []int64        `json:"telegram_user_ids"`
+			TelegramUserID  int64          `json:"telegram_user_id"`
+			Channel         *NotifyChannel `json:"channel"`
 		}
 		if err := decodeJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
+		// F5 新请求体 {channel}：接受未保存草稿；secret 为空时用同 ID 已存值补齐，
+		// 返回 {ok, error, latency_ms} 并写入该渠道的 LastTest。
+		if req.Channel != nil {
+			draft := cloneNotifyChannel(*req.Channel)
+			if stored := store.NotifyChannelByID(draft.ID); stored != nil {
+				// secret 为空时用同 ID 已存值补齐，草稿可以只改非敏感字段。
+				draft = mergeNotifyChannelSecrets([]NotifyChannel{draft}, []NotifyChannel{*stored})[0]
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), notifySendTimeout)
+			defer cancel()
+			started := time.Now()
+			err := sendChannelTestMessage(ctx, draft, store.SiteTitle())
+			latencyMs := time.Since(started).Milliseconds()
+			result := ChannelTestResult{
+				At:        time.Now().Unix(),
+				Ok:        err == nil,
+				LatencyMs: latencyMs,
+			}
+			if err != nil {
+				result.Error = err.Error()
+			}
+			store.RecordChannelTest(draft.ID, result)
+			payload := map[string]any{
+				"ok":         result.Ok,
+				"latency_ms": latencyMs,
+			}
+			if result.Error != "" {
+				payload["error"] = result.Error
+			}
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
+		// 旧请求体：行为保持不变（请求字段、响应结构与状态码均兼容）。
 		webhook := strings.TrimSpace(req.Webhook)
 		telegramToken := strings.TrimSpace(req.TelegramToken)
 		telegramUserIDs := normalizeTelegramUserIDs(req.TelegramUserIDs)
@@ -531,6 +601,24 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+
+	adminMux.HandleFunc("/api/v1/admin/alerts/rules/preview", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var rule AlertRule
+		if err := decodeJSON(w, r, &rule); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		results, err := store.PreviewAlertRule(rule, time.Now())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"results": results})
 	}))
 
 	adminMux.HandleFunc("/api/v1/admin/ai/test", requireAdminJWT(store, cfg.JWTSecret, func(w http.ResponseWriter, r *http.Request) {
@@ -670,6 +758,19 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 				audience = "admin"
 				adminTokenSalt = store.Credentials().TokenSalt
 			}
+			// 公开（未认证）连接同时受全局与按真实客户端 IP 上限约束：超限在 Upgrade
+			// 之前直接 503，不支付全量快照序列化与三条 goroutine 的成本。管理端连接不
+			// 占额度，公开流量饱和时仍可建连。
+			isPublic := audience == "public"
+			releaseQuota := func() {}
+			if isPublic {
+				release, ok := publicWSQuota.acquire(clientIPFromRequest(r, trustedProxyHeaders))
+				if !ok {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "too many connections"})
+					return
+				}
+				releaseQuota = release
+			}
 			upgrader := websocket.Upgrader{
 				EnableCompression: true,
 				CheckOrigin: func(request *http.Request) bool {
@@ -681,6 +782,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			}
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
+				releaseQuota()
 				return
 			}
 			configureWSConn(conn)
@@ -693,14 +795,24 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			payload, err := json.Marshal(snapshot)
 			if err != nil {
 				log.Printf("序列化初始节点快照失败: %v", err)
+				releaseQuota()
 				_ = conn.Close()
 				return
 			}
 			client, err := hub.Add(conn, variant, adminTokenSalt, payload)
 			if err != nil {
 				log.Printf("WebSocket 初始入队失败: %v", err)
+				releaseQuota()
 				_ = conn.Close()
 				return
+			}
+			if isPublic {
+				// 额度在连接结束时释放（client.done 由 hubClient.close() 关闭），
+				// 释放函数幂等，保证每条连接只释放一次。
+				go func() {
+					<-client.done
+					releaseQuota()
+				}()
 			}
 
 			go heartbeatLoop(client, hub)

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -42,69 +43,81 @@ const (
 var secureRandomReader io.Reader = rand.Reader
 
 type Settings struct {
-	AdminPath            string            `json:"admin_path"`
-	AdminUser            string            `json:"admin_user"`
-	AdminPass            string            `json:"admin_pass"`
-	AdminPassPlain       string            `json:"-"`
-	TurnstileSiteKey     string            `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey   string            `json:"turnstile_secret_key,omitempty"`
-	TokenSalt            string            `json:"token_salt,omitempty"`
-	AuthToken            string            `json:"auth_token,omitempty"`
-	AgentToken           string            `json:"agent_token,omitempty"`
-	AgentEndpoint        string            `json:"agent_endpoint,omitempty"`
-	SiteTitle            string            `json:"site_title,omitempty"`
-	SiteIcon             string            `json:"site_icon,omitempty"`
-	SiteBackgroundImage  string            `json:"site_background_image,omitempty"`
-	HomeTitle            string            `json:"home_title,omitempty"`
-	HomeSubtitle         string            `json:"home_subtitle,omitempty"`
-	Locale               string            `json:"locale,omitempty"`
-	RegionGroupDisabled  bool              `json:"region_group_disabled,omitempty"`
-	AlertWebhook         string            `json:"alert_webhook,omitempty"`
-	AlertOfflineSec      int64             `json:"alert_offline_sec,omitempty"`
-	AlertTelegramToken   string            `json:"alert_telegram_token,omitempty"`
-	AlertTelegramUserIDs []int64           `json:"alert_telegram_user_ids,omitempty"`
-	AlertTelegramUserID  int64             `json:"alert_telegram_user_id,omitempty"`
-	LoginFailLimit       int               `json:"login_fail_limit,omitempty"`
-	LoginFailWindowSec   int64             `json:"login_fail_window_sec,omitempty"`
-	LoginLockSec         int64             `json:"login_lock_sec,omitempty"`
-	AdminAuth            AdminAuthSettings `json:"admin_auth,omitempty"`
-	AISettings           AISettings        `json:"ai_settings,omitempty"`
-	Groups               []string          `json:"groups,omitempty"`
-	GroupTree            []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog          []TestCatalogItem `json:"test_catalog,omitempty"`
+	AdminPath            string  `json:"admin_path"`
+	AdminUser            string  `json:"admin_user"`
+	AdminPass            string  `json:"admin_pass"`
+	AdminPassPlain       string  `json:"-"`
+	TurnstileSiteKey     string  `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey   string  `json:"turnstile_secret_key,omitempty"`
+	TokenSalt            string  `json:"token_salt,omitempty"`
+	AuthToken            string  `json:"auth_token,omitempty"`
+	AgentToken           string  `json:"agent_token,omitempty"`
+	AgentEndpoint        string  `json:"agent_endpoint,omitempty"`
+	SiteTitle            string  `json:"site_title,omitempty"`
+	SiteIcon             string  `json:"site_icon,omitempty"`
+	SiteBackgroundImage  string  `json:"site_background_image,omitempty"`
+	HomeTitle            string  `json:"home_title,omitempty"`
+	HomeSubtitle         string  `json:"home_subtitle,omitempty"`
+	Locale               string  `json:"locale,omitempty"`
+	RegionGroupDisabled  bool    `json:"region_group_disabled,omitempty"`
+	AlertWebhook         string  `json:"alert_webhook,omitempty"`
+	AlertOfflineSec      int64   `json:"alert_offline_sec,omitempty"`
+	AlertTelegramToken   string  `json:"alert_telegram_token,omitempty"`
+	AlertTelegramUserIDs []int64 `json:"alert_telegram_user_ids,omitempty"`
+	AlertTelegramUserID  int64   `json:"alert_telegram_user_id,omitempty"`
+	// NotifyChannels 是 F5 引入的多渠道通知模型；为空时由上面的旧字段在加载时
+	// 合成（feishu / telegram 两条迁移渠道）。旧字段在本版本内与渠道双向同步保留。
+	NotifyChannels     []NotifyChannel   `json:"notify_channels,omitempty"`
+	LoginFailLimit     int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec       int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth          AdminAuthSettings `json:"admin_auth,omitempty"`
+	AISettings         AISettings        `json:"ai_settings,omitempty"`
+	Groups             []string          `json:"groups,omitempty"`
+	GroupTree          []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog        []TestCatalogItem `json:"test_catalog,omitempty"`
+	// AlertRules 是 F4 引入的告警规则模型；加载时保证含且仅含一条 metric=offline
+	// 的内置规则（不可删除，duration_sec 始终镜像 AlertOfflineSec）。
+	AlertRules []AlertRule `json:"alert_rules,omitempty"`
 }
 
 type SettingsView struct {
-	AdminPath             string            `json:"admin_path"`
-	AdminUser             string            `json:"admin_user"`
-	TurnstileSiteKey      string            `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey    string            `json:"turnstile_secret_key,omitempty"`
-	AgentEndpoint         string            `json:"agent_endpoint,omitempty"`
-	AgentToken            string            `json:"agent_token,omitempty"`
-	AgentTokenSet         bool              `json:"agent_token_set,omitempty"`
-	SiteTitle             string            `json:"site_title,omitempty"`
-	SiteIcon              string            `json:"site_icon,omitempty"`
-	SiteBackgroundImage   string            `json:"site_background_image,omitempty"`
-	HomeTitle             string            `json:"home_title,omitempty"`
-	HomeSubtitle          string            `json:"home_subtitle,omitempty"`
-	Locale                string            `json:"locale,omitempty"`
-	RegionGroupEnabled    *bool             `json:"region_group_enabled,omitempty"`
-	AlertWebhook          string            `json:"alert_webhook,omitempty"`
-	AlertWebhookSet       bool              `json:"alert_webhook_set,omitempty"`
-	AlertOfflineSec       int64             `json:"alert_offline_sec,omitempty"`
-	AlertTelegramToken    string            `json:"alert_telegram_token,omitempty"`
-	AlertTelegramTokenSet bool              `json:"alert_telegram_token_set,omitempty"`
-	AlertTelegramUserIDs  []int64           `json:"alert_telegram_user_ids,omitempty"`
-	LoginFailLimit        int               `json:"login_fail_limit,omitempty"`
-	LoginFailWindowSec    int64             `json:"login_fail_window_sec,omitempty"`
-	LoginLockSec          int64             `json:"login_lock_sec,omitempty"`
-	AdminAuth             AdminAuthSettings `json:"admin_auth,omitempty"`
-	AISettings            AISettings        `json:"ai_settings,omitempty"`
-	Version               string            `json:"version,omitempty"`
-	Commit                string            `json:"commit,omitempty"`
-	Groups                []string          `json:"groups,omitempty"`
-	GroupTree             []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog           []TestCatalogItem `json:"test_catalog,omitempty"`
+	AdminPath             string  `json:"admin_path"`
+	AdminUser             string  `json:"admin_user"`
+	TurnstileSiteKey      string  `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey    string  `json:"turnstile_secret_key,omitempty"`
+	AgentEndpoint         string  `json:"agent_endpoint,omitempty"`
+	AgentToken            string  `json:"agent_token,omitempty"`
+	AgentTokenSet         bool    `json:"agent_token_set,omitempty"`
+	SiteTitle             string  `json:"site_title,omitempty"`
+	SiteIcon              string  `json:"site_icon,omitempty"`
+	SiteBackgroundImage   string  `json:"site_background_image,omitempty"`
+	HomeTitle             string  `json:"home_title,omitempty"`
+	HomeSubtitle          string  `json:"home_subtitle,omitempty"`
+	Locale                string  `json:"locale,omitempty"`
+	RegionGroupEnabled    *bool   `json:"region_group_enabled,omitempty"`
+	AlertWebhook          string  `json:"alert_webhook,omitempty"`
+	AlertWebhookSet       bool    `json:"alert_webhook_set,omitempty"`
+	AlertOfflineSec       int64   `json:"alert_offline_sec,omitempty"`
+	AlertTelegramToken    string  `json:"alert_telegram_token,omitempty"`
+	AlertTelegramTokenSet bool    `json:"alert_telegram_token_set,omitempty"`
+	AlertTelegramUserIDs  []int64 `json:"alert_telegram_user_ids,omitempty"`
+	// NotifyChannels 为视图形态：Secrets 置空，改以 SecretsSet 标记已配置的敏感字段。
+	NotifyChannels     []NotifyChannel   `json:"notify_channels,omitempty"`
+	LoginFailLimit     int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec       int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth          AdminAuthSettings `json:"admin_auth,omitempty"`
+	AISettings         AISettings        `json:"ai_settings,omitempty"`
+	Version            string            `json:"version,omitempty"`
+	Commit             string            `json:"commit,omitempty"`
+	Groups             []string          `json:"groups,omitempty"`
+	GroupTree          []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog        []TestCatalogItem `json:"test_catalog,omitempty"`
+	// AlertRules（F4）：规则为非敏感配置，View 原样返回；alert_rule_status 为运行时
+	// 聚合（每条规则当前处于 FIRING 的节点数），导入时被忽略。
+	AlertRules      []AlertRule                    `json:"alert_rules,omitempty"`
+	AlertRuleStatus map[string]AlertRuleStatusView `json:"alert_rule_status,omitempty"`
 }
 
 type SettingsUpdate struct {
@@ -126,6 +139,7 @@ type SettingsUpdate struct {
 	AlertOfflineSec      *int64             `json:"alert_offline_sec"`
 	AlertTelegramToken   *string            `json:"alert_telegram_token"`
 	AlertTelegramUserIDs *[]int64           `json:"alert_telegram_user_ids"`
+	NotifyChannels       *[]NotifyChannel   `json:"notify_channels,omitempty"`
 	LoginFailLimit       *int               `json:"login_fail_limit"`
 	LoginFailWindowSec   *int64             `json:"login_fail_window_sec"`
 	LoginLockSec         *int64             `json:"login_lock_sec"`
@@ -133,7 +147,11 @@ type SettingsUpdate struct {
 	AISettings           *AISettings        `json:"ai_settings"`
 	Groups               *[]string          `json:"groups"`
 	GroupTree            *[]GroupNode       `json:"group_tree"`
+	GroupMoves           *[]GroupMove       `json:"group_moves,omitempty"`
 	TestCatalog          *[]TestCatalogItem `json:"test_catalog"`
+	// AlertRules（F4）：nil 表示本次请求不改规则；非 nil 时为完整规则列表（含内置
+	// offline 规则的处理见 normalizeAlertRules）。
+	AlertRules *[]AlertRule `json:"alert_rules,omitempty"`
 }
 
 type AdminAuthSettings struct {
@@ -168,13 +186,16 @@ type OIDCProviderSettings struct {
 }
 
 type PersistedData struct {
-	Settings              Settings                       `json:"settings"`
-	Profiles              map[string]*NodeProfile        `json:"profiles"`
-	Nodes                 map[string]NodeState           `json:"nodes,omitempty"`
-	OfflineSessions       map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
-	Alerted               map[string]AlertedState        `json:"alerted,omitempty"`
-	PendingHistoryClear   bool                           `json:"pending_history_clear,omitempty"`
-	PendingHistoryDeletes []string                       `json:"pending_history_deletes,omitempty"`
+	Settings        Settings                       `json:"settings"`
+	Profiles        map[string]*NodeProfile        `json:"profiles"`
+	Nodes           map[string]NodeState           `json:"nodes,omitempty"`
+	OfflineSessions map[string]OfflineSessionState `json:"offline_sessions,omitempty"`
+	Alerted         map[string]AlertedState        `json:"alerted,omitempty"`
+	// AlertStates（F4）按 `nodeID|ruleID` 记录告警规则的评估状态机；offline 规则
+	// 不在此表中（继续使用上方 Alerted，保证旧离线测试与数据兼容）。
+	AlertStates           map[string]RuleAlertState `json:"alert_states,omitempty"`
+	PendingHistoryClear   bool                      `json:"pending_history_clear,omitempty"`
+	PendingHistoryDeletes []string                  `json:"pending_history_deletes,omitempty"`
 }
 
 type legacyPersistedProfile struct {
@@ -185,13 +206,186 @@ type OfflineSessionState struct {
 	StartedAt int64 `json:"started_at"`
 }
 
+// AlertedState 记录单节点的离线告警投递进度。Delivered 按渠道 ID 记录投递成功
+// 的渠道，只补发失败渠道；旧版 state.json 中的 delivered_feishu / delivered_telegram
+// 两个 bool 在加载时映射到渠道 id "feishu" / "telegram"（见 UnmarshalJSON）。
 type AlertedState struct {
-	OfflineSince      time.Time `json:"offline_since"`
-	NextRetryAt       time.Time `json:"next_retry_at,omitempty"`
-	RetryCount        int       `json:"retry_count,omitempty"`
-	DeliveredFeishu   bool      `json:"delivered_feishu,omitempty"`
-	DeliveredTelegram bool      `json:"delivered_telegram,omitempty"`
-	RecoveryPending   bool      `json:"recovery_pending,omitempty"`
+	OfflineSince    time.Time       `json:"offline_since"`
+	NextRetryAt     time.Time       `json:"next_retry_at,omitempty"`
+	RetryCount      int             `json:"retry_count,omitempty"`
+	Delivered       map[string]bool `json:"delivered,omitempty"`
+	RecoveryPending bool            `json:"recovery_pending,omitempty"`
+}
+
+// UnmarshalJSON 兼容旧格式：delivered_feishu / delivered_telegram 映射到
+// Delivered["feishu"] / Delivered["telegram"]，与加载迁移合成的渠道 ID 一致。
+func (s *AlertedState) UnmarshalJSON(data []byte) error {
+	type alertedStateAlias AlertedState
+	var alias alertedStateAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	var legacy struct {
+		DeliveredFeishu   bool `json:"delivered_feishu,omitempty"`
+		DeliveredTelegram bool `json:"delivered_telegram,omitempty"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	*s = AlertedState(alias)
+	if legacy.DeliveredFeishu || legacy.DeliveredTelegram {
+		if s.Delivered == nil {
+			s.Delivered = make(map[string]bool)
+		}
+		if legacy.DeliveredFeishu {
+			s.Delivered[legacyFeishuChannelID] = true
+		}
+		if legacy.DeliveredTelegram {
+			s.Delivered[legacyTelegramChannelID] = true
+		}
+	}
+	return nil
+}
+
+// AlertRule 是 F4 定稿的单条件告警规则模型（事件类规则 expiry / traffic_quota
+// 单独处理，Op/Threshold 等字段的适用性见指标表）。
+type AlertRule struct {
+	ID          string     `json:"id"`           // "r_" + 随机 10 位；内置离线规则固定为 "offline"
+	Name        string     `json:"name"`         //
+	Enabled     bool       `json:"enabled"`      //
+	Metric      string     `json:"metric"`       // 见 alertRuleMetricTable
+	Op          string     `json:"op"`           // "gt" | "lt"（offline/expiry/traffic_quota 忽略）
+	Threshold   float64    `json:"threshold"`    // 单位随指标（net_in/net_out 为 B/s）
+	DurationSec int64      `json:"duration_sec"` // 持续窗口；0 = 单次采样即判定
+	Ratio       float64    `json:"ratio"`        // 窗口内越限占比，默认 0.7（Nezha 语义）
+	Scope       AlertScope `json:"scope"`        //
+	// ChannelIDs 为空 = 全部已启用渠道。
+	ChannelIDs []string `json:"channel_ids,omitempty"` //
+	// NotifyRecover 默认 true：省略该字段的请求按 true 解码（见 UnmarshalJSON）。
+	NotifyRecover bool   `json:"notify_recover"`       //
+	Repeat        string `json:"repeat"`               // "once" | "backoff"（15min 起 ×2，上限 24h）
+	ProbeName     string `json:"probe_name,omitempty"` // probe_* 指标用，对应 network_tests[].name
+	LeadDays      []int  `json:"lead_days,omitempty"`  // expiry 用，默认 [7,3,1]
+}
+
+// UnmarshalJSON 落实文档「notify_recover 默认 true」：请求 / 草稿省略该字段时按
+// true 解码，显式 false 保持 false（bool 无三态，只能在解码层区分省略与否）。
+// 落盘与 View 的编码始终携带 notify_recover，F4 之前不存在 alert_rules 数据，
+// 因此旧 state.json 与导出文件无兼容负担。解码内部沿用 DisallowUnknownFields，
+// 保持 decodeJSON 对规则体内未知字段的拒绝语义（preview 路由测试依赖该行为）。
+func (r *AlertRule) UnmarshalJSON(data []byte) error {
+	type alertRuleAlias AlertRule
+	payload := struct {
+		*alertRuleAlias
+		NotifyRecover *bool `json:"notify_recover"` // 遮蔽 alias 的同名 bool，捕获「是否显式携带」
+	}{alertRuleAlias: (*alertRuleAlias)(r)}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payload); err != nil {
+		return err
+	}
+	if payload.NotifyRecover == nil {
+		r.NotifyRecover = true
+		return nil
+	}
+	r.NotifyRecover = *payload.NotifyRecover
+	return nil
+}
+
+// AlertScope 描述规则适用的节点集合：mode=all 时 Exclude 生效；mode=include 时
+// Nodes / Groups 任一命中即适用（Groups 值为 "A" 或 "A:t" 这类 selection 字符串）。
+type AlertScope struct {
+	Mode    string   `json:"mode"`              // "all" | "include"
+	Nodes   []string `json:"nodes,omitempty"`   // node id
+	Groups  []string `json:"groups,omitempty"`  // "A" 或 "A:t"
+	Exclude []string `json:"exclude,omitempty"` // node id（mode=all 时生效）
+}
+
+// RuleAlertState 是单 (node, rule) 的评估状态机（F4）。State 为 "OK" | "FIRING"；
+// offline 规则不使用本结构（沿用 AlertedState）。
+type RuleAlertState struct {
+	State          string          `json:"state"`
+	FiringSince    time.Time       `json:"firing_since,omitempty"`
+	LastNotifiedAt time.Time       `json:"last_notified_at,omitempty"`
+	NextRepeatAt   time.Time       `json:"next_repeat_at,omitempty"`
+	Delivered      map[string]bool `json:"delivered,omitempty"`
+	RetryCount     int             `json:"retry_count,omitempty"`
+	NextRetryAt    time.Time       `json:"next_retry_at,omitempty"`
+	// LastStepPct 为 traffic_quota 台阶去重（本周期已提醒到的台阶）。
+	LastStepPct float64 `json:"last_step_pct,omitempty"`
+	// SentLeadDays 为 expiry 提醒去重（已发送的 lead day）。到期时间后移导致
+	// daysLeft 回升超过已记录值时整体清零（见 collectExpiryEventsLocked）。
+	SentLeadDays []int `json:"sent_lead_days,omitempty"`
+}
+
+// AlertRuleStatusView 是 SettingsView.alert_rule_status 的条目：某规则当前处于
+// FIRING 状态的节点数。
+type AlertRuleStatusView struct {
+	Firing int `json:"firing"`
+}
+
+// TrafficCounter 是节点月度流量累计（F4 traffic_quota 的前置数据）。AccSent/AccRecv
+// 由 updateNodeStats 按 Increment 累加，agent 重启回绕时把新值当增量；到重置日清零。
+type TrafficCounter struct {
+	CycleStart int64  `json:"cycle_start,omitempty"` // 当前周期起点（unix 秒，本地时区口径）
+	LastSent   uint64 `json:"last_sent,omitempty"`   // 上次上报的 agent 累计发送字节数
+	LastRecv   uint64 `json:"last_recv,omitempty"`   // 上次上报的 agent 累计接收字节数
+	AccSent    uint64 `json:"acc_sent,omitempty"`    // 本周期累计发送
+	AccRecv    uint64 `json:"acc_recv,omitempty"`    // 本周期累计接收
+}
+
+// NotifyChannel 是 F5 定稿的多渠道通知模型。Config 存非敏感字段，Secrets 存敏感
+// 字段（View 置空并改给 SecretsSet）；SecretsSet 仅出现在视图/请求载体中，落盘前
+// 会被 normalizeNotifyChannels 丢弃。LastTest 由测试推送接口写入。
+type NotifyChannel struct {
+	ID         string             `json:"id,omitempty"`
+	Type       string             `json:"type,omitempty"`
+	Name       string             `json:"name,omitempty"`
+	Enabled    bool               `json:"enabled,omitempty"`
+	Config     map[string]string  `json:"config,omitempty"`
+	Secrets    map[string]string  `json:"secrets,omitempty"`
+	SecretsSet map[string]bool    `json:"secrets_set,omitempty"`
+	LastTest   *ChannelTestResult `json:"last_test,omitempty"`
+	// SecretsClear（B-08 / D-04）仅请求载体：列出本次保存要清除的 secret key。
+	// 合并阶段生效后，落盘（normalizeNotifyChannels）与视图（SettingsView）
+	// 返回前都会被丢弃，不会出现在 state.json 与导出文件中。
+	SecretsClear []string `json:"secrets_clear,omitempty"`
+}
+
+// ChannelTestResult 记录一次测试推送的结果（ok=false 时 Error 为错误原文）。
+type ChannelTestResult struct {
+	At        int64  `json:"at"`
+	Ok        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
+	LatencyMs int64  `json:"latency_ms,omitempty"`
+}
+
+const (
+	legacyFeishuChannelID   = "feishu"
+	legacyTelegramChannelID = "telegram"
+
+	notifyChannelTypeTelegram = "telegram"
+	notifyChannelTypeFeishu   = "feishu"
+	notifyChannelTypeBark     = "bark"
+	notifyChannelTypeSlack    = "slack"
+	notifyChannelTypeDingtalk = "dingtalk"
+	notifyChannelTypeWecom    = "wecom"
+	notifyChannelTypeEmail    = "email"
+
+	defaultTelegramAPIEndpoint = "https://api.telegram.org"
+)
+
+// notifyChannelTypes 是渠道类型白名单（F5 定稿的 7 种）。各类型的发送器均已实现
+// （notify_telegram / notify_feishu / notify_bark / notify_slack / notify_dingtalk /
+// notify_wecom / notify_email，由 newNotifier 构造）。
+var notifyChannelTypes = map[string]struct{}{
+	notifyChannelTypeTelegram: {},
+	notifyChannelTypeFeishu:   {},
+	notifyChannelTypeBark:     {},
+	notifyChannelTypeSlack:    {},
+	notifyChannelTypeDingtalk: {},
+	notifyChannelTypeWecom:    {},
+	notifyChannelTypeEmail:    {},
 }
 
 type TestHistoryEntry struct {
@@ -211,19 +405,23 @@ type ConfigTransferData struct {
 }
 
 type ConfigTransferProfile struct {
-	AlertEnabled     *bool           `json:"alert_enabled,omitempty"`
-	Alias            string          `json:"alias,omitempty"`
-	Group            string          `json:"group,omitempty"`
-	Tags             []string        `json:"tags,omitempty"`
-	Groups           []string        `json:"groups,omitempty"`
-	Region           string          `json:"region,omitempty"`
-	DiskType         string          `json:"disk_type,omitempty"`
-	NetSpeedMbps     int             `json:"net_speed_mbps,omitempty"`
-	ExpireAt         int64           `json:"expire_at,omitempty"`
-	AutoRenew        bool            `json:"auto_renew,omitempty"`
-	RenewIntervalSec int64           `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec  int             `json:"test_interval_sec"`
-	TestSelections   []TestSelection `json:"test_selections,omitempty"`
+	AlertEnabled     *bool    `json:"alert_enabled,omitempty"`
+	Alias            string   `json:"alias,omitempty"`
+	Group            string   `json:"group,omitempty"`
+	Tags             []string `json:"tags,omitempty"`
+	Groups           []string `json:"groups,omitempty"`
+	Region           string   `json:"region,omitempty"`
+	DiskType         string   `json:"disk_type,omitempty"`
+	NetSpeedMbps     int      `json:"net_speed_mbps,omitempty"`
+	ExpireAt         int64    `json:"expire_at,omitempty"`
+	AutoRenew        bool     `json:"auto_renew,omitempty"`
+	RenewIntervalSec int64    `json:"renew_interval_sec,omitempty"`
+	// 流量配额配置（F4）。TrafficCounter 为运行数据，不参与导出（导入后重新累计）。
+	TrafficLimitBytes uint64          `json:"traffic_limit_bytes,omitempty"`
+	TrafficLimitType  string          `json:"traffic_limit_type,omitempty"`
+	TrafficResetDay   int             `json:"traffic_reset_day,omitempty"`
+	TestIntervalSec   int             `json:"test_interval_sec"`
+	TestSelections    []TestSelection `json:"test_selections,omitempty"`
 }
 
 type ResetResult struct {
@@ -287,11 +485,24 @@ type TestCatalogItem struct {
 	Host        string `json:"host"`
 	Port        int    `json:"port,omitempty"`
 	IntervalSec int    `json:"interval_sec,omitempty"`
+	// O-01：下发范围。nil 表示「不下发」（旧数据行为不变，仅节点手动选择生效）；
+	// 非 nil 时经 normalizeAlertScope 规范化（mode=all|include，exclude 两种模式
+	// 都生效，复用 D-05 语义），范围命中的节点自动获得该探测。指针字段：加载后
+	// 不就地修改（normalizeTestCatalog 总是构造新值），浅拷贝（cloneSettings /
+	// settingsViewLocked 的 slices.Clone）共享指针是只读安全的。
+	Scope *AlertScope `json:"scope,omitempty"`
 }
 
 type GroupNode struct {
 	Name     string      `json:"name"`
 	Children []GroupNode `json:"children,omitempty"`
+}
+
+// GroupMove 描述一次分组归属迁移（F1）：From / To 为 selection 字符串，
+// 形如 "A"（分组级，整体替换前缀）或 "A:t"（标签级，精确匹配）。
+type GroupMove struct {
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 func strictUnmarshalJSON(data []byte, target any) error {
@@ -366,6 +577,7 @@ func readPersistedDataFile(path string) (PersistedData, bool, error) {
 	payload.Nodes = nodes
 	payload.OfflineSessions = normalizeNodeIDMap("offline_sessions", payload.OfflineSessions)
 	payload.Alerted = normalizeNodeIDMap("alerted", payload.Alerted)
+	payload.AlertStates = normalizeAlertStates(payload.AlertStates)
 	profiles, err := normalizePersistedProfiles(payload.Settings, payload.Nodes, dropInvalidProfileKeys(payload.Profiles))
 	if err != nil {
 		return PersistedData{}, false, err
@@ -423,6 +635,9 @@ func applyPersistedDataDefaults(payload PersistedData) PersistedData {
 	}
 	if payload.Alerted == nil {
 		payload.Alerted = make(map[string]AlertedState)
+	}
+	if payload.AlertStates == nil {
+		payload.AlertStates = make(map[string]RuleAlertState)
 	}
 	return payload
 }
@@ -739,6 +954,10 @@ func cloneNodeProfileValue(profile *NodeProfile) NodeProfile {
 	copyProfile.Groups = slices.Clone(profile.Groups)
 	copyProfile.TestSelections = slices.Clone(profile.TestSelections)
 	copyProfile.AgentUpdate = cloneAgentUpdateInstruction(profile.AgentUpdate)
+	if profile.TrafficCounter != nil {
+		counter := *profile.TrafficCounter
+		copyProfile.TrafficCounter = &counter
+	}
 	if profile.AlertEnabled != nil {
 		value := *profile.AlertEnabled
 		copyProfile.AlertEnabled = &value
@@ -770,18 +989,21 @@ func configTransferProfilesFromNodeProfiles(profiles map[string]*NodeProfile) ma
 			continue
 		}
 		transfer := ConfigTransferProfile{
-			Alias:            profile.Alias,
-			Group:            profile.Group,
-			Tags:             slices.Clone(profile.Tags),
-			Groups:           slices.Clone(profile.Groups),
-			Region:           profile.Region,
-			DiskType:         profile.DiskType,
-			NetSpeedMbps:     profile.NetSpeedMbps,
-			ExpireAt:         profile.ExpireAt,
-			AutoRenew:        profile.AutoRenew,
-			RenewIntervalSec: profile.RenewIntervalSec,
-			TestIntervalSec:  profile.TestIntervalSec,
-			TestSelections:   slices.Clone(profile.TestSelections),
+			Alias:             profile.Alias,
+			Group:             profile.Group,
+			Tags:              slices.Clone(profile.Tags),
+			Groups:            slices.Clone(profile.Groups),
+			Region:            profile.Region,
+			DiskType:          profile.DiskType,
+			NetSpeedMbps:      profile.NetSpeedMbps,
+			ExpireAt:          profile.ExpireAt,
+			AutoRenew:         profile.AutoRenew,
+			RenewIntervalSec:  profile.RenewIntervalSec,
+			TrafficLimitBytes: profile.TrafficLimitBytes,
+			TrafficLimitType:  profile.TrafficLimitType,
+			TrafficResetDay:   profile.TrafficResetDay,
+			TestIntervalSec:   profile.TestIntervalSec,
+			TestSelections:    slices.Clone(profile.TestSelections),
 		}
 		if profile.AlertEnabled != nil {
 			value := *profile.AlertEnabled
@@ -803,18 +1025,21 @@ func configTransferProfilesToNodeProfiles(profiles map[string]*ConfigTransferPro
 			continue
 		}
 		profile := NodeProfile{
-			Alias:            transfer.Alias,
-			Group:            transfer.Group,
-			Tags:             slices.Clone(transfer.Tags),
-			Groups:           slices.Clone(transfer.Groups),
-			Region:           transfer.Region,
-			DiskType:         transfer.DiskType,
-			NetSpeedMbps:     transfer.NetSpeedMbps,
-			ExpireAt:         transfer.ExpireAt,
-			AutoRenew:        transfer.AutoRenew,
-			RenewIntervalSec: transfer.RenewIntervalSec,
-			TestIntervalSec:  transfer.TestIntervalSec,
-			TestSelections:   slices.Clone(transfer.TestSelections),
+			Alias:             transfer.Alias,
+			Group:             transfer.Group,
+			Tags:              slices.Clone(transfer.Tags),
+			Groups:            slices.Clone(transfer.Groups),
+			Region:            transfer.Region,
+			DiskType:          transfer.DiskType,
+			NetSpeedMbps:      transfer.NetSpeedMbps,
+			ExpireAt:          transfer.ExpireAt,
+			AutoRenew:         transfer.AutoRenew,
+			RenewIntervalSec:  transfer.RenewIntervalSec,
+			TrafficLimitBytes: transfer.TrafficLimitBytes,
+			TrafficLimitType:  transfer.TrafficLimitType,
+			TrafficResetDay:   transfer.TrafficResetDay,
+			TestIntervalSec:   transfer.TestIntervalSec,
+			TestSelections:    slices.Clone(transfer.TestSelections),
 		}
 		if transfer.AlertEnabled != nil {
 			value := *transfer.AlertEnabled
@@ -842,9 +1067,32 @@ func cloneAlertedStates(alerted map[string]AlertedState) map[string]AlertedState
 	}
 	cloned := make(map[string]AlertedState, len(alerted))
 	for nodeID, state := range alerted {
-		cloned[nodeID] = state
+		cloned[nodeID] = cloneAlertedState(state)
 	}
 	return cloned
+}
+
+func cloneAlertedState(state AlertedState) AlertedState {
+	state.Delivered = cloneNotifyBoolMap(state.Delivered)
+	return state
+}
+
+// cloneAlertStates 深拷贝 F4 规则评估状态表（key 为 nodeID|ruleID）。
+func cloneAlertStates(states map[string]RuleAlertState) map[string]RuleAlertState {
+	if len(states) == 0 {
+		return map[string]RuleAlertState{}
+	}
+	cloned := make(map[string]RuleAlertState, len(states))
+	for key, state := range states {
+		cloned[key] = cloneRuleAlertState(state)
+	}
+	return cloned
+}
+
+func cloneRuleAlertState(state RuleAlertState) RuleAlertState {
+	state.Delivered = cloneNotifyBoolMap(state.Delivered)
+	state.SentLeadDays = slices.Clone(state.SentLeadDays)
+	return state
 }
 
 func initSettings(cfg Config) (Settings, error) {
@@ -884,7 +1132,7 @@ func initSettings(cfg Config) (Settings, error) {
 		return Settings{}, err
 	}
 
-	return Settings{
+	settings := Settings{
 		AdminPath:            path,
 		AdminUser:            user,
 		AdminPass:            passHash,
@@ -911,7 +1159,9 @@ func initSettings(cfg Config) (Settings, error) {
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
 		TestCatalog:          []TestCatalogItem{},
-	}, nil
+	}
+	ensureOfflineAlertRule(&settings)
+	return settings, nil
 }
 
 func buildAdminPassword(input string) (string, string, error) {
@@ -1012,7 +1262,494 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 		existing.TestCatalog = fallback.TestCatalog
 	}
 
+	// F5：加载迁移——NotifyChannels 为空时由旧告警字段合成迁移渠道；随后旧字段
+	// 始终从启用渠道回填，保证两套表示一致（Telegram Bot 轮询读 TelegramSettings()）。
+	migrateLegacyNotifyChannels(&existing)
+	syncLegacyAlertFieldsFromChannels(&existing)
+
+	// F4：加载迁移——保证含且仅含一条 metric=offline 的内置规则，且其 duration_sec
+	// 镜像 AlertOfflineSec（旧 state.json 没有任何规则时合成一条）。
+	ensureOfflineAlertRule(&existing)
+
 	return existing, nil
+}
+
+// migrateLegacyNotifyChannels 在 NotifyChannels 为空时由旧告警字段合成迁移渠道：
+// AlertWebhook → {ID:"feishu"}；AlertTelegramToken+AlertTelegramUserIDs → {ID:"telegram"}。
+func migrateLegacyNotifyChannels(settings *Settings) {
+	if len(settings.NotifyChannels) > 0 {
+		return
+	}
+	var channels []NotifyChannel
+	if webhook := strings.TrimSpace(settings.AlertWebhook); webhook != "" {
+		channels = append(channels, NotifyChannel{
+			ID:      legacyFeishuChannelID,
+			Type:    notifyChannelTypeFeishu,
+			Name:    "飞书",
+			Enabled: true,
+			Secrets: map[string]string{"webhook": webhook},
+		})
+	}
+	if token := strings.TrimSpace(settings.AlertTelegramToken); token != "" && len(settings.AlertTelegramUserIDs) > 0 {
+		channels = append(channels, NotifyChannel{
+			ID:      legacyTelegramChannelID,
+			Type:    notifyChannelTypeTelegram,
+			Name:    "Telegram",
+			Enabled: true,
+			Config:  map[string]string{"chat_ids": joinTelegramChatIDs(settings.AlertTelegramUserIDs)},
+			Secrets: map[string]string{"bot_token": token},
+		})
+	}
+	if len(channels) > 0 {
+		settings.NotifyChannels = channels
+	}
+}
+
+// syncLegacyAlertFieldsFromChannels 是渠道 → 旧字段方向的同步：旧字段始终反映
+// 第一个启用渠道的取值（feishu 取 webhook；telegram 取 bot_token + chat_ids），
+// Telegram Bot 轮询因此仍能通过 TelegramSettings() 读到第一个启用 telegram 渠道。
+// 没有满足条件的启用渠道时旧字段清空。
+func syncLegacyAlertFieldsFromChannels(settings *Settings) {
+	settings.AlertWebhook = ""
+	for _, channel := range settings.NotifyChannels {
+		if !channel.Enabled || channel.Type != notifyChannelTypeFeishu {
+			continue
+		}
+		if webhook := strings.TrimSpace(channel.Secrets["webhook"]); webhook != "" {
+			settings.AlertWebhook = webhook
+			break
+		}
+	}
+	settings.AlertTelegramToken = ""
+	settings.AlertTelegramUserIDs = nil
+	for _, channel := range settings.NotifyChannels {
+		if !channel.Enabled || channel.Type != notifyChannelTypeTelegram {
+			continue
+		}
+		token := strings.TrimSpace(channel.Secrets["bot_token"])
+		userIDs := parseNotifyChatIDs(channel.Config["chat_ids"])
+		if token == "" || len(userIDs) == 0 {
+			continue
+		}
+		settings.AlertTelegramToken = token
+		settings.AlertTelegramUserIDs = userIDs
+		break
+	}
+}
+
+// upsertLegacyFeishuChannel 是旧字段 → 渠道方向的同步（更新设置时使用）：
+// webhook 非空时写入/更新 ID 为 "feishu" 的启用渠道；为空时移除该迁移渠道。
+func upsertLegacyFeishuChannel(settings *Settings, webhook string) {
+	webhook = strings.TrimSpace(webhook)
+	for i := range settings.NotifyChannels {
+		if settings.NotifyChannels[i].ID != legacyFeishuChannelID {
+			continue
+		}
+		if webhook == "" {
+			settings.NotifyChannels = append(settings.NotifyChannels[:i], settings.NotifyChannels[i+1:]...)
+			return
+		}
+		settings.NotifyChannels[i].Type = notifyChannelTypeFeishu
+		settings.NotifyChannels[i].Enabled = true
+		setNotifyChannelSecret(&settings.NotifyChannels[i], "webhook", webhook)
+		return
+	}
+	if webhook == "" {
+		return
+	}
+	settings.NotifyChannels = append(settings.NotifyChannels, NotifyChannel{
+		ID:      legacyFeishuChannelID,
+		Type:    notifyChannelTypeFeishu,
+		Name:    "飞书",
+		Enabled: true,
+		Secrets: map[string]string{"webhook": webhook},
+	})
+}
+
+// upsertLegacyTelegramChannel 同上：token 与用户 ID 齐备时写入/更新 ID 为
+// "telegram" 的启用渠道，两者皆空时移除该迁移渠道。
+func upsertLegacyTelegramChannel(settings *Settings, token string, userIDs []int64) {
+	token = strings.TrimSpace(token)
+	ids := normalizeTelegramUserIDs(userIDs)
+	bothSet := token != "" && len(ids) > 0
+	for i := range settings.NotifyChannels {
+		if settings.NotifyChannels[i].ID != legacyTelegramChannelID {
+			continue
+		}
+		if !bothSet {
+			settings.NotifyChannels = append(settings.NotifyChannels[:i], settings.NotifyChannels[i+1:]...)
+			return
+		}
+		settings.NotifyChannels[i].Type = notifyChannelTypeTelegram
+		settings.NotifyChannels[i].Enabled = true
+		setNotifyChannelSecret(&settings.NotifyChannels[i], "bot_token", token)
+		setNotifyChannelConfig(&settings.NotifyChannels[i], "chat_ids", joinTelegramChatIDs(ids))
+		return
+	}
+	if !bothSet {
+		return
+	}
+	settings.NotifyChannels = append(settings.NotifyChannels, NotifyChannel{
+		ID:      legacyTelegramChannelID,
+		Type:    notifyChannelTypeTelegram,
+		Name:    "Telegram",
+		Enabled: true,
+		Config:  map[string]string{"chat_ids": joinTelegramChatIDs(ids)},
+		Secrets: map[string]string{"bot_token": token},
+	})
+}
+
+func setNotifyChannelSecret(channel *NotifyChannel, key, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		delete(channel.Secrets, key)
+		return
+	}
+	if channel.Secrets == nil {
+		channel.Secrets = make(map[string]string)
+	}
+	channel.Secrets[key] = value
+}
+
+func setNotifyChannelConfig(channel *NotifyChannel, key, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		delete(channel.Config, key)
+		return
+	}
+	if channel.Config == nil {
+		channel.Config = make(map[string]string)
+	}
+	channel.Config[key] = value
+}
+
+func normalizeNotifyChannelType(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if _, ok := notifyChannelTypes[value]; !ok {
+		return ""
+	}
+	return value
+}
+
+// normalizeNotifyChannels 规范化渠道列表：类型白名单、ID 去重（空/冲突时生成
+// "c_"+随机串）、字符串修剪、空值丢弃。SecretsSet 与 SecretsClear 均为请求载体
+// 专属字段（后者 B-08 已在合并阶段生效），落盘前在此丢弃。
+func normalizeNotifyChannels(channels []NotifyChannel) ([]NotifyChannel, error) {
+	if len(channels) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(channels))
+	normalized := make([]NotifyChannel, 0, len(channels))
+	for _, channel := range channels {
+		channelType := normalizeNotifyChannelType(channel.Type)
+		if channelType == "" {
+			return nil, fmt.Errorf("不支持的通知渠道类型: %q", strings.TrimSpace(channel.Type))
+		}
+		id := strings.TrimSpace(channel.ID)
+		for {
+			if id != "" {
+				if _, ok := seen[id]; !ok {
+					break
+				}
+			}
+			generatedID, err := randomToken(10)
+			if err != nil {
+				return nil, err
+			}
+			id = "c_" + generatedID
+		}
+		seen[id] = struct{}{}
+		item := NotifyChannel{
+			ID:       id,
+			Type:     channelType,
+			Name:     strings.TrimSpace(channel.Name),
+			Enabled:  channel.Enabled,
+			Config:   normalizeNotifyStringMap(channel.Config, false),
+			Secrets:  normalizeNotifyStringMap(channel.Secrets, true),
+			LastTest: channel.LastTest,
+		}
+		if item.Name == "" {
+			item.Name = channelType
+		}
+		normalized = append(normalized, item)
+	}
+	return normalized, nil
+}
+
+// normalizeNotifyStringMap 修剪键值并丢弃空项（键序稳定，保证结果与 map 遍历
+// 顺序无关；secret 参数保留以区分调用意图，两侧均为 TrimSpace 语义）。
+func normalizeNotifyStringMap(raw map[string]string, secret bool) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(raw))
+	keys := make([]string, 0, len(raw))
+	for key := range raw {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		trimmedKey := strings.TrimSpace(key)
+		value := strings.TrimSpace(raw[key])
+		if trimmedKey == "" || value == "" {
+			continue
+		}
+		normalized[trimmedKey] = value
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func cloneNotifyChannel(channel NotifyChannel) NotifyChannel {
+	channel.Config = cloneNotifyStringMap(channel.Config)
+	channel.Secrets = cloneNotifyStringMap(channel.Secrets)
+	channel.SecretsSet = cloneNotifyBoolMap(channel.SecretsSet)
+	if channel.LastTest != nil {
+		lastTest := *channel.LastTest
+		channel.LastTest = &lastTest
+	}
+	return channel
+}
+
+func cloneNotifyChannels(channels []NotifyChannel) []NotifyChannel {
+	if len(channels) == 0 {
+		return nil
+	}
+	cloned := make([]NotifyChannel, len(channels))
+	for i := range channels {
+		cloned[i] = cloneNotifyChannel(channels[i])
+	}
+	return cloned
+}
+
+func cloneNotifyStringMap(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(raw))
+	for key, value := range raw {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneNotifyBoolMap(raw map[string]bool) map[string]bool {
+	if len(raw) == 0 {
+		return nil
+	}
+	cloned := make(map[string]bool, len(raw))
+	for key, value := range raw {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+// notifyChannelsForView 生成视图形态：Secrets 置空，改以 SecretsSet 标记已配置；
+// SecretsClear 仅请求载体（B-08），返回前同样置空。
+func notifyChannelsForView(channels []NotifyChannel) []NotifyChannel {
+	if len(channels) == 0 {
+		return nil
+	}
+	view := make([]NotifyChannel, 0, len(channels))
+	for _, channel := range channels {
+		item := cloneNotifyChannel(channel)
+		if len(item.Secrets) > 0 {
+			secretsSet := make(map[string]bool, len(item.Secrets))
+			for key, value := range item.Secrets {
+				secretsSet[key] = strings.TrimSpace(value) != ""
+			}
+			item.SecretsSet = secretsSet
+		}
+		item.Secrets = nil
+		item.SecretsClear = nil
+		view = append(view, item)
+	}
+	return view
+}
+
+// mergeNotifyChannelSecrets 在保存时按 ID 匹配已有渠道：某个 secret 为空就保留旧值
+// （与 OAuth Client Secret 的掩码保存语义一致）；secrets_clear 中的 key（B-08/D-04）
+// 例外——不从旧值补齐，并从提交值中删除，实现「清除可选密钥」。
+func mergeNotifyChannelSecrets(incoming, existing []NotifyChannel) []NotifyChannel {
+	if len(incoming) == 0 {
+		return cloneNotifyChannels(incoming)
+	}
+	existingSecrets := make(map[string]map[string]string, len(existing))
+	for _, channel := range existing {
+		existingSecrets[channel.ID] = channel.Secrets
+	}
+	merged := make([]NotifyChannel, len(incoming))
+	for i, channel := range incoming {
+		item := cloneNotifyChannel(channel)
+		cleared := make(map[string]struct{}, len(item.SecretsClear))
+		for _, key := range item.SecretsClear {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			cleared[key] = struct{}{}
+			delete(item.Secrets, key)
+		}
+		if stored, ok := existingSecrets[item.ID]; ok {
+			for key, value := range stored {
+				if _, skip := cleared[key]; skip {
+					continue
+				}
+				if strings.TrimSpace(item.Secrets[key]) == "" && strings.TrimSpace(value) != "" {
+					if item.Secrets == nil {
+						item.Secrets = make(map[string]string)
+					}
+					item.Secrets[key] = value
+				}
+			}
+		}
+		merged[i] = item
+	}
+	return merged
+}
+
+// preserveChannelLastTest 在保存时沿用已记录的测试结果：渠道列表的保存不改动
+// LastTest，只有测试推送接口写入。请求回传相同值时结果不变。
+func preserveChannelLastTest(incoming, existing []NotifyChannel) []NotifyChannel {
+	if len(incoming) == 0 || len(existing) == 0 {
+		return incoming
+	}
+	existingLastTest := make(map[string]*ChannelTestResult, len(existing))
+	for _, channel := range existing {
+		if channel.LastTest == nil {
+			continue
+		}
+		lastTest := *channel.LastTest
+		existingLastTest[channel.ID] = &lastTest
+	}
+	if len(existingLastTest) == 0 {
+		return incoming
+	}
+	for i := range incoming {
+		if incoming[i].LastTest != nil {
+			continue
+		}
+		if lastTest, ok := existingLastTest[incoming[i].ID]; ok {
+			incoming[i].LastTest = lastTest
+		}
+	}
+	return incoming
+}
+
+// redactNotifyChannelsForExport 在导出时清空 Secrets/SecretsSet，以及 Config 中的
+// chat_ids / to（收件人列表视同敏感信息）。
+func redactNotifyChannelsForExport(channels []NotifyChannel) []NotifyChannel {
+	if len(channels) == 0 {
+		return nil
+	}
+	redacted := make([]NotifyChannel, len(channels))
+	for i, channel := range channels {
+		item := cloneNotifyChannel(channel)
+		item.Secrets = nil
+		item.SecretsSet = nil
+		item.Config = redactNotifyChannelConfigForExport(item.Config)
+		redacted[i] = item
+	}
+	return redacted
+}
+
+func redactNotifyChannelConfigForExport(config map[string]string) map[string]string {
+	if len(config) == 0 {
+		return nil
+	}
+	redacted := make(map[string]string, len(config))
+	for key, value := range config {
+		if key == "chat_ids" || key == "to" {
+			continue
+		}
+		redacted[key] = value
+	}
+	if len(redacted) == 0 {
+		return nil
+	}
+	return redacted
+}
+
+// preserveRedactedNotifyChannels 在导入时按 ID 合并保留：导出文件中 Secrets 与
+// chat_ids / to 均已脱敏为空，为空时沿用现有配置，避免导入清掉收件人与密钥。
+func preserveRedactedNotifyChannels(incoming, existing []NotifyChannel) []NotifyChannel {
+	if len(incoming) == 0 {
+		return cloneNotifyChannels(incoming)
+	}
+	existingByID := make(map[string]NotifyChannel, len(existing))
+	for _, channel := range existing {
+		existingByID[channel.ID] = channel
+	}
+	merged := make([]NotifyChannel, len(incoming))
+	for i, channel := range incoming {
+		item := cloneNotifyChannel(channel)
+		if stored, ok := existingByID[item.ID]; ok {
+			for key, value := range stored.Secrets {
+				if strings.TrimSpace(item.Secrets[key]) == "" && strings.TrimSpace(value) != "" {
+					if item.Secrets == nil {
+						item.Secrets = make(map[string]string)
+					}
+					item.Secrets[key] = value
+				}
+			}
+			for _, key := range []string{"chat_ids", "to"} {
+				if strings.TrimSpace(item.Config[key]) == "" && strings.TrimSpace(stored.Config[key]) != "" {
+					if item.Config == nil {
+						item.Config = make(map[string]string)
+					}
+					item.Config[key] = stored.Config[key]
+				}
+			}
+		}
+		merged[i] = item
+	}
+	return merged
+}
+
+// enabledNotifyChannels 返回当前应投递的启用渠道（深拷贝，调用方持有锁外使用）。
+// 渠道列表为空时由旧告警字段即时合成迁移渠道：未落盘迁移的存量配置（以及直接
+// 构造 Store 的旧测试）行为保持不变。
+func enabledNotifyChannels(settings Settings) []NotifyChannel {
+	if len(settings.NotifyChannels) == 0 {
+		synthetic := settings
+		migrateLegacyNotifyChannels(&synthetic)
+		settings.NotifyChannels = synthetic.NotifyChannels
+	}
+	var enabled []NotifyChannel
+	for _, channel := range settings.NotifyChannels {
+		if !channel.Enabled {
+			continue
+		}
+		enabled = append(enabled, cloneNotifyChannel(channel))
+	}
+	return enabled
+}
+
+func joinTelegramChatIDs(ids []int64) string {
+	normalized := normalizeTelegramUserIDs(ids)
+	if len(normalized) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(normalized))
+	for _, id := range normalized {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseNotifyChatIDs 解析逗号分隔的 chat_ids 配置（容忍空白与重复）。
+func parseNotifyChatIDs(raw string) []int64 {
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		value, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || value <= 0 {
+			continue
+		}
+		ids = append(ids, value)
+	}
+	return normalizeTelegramUserIDs(ids)
 }
 
 func normalizeAdminPath(path string) (string, error) {
@@ -1498,15 +2235,13 @@ func normalizeTestCatalog(items []TestCatalogItem) ([]TestCatalogItem, error) {
 		} else if port <= 0 || port > 65535 {
 			return nil, errors.New("TCP 端口需为 1-65535")
 		}
-		interval := 0
-		if itemType == "tcp" {
-			interval = item.IntervalSec
-			if interval < 0 {
-				interval = 0
-			}
-			if interval > 3600 {
-				interval = 3600
-			}
+		// F2：icmp 与 tcp 一样保留 interval（0 表示持续探测），统一钳到 0-3600。
+		interval := item.IntervalSec
+		if interval < 0 {
+			interval = 0
+		}
+		if interval > 3600 {
+			interval = 3600
 		}
 		id := strings.TrimSpace(item.ID)
 		if id == "" {
@@ -1527,6 +2262,16 @@ func normalizeTestCatalog(items []TestCatalogItem) ([]TestCatalogItem, error) {
 			id = generatedID
 		}
 		seen[id] = struct{}{}
+		// O-01：Scope != nil 且 Mode 非空时经 normalizeAlertScope 规范化；
+		// Mode == "" 视为 nil（不下发）；非法 mode 拒绝保存。
+		var scope *AlertScope
+		if item.Scope != nil && strings.TrimSpace(item.Scope.Mode) != "" {
+			normalizedScope, err := normalizeAlertScope(*item.Scope)
+			if err != nil {
+				return nil, err
+			}
+			scope = &normalizedScope
+		}
 		normalized = append(normalized, TestCatalogItem{
 			ID:          id,
 			Name:        name,
@@ -1534,6 +2279,7 @@ func normalizeTestCatalog(items []TestCatalogItem) ([]TestCatalogItem, error) {
 			Host:        host,
 			Port:        port,
 			IntervalSec: interval,
+			Scope:       scope,
 		})
 	}
 	return normalized, nil

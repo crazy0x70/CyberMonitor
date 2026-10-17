@@ -5,9 +5,6 @@ import { getErrorMessage } from "@/lib/admin-format";
 
 export const draftSignature = (serializable: unknown): string => JSON.stringify(serializable);
 
-export const sourceSignature = <T>(make: (src: T) => unknown, src: T): string =>
-  JSON.stringify(make(src));
-
 export function useAsyncAction() {
   return useCallback(
     async <T>(spec: {
@@ -64,7 +61,7 @@ export function useDraftReconcile(options: {
   resetDraft: () => void;
   warningText: string;
   onCleaned?: () => void;
-}): [string, (next: string) => void] {
+}): [string, (next: string) => void, () => void] {
   const { draftSignature, nextSourceSignature, isBusy, warningText } = options;
   const [sourceSignature, setSourceSignature] = useState(nextSourceSignature);
 
@@ -72,6 +69,10 @@ export function useDraftReconcile(options: {
   resetDraftRef.current = options.resetDraft;
   const onCleanedRef = useRef(options.onCleaned);
   onCleanedRef.current = options.onCleaned;
+  // A-03：保存最新 nextSourceSignature，供 discard 在不依赖渲染闭包的情况下
+  // 把基线对齐到服务端当前配置。
+  const nextSourceSignatureRef = useRef(nextSourceSignature);
+  nextSourceSignatureRef.current = nextSourceSignature;
 
   useEffect(() => {
     const isDirty = sourceSignature !== draftSignature;
@@ -99,5 +100,14 @@ export function useDraftReconcile(options: {
   const absorbSourceSignature = useCallback((next: string) => {
     setSourceSignature(next);
   }, []);
-  return [sourceSignature, absorbSourceSignature];
+
+  // A-03 / D-07「放弃修改」：重置草稿并把基线签名对齐到服务端当前配置，
+  // 回到 nextSourceSignature 代表的服务端状态（改回原值后保存条随之消失的同一坐标系）。
+  const discard = useCallback(() => {
+    resetDraftRef.current();
+    setSourceSignature(nextSourceSignatureRef.current);
+    onCleanedRef.current?.();
+  }, []);
+
+  return [sourceSignature, absorbSourceSignature, discard];
 }

@@ -6,7 +6,7 @@ export const adminKVGridClass =
   "admin-kv-grid grid grid-cols-1 items-baseline gap-y-2 sm:grid-cols-[200px_minmax(0,1fr)] sm:gap-x-6 sm:gap-y-0";
 
 export const adminKVLabelClass =
-  "admin-kv-label text-xs font-medium leading-5 text-[var(--label-2)] sm:text-right";
+  "admin-kv-label text-[13px] font-medium leading-5 text-[var(--label-2)] sm:text-right";
 
 type AdminKVFieldProps = {
   label: ReactNode;

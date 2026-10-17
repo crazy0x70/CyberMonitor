@@ -55,6 +55,13 @@ export interface GroupNode {
   children?: GroupNode[];
 }
 
+// F1：一次分组归属迁移（对应后端 SettingsUpdate.GroupMoves）。
+// from / to 为 selection 字符串："A"（分组级）或 "A:t"（标签级）。
+export interface GroupMove {
+  from: string;
+  to: string;
+}
+
 export interface GroupSelection {
   group: string;
   tag: string;
@@ -67,6 +74,10 @@ export interface TestCatalogItem {
   host: string;
   port?: number;
   interval_sec?: number;
+  // O-01：下发范围（后端 persist.go TestCatalogItem.Scope）。undefined 表示
+  // 「不下发」（仅节点手动选择生效）；mode=all 时 exclude 生效，mode=include
+  // 时 nodes / groups 任一命中即下发（exclude 同样生效，D-05）。
+  scope?: AlertScope;
 }
 
 export interface AIProviderConfig {
@@ -74,6 +85,7 @@ export interface AIProviderConfig {
   api_key_set?: boolean;
   base_url?: string;
   model?: string;
+  allow_private_base_url?: boolean;
 }
 
 interface AIProviderProfile extends AIProviderConfig {
@@ -86,6 +98,76 @@ interface AISettings {
   prompt?: string;
   openai?: AIProviderConfig;
   openai_compatibles?: AIProviderProfile[];
+}
+
+// F5 通知渠道测试结果（POST /api/v1/admin/alerts/test 的 {channel} 草稿请求体
+// 返回 {ok, error, latency_ms}；同时由服务端写入渠道的 last_test）。
+export interface ChannelTestResult {
+  at: number;
+  ok: boolean;
+  error?: string;
+  latency_ms?: number;
+}
+
+// F5 多渠道通知模型（后端 persist.go NotifyChannel）。
+// 视图形态：Secrets 恒为空，改以 secrets_set 标记已配置的敏感字段；
+// 保存载荷只需带 id / type / name / enabled / config / secrets（非空 secret）。
+// secrets_clear（B-08 / D-04）：要清除的可选密钥 key 列表，仅保存 / 测试载荷使用，
+// 服务端合并后丢弃，视图不回传。
+export interface NotifyChannel {
+  id?: string;
+  type?: string;
+  name?: string;
+  enabled?: boolean;
+  config?: Record<string, string>;
+  secrets?: Record<string, string>;
+  secrets_set?: Record<string, boolean>;
+  secrets_clear?: string[];
+  last_test?: ChannelTestResult | null;
+}
+
+// F4 告警规则范围（后端 persist.go AlertScope）：mode=all 时 exclude 生效；
+// mode=include 时 nodes / groups 任一命中即适用（groups 值为 "A" 或 "A:t"）。
+export interface AlertScope {
+  mode?: string;
+  nodes?: string[];
+  groups?: string[];
+  exclude?: string[];
+}
+
+// F4 告警规则模型（后端 persist.go AlertRule）。threshold 的存储单位随指标
+// （net_in / net_out 为 B/s，UI 按 Mbps 输入换算后存储）；channel_ids 空 = 全部
+// 已启用渠道；duration_sec 0 = 单次采样即判定；repeat 为 "once" | "backoff"。
+export interface AlertRule {
+  id?: string;
+  name?: string;
+  enabled?: boolean;
+  metric?: string;
+  op?: string;
+  threshold?: number;
+  duration_sec?: number;
+  ratio?: number;
+  scope?: AlertScope;
+  channel_ids?: string[];
+  notify_recover?: boolean;
+  repeat?: string;
+  probe_name?: string;
+  lead_days?: number[];
+}
+
+// SettingsView.alert_rule_status 的条目：某规则当前处于 FIRING 状态的节点数
+// （运行时聚合，只读，不参与保存）。
+export interface AlertRuleStatusView {
+  firing: number;
+}
+
+// F4 模拟评估（POST /api/v1/admin/alerts/rules/preview）的单节点结果；
+// state 为 "pass" | "fail" | "unknown"。
+export interface AlertRulePreviewItem {
+  node_id: string;
+  name: string;
+  value: number;
+  state: string;
 }
 
 export interface SettingsView {
@@ -113,6 +195,11 @@ export interface SettingsView {
   alert_telegram_token?: string;
   alert_telegram_token_set?: boolean;
   alert_telegram_user_ids?: number[];
+  notify_channels?: NotifyChannel[];
+  // F4：alert_rules 为完整规则列表（含内置 offline 规则）；alert_rule_status 为
+  // 运行时聚合（每条规则 FIRING 节点数），只读。
+  alert_rules?: AlertRule[];
+  alert_rule_status?: Record<string, AlertRuleStatusView>;
   login_fail_limit?: number;
   login_fail_window_sec?: number;
   login_lock_sec?: number;
@@ -144,6 +231,9 @@ export interface SettingsUpdate {
   alert_offline_sec?: number;
   alert_telegram_token?: string;
   alert_telegram_user_ids?: number[];
+  notify_channels?: NotifyChannel[];
+  // F4：完整规则列表（含内置 offline 规则）；省略 = 本次请求不改规则。
+  alert_rules?: AlertRule[];
   login_fail_limit?: number;
   login_fail_window_sec?: number;
   login_lock_sec?: number;
@@ -151,6 +241,7 @@ export interface SettingsUpdate {
   ai_settings?: AISettings;
   groups?: string[];
   group_tree?: GroupNode[];
+  group_moves?: GroupMove[];
   test_catalog?: TestCatalogItem[];
 }
 
@@ -299,6 +390,18 @@ export interface NodeView {
   expire_at?: number;
   auto_renew?: boolean;
   renew_interval_sec?: number;
+  // F4 流量配额（后端 NodeView 同名 JSON 字段，omitempty；0 / 空为未设置）。
+  traffic_limit_bytes?: number;
+  traffic_limit_type?: string;
+  traffic_reset_day?: number;
+  // A-02：管理端专属的流量用量字段（仅 admin 快照 / /api/v1/admin/nodes 返回，
+  // 公开快照与公开 WS 载荷不含；0 / 未定义为无数据）。
+  traffic_used_bytes?: number;
+  traffic_cycle_start?: number;
+  // O-01：管理端专属的范围下发探测目录项 ID（只读，仅 admin 快照 /
+  // /api/v1/admin/nodes 返回，公开快照与公开 WS 载荷不含——红线 4）。
+  // 已被节点手动选择的目录项不列入（手动选择优先）。
+  scoped_test_ids?: string[];
   hidden_from_display?: boolean;
   hidden_from_cr?: boolean;
   hidden_from_all?: boolean;
@@ -357,6 +460,60 @@ export interface AgentUpdateInfo {
   published_at?: string;
 }
 
+// F7 主控运行状态（GET /api/v1/admin/system/status 响应，字段与后端 SystemStatus 一致）。
+// Dashboard（每 10s 轮询）与基础设置 system 分区「运行信息」卡各自拉取一份。
+export interface SystemStatusView {
+  version?: string;
+  commit?: string;
+  go_version?: string;
+  started_at?: number;
+  uptime_sec?: number;
+  goroutines?: number;
+  mem?: { alloc?: number; sys?: number; heap_inuse?: number };
+  process?: { cpu_percent?: number; rss?: number };
+  host?: { load1?: number; cpu_percent?: number; mem_used_percent?: number };
+  ws_clients?: { admin?: number; public?: number };
+  data_dir?: { state_bytes?: number; tsdb_bytes?: number; free_bytes?: number };
+  // A-10：当前告警聚合——firing 为告警中 (规则, 节点) 数（阈值类 FIRING + 离线
+  // 告警中的节点），nodes 为涉及的去重节点数。
+  alerts?: { firing?: number; nodes?: number };
+}
+
+// F7 探测总览（GET /api/v1/admin/probes/overview?range=1h|24h）：服务端跨节点按探测
+// 目标聚合的窗口统计；无有效延迟 / 丢包样本时对应字段为 null。
+export interface ProbeTargetOverview {
+  name?: string;
+  type?: string;
+  host?: string;
+  port?: number;
+  nodes?: number;
+  samples?: number;
+  availability_pct?: number;
+  avg_latency_ms?: number | null;
+  p95_latency_ms?: number | null;
+  avg_loss_pct?: number | null;
+}
+
+export interface ProbeNodeOverview {
+  node_id: string;
+  targets: number;
+  samples: number;
+  availability_pct: number;
+  avg_latency_ms?: number | null;
+  p95_latency_ms?: number | null;
+  avg_loss_pct?: number | null;
+}
+
+export type ProbeOverviewRange = "1h" | "24h";
+
+export interface ProbesOverviewResponse {
+  range_key: string;
+  from: number;
+  to: number;
+  targets: ProbeTargetOverview[];
+  nodes?: ProbeNodeOverview[];
+}
+
 export interface Snapshot {
   type: string;
   generated_at: number;
@@ -390,6 +547,10 @@ export interface NodeProfilePayload {
   renew_interval_sec?: number;
   test_selections?: TestSelection[];
   alert_enabled?: boolean;
+  // F4 流量配额（后端 NodeProfileUpdate 指针字段；traffic_reset_day 0 = 清空恢复默认）。
+  traffic_limit_bytes?: number;
+  traffic_limit_type?: string;
+  traffic_reset_day?: number;
 }
 
 export interface AlertTestPayload {

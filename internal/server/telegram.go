@@ -12,9 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 const (
@@ -23,8 +21,6 @@ const (
 	telegramAIWindow        = time.Minute
 	telegramAILimit         = 3
 )
-
-var telegramSendFunc = sendTelegramMessage
 
 const telegramBackoffCap = time.Minute
 
@@ -229,76 +225,28 @@ func fetchTelegramUpdates(ctx context.Context, client *http.Client, token string
 	return payload.Result, nil
 }
 
-func sendTelegramAlert(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
-	return sendTelegramEventNotice(token, userIDs, siteTitle, events, buildAlertMessage, "告警")
-}
-
-func sendTelegramRecovery(token string, userIDs []int64, siteTitle string, events []AlertEvent) bool {
-	return sendTelegramEventNotice(token, userIDs, siteTitle, events, buildRecoveryMessage, "恢复通知")
-}
-
 const telegramMessageLimit = 4000
 
-func splitTelegramMessage(text string, limit int) []string {
-	if len(text) <= limit {
-		return []string{text}
-	}
-	var chunks []string
-	current := ""
-	flush := func() {
-		if current != "" {
-			chunks = append(chunks, current)
-			current = ""
-		}
-	}
-	for _, line := range strings.Split(text, "\n") {
-		candidate := line
-		if current != "" {
-			candidate = current + "\n" + line
-		}
-		switch {
-		case len(candidate) <= limit:
-			current = candidate
-		case len(line) > limit:
-			flush()
-			for len(line) > limit {
-				cut := limit
-				for cut > 0 && !utf8.RuneStart(line[cut]) {
-					cut--
-				}
-				if cut == 0 {
-					cut = limit
-				}
-				chunks = append(chunks, line[:cut])
-				line = line[cut:]
-			}
-			current = line
-		default:
-			flush()
-			current = line
-		}
-	}
-	flush()
-	return chunks
-}
-
-func sendTelegramEventNotice(token string, userIDs []int64, siteTitle string, events []AlertEvent, build func(string, []AlertEvent) string, label string) bool {
-	if token == "" || len(userIDs) == 0 || len(events) == 0 {
-		return true
-	}
-	var errs []string
-	for _, chunk := range splitTelegramMessage(build(siteTitle, events), telegramMessageLimit) {
-		errs = append(errs, sendTelegramMessageToUsers(token, userIDs, chunk)...)
-	}
-	for _, err := range errs {
-		log.Printf("Telegram %s发送失败: %v", label, err)
-	}
-	return len(errs) == 0
-}
-
+// sendTelegramTest 维持旧测试推送语义（消息文案、错误聚合不变），内部改走 F5 的
+// telegram Notifier（parse_mode=HTML + 文本转义，经 SSRF 防护客户端发送）。
 func sendTelegramTest(token string, userIDs []int64, siteTitle string) []string {
+	notifier, err := newNotifier(NotifyChannel{
+		ID:      legacyTelegramChannelID,
+		Type:    notifyChannelTypeTelegram,
+		Enabled: true,
+		Config:  map[string]string{"chat_ids": joinTelegramChatIDs(userIDs)},
+		Secrets: map[string]string{"bot_token": strings.TrimSpace(token)},
+	})
+	if err != nil {
+		return []string{err.Error()}
+	}
 	message := fmt.Sprintf("【%s】Telegram 告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
-	return sendTelegramMessageToUsers(token, userIDs, message)
+	ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
+	defer cancel()
+	if err := notifier.Send(ctx, NotifyMessage{Text: message}); err != nil {
+		return []string{err.Error()}
+	}
+	return nil
 }
 
 type telegramAPIError struct {
@@ -312,41 +260,6 @@ func (e *telegramAPIError) Unwrap() error { return e.err }
 
 func (e *telegramAPIError) permanent() bool {
 	return e.statusCode == 400 || e.statusCode == 401 || e.statusCode == 403 || e.statusCode == 404
-}
-
-func sendTelegramMessageToUsers(token string, userIDs []int64, text string) []string {
-	ids := normalizeTelegramUserIDs(userIDs)
-	if token == "" || len(ids) == 0 || strings.TrimSpace(text) == "" {
-		return nil
-	}
-	errCh := make(chan string, len(ids))
-	sem := make(chan struct{}, telegramSendConcurrency)
-	var wg sync.WaitGroup
-	for _, id := range ids {
-		id := id
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if err := telegramSendFunc(context.Background(), token, id, text); err != nil {
-				var apiErr *telegramAPIError
-				if errors.As(err, &apiErr) && apiErr.permanent() {
-					log.Printf("Telegram 收件人 %d 不可达，跳过该收件人: %v", id, err)
-					return
-				}
-				errCh <- err.Error()
-			}
-		}()
-	}
-	wg.Wait()
-	close(errCh)
-	var errs []string
-	for err := range errCh {
-		errs = append(errs, err)
-	}
-	sort.Strings(errs)
-	return errs
 }
 
 func telegramBotAPICall(ctx context.Context, client *http.Client, token, method string, payload any, label string) (telegramSendResponse, error) {

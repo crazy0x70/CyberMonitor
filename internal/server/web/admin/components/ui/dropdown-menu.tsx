@@ -39,7 +39,11 @@ function DropdownMenuContent({
       >
         <MenuPrimitive.Popup
           data-slot="dropdown-menu-content"
-          className={cn("z-50 max-h-(--available-height) w-(--anchor-width) min-w-32 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover p-1 text-popover-foreground shadow-[var(--cm-elev-2)] ring-1 ring-foreground/10 transition-none duration-100 outline-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:overflow-hidden data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+          // A-13/M-07：玻璃菜单 —— --mat-popover-bg + --blur-thick + --hairline 边 + 上沿内高光 + --shadow-3，圆角 14px。
+          // 出现 scale(.96)→1 + opacity（P-02 第 3 条，--tw-enter-scale 变量传入），
+          // transform-origin 由 base-ui 的 --transform-origin 指向触发点；
+          // 进入 --dur-3 --ease-spring（菜单令牌），退出 --dur-2 + scale(.98) 对齐 A-11 弹窗退出
+          className={cn("z-50 max-h-(--available-height) w-(--anchor-width) min-w-32 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-[14px] border border-[var(--hairline)] bg-[var(--mat-popover-bg)] p-1 text-popover-foreground shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-3)] [-webkit-backdrop-filter:var(--blur-thick)] [backdrop-filter:var(--blur-thick)] transition-none duration-100 outline-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:[--tw-enter-scale:0.96] data-open:duration-[var(--dur-3)] data-open:ease-[var(--ease-spring)] data-closed:animate-out data-closed:overflow-hidden data-closed:fade-out-0 data-closed:[--tw-exit-scale:0.98] data-closed:duration-[var(--dur-2)]", className )}
           {...props}
         />
       </MenuPrimitive.Positioner>
@@ -86,7 +90,8 @@ function DropdownMenuItem({
       data-inset={inset}
       data-variant={variant}
       className={cn(
-        "group/dropdown-menu-item relative flex cursor-default items-center gap-1 rounded-md px-1 py-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-8 data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive dark:data-[variant=destructive]:focus:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
+        // A-13：菜单项悬停/聚焦为 --accent 实底白字（macOS 菜单标志性做法）
+        "group/dropdown-menu-item relative flex cursor-default items-center gap-1 rounded-md px-1 py-1 text-sm outline-hidden select-none focus:bg-[var(--accent)] focus:text-white not-data-[variant=destructive]:focus:**:text-white data-inset:pl-8 data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive dark:data-[variant=destructive]:focus:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
         className
       )}
       {...props}
@@ -111,7 +116,7 @@ function DropdownMenuSubTrigger({
       data-slot="dropdown-menu-sub-trigger"
       data-inset={inset}
       className={cn(
-        "flex cursor-default items-center gap-1 rounded-md px-1 py-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-8 data-popup-open:bg-accent data-popup-open:text-accent-foreground data-open:bg-accent data-open:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "flex cursor-default items-center gap-1 rounded-md px-1 py-1 text-sm outline-hidden select-none focus:bg-[var(--accent)] focus:text-white not-data-[variant=destructive]:focus:**:text-white data-inset:pl-8 data-popup-open:bg-[var(--accent)] data-popup-open:text-white data-open:bg-[var(--accent)] data-open:text-white [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       {...props}
@@ -133,7 +138,7 @@ function DropdownMenuSubContent({
   return (
     <DropdownMenuContent
       data-slot="dropdown-menu-sub-content"
-      className={cn("w-auto min-w-[96px] rounded-lg bg-popover p-1 text-popover-foreground shadow-[var(--cm-elev-2)] ring-1 ring-foreground/10 transition-none duration-100 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+      className={cn("w-auto min-w-[96px] rounded-[14px] border border-[var(--hairline)] bg-[var(--mat-popover-bg)] p-1 text-popover-foreground shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-3)] [-webkit-backdrop-filter:var(--blur-thick)] [backdrop-filter:var(--blur-thick)] transition-none duration-100 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:[--tw-enter-scale:0.96] data-open:duration-[var(--dur-3)] data-open:ease-[var(--ease-spring)] data-closed:animate-out data-closed:fade-out-0 data-closed:[--tw-exit-scale:0.98] data-closed:duration-[var(--dur-2)]", className )}
       align={align}
       alignOffset={alignOffset}
       side={side}
@@ -157,7 +162,7 @@ function DropdownMenuCheckboxItem({
       data-slot="dropdown-menu-checkbox-item"
       data-inset={inset}
       className={cn(
-        "relative flex cursor-default items-center gap-1 rounded-md py-1 pr-8 pl-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-8 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "relative flex cursor-default items-center gap-1 rounded-md py-1 pr-8 pl-1 text-sm outline-hidden select-none focus:bg-[var(--accent)] focus:text-white focus:**:text-white data-inset:pl-8 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       checked={checked}
@@ -199,7 +204,7 @@ function DropdownMenuRadioItem({
       data-slot="dropdown-menu-radio-item"
       data-inset={inset}
       className={cn(
-        "relative flex cursor-default items-center gap-1 rounded-md py-1 pr-8 pl-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-8 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "relative flex cursor-default items-center gap-1 rounded-md py-1 pr-8 pl-1 text-sm outline-hidden select-none focus:bg-[var(--accent)] focus:text-white focus:**:text-white data-inset:pl-8 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       {...props}
@@ -239,7 +244,7 @@ function DropdownMenuShortcut({
     <span
       data-slot="dropdown-menu-shortcut"
       className={cn(
-        "ml-auto text-xs tracking-widest text-muted-foreground group-focus/dropdown-menu-item:text-accent-foreground",
+        "ml-auto text-xs tracking-widest text-muted-foreground group-focus/dropdown-menu-item:text-white",
         className
       )}
       {...props}

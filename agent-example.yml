@@ -1,6 +1,6 @@
 services:
   cyber-monitor-agent:
-    # 仅用于 Linux Docker host；Windows 使用 scripts/agent.ps1，普通 Linux systemd 使用 scripts/agent.sh。
+    # 仅用于 Linux Docker host；其他情况请用 scripts/one-click.sh（Linux / macOS）或 scripts/one-click.ps1（Windows）。
     # 示例：CM_VERSION=v0.6.0 CM_SERVER_URL=http://192.0.2.10:25012 CM_AGENT_TOKEN=... docker compose -f agent-example.yml up -d
     image: ghcr.io/crazy0x70/cyber-monitor-agent:${CM_VERSION:?set CM_VERSION}
     container_name: cyber-monitor-agent

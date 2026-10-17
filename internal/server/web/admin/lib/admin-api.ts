@@ -1,11 +1,14 @@
 import type {
   AdminBootPayload,
+  AlertRule,
+  AlertRulePreviewItem,
   AlertTestPayload,
   AgentUpdateInfo,
   AIProviderConfig,
   AdminLogLevel,
   AdminLogsResponse,
   ApiErrorPayload,
+  ChannelTestResult,
   ConfigImportResponse,
   LoginConfigResponse,
   LoginResponse,
@@ -13,9 +16,13 @@ import type {
   NodeDeleteResponse,
   NodeProfilePayload,
   NodeView,
+  NotifyChannel,
+  ProbeOverviewRange,
+  ProbesOverviewResponse,
   SettingsUpdate,
   SettingsView,
   Snapshot,
+  SystemStatusView,
   SystemUpdateInfo,
 } from "@/lib/admin-types";
 
@@ -332,8 +339,11 @@ export async function deleteNodeProfile(nodeID: string) {
   return unwrapResponse<NodeDeleteResponse>(resp, "删除节点失败");
 }
 
-export async function fetchSystemUpdateInfo() {
-  const resp = await apiFetch("/api/v1/admin/system/update");
+// F3 第 3 条：force=true 时携带 ?force=1，服务端跳过缓存强制刷新更新信息
+// （「检查」按钮传入 true；常规轮询 / 首次加载走默认缓存视图）。
+export async function fetchSystemUpdateInfo(force = false) {
+  const query = force ? "?force=1" : "";
+  const resp = await apiFetch(`/api/v1/admin/system/update${query}`);
   return unwrapResponse<SystemUpdateInfo>(resp, "获取服务端更新状态失败");
 }
 
@@ -343,6 +353,21 @@ export async function triggerSystemUpdate() {
     { method: "POST" },
   );
   return unwrapResponse<{ status: string; target_version?: string }>(resp, "触发服务端更新失败");
+}
+
+// F7：主控运行状态（GET /api/v1/admin/system/status）。Dashboard「主控负载 / 主控状态」
+// 与基础设置「运行信息」卡的数据源，由调用方各自拉取。
+export async function fetchSystemStatus() {
+  const resp = await apiFetch("/api/v1/admin/system/status");
+  return unwrapResponse<SystemStatusView>(resp, "加载主控状态失败");
+}
+
+// F7：探测总览（GET /api/v1/admin/probes/overview?range=1h|24h），跨节点聚合的
+// 可用率 / 平均延迟 / P95 / 平均丢包。
+export async function fetchProbesOverview(range: ProbeOverviewRange) {
+  const params = new URLSearchParams({ range });
+  const resp = await apiFetch(`/api/v1/admin/probes/overview?${params.toString()}`);
+  return unwrapResponse<ProbesOverviewResponse>(resp, "加载探测总览失败");
 }
 
 export async function triggerAgentUpdate(nodeID: string) {
@@ -370,6 +395,35 @@ export async function testAlertChannels(payload: AlertTestPayload) {
     },
   );
   return unwrapResponse<{ status: string }>(resp, "测试告警失败");
+}
+
+// F5 渠道草稿测试：POST {channel} 请求体（接受未保存草稿，secret 为空时服务端按
+// 同 ID 已存值补齐），返回 {ok, error, latency_ms} 并写入该渠道的 last_test。
+// 旧的 webhook/telegram 请求体走 testAlertChannels，保持兼容。
+export async function testNotifyChannelDraft(channel: NotifyChannel) {
+  const resp = await apiFetch(
+    "/api/v1/admin/alerts/test",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel }),
+    },
+  );
+  return unwrapResponse<ChannelTestResult>(resp, "测试发送失败");
+}
+
+// F4 模拟评估：POST 一条规则草稿（请求体即 AlertRule 本身，接受未保存草稿），
+// 返回每个适用节点的 {node_id, name, value, state}，不修改样本环与状态机。
+export async function previewAlertRule(rule: AlertRule) {
+  const resp = await apiFetch(
+    "/api/v1/admin/alerts/rules/preview",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(rule),
+    },
+  );
+  return unwrapResponse<{ results: AlertRulePreviewItem[] }>(resp, "模拟评估失败");
 }
 
 export async function testAIProvider(provider: string, config: AIProviderConfig | null) {

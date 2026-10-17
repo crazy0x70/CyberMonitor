@@ -23,7 +23,18 @@ import (
 	"golang.org/x/oauth2/github"
 )
 
-var oidcProviderCache sync.Map
+var (
+	oidcProviderCache         sync.Map
+	oidcDiscoveryFailureCache sync.Map
+)
+
+// adminOAuthHTTPClientFactory 构造 OIDC 发现与令牌交换使用的 HTTP 客户端。
+// 抽成变量便于测试注入计数客户端；生产环境仍为禁止重定向的受限客户端。
+var adminOAuthHTTPClientFactory = defaultAdminOAuthHTTPClientFactory
+
+func defaultAdminOAuthHTTPClientFactory() *http.Client {
+	return noRedirectHTTPClient(adminOAuthHTTPTimeout)
+}
 
 const (
 	adminOAuthStateCookieName = "cm_admin_oauth_state"
@@ -31,6 +42,15 @@ const (
 	adminOAuthHTTPTimeout     = 8 * time.Second
 	adminOAuthProviderGitHub  = "github"
 	adminOAuthProviderOIDC    = "oidc"
+
+	// adminOAuthUnavailableMessage 是 /oauth/start 失败时对外统一返回的脱敏消息；
+	// 原始错误（可能含 issuer URL、解析出的内网 IP/端口、TLS/连接细节）只写服务端日志。
+	adminOAuthUnavailableMessage = "OAuth 提供方暂不可用"
+	// adminOAuthDiscoveryFailureTTL 是 OIDC 发现失败结果的负缓存时长，避免失败路径反复发起对外请求。
+	adminOAuthDiscoveryFailureTTL = 30 * time.Second
+	// adminOAuthStartRateWindow / adminOAuthStartRateLimit 是 /oauth/start 的按客户端 IP 准入限流参数。
+	adminOAuthStartRateWindow = time.Minute
+	adminOAuthStartRateLimit  = 30
 )
 
 type adminOAuthStatePayload struct {
@@ -265,12 +285,20 @@ func handleAdminOAuthStart(store *Store, jwtSecret string, trustedProxyHeaders b
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
+		// 准入限流：/oauth/start 直挂 adminMux，无 requireAdminJWT，未认证方可触发 OIDC 发现，
+		// 故按客户端 IP 分桶限流，避免被反复用来探测外部/内网目标。
+		if !store.allowAgentRate("admin-oauth-start:"+clientIPFromRemoteAddr(r.RemoteAddr), adminOAuthStartRateWindow, adminOAuthStartRateLimit, time.Now(), true) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
 		providerID := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
 		settings := normalizeAdminAuthSettings(store.Credentials().AdminAuth)
 		redirectURI := adminOAuthRedirectURI(r, trustedProxyHeaders)
 		oauthConfig, _, nonce, err := adminOAuthConfigForProvider(r.Context(), providerID, settings, redirectURI)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			// 不回显原始错误：其可能包含 issuer URL、解析出的内网 IP/端口与 TLS/连接细节。
+			log.Printf("管理员 OAuth start 失败: provider=%s remote=%s err=%v", providerID, r.RemoteAddr, err)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": adminOAuthUnavailableMessage})
 			return
 		}
 		state, err := randomToken(32)
@@ -381,9 +409,14 @@ func adminOAuthConfigForProvider(ctx context.Context, providerID string, setting
 		var provider *oidc.Provider
 		if cached, ok := oidcProviderCache.Load(settings.OIDC.IssuerURL); ok {
 			provider = cached.(*oidc.Provider)
+		} else if until, ok := oidcDiscoveryFailureCachedUntil(settings.OIDC.IssuerURL, time.Now()); ok {
+			// 短时负缓存：失败的发现结果在 TTL 内直接拒绝，不再重复发起对外请求。
+			// 返回不含拓扑细节的通用错误（对外仍会被 handler 脱敏）。
+			return oauth2.Config{}, nil, "", fmt.Errorf("oidc discovery failed, retry after %s", until.Format(time.RFC3339))
 		} else {
 			provider, err = oidc.NewProvider(adminOAuthContext(ctx), settings.OIDC.IssuerURL)
 			if err != nil {
+				oidcDiscoveryFailureCache.Store(settings.OIDC.IssuerURL, time.Now().Add(adminOAuthDiscoveryFailureTTL))
 				return oauth2.Config{}, nil, "", err
 			}
 			oidcProviderCache.Store(settings.OIDC.IssuerURL, provider)
@@ -600,8 +633,23 @@ func sanitizeAdminReturnTo(raw string, adminPath string) string {
 }
 
 func adminOAuthContext(ctx context.Context) context.Context {
-	client := noRedirectHTTPClient(adminOAuthHTTPTimeout)
+	client := adminOAuthHTTPClientFactory()
 	return context.WithValue(ctx, oauth2.HTTPClient, client)
+}
+
+// oidcDiscoveryFailureCachedUntil 返回 issuer 的发现失败负缓存是否仍在有效期内。
+// 过期的缓存项会被清理。
+func oidcDiscoveryFailureCachedUntil(issuerURL string, now time.Time) (time.Time, bool) {
+	value, ok := oidcDiscoveryFailureCache.Load(issuerURL)
+	if !ok {
+		return time.Time{}, false
+	}
+	until, ok := value.(time.Time)
+	if !ok || !now.Before(until) {
+		oidcDiscoveryFailureCache.Delete(issuerURL)
+		return time.Time{}, false
+	}
+	return until, true
 }
 
 func signAdminOAuthState(payload adminOAuthStatePayload, secret string, tokenSalt string) (string, error) {

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -307,7 +308,7 @@ func (c *Collector) Collect() NodeStats {
 
 	diskCounters, err := disk.IOCounters()
 	c.warnOnce("disk.IOCounters", err)
-	diskRead, diskWrite := sumDiskIOBytesWithCache(diskCounters, c.hostRoot, c.blockPartitionAttr)
+	diskRead, diskWrite := sumDiskIOBytesWithCache(diskCounters, c.hostRoot, c.blockPartitionAttr, c.readBlockDeviceSlaves)
 
 	netFilter := c.resolveNetFilterAt(now)
 	netCounters, err := gnet.IOCounters(true)
@@ -318,11 +319,11 @@ func (c *Collector) Collect() NodeStats {
 	if hostName := c.readHostHostnameAt(now); hostName != "" {
 		hostname = hostName
 	}
-	tcpConns, udpConns := c.sampleConnectionCountsAt(now, 5*time.Second, readConnectionCounts)
+	tcpConns, udpConns := c.sampleConnectionCountsAt(now)
 
 	netSpeedMbps := c.collectNetSpeedMbpsAt(now, netFilter, netCounters)
 	publicIPs := c.currentPublicIPs(now)
-	gpuStats, gpuSampled := c.collectGPUStatsAt(now, staticInfoRefreshed, runNVIDIAGPUSample)
+	gpuStats, gpuSampled := c.collectGPUStatsAt(now, staticInfoRefreshed, nil)
 	loadStat := valueOrZero(loadAvg)
 	memoryStat := valueOrZero(memStat)
 	stats := NodeStats{
@@ -509,19 +510,10 @@ func (c *Collector) refreshStaticInfoAt(now time.Time, partitions []disk.Partiti
 	return true
 }
 
-func (c *Collector) sampleConnectionCountsAt(
-	now time.Time,
-	interval time.Duration,
-	sampler func() (int, int),
-) (int, int) {
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	if sampler == nil {
-		sampler = readConnectionCounts
-	}
-	if c.prevConnAt.IsZero() || now.Sub(c.prevConnAt) >= interval {
-		c.prevTCP, c.prevUDP = sampler()
+// sampleConnectionCountsAt 每 5 秒刷新一次 TCP / UDP 连接数，其余 tick 复用上次结果。
+func (c *Collector) sampleConnectionCountsAt(now time.Time) (int, int) {
+	if c.prevConnAt.IsZero() || now.Sub(c.prevConnAt) >= 5*time.Second {
+		c.prevTCP, c.prevUDP = readConnectionCounts()
 		c.prevConnAt = now
 	}
 	return c.prevTCP, c.prevUDP
@@ -551,7 +543,7 @@ func (c *Collector) resolveNetFilterAt(now time.Time) map[string]struct{} {
 		return c.resolvedNetFilter
 	}
 	if counters, err := gnet.IOCounters(true); err == nil {
-		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName, c.isAggregatingMaster)
+		c.resolvedNetFilter = buildDefaultInterfaceFilter(counters, c.readInterfaceMasterName, c.isAggregatingMaster, c.readInterfaceLowerName)
 		c.resolvedNetFilterAt = now
 	}
 	return c.resolvedNetFilter
@@ -662,18 +654,6 @@ func (c *Collector) lookupPublicIPAt(ctx context.Context, family publicIPFamily)
 		return "", err
 	}
 	return normalizePublicIPAddress(family, value), nil
-}
-
-func readConnectionCounts() (int, int) {
-	tcpConns := 0
-	udpConns := 0
-	if conns, err := gnet.Connections("tcp"); err == nil {
-		tcpConns = len(conns)
-	}
-	if conns, err := gnet.Connections("udp"); err == nil {
-		udpConns = len(conns)
-	}
-	return tcpConns, udpConns
 }
 
 func newPublicIPLookup(timeout time.Duration) publicIPLookupFunc {
@@ -862,6 +842,7 @@ func buildDefaultInterfaceFilter(
 	stats []gnet.IOCountersStat,
 	readMaster func(string) string,
 	isAggregatingMaster func(string) bool,
+	readLower func(string) string,
 ) map[string]struct{} {
 	if len(stats) == 0 {
 		return nil
@@ -874,7 +855,7 @@ func buildDefaultInterfaceFilter(
 	}
 	resolved := make(map[string]struct{}, len(stats))
 	for _, stat := range stats {
-		if shouldIgnoreDefaultInterface(stat.Name, readMaster, isAggregatingMaster, known) {
+		if shouldIgnoreDefaultInterface(stat.Name, readMaster, isAggregatingMaster, readLower, known) {
 			continue
 		}
 		name := normalizeInterfaceName(stat.Name)
@@ -893,6 +874,7 @@ func shouldIgnoreDefaultInterface(
 	name string,
 	readMaster func(string) string,
 	isAggregatingMaster func(string) bool,
+	readLower func(string) string,
 	knownInterfaces map[string]struct{},
 ) bool {
 	normalized := normalizeInterfaceName(name)
@@ -906,6 +888,14 @@ func shouldIgnoreDefaultInterface(
 		master := normalizeInterfaceName(readMaster(name))
 		if _, inCounters := knownInterfaces[master]; inCounters && isAggregatingMaster(master) {
 			return true
+		}
+	}
+	if readLower != nil && len(knownInterfaces) > 0 {
+		lower := normalizeInterfaceName(readLower(name))
+		if lower != "" {
+			if _, inCounters := knownInterfaces[lower]; inCounters {
+				return true
+			}
 		}
 	}
 	return false
@@ -974,6 +964,79 @@ func (c *Collector) readInterfaceMasterName(name string) string {
 	return filepath.Base(target)
 }
 
+// readInterfaceLowerName 返回叠加设备（VLAN/macvlan 等子接口）的下层设备名。
+// 判定完全基于 sysfs 的 iflink/ifindex 关系，与接口命名无关：iflink != ifindex
+// 说明该接口挂在下层设备之上。物理口与聚合主口（bridge/bond）自身 iflink == ifindex，
+// 返回 ""。非 Linux 一律返回 ""。
+func (c *Collector) readInterfaceLowerName(name string) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	ifaceName := canonicalInterfaceName(name)
+	if ifaceName == "" {
+		return ""
+	}
+	base := hostSysPath(c.hostRoot, "class", "net", ifaceName)
+	iflink, iflinkErr := readSysfsInt(filepath.Join(base, "iflink"))
+	ifindex, ifindexErr := readSysfsInt(filepath.Join(base, "ifindex"))
+	if iflinkErr == nil && ifindexErr == nil {
+		if iflink == ifindex {
+			return ""
+		}
+		if parent := c.lookupInterfaceByIfindex(iflink); parent != "" {
+			return parent
+		}
+	}
+	// 兜底：内核 >= 4.11 提供的 lower_<parent> 符号链接。
+	return readInterfaceLowerLinkName(base)
+}
+
+// lookupInterfaceByIfindex 把 ifindex 映射回 /sys/class/net 下的接口名。
+func (c *Collector) lookupInterfaceByIfindex(ifindex int) string {
+	dir := hostSysPath(c.hostRoot, "class", "net")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		raw, err := readSysfsInt(filepath.Join(dir, entry.Name(), "ifindex"))
+		if err != nil {
+			continue
+		}
+		if raw == ifindex {
+			return entry.Name()
+		}
+	}
+	return ""
+}
+
+// readInterfaceLowerLinkName 从 lower_<parent> 符号链接解析下层设备名。
+func readInterfaceLowerLinkName(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "lower_") {
+			continue
+		}
+		target, err := os.Readlink(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		return filepath.Base(target)
+	}
+	return ""
+}
+
+func readSysfsInt(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(raw)))
+}
+
 func collectNetSpeedMbps(hostRoot string, filter map[string]struct{}, netCounters []gnet.IOCountersStat) float64 {
 	if runtime.GOOS != "linux" {
 		return 0
@@ -1009,7 +1072,7 @@ func parseSpeedMbps(raw string) float64 {
 	return parsed
 }
 
-func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot string, partitionAttr map[string]bool) (uint64, uint64) {
+func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot string, partitionAttr map[string]bool, readSlaves func(string) []string) (uint64, uint64) {
 	var read, write uint64
 	for name, stat := range counters {
 		if isVirtualBlockDevice(name, hostRoot, partitionAttr) {
@@ -1018,10 +1081,37 @@ func sumDiskIOBytesWithCache(counters map[string]disk.IOCountersStat, hostRoot s
 		if isPartitionOfCountedDisk(name, counters) {
 			continue
 		}
+		if isAggregatingBlockDevice(name, counters, readSlaves) {
+			continue
+		}
 		read += stat.ReadBytes
 		write += stat.WriteBytes
 	}
 	return read, write
+}
+
+// isAggregatingBlockDevice 判断 name 是否为「叠加块设备」——即其底层成员整盘
+// 同时出现在本次 counters 中。dm-*（LVM/LUKS）与 md*（MD RAID）自身与其底层整盘
+// 都会被 /proc/diskstats 计入，直接相加会把吞吐放大约 2~3 倍。方向与网卡侧相反：
+// 保留物理盘、丢弃聚合设备（sda+dm-0 → 只计 sda；sdb+sdc+md0 → 只计 sdb 与 sdc）。
+//
+// 仅当能读到非空 slaves 且其全部成员都在 counters 中时才排除；slaves 为空、读取失败
+// （容器无 /sys）或成员不全在 counters 中时一律保守返回 false（照常计入），避免误删
+// 真实物理盘或孤立的叠加设备（例如 counters 只有 dm-0 时必须计 dm-0）。
+func isAggregatingBlockDevice(name string, counters map[string]disk.IOCountersStat, readSlaves func(string) []string) bool {
+	if readSlaves == nil || len(counters) == 0 {
+		return false
+	}
+	slaves := readSlaves(name)
+	if len(slaves) == 0 {
+		return false
+	}
+	for _, slave := range slaves {
+		if _, exists := counters[slave]; !exists {
+			return false
+		}
+	}
+	return true
 }
 
 func isPartitionOfCountedDisk(name string, counters map[string]disk.IOCountersStat) bool {
@@ -1062,6 +1152,31 @@ func isVirtualBlockDevice(name, hostRoot string, partitionAttr map[string]bool) 
 	return isPartition
 }
 
+// readBlockDeviceSlaves 返回叠加块设备（dm-*/md* 等）在 sysfs 下的底层成员设备名。
+// dm（LVM/LUKS）与 md（MD RAID）的成员会出现在 class/block/<name>/slaves 下。
+// 目录不存在、读取失败或非 Linux 时一律返回 nil——调用方据此保守处理，不排除任何设备，
+// 从而在容器无 /sys 场景下避免误删真实物理盘。注入该函数即可让测试脱离宿主机 /sys。
+func (c *Collector) readBlockDeviceSlaves(name string) []string {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	deviceName := strings.TrimSpace(name)
+	if deviceName == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(hostSysPath(c.hostRoot, "class", "block", deviceName, "slaves"))
+	if err != nil {
+		return nil
+	}
+	slaves := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if slave := strings.TrimSpace(entry.Name()); slave != "" {
+			slaves = append(slaves, slave)
+		}
+	}
+	return slaves
+}
+
 func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionStat) []DiskPartition {
 	if hostUsage := c.collectHostDiskUsage(now); len(hostUsage) > 0 {
 		return hostUsage
@@ -1090,6 +1205,7 @@ func (c *Collector) collectDiskUsage(now time.Time, partitions []disk.PartitionS
 			Mountpoint: p.Mountpoint,
 			Fstype:     p.Fstype,
 			StatPath:   p.Mountpoint,
+			ReadOnly:   slices.Contains(p.Opts, "ro"),
 		})
 	}
 	return collectPartitionUsageCached(candidates, c.mountpointIsDir, c.blockDeviceTotal)
@@ -1107,6 +1223,7 @@ type hostMount struct {
 	Device     string
 	Mountpoint string
 	Fstype     string
+	ReadOnly   bool
 }
 
 type mountCandidate struct {
@@ -1114,6 +1231,7 @@ type mountCandidate struct {
 	Mountpoint string
 	Fstype     string
 	StatPath   string
+	ReadOnly   bool
 }
 
 func (c *Collector) collectHostDiskUsage(now time.Time) []DiskPartition {
@@ -1134,6 +1252,7 @@ func (c *Collector) collectHostDiskUsage(now time.Time) []DiskPartition {
 			Mountpoint: mount.Mountpoint,
 			Fstype:     mount.Fstype,
 			StatPath:   resolveHostMountPath(hostRoot, mount.Mountpoint),
+			ReadOnly:   mount.ReadOnly,
 		})
 	}
 	return collectPartitionUsageCached(candidates, c.mountpointIsDir, c.blockDeviceTotal)
@@ -1179,6 +1298,11 @@ func collectPartitionUsageCached(candidates []mountCandidate, mountpointDirCache
 			Mountpoint: candidate.Mountpoint,
 			Fstype:     candidate.Fstype,
 		}, mountpointDirCache) {
+			continue
+		}
+		// B-06：只读挂载（ISO、只读镜像卷等）不参与总硬盘口径；只读的根分区
+		// 仍保留（系统盘本身可能被以 ro 挂载）。
+		if candidate.ReadOnly && candidate.Mountpoint != "/" {
 			continue
 		}
 		if _, exists := seenMountpoints[candidate.Mountpoint]; exists {
@@ -1299,6 +1423,10 @@ var skipMountPrefixes = []string{
 	"/var/lib/containers",
 	"/var/lib/kubelet",
 	"/var/lib/flatpak",
+	// B-06：macOS 只读镜像卷与系统卷（根分区已代表整个 APFS 容器，由
+	// apfsContainerDevice 去重，跳过 /System/Volumes/* 不会少算用户数据）。
+	"/Library/Developer/CoreSimulator",
+	"/System/Volumes",
 }
 
 var skipFilesystems = map[string]struct{}{
@@ -1345,6 +1473,12 @@ var skipFilesystems = map[string]struct{}{
 	"beegfs":      {},
 	"sshfs":       {},
 	"fdescfs":     {},
+	// B-06：虚拟 / 只读文件系统（devicefs 挂载在 CoreDevice 下、nullfs、
+	// iso9660 与 udf 光盘镜像）不参与「服务器总硬盘」口径。
+	"devicefs": {},
+	"nullfs":   {},
+	"iso9660":  {},
+	"udf":      {},
 }
 
 func shouldSkipPartition(p disk.PartitionStat, mountpointDirCache map[string]bool) bool {
@@ -1423,6 +1557,17 @@ func readMountFile(path string) ([]hostMount, error) {
 	return parseProcMountsFile(path)
 }
 
+// mountOptionsReadOnly 判断挂载选项字段（逗号分隔，如 "rw,relatime"）中是否
+// 含精确的 ro token；避免命中 rootcontext= 这类前缀。
+func mountOptionsReadOnly(options string) bool {
+	for _, opt := range strings.Split(options, ",") {
+		if strings.TrimSpace(opt) == "ro" {
+			return true
+		}
+	}
+	return false
+}
+
 func parseMountInfoFile(path string) ([]hostMount, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -1446,11 +1591,16 @@ func parseMountInfoFile(path string) ([]hostMount, error) {
 		if len(left) < 5 || len(right) < 2 {
 			continue
 		}
-		mounts = append(mounts, hostMount{
+		mount := hostMount{
 			Device:     decodeMountField(right[1]),
 			Mountpoint: decodeMountField(left[4]),
 			Fstype:     decodeMountField(right[0]),
-		})
+		}
+		// B-06：第 6 列为挂载选项（rw / ro,relatime …），从中识别只读挂载。
+		if len(left) >= 6 {
+			mount.ReadOnly = mountOptionsReadOnly(decodeMountField(left[5]))
+		}
+		mounts = append(mounts, mount)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -1472,11 +1622,16 @@ func parseProcMountsFile(path string) ([]hostMount, error) {
 		if len(fields) < 3 {
 			continue
 		}
-		mounts = append(mounts, hostMount{
+		mount := hostMount{
 			Device:     decodeMountField(fields[0]),
 			Mountpoint: decodeMountField(fields[1]),
 			Fstype:     decodeMountField(fields[2]),
-		})
+		}
+		// B-06：第 4 列为挂载选项（rw / ro,relatime …），从中识别只读挂载。
+		if len(fields) >= 4 {
+			mount.ReadOnly = mountOptionsReadOnly(decodeMountField(fields[3]))
+		}
+		mounts = append(mounts, mount)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -1811,20 +1966,32 @@ func defaultLookupNVIDIASMIPath() string {
 
 type gpuSampler func(path string, includeStatic bool) ([]GPUInfo, error)
 
+// gpuSamplerForOS 返回当前平台的 GPU 采样器，以及该采样器是否依赖 nvidia-smi 路径。
+// macOS 不存在 nvidia-smi，改用 IOKit（ioreg）读取 Apple GPU。
+func gpuSamplerForOS() (gpuSampler, bool) {
+	if runtime.GOOS == "darwin" {
+		return runDarwinGPUSample, false
+	}
+	return runNVIDIAGPUSample, true
+}
+
 func (c *Collector) collectGPUStatsAt(
 	now time.Time,
 	includeStatic bool,
 	sampler gpuSampler,
 ) ([]GPUInfo, bool) {
+	needsNVIDIAPath := false
 	if sampler == nil {
-		sampler = runNVIDIAGPUSample
+		sampler, needsNVIDIAPath = gpuSamplerForOS()
 	}
-	if c.nvidiaSMIPathAt.IsZero() || now.Sub(c.nvidiaSMIPathAt) >= nvidiaSMIPathRefreshInterval {
-		c.nvidiaSMIPath = lookupNVIDIASMIPath()
-		c.nvidiaSMIPathAt = now
-	}
-	if c.nvidiaSMIPath == "" {
-		return nil, true
+	if needsNVIDIAPath {
+		if c.nvidiaSMIPathAt.IsZero() || now.Sub(c.nvidiaSMIPathAt) >= nvidiaSMIPathRefreshInterval {
+			c.nvidiaSMIPath = lookupNVIDIASMIPath()
+			c.nvidiaSMIPathAt = now
+		}
+		if c.nvidiaSMIPath == "" {
+			return nil, true
+		}
 	}
 	fresh := !c.gpuSampleAt.IsZero() && now.Sub(c.gpuSampleAt) < gpuSampleRefreshInterval
 	if fresh && (!includeStatic || c.gpuSampleStatic) {
@@ -1832,7 +1999,7 @@ func (c *Collector) collectGPUStatsAt(
 	}
 	gpus, err := sampler(c.nvidiaSMIPath, includeStatic)
 	if err != nil {
-		c.warnOnce("nvidia-smi", err)
+		c.warnOnce("gpu", err)
 		c.gpuSample = nil
 		c.gpuSampleStatic = includeStatic
 		c.gpuSampleAt = now
@@ -1905,6 +2072,115 @@ func parseNVIDIAGPUStats(raw string, includeStatic bool) ([]GPUInfo, error) {
 		gpus = append(gpus, gpu)
 	}
 	return gpus, nil
+}
+
+// runDarwinGPUSample 通过 IOKit 读取 Apple GPU。macOS 没有 nvidia-smi，
+// 但 IOAccelerator 节点在无需 root 的情况下就暴露了利用率与显存占用。
+func runDarwinGPUSample(_ string, includeStatic bool) ([]GPUInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/sbin/ioreg", "-r", "-d", "1", "-c", "IOAccelerator").Output()
+	if err != nil {
+		return nil, fmt.Errorf("采样失败: %w", err)
+	}
+	gpus, err := parseDarwinGPUStats(string(output), includeStatic)
+	if err != nil {
+		return nil, fmt.Errorf("输出解析失败: %w", err)
+	}
+	return gpus, nil
+}
+
+// parseDarwinGPUStats 解析 ioreg 文本输出。每个 "+-o " 开头的行为一个加速器节点，
+// 节点属性以 key = value 形式跟随其后。统一内存机型没有独立显存，
+// 因此只上报 MemoryUsed（"In use system memory"），MemoryTotal 保持 0 以免伪造容量。
+func parseDarwinGPUStats(raw string, includeStatic bool) ([]GPUInfo, error) {
+	var (
+		gpus    []GPUInfo
+		current *GPUInfo
+	)
+	flush := func() {
+		if current == nil {
+			return
+		}
+		current.Index = len(gpus)
+		gpus = append(gpus, *current)
+		current = nil
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "+-o ") {
+			flush()
+			current = &GPUInfo{}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		key, value, ok := splitIORegProperty(trimmed)
+		if !ok {
+			continue
+		}
+		switch key {
+		case "PerformanceStatistics":
+			forEachIORegInlinePair(value, func(innerKey, innerValue string) {
+				switch innerKey {
+				case "Device Utilization %":
+					current.UtilizationPercent = clampPercent(parseOptionalFloatZero(innerValue))
+				case "In use system memory":
+					current.MemoryUsed = uint64(math.Max(parseOptionalFloatZero(innerValue), 0))
+				}
+			})
+		case "model":
+			if includeStatic {
+				current.Name = cleanGPUText(unquoteIORegValue(value), 160)
+				current.Vendor = "Apple"
+			}
+		}
+	}
+	flush()
+	return gpus, nil
+}
+
+// forEachIORegInlinePair 遍历 ioreg 内联字典 {"key"=value,...} 的键值对。
+// 内联字典的写法没有 " = " 空格，因此不能复用 splitIORegProperty。
+func forEachIORegInlinePair(raw string, visit func(key, value string)) {
+	body := strings.TrimSpace(raw)
+	body = strings.TrimPrefix(body, "{")
+	body = strings.TrimSuffix(body, "}")
+	for _, part := range strings.Split(body, ",") {
+		eq := strings.Index(part, "=")
+		if eq <= 0 {
+			continue
+		}
+		key := unquoteIORegValue(part[:eq])
+		if key == "" {
+			continue
+		}
+		visit(key, strings.TrimSpace(part[eq+1:]))
+	}
+}
+
+// splitIORegProperty 拆分 ioreg 的 "key" = value 行。返回的 value 保留原始形态，
+// 由调用方按需去掉引号。PerformanceStatistics 这类嵌套字典不在此处理。
+func splitIORegProperty(line string) (string, string, bool) {
+	eq := strings.Index(line, " = ")
+	if eq <= 0 {
+		return "", "", false
+	}
+	key := unquoteIORegValue(strings.TrimSpace(line[:eq]))
+	value := strings.TrimSpace(line[eq+3:])
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+func unquoteIORegValue(raw string) string {
+	value := strings.TrimSpace(raw)
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func parseOptionalInt(raw string) (int, bool) {

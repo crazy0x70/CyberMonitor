@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -37,7 +38,75 @@ const (
 	aiHTTPTimeout               = 18 * time.Second
 )
 
-var aiHTTPClient = noRedirectHTTPClient(aiHTTPTimeout)
+// aiPrivateTargetHint 在默认拒绝内网目标时随错误一并返回，指引管理员显式开启开关。
+const aiPrivateTargetHint = "如确需访问内网端点，请在提供商配置中显式开启内网地址"
+
+var (
+	// aiHTTPClient 默认受限客户端：拒绝解析到私网/环回/链路本地/未指定地址的目标。
+	aiHTTPClient = newAIRestrictedHTTPClient(aiHTTPTimeout)
+	// aiAllowPrivateHTTPClient 在管理员显式开启内网地址后使用：保留原超时与禁重定向语义，
+	// 但不限制目标地址，使 10.x 上的 vLLM/ollama 等内网网关可用。
+	aiAllowPrivateHTTPClient = noRedirectHTTPClient(aiHTTPTimeout)
+)
+
+// aiHTTPClientFor 按提供商配置选择出站客户端：默认走受限拨号器；
+// 仅当 AllowPrivateBaseURL 显式开启时才放行内网目标。
+func aiHTTPClientFor(cfg AIProviderConfig) *http.Client {
+	if cfg.AllowPrivateBaseURL {
+		return aiAllowPrivateHTTPClient
+	}
+	return aiHTTPClient
+}
+
+// newAIRestrictedHTTPClient 构造 AI 出站客户端：保留原有超时与禁止重定向行为，
+// 并挂上与 webhook 相同的受限拨号器（restrictedCallbackDialContext），
+// 拒绝解析到私网/环回/链路本地/未指定地址的目标，阻断管理员改写 base_url 后
+// 借真实 AI API Key 探测内网（含云元数据地址）。
+//
+// 超时语义与被替换的 noRedirectHTTPClient（http.DefaultTransport）保持一致：
+// 只保留客户端整体 Timeout，不设 ResponseHeaderTimeout。非流式的
+// chat/completions 只有在模型生成结束后才返回响应头，任何早于整体超时的
+// 响应头级上限都会把正常推理误判为 "timeout awaiting response headers"。
+//
+// 代理与协议行为同样与被替换的 http.DefaultTransport 对齐：显式读取
+// HTTP_PROXY/HTTPS_PROXY/NO_PROXY，并允许 HTTP/2 升级（自定义 DialContext
+// 会让 Transport 保守地关闭 HTTP/2，需显式开启）。注意：配置代理后，
+// 拨号器校验的是代理地址而非 base_url 主机，此时内网阻断由代理侧策略承担。
+func newAIRestrictedHTTPClient(timeout time.Duration) *http.Client {
+	restrictedDial := restrictedCallbackDialContext(defaultCallbackResolver, defaultCallbackDialer)
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				conn, err := restrictedDial(ctx, network, address)
+				if err != nil {
+					return nil, decorateAIPrivateTargetError(err)
+				}
+				return conn, nil
+			},
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			IdleConnTimeout:       60 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// decorateAIPrivateTargetError 将受限拨号器的内网拒绝错误改写为对管理员有指引意义的文案。
+// 只针对"解析到内网/环回"这一确定性拒绝，不影响普通网络错误的原样透出。
+func decorateAIPrivateTargetError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "callback private ip rejected") {
+		return fmt.Errorf("目标地址解析为内网/环回地址，已被安全策略拒绝，%s", aiPrivateTargetHint)
+	}
+	return err
+}
 
 func readResponseBodyLimited(body io.Reader) ([]byte, error) {
 	if body == nil {
@@ -70,7 +139,7 @@ type aiProviderErrorEnvelope struct {
 	} `json:"error,omitempty"`
 }
 
-func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]string, body []byte, out any) error {
+func aiDoJSON(ctx context.Context, client *http.Client, method, endpoint string, headers map[string]string, body []byte, out any) error {
 	var payload io.Reader
 	if body != nil {
 		payload = bytes.NewReader(body)
@@ -82,7 +151,10 @@ func aiDoJSON(ctx context.Context, method, endpoint string, headers map[string]s
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	resp, err := aiHTTPClient.Do(req)
+	if client == nil {
+		client = aiHTTPClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("AI 请求失败: %s", aiRequestErrorMessage(err))
 	}
@@ -115,6 +187,11 @@ type AIProviderConfig struct {
 	APIKeySet bool   `json:"api_key_set,omitempty"`
 	BaseURL   string `json:"base_url,omitempty"`
 	Model     string `json:"model,omitempty"`
+	// 显式放行解析到私网/环回地址的 base_url；默认 false 即拒绝（刻意加固）。
+	// 兼容性：存量配置反序列化后为零值，原先指向内网 LLM 网关（10.x vLLM/ollama）
+	// 的部署升级后 AI 查询与 /ai/test、/ai/models 会直接失败，需在提供商配置中
+	// 开启“内网地址”开关恢复——此行为变更须在发布说明中明示。
+	AllowPrivateBaseURL bool `json:"allow_private_base_url,omitempty"`
 }
 
 type AISettings struct {
@@ -611,7 +688,7 @@ func listOpenAIModels(ctx context.Context, config AIProviderConfig) ([]string, e
 	endpoint := fmt.Sprintf("%s/models", baseURL)
 	headers := map[string]string{"Authorization": fmt.Sprintf("Bearer %s", config.APIKey)}
 	var parsed openAIModelsResponse
-	if err := aiDoJSON(ctx, http.MethodGet, endpoint, headers, nil, &parsed); err != nil {
+	if err := aiDoJSON(ctx, aiHTTPClientFor(config), http.MethodGet, endpoint, headers, nil, &parsed); err != nil {
 		return nil, err
 	}
 	seen := make(map[string]struct{})
@@ -709,7 +786,8 @@ func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 func buildAIServerSummary(ctx context.Context, node NodeView, offlineStore *history.OfflineStore, store *Store, snapshotTime time.Time) aiServerSummary {
 	stats := node.Stats
 
-	diskUsed := calculateMaxDiskUsage(stats.Disk)
+	// B-06（D-02）：磁盘使用率 = Σused / Σtotal（服务器总硬盘口径）；总量未知时为 0。
+	_, _, diskUsed, _ := nodeDiskUsage(stats.Disk)
 	name := resolveNodeDisplayName(node)
 	offlineSummary, offlineHistoryUnavailable := buildAIOfflineSummary(ctx, offlineStore, stats.NodeID, snapshotTime)
 	hostName := resolveHostName(stats)
@@ -761,16 +839,6 @@ func buildAIServerSummary(ctx context.Context, node NodeView, offlineStore *hist
 		NetworkTestTrends: testTrends,
 		Diagnostics:       diagnostics,
 	}
-}
-
-func calculateMaxDiskUsage(disks []metrics.DiskPartition) float64 {
-	maxUsed := 0.0
-	for _, disk := range disks {
-		if disk.UsedPercent > maxUsed {
-			maxUsed = disk.UsedPercent
-		}
-	}
-	return maxUsed
 }
 
 func resolveHostName(stats metrics.NodeStats) string {
@@ -1150,7 +1218,7 @@ func callOpenAICompatible(ctx context.Context, config AIProviderConfig, systemPr
 		"Authorization": fmt.Sprintf("Bearer %s", config.APIKey),
 	}
 	var parsed openAIChatResponse
-	if err := aiDoJSON(ctx, http.MethodPost, endpoint, headers, data, &parsed); err != nil {
+	if err := aiDoJSON(ctx, aiHTTPClientFor(config), http.MethodPost, endpoint, headers, data, &parsed); err != nil {
 		return "", err
 	}
 	if len(parsed.Choices) == 0 {

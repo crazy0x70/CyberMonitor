@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AdminPageHeader } from "@/components/admin-page-header";
-import { AdminPanel } from "@/components/admin-panel";
 import { AdminKVField } from "@/components/admin-kv-field";
-import { AdminMetricStrip } from "@/components/admin-metric-strip";
+import {
+  AdminGroupedCard,
+  AdminGroupedFieldRow,
+  AdminSectionPanel,
+} from "@/components/admin-section-panel";
+import { AdminSaveBar } from "@/components/admin-save-bar";
 import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
 import { AdminDrawer } from "@/components/admin-drawer";
+import { AdminEmptyState } from "@/components/admin-empty-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
 import {
   Bot,
   CheckCircle2,
@@ -33,16 +39,16 @@ import {
   useDraftReconcile,
 } from "@/lib/admin-hooks";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
 import {
   adminActionButtonClass,
   adminCompactActionButtonClass,
   adminDangerOutlineButtonClass,
-  adminDirtyBadgeClass,
   adminInputClass,
   adminMutedTextClass,
   adminNeutralBadgeClass,
+  adminNarrowPageShellClass,
   adminOutlineButtonClass,
-  adminPageShellClass,
   adminPrimaryButtonClass,
   adminSuccessBadgeClass,
   adminSelectContentClass,
@@ -70,6 +76,7 @@ type ProviderDraft = {
   apiKey: string;
   baseURL: string;
   model: string;
+  allowPrivateBaseURL: boolean;
   models: string[];
   status: ProviderStatus;
   keyConfigured: boolean;
@@ -99,6 +106,7 @@ function makeProviderDrafts(settings: SettingsView | null): ProviderDraft[] {
       apiKey: ai.openai?.api_key || "",
       baseURL: ai.openai?.base_url || "",
       model: ai.openai?.model || "",
+      allowPrivateBaseURL: Boolean(ai.openai?.allow_private_base_url),
       models: [],
       status: resolveStatus(ai.openai),
       keyConfigured: Boolean(ai.openai?.api_key_set),
@@ -113,6 +121,7 @@ function makeProviderDrafts(settings: SettingsView | null): ProviderDraft[] {
       apiKey: item.api_key || "",
       baseURL: item.base_url || "",
       model: item.model || "",
+      allowPrivateBaseURL: Boolean(item.allow_private_base_url),
       models: [],
       status: resolveStatus(item),
       keyConfigured: Boolean(item.api_key_set),
@@ -127,6 +136,7 @@ type ProviderFormState = {
   apiKey: string;
   baseURL: string;
   model: string;
+  allowPrivateBaseURL: boolean;
 };
 
 function toConfig(item: ProviderDraft): AIProviderConfig {
@@ -134,6 +144,7 @@ function toConfig(item: ProviderDraft): AIProviderConfig {
     api_key: item.apiKey.trim(),
     base_url: item.baseURL.trim(),
     model: item.model.trim(),
+    allow_private_base_url: item.allowPrivateBaseURL,
   };
 }
 
@@ -185,6 +196,7 @@ function projectAISettingsDraft(draft: AISettingsDraft) {
       apiKey: item.apiKey,
       baseURL: item.baseURL,
       model: item.model,
+      allowPrivateBaseURL: item.allowPrivateBaseURL,
     })),
   };
 }
@@ -194,30 +206,37 @@ function renderStatusBadge(status: ProviderStatus) {
     case "verified":
       return (
         <Badge variant="secondary" className={adminSuccessBadgeClass}>
-          <CheckCircle2 className="mr-1 h-3 w-3" /> 已验证可用
+          <CheckCircle2 aria-hidden="true" className="h-3 w-3" /> 已验证可用
         </Badge>
       );
     case "unverified":
       return (
         <Badge variant="secondary" className={adminWarningBadgeClass}>
-          <HelpCircle className="mr-1 h-3 w-3" /> 已配置未验证
+          <HelpCircle aria-hidden="true" className="h-3 w-3" /> 已配置未验证
         </Badge>
       );
     default:
       return (
         <Badge variant="secondary" className={adminNeutralBadgeClass}>
-          <XCircle className="mr-1 h-3 w-3" /> 未配置
+          <XCircle aria-hidden="true" className="h-3 w-3" /> 未配置
         </Badge>
       );
   }
 }
+
+// E-01 / A-07 第 1 条：页头图标方块（F6 后运维助手为无分区单页）。
+// 第 4 节图标表：运维助手 → Bot · 靛。
+const PAGE_ICON_META: { icon: ReactNode; background: string } = {
+  icon: <Bot className="h-5 w-5" />,
+  background: "bg-linear-to-br from-[#7f8cff] to-[#5b57f0]",
+};
 
 const providerTableColumns: ReadonlyArray<AdminDataTableColumn<ProviderDraft>> = [
   {
     key: "name",
     label: "名称",
     render: (item) => (
-      <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">{item.name}</span>
+      <span className="text-sm font-medium text-[var(--label-1)]">{item.name}</span>
     ),
   },
   {
@@ -226,7 +245,10 @@ const providerTableColumns: ReadonlyArray<AdminDataTableColumn<ProviderDraft>> =
     mono: true,
     render: (item) => (
       <span
-        className="block w-full truncate text-slate-600 dark:text-neutral-300"
+        className={cn(
+          "block max-w-[18rem] truncate text-[var(--label-2)] lg:max-w-[28rem]",
+          !item.baseURL && "font-sans text-[var(--label-3)]",
+        )}
         title={item.baseURL || "未设置 Base URL"}
       >
         {item.baseURL || "未设置 Base URL"}
@@ -267,15 +289,20 @@ export default function AIProvider({
     apiKey: "",
     baseURL: "",
     model: "",
+    allowPrivateBaseURL: false,
   });
   const isBusy = isSaving || externalSaving || testingId !== null || fetchingModelsId !== null;
+  // settings 尚未加载成功时草稿为空，保存会整份覆盖 ai_settings；settings===null 一律禁止保存。
+  const settingsLoaded = settings !== null;
 
   const currentDraftSignature = useMemo(
     () => draftSignature(projectAISettingsDraft({ providers, commandProvider, prompt })),
     [commandProvider, prompt, providers],
   );
 
-  const [sourceSignature, absorbSourceSignature] = useDraftReconcile({
+  // A-03：接收 useDraftReconcile 第三个返回值 discard（保存条「放弃修改」），
+  // 其余签名化脏检测逻辑不动。
+  const [sourceSignature, absorbSourceSignature, discard] = useDraftReconcile({
     draftSignature: currentDraftSignature,
     nextSourceSignature: draftSignature(projectAISettingsDraft(makeAISettingsDraft(settings))),
     isBusy,
@@ -358,6 +385,7 @@ export default function AIProvider({
       apiKey: item.apiKey,
       baseURL: item.baseURL,
       model: item.model,
+      allowPrivateBaseURL: item.allowPrivateBaseURL,
     });
     setIsDialogOpen(true);
   };
@@ -380,6 +408,16 @@ export default function AIProvider({
     setVerifiedScope(null);
   };
 
+  const updateProviderAllowPrivateForm = (value: boolean) => {
+    if (isBusy) {
+      return;
+    }
+    setProviderForm((current) => ({ ...current, allowPrivateBaseURL: value }));
+
+    setVerifiedSnapshot(null);
+    setVerifiedScope(null);
+  };
+
   const applyProviderForm = () => {
     if (isBusy || editingId === null) {
       return;
@@ -388,13 +426,15 @@ export default function AIProvider({
     updateProviderInput(editingId, "apiKey", providerForm.apiKey);
     updateProviderInput(editingId, "baseURL", providerForm.baseURL);
     updateProviderInput(editingId, "model", providerForm.model);
+    updateProviderAllowPrivate(editingId, providerForm.allowPrivateBaseURL);
     if (verifiedSnapshot && verifiedScope === editingId) {
       const earned = { ...providerForm };
       const matchesSnapshot =
         earned.name === verifiedSnapshot.name &&
         earned.apiKey === verifiedSnapshot.apiKey &&
         earned.baseURL === verifiedSnapshot.baseURL &&
-        earned.model === verifiedSnapshot.model;
+        earned.model === verifiedSnapshot.model &&
+        earned.allowPrivateBaseURL === verifiedSnapshot.allowPrivateBaseURL;
       if (matchesSnapshot) {
         updateProviderDraft(editingId, (current) => ({ ...current, status: "verified" }));
       }
@@ -441,6 +481,13 @@ export default function AIProvider({
     });
   };
 
+  const updateProviderAllowPrivate = (id: string, value: boolean) => {
+    if (isBusy) {
+      return;
+    }
+    updateProviderDraft(id, (current) => ({ ...current, allowPrivateBaseURL: value }));
+  };
+
   const addCompatible = () => {
     if (isBusy) {
       return;
@@ -456,6 +503,7 @@ export default function AIProvider({
           apiKey: "",
           baseURL: "",
           model: "",
+          allowPrivateBaseURL: false,
           models: [],
           keyConfigured: false,
           status: "unconfigured",
@@ -507,6 +555,7 @@ export default function AIProvider({
           apiKey: item.apiKey,
           baseURL: item.baseURL,
           model: item.model,
+          allowPrivateBaseURL: item.allowPrivateBaseURL,
         });
         setVerifiedScope(item.id);
       },
@@ -540,11 +589,18 @@ export default function AIProvider({
 
   const editingItem = providers.find((item) => item.id === editingId) ?? null;
   const formItem: ProviderDraft | null = editingItem
-    ? { ...editingItem, name: providerForm.name, apiKey: providerForm.apiKey, baseURL: providerForm.baseURL, model: providerForm.model }
+    ? { ...editingItem, name: providerForm.name, apiKey: providerForm.apiKey, baseURL: providerForm.baseURL, model: providerForm.model, allowPrivateBaseURL: providerForm.allowPrivateBaseURL }
     : null;
 
+  // A-07：指令服务商下拉显式渲染当前选中项的中文标签（原 <SelectValue /> 不传
+  // children 时 Base UI 直接渲染原始 value，如 openai / openai_compatible:…）。
+  const selectedCommandProvider = providerOptions.find((item) => item.value === commandProvider);
+  const selectedCommandProviderLabel = selectedCommandProvider
+    ? `${selectedCommandProvider.label}${selectedCommandProvider.configured ? "" : "（未配置）"}`
+    : "选择命令服务商…";
+
   const handleSave = () => {
-    if (isBusy) {
+    if (isBusy || !settingsLoaded) {
       return;
     }
     const openai = providers.find((item) => item.provider === "openai");
@@ -564,7 +620,7 @@ export default function AIProvider({
           },
         }),
       fallbackError: "保存 AI 配置失败",
-      successToast: "AI 服务商配置已保存",
+      successToast: "运维助手配置已保存",
       onSuccess: (savedSettings) => {
         const canonicalDraft = makeAISettingsDraft(savedSettings);
         setProviders(canonicalDraft.providers);
@@ -576,109 +632,115 @@ export default function AIProvider({
     });
   };
 
-  const verifiedCount = providers.filter((item) => item.status === "verified").length;
-
-  const metricItems = [
-    { label: "服务商", value: providers.length },
-    { label: "已验证可用", value: verifiedCount },
-  ] as const;
-
   return (
-    <div className={adminPageShellClass}>
+    // E-03：设置页窄版外壳（页头、表单、表格同宽 880px）；A-12：保存入口移入浮动保存条，
+    // isDirty 为假时页头不显示保存按钮（0.1.2）。F6：无分区单页，依次渲染
+    // 「助手设置」「服务商」两张分组卡片，顶部不再放统计卡。
+    <div className={adminNarrowPageShellClass}>
       <AdminPageHeader
-        title="AI 服务商"
-        actions={
-          <>
-            {isDirty && (
-              <span className={adminDirtyBadgeClass}>有未保存的修改</span>
-            )}
-            <Button
-              className={`${adminPrimaryButtonClass} h-9 px-4 font-medium`}
-              onClick={handleSave}
-              disabled={!isDirty || isBusy}
-            >
-              {isSaving || externalSaving ? "保存中…" : "保存更改"}
-            </Button>
-          </>
-        }
+        icon={PAGE_ICON_META.icon}
+        iconClassName={PAGE_ICON_META.background}
+        title="运维助手"
+        description="通过 Telegram /ai 命令，用自然语言查询节点状态。"
       />
 
-      <AdminMetricStrip ariaLabel="AI 服务商统计" items={metricItems} />
-
-      <AdminPanel
-        title="全局策略"
-        icon={<Bot className="h-4 w-4 text-[var(--label-3)]" />}
-      >
-        <div className="space-y-6">
-          <AdminKVField label="指令服务商" htmlFor="ai-command-provider">
-            <Select
-              value={commandProvider}
-              disabled={isBusy}
-              onValueChange={(value) => {
-                if (isBusy || value === null) {
-                  return;
-                }
-                setCommandProvider(value);
-              }}
-            >
-              <SelectTrigger
-                id="ai-command-provider"
-                size="sm"
-                className={`min-w-56 ${adminSelectTriggerClass}`}
+      <div className="space-y-8">
+        <AdminSectionPanel label="助手设置">
+          <AdminGroupedCard>
+            <AdminGroupedFieldRow label="指令服务商" htmlFor="ai-command-provider">
+              <Select
+                value={commandProvider}
+                disabled={isBusy}
+                onValueChange={(value) => {
+                  if (isBusy || value === null) {
+                    return;
+                  }
+                  setCommandProvider(value);
+                }}
               >
-                <SelectValue placeholder="选择命令服务商…" />
-              </SelectTrigger>
-              <SelectContent className={adminSelectContentClass}>
-                {providerOptions.map((item) => (
-                  <SelectItem key={`command-${item.value}`} value={item.value}>
-                    {item.label}{item.configured ? "" : "（未配置）"}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </AdminKVField>
-          <AdminKVField label="运维提示词" htmlFor="ai-prompt">
-            <Textarea
-              id="ai-prompt"
-              className={`min-h-20 max-h-40 ${adminTextareaClass}`}
-              value={prompt}
-              onChange={(event) => {
-                if (isBusy) {
-                  return;
-                }
-                setPrompt(event.target.value);
-              }}
-              disabled={isBusy}
-              placeholder="例如：请重点关注网络流量、下载量与离线情况…"
-            />
-          </AdminKVField>
-        </div>
-      </AdminPanel>
+                <SelectTrigger
+                  id="ai-command-provider"
+                  size="sm"
+                  className={`w-full sm:w-56 ${adminSelectTriggerClass}`}
+                >
+                  <SelectValue placeholder="选择命令服务商…">{selectedCommandProviderLabel}</SelectValue>
+                </SelectTrigger>
+                <SelectContent className={adminSelectContentClass}>
+                  {providerOptions.map((item) => (
+                    <SelectItem key={`command-${item.value}`} value={item.value}>
+                      {item.label}{item.configured ? "" : "（未配置）"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </AdminGroupedFieldRow>
+            <AdminGroupedFieldRow label="运维提示词" htmlFor="ai-prompt">
+              <Textarea
+                id="ai-prompt"
+                className={`min-h-24 max-h-40 resize-y supports-[field-sizing:content]:resize-none ${adminTextareaClass}`}
+                value={prompt}
+                onChange={(event) => {
+                  if (isBusy) {
+                    return;
+                  }
+                  setPrompt(event.target.value);
+                }}
+                disabled={isBusy}
+                placeholder="例如：请重点关注网络流量、下载量与离线情况…"
+              />
+            </AdminGroupedFieldRow>
+          </AdminGroupedCard>
+        </AdminSectionPanel>
 
-      <AdminPanel
-        title="服务商"
-        icon={<Layers3 className="h-4 w-4 text-[var(--label-3)]" />}
-        actions={
-          <Button
-            variant="outline"
-            className={adminCompactActionButtonClass}
-            onClick={addCompatible}
-            disabled={isBusy}
-          >
-            <Plus className="h-3.5 w-3.5" />
-            新增兼容服务商
-          </Button>
-        }
-      >
-        <AdminDataTable
-          ariaLabel="AI 服务商列表"
-          columns={providerTableColumns}
-          rows={providers}
-          rowKey={(item) => item.id}
-          onRowClick={(item) => openProviderDialog(item)}
-          emptyLabel="还没有服务商。"
+        <AdminSectionPanel
+          label="服务商"
+          actions={
+            <Button
+              variant="outline"
+              className={adminCompactActionButtonClass}
+              onClick={addCompatible}
+              disabled={isBusy}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              新增兼容服务商
+            </Button>
+          }
+        >
+          <AdminDataTable
+            ariaLabel="服务商列表"
+            columns={providerTableColumns}
+            rows={providers}
+            rowKey={(item) => item.id}
+            onRowClick={(item) => openProviderDialog(item)}
+            emptyLabel={
+              // A-16 / 0.1.2：空态用 AdminEmptyState，按钮复用页头「新增兼容服务商」
+              // 同一个 onClick（addCompatible），不新增逻辑。
+              <AdminEmptyState
+                icon={<Layers3 aria-hidden="true" />}
+                title="还没有服务商"
+                description="新增一个 OpenAI 兼容服务商后，可在对话指令中调用它分析节点状态。"
+                action={
+                  <Button className={adminPrimaryButtonClass} onClick={addCompatible} disabled={isBusy}>
+                    <Plus className="h-4 w-4" />
+                    新增兼容服务商
+                  </Button>
+                }
+              />
+            }
+          />
+        </AdminSectionPanel>
+      </div>
+
+      {isDirty ? (
+        // A-12：保存入口移入浮动保存条；handleSave 与禁用条件复用原有逻辑，只改呈现位置。
+        // A-03：左侧「放弃修改」带二次确认（D-07），确认后回到服务端当前配置。
+        <AdminSaveBar
+          saving={isSaving || externalSaving}
+          disabled={isBusy || !settingsLoaded}
+          onSave={handleSave}
+          onDiscard={discard}
         />
-      </AdminPanel>
+      ) : null}
 
       <AdminDrawer
         open={isDialogOpen && editingItem !== null}
@@ -689,14 +751,15 @@ export default function AIProvider({
         }}
         title={
           editingItem ? (
-            <span className="flex flex-wrap items-center gap-2.5">
+            <span className="flex flex-wrap items-center gap-2">
               {providerForm.name || editingItem.name}
               {renderStatusBadge(
                 verifiedSnapshot &&
                   providerForm.name === verifiedSnapshot.name &&
                   providerForm.apiKey === verifiedSnapshot.apiKey &&
                   providerForm.baseURL === verifiedSnapshot.baseURL &&
-                  providerForm.model === verifiedSnapshot.model
+                  providerForm.model === verifiedSnapshot.model &&
+                  providerForm.allowPrivateBaseURL === verifiedSnapshot.allowPrivateBaseURL
                   ? "verified"
                   : editingItem.status,
               )}
@@ -712,7 +775,7 @@ export default function AIProvider({
         }
         footer={
           editingItem ? (
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               {editingItem.provider === "openai_compatible" ? (
                 <Button
                   variant="outline"
@@ -729,7 +792,7 @@ export default function AIProvider({
               ) : (
                 <span />
               )}
-              <div className="flex gap-2">
+              <div className="ml-auto flex gap-2">
                 <Button
                   variant="outline"
                   className={`${adminOutlineButtonClass} h-9 min-w-[84px] px-4`}
@@ -753,7 +816,7 @@ export default function AIProvider({
         {editingItem && formItem ? (
           <>
             <section>
-              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              <h3 className="text-sm font-semibold text-[var(--label-1)]">
                 基础信息
               </h3>
               <AdminKVField label="显示名称" htmlFor="provider-display-name">
@@ -782,7 +845,7 @@ export default function AIProvider({
             </section>
 
             <section>
-              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              <h3 className="text-sm font-semibold text-[var(--label-1)]">
                 接入参数
               </h3>
               <AdminKVField label="Base URL" htmlFor="provider-base-url">
@@ -798,8 +861,27 @@ export default function AIProvider({
                   onChange={(event) => updateProviderFormField("baseURL", event.target.value)}
                 />
               </AdminKVField>
+              <AdminKVField label="内网地址" htmlFor="provider-allow-private">
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex min-h-9 items-center gap-2.5">
+                    <Switch
+                      id="provider-allow-private"
+                      checked={providerForm.allowPrivateBaseURL}
+                      disabled={isBusy}
+                      onCheckedChange={updateProviderAllowPrivateForm}
+                    />
+                    <span className="text-sm text-[var(--label-1)]">
+                      允许访问内网 / 环回地址
+                    </span>
+                  </div>
+                  <p className={`text-xs leading-relaxed ${adminMutedTextClass}`}>
+                    默认禁止指向私网、环回、链路本地等地址，以防借 API Key 探测内网。自建内网 LLM
+                    网关（如 10.x 上的 vLLM / ollama）需显式开启。
+                  </p>
+                </div>
+              </AdminKVField>
               <AdminKVField label="模型" htmlFor="provider-model">
-                <div className="space-y-2">
+                <div className="space-y-1.5">
                   <Input
                     id="provider-model"
                     className={`${adminInputClass} data-text`}
@@ -815,7 +897,7 @@ export default function AIProvider({
                       <option key={model} value={model} />
                     ))}
                   </datalist>
-                  <p className={`text-xs ${adminMutedTextClass}`}>
+                  <p className={`text-xs leading-relaxed ${adminMutedTextClass}`}>
                     {editingItem.models.length > 0
                       ? `已缓存 ${editingItem.models.length} 个模型候选`
                       : "尚未获取模型列表"}
@@ -825,7 +907,7 @@ export default function AIProvider({
             </section>
 
             <section>
-              <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
+              <h3 className="text-sm font-semibold text-[var(--label-1)]">
                 连接验证
               </h3>
               <div className="flex flex-wrap gap-2">
@@ -860,7 +942,7 @@ export default function AIProvider({
                   )}
                 </Button>
               </div>
-              <p className={`text-xs ${adminMutedTextClass}`}>
+              <p className={`text-xs leading-relaxed ${adminMutedTextClass}`}>
                 验证与获取模型使用当前抽屉内的端点与密钥；端点改动需先完成并保存后再验证存储密钥。
               </p>
             </section>

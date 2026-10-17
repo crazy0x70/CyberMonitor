@@ -71,6 +71,14 @@ function getSystemTheme() {
 function applyTheme(mode) {
   const resolved = mode === "dark" ? "dark" : mode === "light" ? "light" : getSystemTheme();
   document.documentElement.setAttribute("data-theme", resolved);
+  // P-15：theme-color meta 同步 --canvas 画布色（纯展示更新）。
+  // 两个 meta 带 media 属性跟随系统选用，这里把两者的 content 一并写成
+  // 当前生效主题对应的颜色，手动覆盖系统偏好时选中的 meta 也返回正确值；
+  // 无 JS 时回落到 index.html 的静态值，同样跟随系统。
+  const themeColor = resolved === "dark" ? "#0c0d10" : "#f4f5f8";
+  document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+    meta.setAttribute("content", themeColor);
+  });
   return resolved;
 }
 

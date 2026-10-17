@@ -3,8 +3,9 @@ import { AdminPageHeader } from "@/components/admin-page-header";
 import { AdminPanel } from "@/components/admin-panel";
 import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
 import { AdminDrawer } from "@/components/admin-drawer";
+import { AdminEmptyState } from "@/components/admin-empty-state";
 import { AdminKVField } from "@/components/admin-kv-field";
-import { AdminMetricStrip } from "@/components/admin-metric-strip";
+import { AdminSaveBar } from "@/components/admin-save-bar";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,31 +16,63 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Plus, Radio, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAsyncAction, useDirtyNotification, useDraftReconcile } from "@/lib/admin-hooks";
-import { DEFAULT_TCP_INTERVAL, MAX_TCP_INTERVAL, type SettingsView, type TestCatalogItem } from "@/lib/admin-types";
+import { fetchNodes, fetchSettings } from "@/lib/admin-api";
+import { flattenGroupTree, resolveNodeId, resolveNodeName } from "@/lib/admin-format";
+import { RuleMultiSelect } from "@/components/alert-rule-drawer";
+import {
+  DEFAULT_TCP_INTERVAL,
+  MAX_TCP_INTERVAL,
+  type AlertScope,
+  type GroupNode,
+  type NodeView,
+  type SettingsView,
+  type TestCatalogItem,
+} from "@/lib/admin-types";
 import {
   adminActionButtonClass,
   adminDialogCancelClass,
   adminDangerOutlineButtonClass,
   adminDialogContentClass,
+  adminDialogDangerActionClass,
   adminDialogFooterClass,
   adminDialogHeaderClass,
   adminDirtyBadgeClass,
+  adminFieldErrorClass,
+  adminHelpTextClass,
   adminInputClass,
-  adminPageActionsClass,
+  adminNeutralBadgeClass,
   adminPageShellClass,
   adminPrimaryButtonClass,
   adminOutlineButtonClass,
+  adminSegmentedItemActiveClass,
+  adminSegmentedItemClass,
+  adminSegmentedItemInactiveClass,
+  adminSegmentedTrackClass,
+  adminSelectContentClass,
+  adminSelectTriggerClass,
 } from "@/lib/admin-ui";
 import { cn } from "@/lib/utils";
 
 const MAX_TCP_PORT = 65535;
 
 type ProbeType = "icmp" | "tcp";
+
+// O-01：探测目标的下发范围模式（存储形态为 AlertScope——none ⇔ 无 scope，
+// groups / nodes 均映射为 mode=include）。
+type ProbeScopeMode = "none" | "all" | "groups" | "nodes";
 
 type ProbeFormState = {
   id?: string;
@@ -48,9 +81,13 @@ type ProbeFormState = {
   host: string;
   port: string;
   intervalSec: string;
+  scopeMode: ProbeScopeMode;
+  scopeNodes: string[];
+  scopeGroups: string[];
+  scopeExclude: string[];
 };
 
-type ProbeField = "name" | "host" | "port" | "intervalSec";
+type ProbeField = "name" | "host" | "port" | "intervalSec" | "scope";
 
 type ProbeValidationResult =
   | {
@@ -66,7 +103,72 @@ const probeFieldIDMap: Record<ProbeField, string> = {
   host: "probe-host",
   port: "probe-port",
   intervalSec: "probe-interval",
+  scope: "probe-scope",
 };
+
+// O-01：清洗 scope 内的字符串列表（去空格、去空项；顺序保留，与服务端
+// normalizeUniqueStrings 的顺序语义一致）。
+function cleanScopeList(values?: string[]): string[] {
+  return (values || []).map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+// O-01：scope 的规范化形态（与服务端 normalizeTestCatalog + normalizeAlertScope
+// 后的落盘形态对齐：mode 为 all / include，空列表删除）。
+function normalizeProbeScope(scope?: AlertScope): AlertScope | undefined {
+  const mode = String(scope?.mode || "").trim();
+  if (!scope || (mode !== "all" && mode !== "include")) {
+    return undefined;
+  }
+  const exclude = cleanScopeList(scope.exclude);
+  if (mode === "all") {
+    return exclude.length > 0 ? { mode: "all", exclude } : { mode: "all" };
+  }
+  const nodes = cleanScopeList(scope.nodes);
+  const groups = cleanScopeList(scope.groups);
+  const next: AlertScope = { mode: "include" };
+  if (nodes.length > 0) next.nodes = nodes;
+  if (groups.length > 0) next.groups = groups;
+  if (exclude.length > 0) next.exclude = exclude;
+  return next;
+}
+
+// O-01：从存储形态推导抽屉的模式（groups 非空优先显示「指定分组」）。
+function probeScopeModeOf(scope?: AlertScope): ProbeScopeMode {
+  const mode = String(scope?.mode || "").trim();
+  if (mode === "all") {
+    return "all";
+  }
+  if (mode === "include") {
+    return cleanScopeList(scope?.groups).length > 0 ? "groups" : "nodes";
+  }
+  return "none";
+}
+
+// O-01：抽屉草稿 → 存储形态。none → undefined（不下发）；exclude 在 all 与
+// include 两种模式下都原样携带（D-05 语义，避免重存丢失）。
+function buildProbeScope(mode: ProbeScopeMode, nodes: string[], groups: string[], exclude: string[]): AlertScope | undefined {
+  if (mode === "none") {
+    return undefined;
+  }
+  if (mode === "all") {
+    const cleanedExclude = cleanScopeList(exclude);
+    return cleanedExclude.length > 0 ? { mode: "all", exclude: cleanedExclude } : { mode: "all" };
+  }
+  const next: AlertScope = { mode: "include" };
+  const cleanedNodes = cleanScopeList(nodes);
+  const cleanedGroups = cleanScopeList(groups);
+  if (mode === "groups" && cleanedGroups.length > 0) {
+    next.groups = cleanedGroups;
+  }
+  if (mode === "nodes" && cleanedNodes.length > 0) {
+    next.nodes = cleanedNodes;
+  }
+  const cleanedExclude = cleanScopeList(exclude);
+  if (cleanedExclude.length > 0) {
+    next.exclude = cleanedExclude;
+  }
+  return next;
+}
 
 type ProbeDraft = { uid: string; item: TestCatalogItem };
 
@@ -99,7 +201,14 @@ function normalizeCatalogItem(item: TestCatalogItem): TestCatalogItem {
     name: String(item.name || "").trim(),
     type,
     host: String(item.host || "").trim(),
+    // F2：icmp 也带 interval_sec（0 表示持续），不再只对 tcp 保留。
+    interval_sec: normalizeInterval(item.interval_sec),
   };
+  // O-01：scope 参与规范化（与服务端 normalizeTestCatalog 的落盘口径对齐）。
+  const scope = normalizeProbeScope(item.scope);
+  if (scope) {
+    normalizedBase.scope = scope;
+  }
 
   if (type === "icmp") {
     return normalizedBase;
@@ -108,7 +217,6 @@ function normalizeCatalogItem(item: TestCatalogItem): TestCatalogItem {
   return {
     ...normalizedBase,
     port: Math.max(0, Math.trunc(Number(item.port) || 0)),
-    interval_sec: normalizeInterval(item.interval_sec),
   };
 }
 
@@ -120,13 +228,23 @@ function serializeCatalog(items: TestCatalogItem[]) {
   return JSON.stringify(
     normalizeCatalog(items).map((item) => {
       const type = resolveProbeType(item);
+      // O-01：scope 入签名（与保存载荷同源——A-03：改范围必须让保存条出现）。
+      const scope = normalizeProbeScope(item.scope);
       return {
         id: item.id || "",
         name: item.name,
         type,
         host: item.host,
         port: type === "tcp" ? Number(item.port) || 0 : 0,
-        interval_sec: type === "tcp" ? normalizeInterval(item.interval_sec) : 0,
+        interval_sec: normalizeInterval(item.interval_sec),
+        scope: scope
+          ? {
+              mode: scope.mode,
+              nodes: scope.nodes || [],
+              groups: scope.groups || [],
+              exclude: scope.exclude || [],
+            }
+          : null,
       };
     }),
   );
@@ -140,10 +258,14 @@ function toFormState(item?: TestCatalogItem): ProbeFormState {
     type,
     host: item?.host || "",
     port: type === "tcp" && Number(item?.port) > 0 ? String(item?.port) : "",
-    intervalSec:
-      type === "tcp" && normalizeInterval(item?.interval_sec) > 0
-        ? String(normalizeInterval(item?.interval_sec))
-        : "",
+    intervalSec: normalizeInterval(item?.interval_sec) > 0
+      ? String(normalizeInterval(item?.interval_sec))
+      : "",
+    // O-01：下发范围草稿（exclude 两种模式都保留，重存不丢失——D-05）。
+    scopeMode: probeScopeModeOf(item?.scope),
+    scopeNodes: cleanScopeList(item?.scope?.nodes),
+    scopeGroups: cleanScopeList(item?.scope?.groups),
+    scopeExclude: cleanScopeList(item?.scope?.exclude),
   };
 }
 
@@ -250,22 +372,7 @@ function validateProbeForm(formState: ProbeFormState): ProbeValidationResult {
     return { field: "host", error: "探测节点地址格式不正确。" };
   }
 
-  if (formState.type === "icmp") {
-    return {
-      item: {
-        id: formState.id,
-        name,
-        type: "icmp",
-        host,
-      } satisfies TestCatalogItem,
-    };
-  }
-
-  const port = Number.parseInt(formState.port, 10);
-  if (!Number.isFinite(port) || port < 1 || port > MAX_TCP_PORT) {
-    return { field: "port", error: `TCP 端口需为 1 - ${MAX_TCP_PORT}。` };
-  }
-
+  // F2：ICMP 与 TCP 都可配置间隔，校验逻辑共用；0 = ICMP 持续 / TCP 5 秒。
   const intervalRaw = formState.intervalSec.trim();
   const intervalValue = intervalRaw === "" ? 0 : Number.parseInt(intervalRaw, 10);
   if (
@@ -274,20 +381,56 @@ function validateProbeForm(formState: ProbeFormState): ProbeValidationResult {
   ) {
     return {
       field: "intervalSec",
-      error: `TCP 默认间隔需为 0 - ${MAX_TCP_INTERVAL} 秒，留空或 0 表示默认 ${DEFAULT_TCP_INTERVAL} 秒。`,
+      error: `探测间隔需为 0 - ${MAX_TCP_INTERVAL} 秒。`,
     };
   }
 
-  return {
-    item: {
+  // O-01：指定分组 / 指定节点时至少选择一项（与规则抽屉「指定范围时至少选择
+  // 一个节点或分组。」同语义）。
+  if (
+    (formState.scopeMode === "groups" && cleanScopeList(formState.scopeGroups).length === 0) ||
+    (formState.scopeMode === "nodes" && cleanScopeList(formState.scopeNodes).length === 0)
+  ) {
+    return { field: "scope", error: "指定范围时至少选择一个节点或分组。" };
+  }
+  const scope = buildProbeScope(
+    formState.scopeMode,
+    formState.scopeNodes,
+    formState.scopeGroups,
+    formState.scopeExclude,
+  );
+
+  if (formState.type === "icmp") {
+    const item: TestCatalogItem = {
       id: formState.id,
       name,
-      type: "tcp",
+      type: "icmp",
       host,
-      port,
       interval_sec: intervalValue > 0 ? intervalValue : 0,
-    } satisfies TestCatalogItem,
+    };
+    if (scope) {
+      item.scope = scope;
+    }
+    return { item };
+  }
+
+  const port = Number.parseInt(formState.port, 10);
+  if (!Number.isFinite(port) || port < 1 || port > MAX_TCP_PORT) {
+    return { field: "port", error: `TCP 端口需为 1 - ${MAX_TCP_PORT}。` };
+  }
+
+  const item: TestCatalogItem = {
+    id: formState.id,
+    name,
+    type: "tcp",
+    host,
+    port,
+    interval_sec: intervalValue > 0 ? intervalValue : 0,
   };
+  if (scope) {
+    item.scope = scope;
+  }
+  return { item };
 }
 
 function formatProbeTarget(item: TestCatalogItem) {
@@ -299,11 +442,33 @@ function formatProbeTarget(item: TestCatalogItem) {
 }
 
 function formatProbeInterval(item: TestCatalogItem) {
-  if (resolveProbeType(item) !== "tcp") {
-    return "固定";
-  }
   const interval = normalizeInterval(item.interval_sec);
-  return interval > 0 ? `${interval} 秒` : `默认 ${DEFAULT_TCP_INTERVAL} 秒`;
+  if (interval > 0) {
+    return `${interval} 秒`;
+  }
+  // F2：ICMP 0 = 持续；TCP 0 = 5 秒。
+  return resolveProbeType(item) === "tcp" ? `${DEFAULT_TCP_INTERVAL} 秒` : "持续";
+}
+
+// O-01：「下发」列文案——不下发 → 「—」；全部节点 → 「全部节点」；
+// 分组 / 节点 → 「N 个分组」/「N 个节点」（groups 非空优先，与抽屉模式推导一致）。
+function formatProbeDelivery(item: TestCatalogItem) {
+  const scope = item.scope;
+  const mode = String(scope?.mode || "").trim();
+  if (mode === "all") {
+    return "全部节点";
+  }
+  if (mode === "include") {
+    const groups = cleanScopeList(scope?.groups);
+    if (groups.length > 0) {
+      return `${groups.length} 个分组`;
+    }
+    const nodes = cleanScopeList(scope?.nodes);
+    if (nodes.length > 0) {
+      return `${nodes.length} 个节点`;
+    }
+  }
+  return "—";
 }
 
 // 探测目标账本列：地址等宽、间隔数字右对齐；无逐条启停数据，删除
@@ -313,7 +478,7 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
     key: "name",
     label: "名称",
     render: (draft) => (
-      <span className="text-sm font-medium text-slate-900 dark:text-neutral-50">
+      <span className="text-sm font-medium text-[var(--label-1)]">
         {draft.item.name || "未命名探测节点"}
       </span>
     ),
@@ -323,7 +488,7 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
     label: "目标地址",
     mono: true,
     render: (draft) => (
-      <span className="text-slate-700 dark:text-neutral-200">
+      <span className="text-[13px] text-[var(--label-1)]">
         {formatProbeTarget(draft.item)}
       </span>
     ),
@@ -331,15 +496,28 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
   {
     key: "type",
     label: "协议",
-    mono: true,
-    render: (draft) => resolveProbeType(draft.item).toUpperCase(),
+    render: (draft) => (
+      <Badge variant="secondary" className={`${adminNeutralBadgeClass} tracking-wide`}>
+        {resolveProbeType(draft.item).toUpperCase()}
+      </Badge>
+    ),
+  },
+  {
+    key: "delivery",
+    label: "下发",
+    render: (draft) => (
+      <span className="text-[13px] text-[var(--label-2)]">
+        {formatProbeDelivery(draft.item)}
+      </span>
+    ),
   },
   {
     key: "interval",
     label: "间隔",
-    mono: true,
     width: "20%",
-    render: (draft) => formatProbeInterval(draft.item),
+    render: (draft) => (
+      <span className="tabular-nums text-[var(--label-2)]">{formatProbeInterval(draft.item)}</span>
+    ),
   },
 ];
 
@@ -359,27 +537,27 @@ export default function ProbeSettings({
   const nextProbeUid = () => `probe-draft-${++uidSeqRef.current}`;
   const attachUid = (item: TestCatalogItem): ProbeDraft => ({ uid: nextProbeUid(), item });
   const [drafts, setDrafts] = useState<ProbeDraft[]>(() => normalizedCatalog.map(attachUid));
-  const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [editingUid, setEditingUid] = useState<string | null>(null);
   const [pendingDeleteUid, setPendingDeleteUid] = useState<string | null>(null);
   const [formState, setFormState] = useState<ProbeFormState>(() => toFormState());
   const [formError, setFormError] = useState<{ field: ProbeField; message: string } | null>(null);
-  const draftSignature = useMemo(
+  const currentDraftSignature = useMemo(
     () => serializeCatalog(drafts.map((draft) => draft.item)),
     [drafts],
   );
   const isBusy = isSaving || saving;
 
-  const [, absorbSourceSignature] = useDraftReconcile({
-    draftSignature,
+  const [sourceSignature, absorbSourceSignature, discardDraft] = useDraftReconcile({
+    draftSignature: currentDraftSignature,
     nextSourceSignature: normalizedCatalogSignature,
     isBusy,
     resetDraft: () => setDrafts(normalizedCatalog.map(attachUid)),
     warningText: "服务端探测配置已更新，当前未保存修改已保留。",
-    onCleaned: () => setIsDirty(false),
   });
+  // A-03：isDirty 由「草稿签名 ≠ 已吸收的服务端签名」派生——改回原值后保存条自动消失。
+  const isDirty = sourceSignature !== currentDraftSignature;
   useDirtyNotification(onDirtyChange, isDirty);
 
   // 全量替换保存语义下的并发闸门（对齐 ServerManagement 的
@@ -399,9 +577,15 @@ export default function ProbeSettings({
 
   const discardLocalChanges = () => {
     setDrafts(normalizedCatalog.map(attachUid));
-    setIsDirty(false);
     setSourceConflict(false);
     toast.info("已放弃本地修改，已重置为服务端当前配置。");
+  };
+
+  // A-03 / D-07 保存条「放弃修改」：回到服务端当前配置；丢弃后草稿与服务端一致，
+  // 冲突闸门（sourceConflict）一并解除，避免「保存已被阻止」徽标残留。
+  const discardDraftChanges = () => {
+    discardDraft();
+    setSourceConflict(false);
   };
 
   const openDrawer = (draft?: ProbeDraft) => {
@@ -414,13 +598,78 @@ export default function ProbeSettings({
     setIsDrawerOpen(true);
   };
 
+  // O-01：「下发范围」的节点 / 分组数据。页面未从 App 接收 nodes / groupTree
+  //（App.tsx 不在本阶段白名单），抽屉打开时经现有 admin API 自取一份最新值；
+  // 拉取失败不阻塞其他字段编辑（多选器显示空态，重开抽屉重试）。
+  const [scopeData, setScopeData] = useState<{ nodes: NodeView[]; groupTree: GroupNode[] } | null>(null);
+  const [scopeDataLoading, setScopeDataLoading] = useState(false);
+  useEffect(() => {
+    if (!isDrawerOpen) {
+      return;
+    }
+    let cancelled = false;
+    setScopeDataLoading(true);
+    void (async () => {
+      try {
+        const [nodesSnapshot, settingsView] = await Promise.all([fetchNodes(), fetchSettings()]);
+        if (!cancelled) {
+          setScopeData({
+            nodes: nodesSnapshot?.nodes || [],
+            groupTree: settingsView?.group_tree || [],
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setScopeData(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setScopeDataLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isDrawerOpen]);
+
+  const scopeNodeOptions = (scopeData?.nodes || [])
+    .map((node) => {
+      const id = resolveNodeId(node);
+      return { value: id, label: resolveNodeName(node) || id };
+    })
+    .filter((option) => option.value);
+  const scopeGroupOptions = flattenGroupTree(scopeData?.groupTree || []).flatMap((entry) => [
+    { value: entry.group, label: entry.group },
+    ...entry.tags.map((tag) => ({
+      value: `${entry.group}:${tag}`,
+      label: `${entry.group} / ${tag}`,
+      indent: true,
+    })),
+  ]);
+
+  const updateScopeListField = (field: "scopeNodes" | "scopeGroups" | "scopeExclude", value: string, checked: boolean) => {
+    if (isBusy) {
+      return;
+    }
+    setFormState((current) => ({
+      ...current,
+      [field]: checked
+        ? [...current[field], value]
+        : current[field].filter((item) => item !== value),
+    }));
+    setFormError((current) => (current?.field === "scope" ? null : current));
+  };
+
   const closeDrawer = () => {
     setFormError(null);
     setIsDrawerOpen(false);
     setEditingUid(null);
   };
 
-  const updateFormField = <TField extends ProbeField>(
+  // O-01：scope 模式的编辑不走 updateFormField（Select / 多选器有各自的 handler），
+  // 泛型收窄到 ProbeFormState 实际持有的字段键。
+  const updateFormField = <TField extends Exclude<ProbeField, "scope">>(
     field: TField,
     value: ProbeFormState[TField],
   ) => {
@@ -466,7 +715,6 @@ export default function ProbeSettings({
         draft.uid === editingUid ? { ...draft, item: result.item } : draft
       );
     });
-    setIsDirty(true);
     closeDrawer();
     toast.success(editingUid === null ? "探测节点已添加" : "探测节点已更新");
   };
@@ -482,7 +730,6 @@ export default function ProbeSettings({
       return;
     }
     setDrafts((current) => current.filter((draft) => draft.uid !== uid));
-    setIsDirty(true);
     clearPendingDelete();
     toast.success("探测节点已移除");
   };
@@ -506,7 +753,6 @@ export default function ProbeSettings({
         const canonicalCatalog = normalizeCatalog(savedSettings.test_catalog || payload);
         setDrafts(canonicalCatalog.map(attachUid));
         absorbSourceSignature(serializeCatalog(canonicalCatalog));
-        setIsDirty(false);
         setSourceConflict(false);
       },
       setBusy: setIsSaving,
@@ -515,23 +761,19 @@ export default function ProbeSettings({
 
   const editingDraft = editingUid ? drafts.find((draft) => draft.uid === editingUid) || null : null;
 
-  const metricItems = [
-    { label: "接入目标", value: drafts.length },
-  ] as const;
-
   return (
     <div className={adminPageShellClass}>
       <AdminPageHeader
         title="探测设置"
-        actionsClassName={cn(adminPageActionsClass, "flex-col gap-2 sm:flex-row sm:items-center")}
         actions={
           <>
             {sourceConflict ? (
               <>
                 <span className={adminDirtyBadgeClass}>服务端配置已更新，保存已被阻止</span>
+                {/* 0.1.2 裁定：「放弃本地修改」保持页头原位、原逻辑，不搬进浮动保存条。 */}
                 <Button
                   variant="outline"
-                  className={`${adminActionButtonClass} h-9 px-4 font-medium`}
+                  className={`${adminActionButtonClass} h-9 flex-1 px-4 font-medium sm:flex-none`}
                   onClick={discardLocalChanges}
                   disabled={isBusy}
                 >
@@ -539,30 +781,19 @@ export default function ProbeSettings({
                 </Button>
               </>
             ) : null}
-            {isDirty && !sourceConflict ? (
-              <span className={adminDirtyBadgeClass}>有未保存的修改</span>
-            ) : null}
+            {/* A-12 / 0.1.2：保存入口与「有未保存的修改」徽标移入浮动保存条，页头只留「新增探测节点」。 */}
             <Button
               variant="outline"
-              className={`${adminActionButtonClass} h-9 min-w-[140px] px-4 font-medium`}
+              className={`${adminActionButtonClass} h-9 min-w-[140px] flex-1 gap-1.5 px-4 font-medium sm:flex-none`}
               onClick={() => openDrawer()}
               disabled={isBusy}
             >
-              <Plus className="mr-2 h-4 w-4" />
+              <Plus className="h-4 w-4" aria-hidden="true" />
               新增探测节点
-            </Button>
-            <Button
-              className={`${adminPrimaryButtonClass} h-9 px-4 font-medium`}
-              onClick={handleSave}
-              disabled={!isDirty || isBusy || sourceConflict}
-            >
-              {isBusy ? "保存中…" : "保存更改"}
             </Button>
           </>
         }
       />
-
-      <AdminMetricStrip ariaLabel="探测统计" items={metricItems} />
 
       <AdminPanel
         title="目标列表"
@@ -574,9 +805,39 @@ export default function ProbeSettings({
           rows={drafts}
           rowKey={(draft) => draft.uid}
           onRowClick={(draft) => openDrawer(draft)}
-          emptyLabel="暂无探测节点，点击右上角「新增探测节点」开始。"
+          emptyLabel={
+            // E-11 / A-16 / 0.1.2：空态用 AdminEmptyState，主按钮复用页头「新增探测节点」
+            // 同一个 onClick（openDrawer()），不新增逻辑。
+            <AdminEmptyState
+              icon={<Radio aria-hidden="true" />}
+              title="暂无探测节点"
+              description="添加探测目标后，展示页节点详情中将显示到各目标的延迟图表。"
+              action={
+                <Button
+                  className={adminPrimaryButtonClass}
+                  onClick={() => openDrawer()}
+                  disabled={isBusy}
+                >
+                  <Plus className="h-4 w-4" aria-hidden="true" />
+                  新增探测节点
+                </Button>
+              }
+            />
+          }
         />
       </AdminPanel>
+
+      {isDirty ? (
+        // A-12：保存入口移入浮动保存条；handleSave 的冲突闸门与禁用条件
+        // （!isDirty 由渲染条件覆盖）复用原有逻辑，只改呈现位置。
+        // A-03：左侧「放弃修改」带二次确认（D-07），确认后回到服务端当前配置。
+        <AdminSaveBar
+          saving={isSaving || saving}
+          disabled={isBusy || sourceConflict}
+          onSave={handleSave}
+          onDiscard={discardDraftChanges}
+        />
+      ) : null}
 
       <AdminDrawer
         open={isDrawerOpen}
@@ -594,7 +855,7 @@ export default function ProbeSettings({
             : "配置探测目标的基础信息与协议参数。"
         }
         footer={
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             {editingUid !== null ? (
               <AlertDialog
                 open={pendingDeleteUid !== null}
@@ -613,10 +874,10 @@ export default function ProbeSettings({
                     <Button
                       type="button"
                       variant="destructive"
-                      className={cn(adminDangerOutlineButtonClass, "h-9 min-w-[92px] px-4")}
+                      className={cn(adminDangerOutlineButtonClass, "min-w-[92px] gap-1.5 px-4")}
                       disabled={isBusy}
                     >
-                      <Trash2 className="mr-2 h-4 w-4" />
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
                       删除
                     </Button>
                   )}
@@ -628,7 +889,7 @@ export default function ProbeSettings({
                   <AlertDialogFooter className={adminDialogFooterClass}>
                     <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
                     <AlertDialogAction
-                      className={adminPrimaryButtonClass}
+                      className={adminDialogDangerActionClass}
                       disabled={isBusy}
                       onClick={() => {
                         if (pendingDeleteUid !== null) {
@@ -646,11 +907,11 @@ export default function ProbeSettings({
             ) : (
               <span />
             )}
-            <div className="flex gap-2">
+            <div className="ml-auto flex gap-2">
               <Button
                 type="button"
                 variant="outline"
-                className={cn(adminOutlineButtonClass, "h-9 min-w-[84px] px-4")}
+                className={cn(adminOutlineButtonClass, "min-w-[84px] px-4")}
                 onClick={closeDrawer}
                 disabled={isBusy}
               >
@@ -658,7 +919,7 @@ export default function ProbeSettings({
               </Button>
               <Button
                 type="button"
-                className={cn(adminPrimaryButtonClass, "h-9 min-w-[110px] px-4")}
+                className={cn(adminPrimaryButtonClass, "min-w-[110px] px-4")}
                 onClick={handleDrawerSave}
                 disabled={isBusy}
               >
@@ -669,14 +930,14 @@ export default function ProbeSettings({
         }
       >
         <section>
-          <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">基础信息</h3>
+          <h3 className="text-sm font-semibold text-[var(--label-1)]">基础信息</h3>
           <AdminKVField label="名称" htmlFor="probe-name">
-            <div className="space-y-2">
+            <div className="space-y-1.5">
               <Input
                 id="probe-name"
                 name="probe-name"
                 autoComplete="off"
-                className={adminInputClass}
+                className={`${adminInputClass} w-full`}
                 aria-invalid={formError?.field === "name"}
                 aria-describedby={formError?.field === "name" ? "probe-name-error" : undefined}
                 value={formState.name}
@@ -685,26 +946,29 @@ export default function ProbeSettings({
                 placeholder="例如：主站 TCP 443…"
               />
               {formError?.field === "name" ? (
-                <p id="probe-name-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                <p id="probe-name-error" className={adminFieldErrorClass} aria-live="polite">
                   {formError.message}
                 </p>
               ) : null}
             </div>
           </AdminKVField>
           <AdminKVField label="类型">
-            <div className="grid grid-cols-2 gap-2">
+            <div className={adminSegmentedTrackClass}>
               {(["icmp", "tcp"] as const).map((type) => {
                 const active = formState.type === type;
                 return (
                   <Button
                     key={type}
                     type="button"
-                    variant="outline"
-                    className={
+                    variant={null}
+                    aria-pressed={active}
+                    className={cn(
+                      adminSegmentedItemClass,
+                      "outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] disabled:opacity-50",
                       active
-                        ? `${adminPrimaryButtonClass} h-9 w-full min-w-0 px-4`
-                        : `${adminOutlineButtonClass} h-9 w-full min-w-0 px-4`
-                    }
+                        ? adminSegmentedItemActiveClass
+                        : adminSegmentedItemInactiveClass,
+                    )}
                     onClick={() => {
                       if (isBusy) {
                         return;
@@ -713,7 +977,6 @@ export default function ProbeSettings({
                         ...current,
                         type,
                         port: type === "tcp" ? current.port : "",
-                        intervalSec: type === "tcp" ? current.intervalSec : "",
                       }));
                     }}
                     disabled={isBusy}
@@ -727,15 +990,15 @@ export default function ProbeSettings({
         </section>
 
         <section>
-          <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">目标地址</h3>
+          <h3 className="text-sm font-semibold text-[var(--label-1)]">目标地址</h3>
           <AdminKVField label="地址" htmlFor="probe-host">
-            <div className="space-y-2">
+            <div className="space-y-1.5">
               <Input
                 id="probe-host"
                 name="probe-host"
                 autoComplete="off"
                 spellCheck={false}
-                className={`${adminInputClass} data-text`}
+                className={`${adminInputClass} data-text w-full`}
                 aria-invalid={formError?.field === "host"}
                 aria-describedby={formError?.field === "host" ? "probe-host-error" : undefined}
                 value={formState.host}
@@ -744,7 +1007,7 @@ export default function ProbeSettings({
                 placeholder="例如：1.1.1.1 / example.com…"
               />
               {formError?.field === "host" ? (
-                <p id="probe-host-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                <p id="probe-host-error" className={adminFieldErrorClass} aria-live="polite">
                   {formError.message}
                 </p>
               ) : null}
@@ -752,13 +1015,13 @@ export default function ProbeSettings({
           </AdminKVField>
         </section>
 
-        {formState.type === "tcp" ? (
-          <section>
-            <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">
-              TCP 参数
-            </h3>
+        <section>
+          <h3 className="text-sm font-semibold text-[var(--label-1)]">
+            {formState.type === "tcp" ? "TCP 参数" : "ICMP 参数"}
+          </h3>
+          {formState.type === "tcp" ? (
             <AdminKVField label="端口" htmlFor="probe-port">
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 <Input
                   id="probe-port"
                   name="probe-port"
@@ -767,7 +1030,7 @@ export default function ProbeSettings({
                   max={MAX_TCP_PORT}
                   autoComplete="off"
                   inputMode="numeric"
-                  className={`${adminInputClass} data-text`}
+                  className={`${adminInputClass} data-text w-full`}
                   aria-invalid={formError?.field === "port"}
                   aria-describedby={formError?.field === "port" ? "probe-port-error" : undefined}
                   value={formState.port}
@@ -776,44 +1039,139 @@ export default function ProbeSettings({
                   placeholder="例如：443…"
                 />
                 {formError?.field === "port" ? (
-                  <p id="probe-port-error" className="text-xs font-medium text-rose-500" aria-live="polite">
+                  <p id="probe-port-error" className={adminFieldErrorClass} aria-live="polite">
                     {formError.message}
                   </p>
                 ) : null}
               </div>
             </AdminKVField>
-            <AdminKVField label="默认间隔（秒）" htmlFor="probe-interval">
-              <div className="space-y-2">
-                <Input
-                  id="probe-interval"
-                  name="probe-interval"
-                  type="number"
-                  min={0}
-                  max={MAX_TCP_INTERVAL}
-                  autoComplete="off"
-                  inputMode="numeric"
-                  className={`${adminInputClass} data-text`}
-                  aria-invalid={formError?.field === "intervalSec"}
-                  aria-describedby={
-                    formError?.field === "intervalSec" ? "probe-interval-error" : undefined
-                  }
-                  value={formState.intervalSec}
-                  disabled={isBusy}
-                  onChange={(event) => updateFormField("intervalSec", event.target.value)}
-                  placeholder={`例如：${DEFAULT_TCP_INTERVAL}…`}
-                />
-                <p className="text-xs text-slate-500 dark:text-neutral-400">
-                  {`留空或填写 0 时，将沿用默认间隔 ${DEFAULT_TCP_INTERVAL} 秒。`}
+          ) : null}
+          <AdminKVField label="探测间隔（秒）" htmlFor="probe-interval">
+            <div className="space-y-1.5">
+              <Input
+                id="probe-interval"
+                name="probe-interval"
+                type="number"
+                min={0}
+                max={MAX_TCP_INTERVAL}
+                autoComplete="off"
+                inputMode="numeric"
+                className={`${adminInputClass} tabular-nums w-full`}
+                aria-invalid={formError?.field === "intervalSec"}
+                aria-describedby={
+                  formError?.field === "intervalSec" ? "probe-interval-error" : undefined
+                }
+                value={formState.intervalSec}
+                disabled={isBusy}
+                onChange={(event) => updateFormField("intervalSec", event.target.value)}
+                placeholder={formState.type === "icmp" ? "持续" : String(DEFAULT_TCP_INTERVAL)}
+              />
+              <p className={adminHelpTextClass}>
+                {formState.type === "icmp"
+                  ? "留空或填 0 为持续探测。"
+                  : `留空或填 0 为每 ${DEFAULT_TCP_INTERVAL} 秒。`}
+              </p>
+              {formError?.field === "intervalSec" ? (
+                <p id="probe-interval-error" className={adminFieldErrorClass} aria-live="polite">
+                  {formError.message}
                 </p>
-                {formError?.field === "intervalSec" ? (
-                  <p id="probe-interval-error" className="text-xs font-medium text-rose-500" aria-live="polite">
-                    {formError.message}
-                  </p>
-                ) : null}
-              </div>
+              ) : null}
+            </div>
+          </AdminKVField>
+        </section>
+
+        {/* O-01：下发范围（复用共享规则抽屉的范围选择组件 RuleMultiSelect）。 */}
+        <section>
+          <h3 className="text-sm font-semibold text-[var(--label-1)]">下发范围</h3>
+          <AdminKVField label="范围" htmlFor="probe-scope">
+            <div className="space-y-1.5">
+              <Select
+                value={formState.scopeMode}
+                onValueChange={(next) => {
+                  if (isBusy || !next) {
+                    return;
+                  }
+                  const mode: ProbeScopeMode =
+                    next === "all" || next === "groups" || next === "nodes" ? next : "none";
+                  setFormState((current) => ({ ...current, scopeMode: mode }));
+                  setFormError((current) => (current?.field === "scope" ? null : current));
+                }}
+              >
+                <SelectTrigger
+                  id="probe-scope"
+                  size="sm"
+                  disabled={isBusy}
+                  className={`${adminSelectTriggerClass} w-full`}
+                  aria-invalid={formError?.field === "scope"}
+                  aria-describedby={formError?.field === "scope" ? "probe-scope-error" : undefined}
+                >
+                  <SelectValue>
+                    {formState.scopeMode === "all"
+                      ? "全部节点"
+                      : formState.scopeMode === "groups"
+                        ? "指定分组"
+                        : formState.scopeMode === "nodes"
+                          ? "指定节点"
+                          : "不下发"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent className={adminSelectContentClass}>
+                  <SelectItem value="none">不下发</SelectItem>
+                  <SelectItem value="all">全部节点</SelectItem>
+                  <SelectItem value="groups">指定分组</SelectItem>
+                  <SelectItem value="nodes">指定节点</SelectItem>
+                </SelectContent>
+              </Select>
+              {scopeDataLoading ? (
+                <p className={adminHelpTextClass}>正在加载数据…</p>
+              ) : null}
+              {formError?.field === "scope" ? (
+                <p id="probe-scope-error" className={adminFieldErrorClass} aria-live="polite">
+                  {formError.message}
+                </p>
+              ) : null}
+            </div>
+          </AdminKVField>
+          {formState.scopeMode === "groups" ? (
+            <AdminKVField label="指定分组" htmlFor="probe-scope-groups">
+              <RuleMultiSelect
+                id="probe-scope-groups"
+                summary={`已选 ${formState.scopeGroups.length} 项`}
+                emptyText={scopeGroupOptions.length === 0 ? "暂无分组" : "未选择"}
+                options={scopeGroupOptions}
+                selected={formState.scopeGroups}
+                disabled={isBusy || scopeDataLoading}
+                onToggle={(value, checked) => updateScopeListField("scopeGroups", value, checked)}
+              />
             </AdminKVField>
-          </section>
-        ) : null}
+          ) : null}
+          {formState.scopeMode === "nodes" ? (
+            <AdminKVField label="指定节点" htmlFor="probe-scope-nodes">
+              <RuleMultiSelect
+                id="probe-scope-nodes"
+                summary={`已选 ${formState.scopeNodes.length} 个节点`}
+                emptyText={scopeNodeOptions.length === 0 ? "暂无节点" : "未选择"}
+                options={scopeNodeOptions}
+                selected={formState.scopeNodes}
+                disabled={isBusy || scopeDataLoading}
+                onToggle={(value, checked) => updateScopeListField("scopeNodes", value, checked)}
+              />
+            </AdminKVField>
+          ) : null}
+          {formState.scopeMode === "all" ? (
+            <AdminKVField label="排除节点" htmlFor="probe-scope-exclude">
+              <RuleMultiSelect
+                id="probe-scope-exclude"
+                summary={`已选 ${formState.scopeExclude.length} 个节点`}
+                emptyText={scopeNodeOptions.length === 0 ? "暂无节点" : "未选择"}
+                options={scopeNodeOptions}
+                selected={formState.scopeExclude}
+                disabled={isBusy || scopeDataLoading}
+                onToggle={(value, checked) => updateScopeListField("scopeExclude", value, checked)}
+              />
+            </AdminKVField>
+          ) : null}
+        </section>
       </AdminDrawer>
     </div>
   );

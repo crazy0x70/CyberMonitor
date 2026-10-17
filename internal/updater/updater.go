@@ -66,6 +66,11 @@ type Client struct {
 	CurrentVersion string
 	HTTPClient     *http.Client
 	UserAgent      string
+	// GOOS/GOARCH 指定选包与校验的目标平台；为空时回退到本进程的 runtime 值，
+	// 因此不设置这两个字段的调用方（Agent 自更新、服务端自更新）行为不变。
+	// 服务端为平台不一致的节点挑包时按节点上报的 OS/Arch 填充。
+	GOOS   string
+	GOARCH string
 }
 
 type githubRelease struct {
@@ -227,7 +232,7 @@ type releaseAssetRef struct {
 }
 
 func (c *Client) ValidateReleaseAssetURLs(expectedVersion, downloadURL, checksumURL string) error {
-	download, err := c.parseGitHubReleaseAssetURL(downloadURL, AssetName(c.Kind))
+	download, err := c.parseGitHubReleaseAssetURL(downloadURL, c.platformAssetName())
 	if err != nil {
 		return fmt.Errorf("拒绝更新下载地址: %w", err)
 	}
@@ -317,7 +322,7 @@ func (c *Client) buildReleaseInfo(release githubRelease) ReleaseInfo {
 	}
 	info.HasUpdate = HasVersionUpdate(info.CurrentVersion, info.LatestVersion)
 
-	assetName := AssetName(c.Kind)
+	assetName := c.platformAssetName()
 	info.AssetName = assetName
 	for _, asset := range assets {
 		switch asset.Name {
@@ -549,13 +554,28 @@ func resolveExecutablePath() (string, error) {
 	return resolved, nil
 }
 
-func AssetName(kind Kind) string {
-	arch := runtime.GOARCH
-	if arch == "arm" {
-		arch = "armv7"
+// platformAssetName 返回该 Client 目标平台对应的安装包名：GOOS/GOARCH 为空时
+// 由 AssetNameFor 回退到本进程 runtime，因此未设置这两个字段的调用方行为不变。
+func (c *Client) platformAssetName() string {
+	return AssetNameFor(c.Kind, c.GOOS, c.GOARCH)
+}
+
+// AssetNameFor 返回指定平台（goos/goarch）对应的安装包名：arm 映射为 armv7，windows 追加 .exe。goos/goarch 为空时回退到本进程
+// runtime 值，因此服务端可为平台不一致的节点按 stats.OS/stats.Arch 挑包。
+func AssetNameFor(kind Kind, goos, goarch string) string {
+	if strings.TrimSpace(goos) == "" {
+		goos = runtime.GOOS
 	}
-	name := fmt.Sprintf("cyber-monitor-%s-%s-%s", kind, runtime.GOOS, arch)
-	if runtime.GOOS == "windows" {
+	if strings.TrimSpace(goarch) == "" {
+		goarch = runtime.GOARCH
+	}
+	goos = strings.ToLower(strings.TrimSpace(goos))
+	goarch = strings.ToLower(strings.TrimSpace(goarch))
+	if goarch == "arm" {
+		goarch = "armv7"
+	}
+	name := fmt.Sprintf("cyber-monitor-%s-%s-%s", kind, goos, goarch)
+	if goos == "windows" {
 		name += ".exe"
 	}
 	return name

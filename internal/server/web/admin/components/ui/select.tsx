@@ -2,7 +2,7 @@ import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
 
 import { cn } from "@/lib/utils"
-import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react"
+import { ChevronDownIcon, CheckIcon, ChevronsUpDownIcon, ChevronUpIcon } from "lucide-react"
 
 const Select = SelectPrimitive.Root
 
@@ -39,7 +39,9 @@ function SelectTrigger({
       data-slot="select-trigger"
       data-size={size}
       className={cn(
-        "flex w-fit items-center justify-between gap-1 rounded-[1rem] border border-input bg-background py-2 pr-2 pl-4 text-sm whitespace-nowrap transition-[border-color,box-shadow,background-color] outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/45 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 data-placeholder:text-muted-foreground data-[size=default]:h-10 data-[size=sm]:h-9 data-[size=sm]:rounded-[0.9rem] *:data-[slot=select-value]:line-clamp-1 *:data-[slot=select-value]:flex *:data-[slot=select-value]:items-center *:data-[slot=select-value]:gap-1 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        // A-06 选择框：同输入框（36px、--r-md、--surface-sunken 内凹无边框、聚焦 accent 环），
+        // 右侧 chevron.up.chevron.down 双箭头（12px --label-3，macOS 弹出按钮样式）
+        "flex w-fit items-center justify-between gap-1 rounded-[var(--r-md)] bg-[var(--surface-sunken)] py-2 pr-3 pl-3.5 text-sm whitespace-nowrap text-[var(--label-1)] outline-none select-none [transition:background-color_var(--dur-2),box-shadow_var(--dur-2)] hover:bg-[color-mix(in_oklab,var(--surface-sunken)_98%,black)] focus:bg-[var(--surface-solid)] focus:shadow-[0_0_0_1px_var(--accent),0_0_0_4px_var(--accent-ring)] disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:bg-[var(--danger-tint)] aria-invalid:focus:shadow-[0_0_0_1px_var(--danger),0_0_0_4px_color-mix(in_srgb,var(--danger)_40%,transparent)] data-placeholder:text-[var(--label-4)] data-[size=default]:h-9 data-[size=sm]:h-9 data-[size=sm]:rounded-[var(--r-md)] *:data-[slot=select-value]:line-clamp-1 *:data-[slot=select-value]:flex *:data-[slot=select-value]:items-center *:data-[slot=select-value]:gap-1 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       {...props}
@@ -47,7 +49,7 @@ function SelectTrigger({
       {children}
       <SelectPrimitive.Icon
         render={
-          <ChevronDownIcon className="pointer-events-none size-4 text-muted-foreground" />
+          <ChevronsUpDownIcon className="pointer-events-none size-3 text-[var(--label-3)]" />
         }
       />
     </SelectPrimitive.Trigger>
@@ -81,7 +83,7 @@ function SelectContent({
         <SelectPrimitive.Popup
           data-slot="select-content"
           data-align-trigger={alignItemWithTrigger}
-          className={cn("relative isolate z-50 max-h-(--available-height) w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-[1rem] border border-border bg-popover text-popover-foreground shadow-[var(--cm-elev-2)] transition-none duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+          className={cn("relative isolate z-50 max-h-(--available-height) w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-[14px] border border-border bg-popover text-popover-foreground shadow-[var(--cm-elev-2)] transition-none duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:[--tw-enter-scale:0.96] data-open:duration-[var(--dur-3)] data-open:ease-[var(--ease-spring)] data-closed:animate-out data-closed:fade-out-0 data-closed:[--tw-exit-scale:0.98] data-closed:duration-[var(--dur-2)]", className )}
           {...props}
         >
           <SelectScrollUpButton />

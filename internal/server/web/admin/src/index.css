@@ -24,22 +24,16 @@
         U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
-@font-face {
-    font-family: "Source Code Pro";
-    font-style: normal;
-    font-weight: 200 900;
-    font-display: swap;
-    src: url("./assets/fonts/source-code-pro-latin.woff2") format("woff2-variations"),
-        url("./assets/fonts/source-code-pro-latin.woff2") format("woff2");
-    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
-        U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
-}
-
 @custom-variant dark (&:is(.dark *));
 
 .data-text {
     font-family: var(--font-data);
     font-variant-numeric: tabular-nums;
+}
+
+/* E-06：等宽只用于数值本身；占位提示文字（含中文）回落 UI 字体 */
+.data-text::placeholder {
+    font-family: var(--font-ui);
 }
 
 @theme inline {
@@ -78,39 +72,137 @@
 
 :root {
 
-    --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    --font-data: "Geist Mono", "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, "PingFang SC", "Hiragino Sans GB", monospace;
+    /* ===== 4.5 字体（0.1.1 裁定：系统字体优先；--font-data 不含任何 CJK 字体，中文回落 --font-ui） ===== */
+    --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "PingFang SC",
+        "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "PingFang SC",
+        "Noto Sans SC", sans-serif;
+    --font-data: "SF Mono", "Geist Mono", ui-monospace, Menlo, Consolas, monospace;
 
-    --surface-base: #f5f5f7;
-    --surface-1: #ffffff;
+    /* ===== 4.1 颜色 —— 浅色：白釉 ===== */
+    --canvas: #f4f5f8;
+    --canvas-tint-a: rgba(120, 150, 255, 0.10);
+    --canvas-tint-b: rgba(255, 170, 200, 0.07);
+    --canvas-tint-c: rgba(120, 220, 200, 0.07);
+
+    --surface-solid: #ffffff;
+    --surface-raised: rgba(255, 255, 255, 0.86);
+    --surface-sunken: rgba(118, 118, 128, 0.08);
+
+    --hairline: rgba(0, 0, 0, 0.08);
+    --hairline-strong: rgba(0, 0, 0, 0.14);
+    --glass-edge: rgba(255, 255, 255, 0.65);
+
+    /* 主色（0.1.1：采用 4.1 的 #0a64ff，深色 #3d8bff；同名覆盖原 shadcn 灰色高亮定义） */
+    --accent: #0a64ff;
+    --accent-hover: #0057e6;
+    --accent-text: #0057e6;
+    --accent-tint: rgba(10, 100, 255, 0.10);
+    --accent-ring: rgba(10, 100, 255, 0.40);
+
+    --ok: #1fa855;
+    --ok-tint: rgba(31, 168, 85, 0.12);
+    --warn: #e08600;
+    --warn-tint: rgba(224, 134, 0, 0.12);
+    --danger: #e5383b;
+    --danger-tint: rgba(229, 56, 59, 0.10);
+
+    /* 数据条专用（指标语义色，比状态色更柔） */
+    --meter-cpu: linear-gradient(90deg, #4f8bff, #0a64ff);
+    --meter-mem: linear-gradient(90deg, #44d39b, #1fa855);
+    --meter-disk: linear-gradient(90deg, #ffb35c, #ff8a1f);
+    --meter-net: linear-gradient(90deg, #8e8cff, #5b57f0);
+    --meter-hot: linear-gradient(90deg, #ff8a6a, #e5383b);
+    --meter-track: rgba(118, 118, 128, 0.14);
+
+    /* ===== 4.2 材质：blur 四档 + 浅色材质底 ===== */
+    --blur-ultrathin: saturate(180%) blur(12px);
+    --blur-thin: saturate(180%) blur(20px);
+    --blur-regular: saturate(190%) blur(28px);
+    --blur-thick: saturate(200%) blur(40px);
+
+    --mat-sidebar-bg: rgba(246, 247, 250, 0.72);
+    --mat-bar-bg: rgba(250, 250, 252, 0.70);
+    --mat-popover-bg: rgba(252, 252, 254, 0.78);
+    --mat-sheet-bg: rgba(255, 255, 255, 0.82);
+    --mat-control-bg: rgba(255, 255, 255, 0.62);
+
+    /* ===== 4.3 投影（浅色）：大半径、低不透明度、两层叠加 ===== */
+    --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 1px rgba(16, 24, 40, 0.03);
+    --shadow-2: 0 2px 6px rgba(16, 24, 40, 0.05), 0 10px 24px -6px rgba(16, 24, 40, 0.08);
+    --shadow-3: 0 8px 24px rgba(16, 24, 40, 0.08), 0 24px 56px -12px rgba(16, 24, 40, 0.16);
+    --shadow-4: 0 24px 64px -8px rgba(16, 24, 40, 0.22), 0 0 0 1px rgba(16, 24, 40, 0.04);
+
+    /* ===== 4.4 圆角（同心体系：内层 = 外层 − 内边距，最小 --r-xs） ===== */
+    --r-xs: 6px;
+    --r-sm: 10px;
+    --r-md: 12px;
+    --r-lg: 16px;
+    --r-xl: 20px;
+    --r-2xl: 24px;
+    --r-full: 999px;
+
+    /* ===== 4.5 字号阶梯：--t-* 为 font 简写（字重 字号/行高 字体族），字距用配套 --t-*-ls ===== */
+    --t-hero: 700 clamp(44px, 7vw, 96px)/0.95 var(--font-display);
+    --t-hero-ls: -0.045em;
+    --t-display: 700 34px/1.1 var(--font-display);
+    --t-display-ls: -0.03em;
+    --t-title1: 650 28px/1.15 var(--font-display);
+    --t-title1-ls: -0.022em;
+    --t-title2: 600 20px/1.25 var(--font-ui);
+    --t-title2-ls: -0.018em;
+    --t-headline: 600 15px/1.35 var(--font-ui);
+    --t-headline-ls: -0.01em;
+    --t-body: 400 14px/1.5 var(--font-ui);
+    --t-callout: 500 13px/1.45 var(--font-ui);
+    --t-footnote: 400 12px/1.4 var(--font-ui);
+    --t-caption: 500 11px/1.3 var(--font-ui);
+    --t-caption-ls: 0.02em; /* 中文时字距取 0 */
+
+    /* ===== 4.7 动效令牌 ===== */
+    --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+    --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+    --dur-1: 120ms;
+    --dur-2: 200ms;
+    --dur-3: 320ms;
+    --dur-4: 480ms;
+    --dur-5: 900ms;
+
+    /* ===== 0.1.3 旧变量别名（旧名保留指向新令牌；--surface-2/--surface-3/--radius 保持原值不做别名） ===== */
+    --surface-base: var(--canvas);
+    --surface-1: var(--surface-solid);
     --surface-2: #f2f2f7;
     --surface-3: rgba(255, 255, 255, 0.98);
-    --label-1: #0f172a;
-    --label-2: #5b6675;
-    --label-3: rgba(60, 60, 67, 0.55);
-    --label-4: rgba(60, 60, 67, 0.35);
-    --separator: rgba(60, 60, 67, 0.29);
+    --label-1: #1d1d1f;
+    --label-2: #515154;
+    /* R8：0.55 在白底仅 2.55:1，提到 0.74（≈4.9:1）满足 WCAG AA 小字 */
+    --label-3: rgba(60, 60, 67, 0.74);
+    --label-4: rgba(60, 60, 67, 0.36);
+    --separator: var(--hairline-strong);
     --separator-opaque: #c6c6c8;
-    --bg-1: #f5f5f7;
-    --panel-bg: var(--surface-1);
+    --bg-1: var(--canvas);
+    --panel-bg: var(--surface-solid);
     --panel-border: var(--separator);
-    --input-bg: rgba(255, 255, 255, 0.9);
+    --input-bg: var(--surface-sunken);
     --control-bg: rgba(255, 255, 255, 0.6);
     --control-border: var(--separator);
-    --background: #f5f5f7;
+    --background: var(--canvas);
     --foreground: var(--label-1);
-    --card: oklch(0.992 0.004 240);
+    --card: var(--surface-solid);
     --card-foreground: var(--label-1);
-    --popover: var(--surface-3);
+    --popover: var(--mat-popover-bg);
     --popover-foreground: var(--label-1);
 
-    --primary: #1f5dff;
-    --primary-hover: #1a4fd6;
+    --primary: var(--accent);
+    --primary-hover: var(--accent-hover);
     --primary-active: #163fae;
-    --primary-tint: rgba(31, 93, 255, 0.10);
-    --primary-border: rgba(31, 93, 255, 0.42);
-    --primary-ring: rgba(31, 93, 255, 0.45);
+    --primary-tint: var(--accent-tint);
+    --primary-border: color-mix(in oklab, var(--accent) 42%, transparent);
+    --primary-ring: var(--accent-ring);
     --primary-tint-soft: rgba(31, 93, 255, 0.06);
+    /* R8：文本用主色需保 AA，别名到 4.1 --accent-text（同为 hover 档） */
+    --primary-text: var(--accent-text);
 
     --space-1: 4px;
     --space-2: 8px;
@@ -122,26 +214,32 @@
     --secondary-foreground: oklch(0.34 0.014 250);
     --muted: oklch(0.968 0.008 242);
     --muted-foreground: var(--label-2);
-    --accent: oklch(0.958 0.014 220);
+    /* --accent 由上方 4.1 令牌定义（主色），此处不再重复定义 */
     --accent-foreground: oklch(0.31 0.02 246);
     --destructive: oklch(0.62 0.19 23);
     --border: oklch(0.9 0.01 238);
     --input: oklch(0.938 0.008 238);
-    --ring: #1f5dff;
-    --radius: 1rem;
+    --ring: var(--accent);
+    /* U3 圆角体系：lg=12(输入/代码块) md≈10(菜单项/侧栏) xl≈17(卡片) 2xl≈22(弹窗)；0.1.3：保持原值不做别名 */
+    --radius: 0.75rem;
     --cm-panel-bg: var(--panel-bg);
     --cm-panel-border: var(--panel-border);
     --cm-panel-header-bg: #ffffff;
     --cm-muted-surface: rgba(255, 255, 255, 0.6);
-    --cm-control-bg: var(--input-bg);
+    --cm-control-bg: var(--surface-sunken);
     --cm-control-border: var(--control-border);
     --cm-control-hover: rgba(248, 250, 252, 0.96);
-    --cm-sidebar-bg: rgba(255, 255, 255, 0.74);
+    --cm-sidebar-bg: var(--mat-sidebar-bg);
     --cm-sidebar-border: var(--separator);
 
-    --cm-elev-1: none;
-    --cm-elev-2: 0 2px 4px rgba(15, 23, 42, 0.06), 0 8px 20px -8px rgba(15, 23, 42, 0.12);
+    /* none 会让 Tailwind ring 的 box-shadow 组合列表整条失效（ring+shadow 同元素时暗色丢焦点环），
+       用 0 0 #0000 表示"无阴影"且可安全参与组合。0.1.3：--cm-elev-1 保持该值，不做别名 */
+    --cm-elev-1: 0 0 #0000;
+    --cm-elev-2: var(--shadow-2);
     --cm-panel-shadow: var(--cm-elev-1);
+    --status-ok: var(--ok);
+    --status-warn: var(--warn);
+    --status-danger: var(--danger);
     --sidebar: oklch(0.978 0.01 238);
     --sidebar-foreground: var(--label-1);
     --sidebar-border: oklch(0.89 0.012 236);
@@ -149,68 +247,131 @@
 
 .dark {
 
-    --surface-base: #000000;
-    --surface-1: #0a0a0b;
-    --surface-2: #121214;
-    --surface-3: #1c1c1e;
+    /* ===== 4.1 颜色 —— 深色：曜石玻璃（不是纯黑） ===== */
+    --canvas: #0c0d10;
+    --canvas-tint-a: rgba(70, 110, 255, 0.16);
+    --canvas-tint-b: rgba(190, 90, 255, 0.08);
+    --canvas-tint-c: rgba(40, 200, 170, 0.07);
 
-    --label-1: #f2f2f7;
+    --surface-solid: #16171b;
+    --surface-raised: rgba(28, 29, 34, 0.78);
+    --surface-sunken: rgba(118, 118, 128, 0.16);
+
+    --hairline: rgba(255, 255, 255, 0.08);
+    --hairline-strong: rgba(255, 255, 255, 0.14);
+    --glass-edge: rgba(255, 255, 255, 0.12);
+
+    --accent: #3d8bff;
+    --accent-hover: #5a9cff;
+    --accent-text: #74abff;
+    --accent-tint: rgba(61, 139, 255, 0.16);
+    --accent-ring: rgba(61, 139, 255, 0.5);
+
+    --ok: #34d27b;
+    --warn: #ffb340;
+    --danger: #ff5d5f;
+
+    --meter-track: rgba(118, 118, 128, 0.24);
+
+    /* ===== 4.2 材质（深色） ===== */
+    --mat-sidebar-bg: rgba(22, 23, 28, 0.66);
+    --mat-bar-bg: rgba(20, 21, 26, 0.66);
+    --mat-popover-bg: rgba(36, 37, 43, 0.78);
+    --mat-sheet-bg: rgba(30, 31, 36, 0.84);
+    --mat-control-bg: rgba(255, 255, 255, 0.07);
+
+    /* ===== 4.3 投影（深色）：阴影不可见，改用"亮边 + 更深的影" ===== */
+    --shadow-1: 0 0 0 1px rgba(255, 255, 255, 0.04);
+    --shadow-2: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 10px 24px -6px rgba(0, 0, 0, 0.5);
+    --shadow-3: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 24px 56px -12px rgba(0, 0, 0, 0.6);
+    --shadow-4: 0 0 0 1px rgba(255, 255, 255, 0.10), 0 32px 80px -8px rgba(0, 0, 0, 0.7);
+
+    /* ===== 0.1.3 旧变量别名（深色；--surface-2/--surface-3/--radius 保持原值不做别名） ===== */
+    --surface-base: var(--canvas);
+    --surface-1: var(--surface-solid);
+    --surface-2: #18181b;
+    --surface-3: #1f1f23;
+
+    --label-1: #f5f5f7;
     --label-2: rgba(235, 235, 245, 0.78);
-    --label-3: rgba(235, 235, 245, 0.48);
-    --label-4: rgba(235, 235, 245, 0.28);
+    /* R8：0.48 合成后约 4.4:1 差一点，提到 0.62（≈6.2:1）满足 WCAG AA 小字 */
+    --label-3: rgba(235, 235, 245, 0.62);
+    --label-4: rgba(235, 235, 245, 0.30);
 
-    --separator: rgba(84, 84, 88, 0.65);
+    --separator: var(--hairline-strong);
     --separator-opaque: #38383a;
 
-    --bg-1: var(--surface-base);
-    --panel-bg: var(--surface-1);
+    --bg-1: var(--canvas);
+    --panel-bg: var(--surface-solid);
     --panel-border: var(--separator);
-    --input-bg: var(--surface-2);
+    --input-bg: var(--surface-sunken);
     --control-bg: var(--surface-2);
     --control-border: var(--separator);
-    --background: var(--surface-base);
+    --background: var(--canvas);
     --foreground: var(--label-1);
-    --card: var(--surface-1);
+    --card: var(--surface-solid);
     --card-foreground: var(--label-1);
 
-    --popover: var(--surface-3);
+    --popover: var(--mat-popover-bg);
     --popover-foreground: var(--label-1);
 
-    --primary: #2563eb;
-    --primary-hover: #1d4ed8;
+    --primary: var(--accent);
+    --primary-hover: var(--accent-hover);
     --primary-active: #1e40af;
-    --primary-tint: rgba(37, 99, 235, 0.16);
-    --primary-border: rgba(37, 99, 235, 0.45);
-    --primary-ring: rgba(37, 99, 235, 0.5);
+    --primary-tint: var(--accent-tint);
+    --primary-border: color-mix(in oklab, var(--accent) 42%, transparent);
+    --primary-ring: var(--accent-ring);
     --primary-tint-soft: rgba(37, 99, 235, 0.10);
+    /* R8：暗色文本用亮蓝保对比，别名到 4.1 --accent-text */
+    --primary-text: var(--accent-text);
     --primary-foreground: #ffffff;
     --secondary: var(--surface-2);
     --secondary-foreground: var(--label-1);
     --muted: var(--surface-2);
     --muted-foreground: var(--label-2);
-    --accent: var(--surface-2);
+    /* --accent 由上方 4.1 令牌定义（深色主色），不再重复定义 */
     --accent-foreground: var(--label-1);
     --destructive: oklch(0.704 0.191 22.216);
     --border: var(--separator-opaque);
     --input: var(--surface-2);
-    --ring: #3b82f6;
+    --ring: var(--accent);
     --cm-panel-bg: var(--panel-bg);
     --cm-panel-border: var(--panel-border);
     --cm-panel-header-bg: var(--surface-2);
     --cm-muted-surface: var(--surface-2);
-    --cm-control-bg: var(--input-bg);
+    --cm-control-bg: var(--surface-sunken);
     --cm-control-border: var(--control-border);
 
     --cm-control-hover: var(--surface-3);
-    --cm-sidebar-bg: var(--surface-1);
+    --cm-sidebar-bg: var(--mat-sidebar-bg);
     --cm-sidebar-border: var(--separator);
 
-    --cm-elev-1: none;
-    --cm-elev-2: none;
+    /* R8：none 会令 ring+shadow 组合的 box-shadow 整条失效（暗色 skip link 丢焦点环），改 0 0 #0000。
+       0.1.3：--cm-elev-1 保持该值，不做别名 */
+    --cm-elev-1: 0 0 #0000;
+    --cm-elev-2: var(--shadow-2);
     --cm-panel-shadow: var(--cm-elev-1);
-    --sidebar: #050506;
+    --status-ok: var(--ok);
+    --status-warn: var(--warn);
+    --status-danger: var(--danger);
+    --sidebar: #0c0c0e;
     --sidebar-foreground: var(--label-1);
     --sidebar-border: var(--separator-opaque);
+}
+
+/* ===== 4.2 通用玻璃配方：.glass（后台按文档写成 Tailwind v4 @utility）。
+   材质 = 底色 + 模糊/饱和 + 1px hairline 边 + 上沿内高光 + 投影。
+   具体元素通过 --mat-bg / --mat-blur / --mat-shadow 局部覆盖档位：
+   侧栏 --mat-sidebar-bg、顶栏 --mat-bar-bg、菜单 --mat-popover-bg、
+   弹窗/抽屉 --mat-sheet-bg + --blur-thick + --shadow-4 */
+@utility glass {
+    background: var(--mat-bg, var(--mat-control-bg));
+    -webkit-backdrop-filter: var(--mat-blur, var(--blur-thin));
+    backdrop-filter: var(--mat-blur, var(--blur-thin));
+    border: 1px solid var(--hairline);
+    box-shadow:
+        inset 0 1px 0 var(--glass-edge),
+        var(--mat-shadow, var(--shadow-2));
 }
 
 @layer base {
@@ -220,6 +381,9 @@
   html {
     @apply bg-background font-sans text-foreground;
     color-scheme: light;
+    /* A-09：滚动锁（下拉 / 抽屉 / 弹窗）去掉滚动条时宽度变化导致主内容区横跳 8px；
+       scrollbar-gutter: stable 让滚动条槽位常驻，宽度保持不变。 */
+    scrollbar-gutter: stable;
     }
   html.dark {
     color-scheme: dark;
@@ -228,6 +392,26 @@
     @apply bg-background text-foreground;
     min-height: 100vh;
     font-feature-settings: normal;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    }
+
+  /* A-01：后台画布 —— 静态版白釉。--canvas 基色 + 两个极淡色团（tint-a/tint-b）
+     + feTurbulence 噪点（baseFrequency .9，不透明度 .025）。
+     后台不做漂移动画（区别于前台 P-01），主区透出微弱冷色渐变，
+     侧栏/顶栏玻璃才有内容可"磨"。深色下色团随 --canvas-tint-* 令牌自动切换 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E"),
+      radial-gradient(60vmax 60vmax at 10% 0%, var(--canvas-tint-a), transparent 70%),
+      radial-gradient(60vmax 60vmax at 90% 100%, var(--canvas-tint-b), transparent 70%),
+      var(--canvas);
     }
   #root {
     min-height: 100vh;
@@ -260,31 +444,49 @@
 @media (prefers-contrast: more) {
   :root {
 
+    /* 8.3：--hairline 提到 .22（玻璃 1px 边、内容层分隔线更可见） */
+    --hairline: rgba(0, 0, 0, 0.22);
+
     --label-2: rgba(60, 60, 67, 0.85);
-    --label-3: rgba(60, 60, 67, 0.72);
+    --label-3: rgba(60, 60, 67, 0.85);
     --label-4: rgba(60, 60, 67, 0.55);
     --separator: rgba(60, 60, 67, 0.6);
     --separator-opaque: #8e8e93;
   }
 
   .dark {
+
+    /* 8.3：深色 --hairline 同步提到 .22 */
+    --hairline: rgba(255, 255, 255, 0.22);
+
     --label-2: rgba(235, 235, 245, 0.94);
     --label-3: rgba(235, 235, 245, 0.74);
     --label-4: rgba(235, 235, 245, 0.56);
     --separator: rgba(84, 84, 88, 0.9);
     --separator-opaque: #545458;
   }
+
+  /* 8.3：玻璃边框实线化 —— hairline 换成实色 --label-3（浅/深色各自取值）。
+     此规则不在 @layer 中，层叠优先于 utilities 层里的 @utility glass */
+  .glass {
+    border-color: var(--label-3);
+  }
 }
 
 @media (prefers-reduced-transparency: reduce) {
 
   :root {
+    /* 8.2：降低透明度时所有 --mat-*-bg 换不透明值（浅色 #f9f9fb） */
+    --mat-sidebar-bg: #f9f9fb;
+    --mat-bar-bg: #f9f9fb;
+    --mat-popover-bg: #f9f9fb;
+    --mat-sheet-bg: #f9f9fb;
+    --mat-control-bg: #f9f9fb;
     --panel-bg: #ffffff;
     --card: #ffffff;
     --popover: #ffffff;
     --secondary: #f2f2f7;
     --muted: #f2f2f7;
-    --accent: #f2f2f7;
     --input-bg: #ffffff;
     --input: #ffffff;
     --control-bg: #ffffff;
@@ -297,6 +499,12 @@
   }
 
   .dark {
+    /* 8.2：降低透明度时所有 --mat-*-bg 换不透明值（深色 #1c1d22） */
+    --mat-sidebar-bg: #1c1d22;
+    --mat-bar-bg: #1c1d22;
+    --mat-popover-bg: #1c1d22;
+    --mat-sheet-bg: #1c1d22;
+    --mat-control-bg: #1c1d22;
     --surface-1: #161618;
     --surface-2: #1f1f21;
     --panel-bg: #161618;
@@ -304,7 +512,6 @@
     --popover: #2c2c2e;
     --secondary: #2c2c2e;
     --muted: #2c2c2e;
-    --accent: #2c2c2e;
     --input-bg: #2c2c2e;
     --input: #2c2c2e;
     --control-bg: #2c2c2e;
@@ -319,11 +526,129 @@
   *,
   *::before,
   *::after {
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
   }
+}
+
+/* A-03 手机端导航抽屉遮罩：rgba(0,0,0,.18) + blur(4px)，替代 Sheet 组件默认的 bg-black/50。
+   用 :has 限定在导航抽屉（App.tsx 给 SheetContent 传 data-nav-drawer），
+   不影响节点详情抽屉（admin-drawer，遮罩规格属 A-11）等其他 Sheet 实例 */
+body:has([data-nav-drawer]) [data-slot="sheet-overlay"] {
+    background: rgba(0, 0, 0, 0.18);
+    -webkit-backdrop-filter: blur(4px);
+    backdrop-filter: blur(4px);
 }
 
 section[id] {
   scroll-margin-top: 3.5rem;
+}
+
+/* =====================================================================
+   A-20 登录页专用选择器（后台唯一允许动态背景的地方）
+
+   - .cm-login-shell::before：P-01 式白釉流光画布（噪点 + 三个 60vmax 径向色团
+     + --canvas 底），覆盖在 A-01 的静态画布（body::before）之上；
+     inset 向四周外扩 6vmax，配合 ≤6vmax 的漂移幅度平移后不露边（同前台 styles.css）。
+   - .cm-login-card / .cm-login-logo：卡片与 Logo 入场动画。
+   - .cm-login-card-shake：登录失败水平抖动，由 Login.tsx 在错误信息变化时
+     切换 class 重播（0.1.2 裁定）。
+   深色令牌（--canvas-tint-*）随 .dark 自动切换；prefers-reduced-motion 下
+     漂移与入场/抖动全部停用（§7 通用约束）。
+   ===================================================================== */
+.cm-login-shell::before {
+    content: "";
+    position: fixed;
+    inset: -6vmax;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E"),
+      radial-gradient(60vmax 60vmax at 10% 0%, var(--canvas-tint-a), transparent 70%),
+      radial-gradient(60vmax 60vmax at 90% 10%, var(--canvas-tint-b), transparent 70%),
+      radial-gradient(60vmax 60vmax at 50% 100%, var(--canvas-tint-c), transparent 70%),
+      var(--canvas);
+    will-change: transform;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* P-01 第 2 条：色团 40–60s 缓慢漂移，幅度 ≤ 6vmax */
+  .cm-login-shell::before {
+    animation: cm-login-canvas-drift 48s ease-in-out infinite;
+  }
+
+  /* A-20 第 4 条：卡片 translateY(16px) scale(.98) → 0 + opacity，--dur-4 --ease-spring。
+     入场类由 Login.tsx 在入场结束后移除（约 800ms），避免此后失败抖动 class
+     切换时 animation-name 变回入场动画导致卡片重放入场 */
+  .cm-login-card-enter {
+    animation: cm-login-card-enter var(--dur-4) var(--ease-spring) backwards;
+  }
+
+  /* Logo 延迟 80ms，scale(.8)→1 弹性（--ease-bounce） */
+  .cm-login-logo {
+    animation: cm-login-logo-pop var(--dur-4) var(--ease-bounce) 80ms backwards;
+  }
+
+  /* A-20 第 5 条：登录失败抖动 translateX 0→-6→6→-4→4→0，320ms。
+     双类选择器优先级高于 .cm-login-card，添加 class 即重播（覆盖已结束的入场动画，
+     两者终态均为自然状态，切换无跳变） */
+  .cm-login-card.cm-login-card-shake {
+    animation: cm-login-card-shake 320ms var(--ease-out);
+  }
+}
+
+@keyframes cm-login-canvas-drift {
+    0% {
+      transform: translate3d(0, 0, 0);
+    }
+    25% {
+      transform: translate3d(3vmax, -2vmax, 0);
+    }
+    50% {
+      transform: translate3d(-2vmax, 3vmax, 0);
+    }
+    75% {
+      transform: translate3d(-3vmax, -1vmax, 0);
+    }
+    100% {
+      transform: translate3d(0, 0, 0);
+    }
+}
+
+@keyframes cm-login-card-enter {
+    from {
+      opacity: 0;
+      transform: translateY(16px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+}
+
+@keyframes cm-login-logo-pop {
+    from {
+      transform: scale(0.8);
+    }
+    to {
+      transform: scale(1);
+    }
+}
+
+@keyframes cm-login-card-shake {
+    0%, 100% {
+      transform: translateX(0);
+    }
+    15% {
+      transform: translateX(-6px);
+    }
+    35% {
+      transform: translateX(6px);
+    }
+    55% {
+      transform: translateX(-4px);
+    }
+    75% {
+      transform: translateX(4px);
+    }
 }

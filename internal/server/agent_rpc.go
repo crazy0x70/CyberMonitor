@@ -64,6 +64,34 @@ func agentUpdateReportConflict() *agentAPIError {
 
 const maxAgentNodeIDBytes = 128
 
+// 单次上报允许携带的磁盘/GPU 条数上限，与 maxNetworkTestsPerNode 同一意图：
+// 持有任一节点 token 的一方可以提交最大 4MB 的请求体（maxJSONBodySize），
+// 若不设上限，可一次写入数万条 disk/GPU 记录，并被写入 store、落盘快照、
+// 广播给所有公开 WS 客户端，形成放大式资源消耗。
+//
+// 取值明显高于真实硬件规模——60 盘位机型、8 卡 GPU 机——
+// 因此不会截断正常节点，只在异常/恶意 payload 上生效。
+const (
+	maxDisksPerNode = 128
+	maxGPUsPerNode  = 64
+)
+
+// reportUpdate 的限速阈值。reportUpdate 是唯一未接限速的 Agent 入口：每个被接受的
+// 升级上报都会触发一次全量快照广播（a.broadcastSnapshot）与一次全量 state.json 落盘
+// （applyAgentUpdateReportNodeLocked → persist），而 agentUpdateReportAllowedForCurrentState
+// 允许 current=updating → next=updating 重复上报，同一状态可被无限次重放，且升级任务
+// 在 1 小时内不收口。持该节点 token 的一方因此可在升级窗口内以任意速率制造全量写盘与
+// 全量广播。这里与 ingest/config 一致接入限速，使用 ingest 那张表（useIngestMap=true），
+// 以便被 sweepExpiredAgentRateWindows 回收。
+//
+// 窗口与 ingest 同量级（agentIngestWindow），上限明显放宽到 10：一次升级仅产生
+// pending→updating→restarting→done/failed 等少量状态迁移，阈值过紧会丢掉中间态，
+// 使服务端任务状态停滞到 1 小时超时才收口——这是本限速的主要风险，故留足余量。
+const (
+	agentUpdateReportRateWindow = agentIngestWindow
+	agentUpdateReportRateLimit  = 10
+)
+
 func cleanAgentNodeID(nodeID string) string {
 	nodeID = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
@@ -114,10 +142,18 @@ func normalizeStatsPayload(payload metrics.NodeStats) (metrics.NodeStats, *agent
 	payload.PublicIPv4 = cleanAgentText(payload.PublicIPv4, 64)
 	payload.PublicIPv6 = cleanAgentText(payload.PublicIPv6, 64)
 	payload.CPU.Model = cleanAgentText(payload.CPU.Model, 256)
+	if len(payload.Disk) > maxDisksPerNode {
+		log.Printf("节点 %s 上报磁盘条目过多，已截断: %d -> %d", nodeID, len(payload.Disk), maxDisksPerNode)
+		payload.Disk = payload.Disk[:maxDisksPerNode]
+	}
 	for i := range payload.Disk {
 		payload.Disk[i].Device = cleanAgentText(payload.Disk[i].Device, 128)
 		payload.Disk[i].Mountpoint = cleanAgentText(payload.Disk[i].Mountpoint, 128)
 		payload.Disk[i].Fstype = cleanAgentText(payload.Disk[i].Fstype, 64)
+	}
+	if len(payload.GPU) > maxGPUsPerNode {
+		log.Printf("节点 %s 上报 GPU 条目过多，已截断: %d -> %d", nodeID, len(payload.GPU), maxGPUsPerNode)
+		payload.GPU = payload.GPU[:maxGPUsPerNode]
 	}
 	for i := range payload.GPU {
 		payload.GPU[i].ID = cleanAgentText(payload.GPU[i].ID, 128)
@@ -351,6 +387,9 @@ func (a *agentAPI) reportUpdate(nodeID, token string, report AgentUpdateReport) 
 		if apiErr := a.validateAgentToken(nodeID, token); apiErr != nil {
 			return false, apiErr
 		}
+		if !a.store.allowAgentRate("update-report:"+nodeID, agentUpdateReportRateWindow, agentUpdateReportRateLimit, time.Now(), true) {
+			return false, agentRateLimitError()
+		}
 		_, applied, persistErr := a.store.applyAgentUpdateReportNodeLocked(nodeID, report)
 		if persistErr != nil {
 			return false, &agentAPIError{statusCode: http.StatusServiceUnavailable, message: "persist failed, retry later"}
@@ -397,7 +436,12 @@ func wrapPublicHandler(httpHandler http.Handler, grpcServer *grpc.Server) http.H
 		}
 		httpHandler.ServeHTTP(w, r)
 	})
-	return h2c.NewHandler(mux, &http2.Server{})
+	// h2c 的 HTTP/1.1 upgrade 握手会在路由/鉴权之前把整个请求体 io.ReadAll 进内存
+	// （x/net/http2/h2c 的 h2cUpgrade），唯一边界只有 ReadTimeout。按 h2c.NewHandler
+	// 文档要求，用 http.MaxBytesHandler 包在最外层给这条入口加上界。
+	// prior-knowledge 连接（gRPC）由 h2c hijack 后交给 http2 重新解析请求，不经过
+	// 这层 MaxBytesReader，gRPC 消息体大小不受该上限约束。
+	return http.MaxBytesHandler(h2c.NewHandler(mux, &http2.Server{}), maxPublicRequestBodySize)
 }
 
 func isAgentGRPCRequest(r *http.Request) bool {

@@ -6,13 +6,13 @@
     <meta
       name="theme-color"
       media="(prefers-color-scheme: light)"
-      content="#f4f7fb"
+      content="#f4f5f8"
       id="theme-color-light"
     />
     <meta
       name="theme-color"
       media="(prefers-color-scheme: dark)"
-      content="#0b0b0d"
+      content="#0c0d10"
       id="theme-color-dark"
     />
     
@@ -34,8 +34,7 @@
           </h1>
           <p class="subtitle" id="brand-subtitle" data-i18n="brandSubtitle">主机监控</p>
         </div>
-        <div class="topbar-right">
-          <div class="topbar-actions" role="group" aria-label="展示偏好">
+        <div class="topbar-actions" role="group" aria-label="展示偏好">
             <div class="control-menu">
               <button
                 class="control-toggle language-toggle"
@@ -47,7 +46,7 @@
                 aria-controls="language-menu"
               >
                 <span class="control-icon language-icon" id="language-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
                     <path d="m5 8 6 6"></path>
                     <path d="m4 14 6-6 2-3"></path>
                     <path d="M2 5h12"></path>
@@ -57,7 +56,7 @@
                   </svg>
                 </span>
               </button>
-              <div class="control-menu-panel" id="language-menu" role="menu" hidden>
+              <div class="control-menu-panel glass" id="language-menu" role="menu" hidden>
                 <button class="control-menu-item" type="button" role="menuitemradio" data-locale-option="zh-CN" aria-checked="true">简体中文</button>
                 <button class="control-menu-item" type="button" role="menuitemradio" data-locale-option="en-US" aria-checked="false">English</button>
               </div>
@@ -73,7 +72,7 @@
                 aria-controls="theme-menu"
               >
                 <span class="control-icon" id="theme-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="12" cy="12" r="4"></circle>
                     <path d="M12 2v2"></path>
                     <path d="M12 20v2"></path>
@@ -86,38 +85,28 @@
                   </svg>
                 </span>
               </button>
-              <div class="control-menu-panel" id="theme-menu" role="menu" hidden>
+              <div class="control-menu-panel glass" id="theme-menu" role="menu" hidden>
                 <button class="control-menu-item" type="button" role="menuitemradio" data-theme-option="auto" aria-checked="true" data-i18n="themeAuto">跟随系统</button>
                 <button class="control-menu-item" type="button" role="menuitemradio" data-theme-option="light" aria-checked="false" data-i18n="themeLight">浅色主题</button>
                 <button class="control-menu-item" type="button" role="menuitemradio" data-theme-option="dark" aria-checked="false" data-i18n="themeDark">深色主题</button>
               </div>
             </div>
           </div>
-        </div>
       </header>
 
       <main id="public-main-content">
       <section class="stats-grid">
         <button class="stat-card stat-filter-button" type="button" data-filter="all">
           <div class="stat-label" data-i18n="statTotal">服务器总数</div>
-          <div class="stat-value">
-            <span class="stat-dot blue"></span>
-            <span id="stat-total">0</span>
-          </div>
+          <div class="stat-value"><span class="stat-dot blue"></span><span id="stat-total">0</span></div>
         </button>
         <button class="stat-card stat-filter-button" type="button" data-filter="online">
           <div class="stat-label" data-i18n="statOnline">在线服务器</div>
-          <div class="stat-value">
-            <span class="stat-dot green"></span>
-            <span id="stat-online">0</span>
-          </div>
+          <div class="stat-value"><span class="stat-dot green"></span><span id="stat-online">0</span><span class="stat-sub" id="stat-online-total">/ 0</span></div>
         </button>
         <button class="stat-card stat-filter-button" type="button" data-filter="offline">
           <div class="stat-label" data-i18n="statOffline">离线服务器</div>
-          <div class="stat-value">
-            <span class="stat-dot red"></span>
-            <span id="stat-offline">0</span>
-          </div>
+          <div class="stat-value"><span class="stat-dot red"></span><span id="stat-offline">0</span></div>
         </button>
         <div class="stat-card">
           <div class="stat-label" data-i18n="statNetwork">网络信息</div>
@@ -128,11 +117,22 @@
         </div>
       </section>
 
-      <nav id="group-tabs" class="group-tabs" aria-label="节点分组导航" data-i18n-attr="aria-label:groupTabsLabel"></nav>
+      <div class="group-tabs-wrap">
+        <nav id="group-tabs" class="group-tabs" aria-label="节点分组导航" data-i18n-attr="aria-label:groupTabsLabel"></nav>
+      </div>
 
       <section id="list" class="node-list"></section>
 
+      <!-- P-12：空态 —— 居中 56px 图标方块 + 标题 + 说明；文案仍由 data-i18n / monitor.js 写入 -->
       <div id="empty" class="empty">
+        <div class="state-icon-block" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="20" height="8" x="2" y="2" rx="2" ry="2"></rect>
+            <rect width="20" height="8" x="2" y="14" rx="2" ry="2"></rect>
+            <line x1="6" x2="6.01" y1="6" y2="6"></line>
+            <line x1="6" x2="6.01" y1="18" y2="18"></line>
+          </svg>
+        </div>
         <h2 data-i18n="emptyWaitingTitle">等待节点接入</h2>
         <p data-i18n="emptyWaitingBody">请启动 Agent 并指向当前管理端地址。</p>
       </div>

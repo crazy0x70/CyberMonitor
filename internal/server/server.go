@@ -42,9 +42,14 @@ import (
 )
 
 const (
-	maxLogSize                      = 10 * 1024 * 1024
-	maxLogBackupCount               = 3
-	maxJSONBodySize                 = 4 * 1024 * 1024
+	maxLogSize        = 10 * 1024 * 1024
+	maxLogBackupCount = 3
+	maxJSONBodySize   = 4 * 1024 * 1024
+	// maxPublicRequestBodySize 是公开入口最外层（包在 h2c 之外）的请求体上限。
+	// h2c 的 HTTP/1.1 upgrade 握手会在路由/鉴权之前把整个请求体 io.ReadAll 进内存
+	// （x/net/http2/h2c 的 h2cUpgrade），必须用 http.MaxBytesHandler 约束这条无界入口。
+	// 取值 ≥ maxJSONBodySize，并远大于 Agent HTTP 回退上报体积。
+	maxPublicRequestBodySize        = 16 * 1024 * 1024
 	wsMaxClientMessageBytes         = 4 * 1024
 	maxHTTPHeaderBytes              = 1 << 20
 	wsSendQueueSize                 = 8
@@ -65,15 +70,48 @@ const (
 	defaultAgentIngestLimit         = 2
 	defaultAgentRegisterLimit       = 1
 	defaultAgentRegisterGlobalLimit = 30
-	maxNetworkTestsPerNode          = 128
-	nodeStaleGraceSeconds           = 12
-	nodeStatusOnline                = "online"
-	nodeStatusOffline               = "offline"
-	nodeStatusWaitingRegistration   = "waiting_registration"
-	publicVariantBalanced           = "balanced"
-	adminVariant                    = "admin"
-	adminSessionCookieName          = "cm_admin_session"
+	// register-invalid:* 桶的限速：非法 bootstrap token 的猜测速率上限，与全局注册
+	// 配额同量级（改动前非法请求消耗 register:* 时即受 30 次/分钟约束）。
+	defaultAgentRegisterInvalidLimit = 30
+	maxNetworkTestsPerNode           = 128
+	// maxLoginUsernameLen 限制登录用户名的字节长度：用户名直接作为 loginAttempts 的键，
+	// 无上限时被拒的登录可用接近 4MB 的请求体写出超长键，轮换用户名即可无限堆积。
+	maxLoginUsernameLen = 256
+	// maxLoginAttemptsEntries 是 loginAttempts 的硬上限，保证 map 大小有界。
+	maxLoginAttemptsEntries = 4096
+	// loginAttemptPruneInterval 是摊还清理间隔：每 N 次登录限流操作才做一次全表扫描，
+	// 避免未认证流量在全局锁内触发随表大小线性上升的 O(n) 扫描。
+	loginAttemptPruneInterval = 64
+	// loginAttemptEvictBatch 是表达到上限时按最旧活跃时间淘汰的批大小。
+	loginAttemptEvictBatch = 256
+	// loginGlobalAttemptKey 是进程级登录尝试预算的固定键：不含任何攻击者可控字段，
+	// 使任意用户名/IP 轮换下的 bcrypt 总次数在 defaultLoginFailWindow 窗口内有上界。
+	loginGlobalAttemptKey = "login-global"
+	// defaultLoginGlobalLimit 是全局登录尝试预算：取单 IP 阈值的 10 倍，宽松到不误伤
+	// 正常运维，同时把全进程每窗口的 bcrypt 次数封顶（单 IP 键已被 IP 分桶约束）。
+	defaultLoginGlobalLimit       = 10 * defaultLoginFailLimit
+	nodeStaleGraceSeconds         = 12
+	nodeStatusOnline              = "online"
+	nodeStatusOffline             = "offline"
+	nodeStatusWaitingRegistration = "waiting_registration"
+	publicVariantBalanced         = "balanced"
+	adminVariant                  = "admin"
+	adminSessionCookieName        = "cm_admin_session"
+	// publicWSGlobalLimit / publicWSPerIPLimit 是公开（未认证）WS 连接的进程级上限：
+	// 全局与按真实客户端 IP 双重限制，避免未认证放大（每条连接一次全量快照 + 三条 goroutine）。
+	publicWSGlobalLimit = 512
+	publicWSPerIPLimit  = 8
+	// startupOfflineGrace 是服务端启动后的离线判定宽限期：自身重启期间节点 LastSeen
+	// 停留在旧值，若不设宽限期会在启动瞬间对全部节点产生离线告警风暴与离线历史污染。
+	// 宽限期结束后恢复正常判定，始终不重连的节点仍会在宽限期后被告警。
+	startupOfflineGrace = 60 * time.Second
+	// alertDeliveryDrainTimeout 是关闭时等待告警投递 goroutine 的兜底上限：避免排空卡死。
+	alertDeliveryDrainTimeout = 5 * time.Second
 )
+
+// loginGlobalAttemptLimit 是全局登录尝试预算的当前值。用变量而非常量，便于测试注入较小
+// 阈值，避免用例为触发全局预算而支付大量 bcrypt 成本；生产值恒为 defaultLoginGlobalLimit。
+var loginGlobalAttemptLimit = defaultLoginGlobalLimit
 
 type sizeLimitedWriter struct {
 	path    string
@@ -249,29 +287,41 @@ type Config struct {
 }
 
 type Store struct {
-	mu                 sync.RWMutex
-	agentMutationMu    sync.RWMutex
-	nodeMutationMu     sync.Mutex
-	nodeMutationLocks  map[string]*nodeMutationLock
-	persistMu          sync.Mutex
-	persistPending     bool // 持久化失败后置位（persistMu 内维护），成功后清除
-	nodes              map[string]NodeState
-	profiles           map[string]*NodeProfile
-	settings           Settings
-	buildVersion       string
-	buildCommit        string
-	dataPath           string
-	lastPersist        time.Time
-	persistInterval    time.Duration
-	alerted            map[string]AlertedState
-	offlineSessions    map[string]OfflineSessionState
+	mu                sync.RWMutex
+	agentMutationMu   sync.RWMutex
+	nodeMutationMu    sync.Mutex
+	nodeMutationLocks map[string]*nodeMutationLock
+	persistMu         sync.Mutex
+	persistPending    bool // 持久化失败后置位（persistMu 内维护），成功后清除
+	nodes             map[string]NodeState
+	profiles          map[string]*NodeProfile
+	settings          Settings
+	buildVersion      string
+	buildCommit       string
+	dataPath          string
+	lastPersist       time.Time
+	persistInterval   time.Duration
+	alerted           map[string]AlertedState
+	offlineSessions   map[string]OfflineSessionState
+	// alertStates（F4）按 nodeID|ruleID 记录告警规则评估状态机（offline 规则除外，
+	// 继续使用 alerted）；ruleSamples 为同 key 的阈值类样本环（仅内存，重启重建）。
+	alertStates        map[string]RuleAlertState
+	ruleSamples        map[string][]ruleSample
 	historyManager     *history.Manager
 	pendingNodeDeletes map[string]struct{}
 	pendingClearNodes  bool
 	loginAttempts      map[string]*loginAttempt
+	loginPruneOps      int
 	configRefresh      map[string]struct{}
 	agentIngestRate    map[string]agentRateWindow
 	agentRegisterRate  map[string]agentRateWindow
+
+	// startedAt 是服务端进程启动时间（仅内存，不落盘）：启动宽限期内抑制离线告警与
+	// 离线会话/历史写入，避免自身停机被误判为节点离线。
+	startedAt time.Time
+	// alertDeliveryWG 跟踪 tick 循环派生的告警投递 goroutine：关闭时在释放
+	// historyManager/数据目录锁之前做有界等待。
+	alertDeliveryWG sync.WaitGroup
 
 	deltaDigests map[string]uint64
 }
@@ -296,16 +346,22 @@ type NodeProfile struct {
 	Tags           []string `json:"tags,omitempty"`
 	Groups         []string `json:"groups,omitempty"`
 
-	GroupSeeded              bool                    `json:"group_seeded,omitempty"`
-	Region                   string                  `json:"region,omitempty"`
-	HideFromCR               bool                    `json:"hide_from_cr,omitempty"`
-	HideFromAll              bool                    `json:"hide_from_all,omitempty"`
-	HideFromDisplay          bool                    `json:"hide_from_display,omitempty"`
-	DiskType                 string                  `json:"disk_type,omitempty"`
-	NetSpeedMbps             int                     `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64                   `json:"expire_at,omitempty"`
-	AutoRenew                bool                    `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64                   `json:"renew_interval_sec,omitempty"`
+	GroupSeeded      bool   `json:"group_seeded,omitempty"`
+	Region           string `json:"region,omitempty"`
+	HideFromCR       bool   `json:"hide_from_cr,omitempty"`
+	HideFromAll      bool   `json:"hide_from_all,omitempty"`
+	HideFromDisplay  bool   `json:"hide_from_display,omitempty"`
+	DiskType         string `json:"disk_type,omitempty"`
+	NetSpeedMbps     int    `json:"net_speed_mbps,omitempty"`
+	ExpireAt         int64  `json:"expire_at,omitempty"`
+	AutoRenew        bool   `json:"auto_renew,omitempty"`
+	RenewIntervalSec int64  `json:"renew_interval_sec,omitempty"`
+	// 流量配额（F4 traffic_quota 前置）：配额与计算方式为配置，TrafficCounter 为
+	// updateNodeStats 按增量累加的运行数据（均落盘）。
+	TrafficLimitBytes        uint64                  `json:"traffic_limit_bytes,omitempty"`
+	TrafficLimitType         string                  `json:"traffic_limit_type,omitempty"` // sum|max|up|down，默认 sum
+	TrafficResetDay          int                     `json:"traffic_reset_day,omitempty"`  // 1–28，默认 1
+	TrafficCounter           *TrafficCounter         `json:"traffic_counter,omitempty"`
 	TestIntervalSec          int                     `json:"test_interval_sec"`
 	TestSelections           []TestSelection         `json:"test_selections,omitempty"`
 	AgentUpdate              *AgentUpdateInstruction `json:"agent_update,omitempty"`
@@ -340,32 +396,44 @@ type AgentConfig struct {
 }
 
 type NodeView struct {
-	Stats                    metrics.NodeStats `json:"stats"`
-	LastSeen                 int64             `json:"last_seen"`
-	FirstSeen                int64             `json:"first_seen,omitempty"`
-	Status                   string            `json:"status"`
-	ServerID                 string            `json:"server_id,omitempty"`
-	AlertEnabled             bool              `json:"alert_enabled"`
-	Alias                    string            `json:"alias,omitempty"`
-	Group                    string            `json:"group,omitempty"`
-	Tags                     []string          `json:"tags,omitempty"`
-	Groups                   []string          `json:"groups,omitempty"`
-	Region                   string            `json:"region,omitempty"`
-	HiddenFromDisplay        bool              `json:"hidden_from_display,omitempty"`
-	HiddenFromCR             bool              `json:"hidden_from_cr,omitempty"`
-	HiddenFromAll            bool              `json:"hidden_from_all,omitempty"`
-	DiskType                 string            `json:"disk_type,omitempty"`
-	NetSpeedMbps             int               `json:"net_speed_mbps,omitempty"`
-	ExpireAt                 int64             `json:"expire_at,omitempty"`
-	AutoRenew                bool              `json:"auto_renew,omitempty"`
-	RenewIntervalSec         int64             `json:"renew_interval_sec,omitempty"`
-	TestIntervalSec          int               `json:"test_interval_sec,omitempty"`
-	TestSelections           []TestSelection   `json:"test_selections,omitempty"`
-	AgentUpdateSupported     bool              `json:"agent_update_supported"`
-	AgentUpdateMode          string            `json:"agent_update_mode,omitempty"`
-	AgentUpdateState         string            `json:"agent_update_state,omitempty"`
-	AgentUpdateTargetVersion string            `json:"agent_update_target_version,omitempty"`
-	AgentUpdateMessage       string            `json:"agent_update_message,omitempty"`
+	Stats             metrics.NodeStats `json:"stats"`
+	LastSeen          int64             `json:"last_seen"`
+	FirstSeen         int64             `json:"first_seen,omitempty"`
+	Status            string            `json:"status"`
+	ServerID          string            `json:"server_id,omitempty"`
+	AlertEnabled      bool              `json:"alert_enabled"`
+	Alias             string            `json:"alias,omitempty"`
+	Group             string            `json:"group,omitempty"`
+	Tags              []string          `json:"tags,omitempty"`
+	Groups            []string          `json:"groups,omitempty"`
+	Region            string            `json:"region,omitempty"`
+	HiddenFromDisplay bool              `json:"hidden_from_display,omitempty"`
+	HiddenFromCR      bool              `json:"hidden_from_cr,omitempty"`
+	HiddenFromAll     bool              `json:"hidden_from_all,omitempty"`
+	DiskType          string            `json:"disk_type,omitempty"`
+	NetSpeedMbps      int               `json:"net_speed_mbps,omitempty"`
+	ExpireAt          int64             `json:"expire_at,omitempty"`
+	AutoRenew         bool              `json:"auto_renew,omitempty"`
+	RenewIntervalSec  int64             `json:"renew_interval_sec,omitempty"`
+	TrafficLimitBytes uint64            `json:"traffic_limit_bytes,omitempty"`
+	TrafficLimitType  string            `json:"traffic_limit_type,omitempty"`
+	TrafficResetDay   int               `json:"traffic_reset_day,omitempty"`
+	// A-02：管理端专属的流量用量字段（红线 4：不得进入公开快照与公开 WS 载荷）。
+	// 只在 AdminSnapshot 路径（snapshotLocked includeProfileOnly=true）填充；
+	// nodeViewLocked 保持零值，omitempty 序列化时省略，公开快照与 node_delta 不含。
+	TrafficUsedBytes  uint64 `json:"traffic_used_bytes,omitempty"`
+	TrafficCycleStart int64  `json:"traffic_cycle_start,omitempty"`
+	// O-01：管理端专属的范围下发探测目录项 ID（只读；手动选择优先，已被节点手动
+	// 选择的目录项不列入）。红线 4：同样只在 AdminSnapshot 路径填充，公开快照与
+	// node_delta 不含。
+	ScopedTestIDs            []string        `json:"scoped_test_ids,omitempty"`
+	TestIntervalSec          int             `json:"test_interval_sec,omitempty"`
+	TestSelections           []TestSelection `json:"test_selections,omitempty"`
+	AgentUpdateSupported     bool            `json:"agent_update_supported"`
+	AgentUpdateMode          string          `json:"agent_update_mode,omitempty"`
+	AgentUpdateState         string          `json:"agent_update_state,omitempty"`
+	AgentUpdateTargetVersion string          `json:"agent_update_target_version,omitempty"`
+	AgentUpdateMessage       string          `json:"agent_update_message,omitempty"`
 }
 
 type PublicSettings struct {
@@ -383,6 +451,7 @@ type Snapshot struct {
 	GeneratedAt int64          `json:"generated_at"`
 	Nodes       []NodeView     `json:"nodes"`
 	Groups      []string       `json:"groups,omitempty"`
+	GroupTree   []GroupNode    `json:"group_tree,omitempty"`
 	Settings    PublicSettings `json:"settings,omitempty"`
 }
 
@@ -483,6 +552,14 @@ func (c *hubClient) enqueue(payload []byte, prepared *websocket.PreparedMessage)
 
 const shutdownGraceTimeout = 5 * time.Second
 
+// 测试接缝（生产恒为 nil）：publicHandlerDecorator 允许测试在公开 handler 外层注入
+// 阻塞逻辑；historyManagerCloseHook 允许测试观测 historyManager 关闭时序。二者仅用于
+// 验证关闭排空顺序，不改变生产行为。
+var (
+	publicHandlerDecorator  func(http.Handler) http.Handler
+	historyManagerCloseHook func()
+)
+
 func Run(ctx context.Context, cfg Config) error {
 	if err := applyDefaults(&cfg); err != nil {
 		return err
@@ -516,6 +593,7 @@ func Run(ctx context.Context, cfg Config) error {
 	nodes := make(map[string]NodeState)
 	offlineSessions := make(map[string]OfflineSessionState)
 	alerted := make(map[string]AlertedState)
+	alertStates := make(map[string]RuleAlertState)
 	if loaded {
 		settings, err = mergeSettings(persisted.Settings, defaultSettings)
 		if err != nil {
@@ -531,6 +609,9 @@ func Run(ctx context.Context, cfg Config) error {
 		if persisted.Alerted != nil {
 			alerted = persisted.Alerted
 		}
+		if persisted.AlertStates != nil {
+			alertStates = persisted.AlertStates
+		}
 	}
 	if err := ensureServerIDsForProfiles(profiles, nodes); err != nil {
 		return err
@@ -544,6 +625,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Nodes:                 nodes,
 		OfflineSessions:       offlineSessions,
 		Alerted:               alerted,
+		AlertStates:           alertStates,
 		PendingHistoryClear:   persisted.PendingHistoryClear,
 		PendingHistoryDeletes: slices.Clone(persisted.PendingHistoryDeletes),
 	}
@@ -556,6 +638,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return wrapDataPathError("初始化历史存储失败", history.HistoryRootDir(cfg.DataDir), err)
 	}
 	defer func() {
+		if historyManagerCloseHook != nil {
+			historyManagerCloseHook()
+		}
 		if err := historyManager.Close(); err != nil {
 			log.Printf("关闭历史存储失败: %v", err)
 		}
@@ -582,11 +667,14 @@ func Run(ctx context.Context, cfg Config) error {
 		persistInterval:   defaultPersistInterval,
 		alerted:           alerted,
 		offlineSessions:   offlineSessions,
+		alertStates:       alertStates,
+		ruleSamples:       make(map[string][]ruleSample),
 		historyManager:    historyManager,
 		loginAttempts:     make(map[string]*loginAttempt),
 		configRefresh:     make(map[string]struct{}),
 		agentIngestRate:   make(map[string]agentRateWindow),
 		agentRegisterRate: make(map[string]agentRateWindow),
+		startedAt:         time.Now(),
 		deltaDigests:      make(map[string]uint64),
 	}
 	if _, err := recoverLegacyHistoryAndPendingCleanup(dataPath, historyPath, historyManager, persistedSnapshot); err != nil {
@@ -603,12 +691,16 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	// F7 system/status：CPU 百分比后台采样器（随 runCtx 启动，见下）。
+	statusMonitor := newSystemStatusMonitor()
+
 	publicMux, adminMux, err := newRouteMuxes(routeDeps{
 		cfg:                 cfg,
 		store:               store,
 		hub:                 hub,
 		agentAPI:            agentAPI,
 		systemUpdater:       systemUpdater,
+		systemStatusMonitor: statusMonitor,
 		splitMode:           splitMode,
 		trustedProxyHeaders: trustedProxyHeaders,
 		webRoot:             webRoot,
@@ -619,6 +711,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 	grpcServer := newAgentRPCServer(agentAPI)
 	publicHandler := stripForwardedPrefixPath(wrapPublicHandler(publicMux, grpcServer), trustedProxyHeaders)
+	if publicHandlerDecorator != nil {
+		publicHandler = publicHandlerDecorator(publicHandler)
+	}
 	publicServer := newHTTPServer(cfg.PublicAddr, withSecurityHeaders(publicHandler))
 
 	adminServer := &http.Server{}
@@ -630,6 +725,8 @@ func Run(ctx context.Context, cfg Config) error {
 	defer func() { <-tickDone }()
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
+	// F7 system/status：CPU 百分比每 5s 采样一次并缓存，请求只读缓存。
+	statusMonitor.start(runCtx)
 	go func() {
 		defer close(tickDone)
 		runTickLoop(runCtx, store, hub)
@@ -637,7 +734,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	startTelegramBot(ctx, store)
 
+	// shutdownDone 在 HTTP Shutdown 完成排空（或 5s 宽限到期）后关闭：Run 必须等它关闭
+	// 后才能返回，否则在途请求与告警投递 goroutine 会踩到随后释放的 TSDB 与锁文件。
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		select {
 		case <-ctx.Done():
 		case <-runCtx.Done():
@@ -696,16 +797,23 @@ func Run(ctx context.Context, cfg Config) error {
 
 		for i := 0; i < 2; i++ {
 			if err := <-serverErr; err != nil {
-				shutdownHTTPServer(adminServer)
-				shutdownHTTPServer(publicServer)
+				awaitGracefulDrain(shutdownDone, runCancel, tickDone, &store.alertDeliveryWG)
 				return err
 			}
 		}
+		awaitGracefulDrain(shutdownDone, runCancel, tickDone, &store.alertDeliveryWG)
+		// B-02：普通累加不再逐次落盘后，退出前做一次最终落盘（含至多 10s 节流窗口内的
+		// 流量计数增量）。
+		store.persistLogged()
 		return nil
 	}
 	if err := publicServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		awaitGracefulDrain(shutdownDone, runCancel, tickDone, &store.alertDeliveryWG)
 		return err
 	}
+	awaitGracefulDrain(shutdownDone, runCancel, tickDone, &store.alertDeliveryWG)
+	// B-02：同上，退出前最终落盘。
+	store.persistLogged()
 	return nil
 }
 
@@ -718,12 +826,21 @@ func shutdownHTTPServer(server *http.Server) {
 	_ = server.Shutdown(ctx)
 }
 
+// tickRunner 持有跨 tick 的派生状态（快照摘要、限速回收时间），使单次 tick 可被独立
+// 调用与测试。
+type tickRunner struct {
+	lastBalancedDigest string
+	lastAdminDigest    string
+	lastRateSweep      time.Time
+	// F4 评估节奏：expiry 每天本地 09:00（启动后立即一次）、traffic_quota 每分钟。
+	lastExpiryScan  time.Time
+	lastTrafficEval time.Time
+}
+
 func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	lastBalancedDigest := ""
-	lastAdminDigest := ""
-	lastRateSweep := time.Time{}
+	runner := &tickRunner{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -735,67 +852,151 @@ func runTickLoop(ctx context.Context, store *Store, hub *Hub) {
 						log.Printf("tick 巡检 panic 已恢复: %v\n%s", rec, debug.Stack())
 					}
 				}()
-				now := time.Now()
-				if lastRateSweep.IsZero() || now.Sub(lastRateSweep) >= agentRateSweepInterval {
-					store.sweepExpiredAgentRateWindows(now)
-					lastRateSweep = now
-				}
-				if hub.HasVariant(adminVariant) {
-
-					payload, err := json.Marshal(adminStoreSnapshot(store))
-					if err != nil {
-						log.Printf("序列化管理端节点快照失败: %v", err)
-					} else if digest := snapshotPayloadDigest(payload); digest != lastAdminDigest {
-						hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
-						lastAdminDigest = digest
-					}
-				}
-				if hub.HasVariant(publicVariantBalanced) {
-					payload, err := json.Marshal(storeSnapshot(store))
-					if err != nil {
-						log.Printf("序列化节点快照失败: %v", err)
-					} else if digest := snapshotPayloadDigest(payload); digest != lastBalancedDigest {
-						hub.BroadcastVariant(payload, publicVariantBalanced)
-						lastBalancedDigest = digest
-					}
-				}
-				if store.reconcileProfiles(now) {
-					store.persistLogged()
-				}
-				store.ReconcileOfflineTracker(now)
-				targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
-				logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
-				if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
-					go func() {
-						defer func() {
-							if rec := recover(); rec != nil {
-								log.Printf("告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
-							}
-						}()
-						if targets.FeishuWebhook == "" && targets.TelegramToken == "" {
-							store.RecordAlertDelivery(offlineEvents, false, false, true)
-							return
-						}
-						if len(offlineEvents) > 0 {
-							feishuOwed, telegramOwed := splitOwedChannels(offlineEvents)
-							feishuOK := sendFeishuEventNotice(targets.FeishuWebhook, targets.SiteTitle, feishuOwed, buildAlertMessage, "告警")
-							telegramOK := sendTelegramAlert(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
-							if !feishuOK || !telegramOK {
-								store.RecordAlertDelivery(offlineEvents, feishuOK, telegramOK, true)
-							}
-						}
-						if len(recoveredEvents) > 0 {
-							feishuOwed, telegramOwed := splitOwedChannels(recoveredEvents)
-							feishuOK := sendFeishuEventNotice(targets.FeishuWebhook, targets.SiteTitle, feishuOwed, buildRecoveryMessage, "恢复通知")
-							telegramOK := sendTelegramRecovery(targets.TelegramToken, targets.TelegramUserIDs, targets.SiteTitle, telegramOwed)
-							if !feishuOK || !telegramOK {
-								store.RecordAlertDelivery(recoveredEvents, feishuOK, telegramOK, false)
-							}
-						}
-					}()
-				}
+				runner.runOnce(store, hub, time.Now())
 			}()
 		}
+	}
+}
+
+func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
+	if t.lastRateSweep.IsZero() || now.Sub(t.lastRateSweep) >= agentRateSweepInterval {
+		store.sweepExpiredAgentRateWindows(now)
+		t.lastRateSweep = now
+	}
+	if hub.HasVariant(adminVariant) {
+
+		payload, err := json.Marshal(adminStoreSnapshot(store))
+		if err != nil {
+			log.Printf("序列化管理端节点快照失败: %v", err)
+		} else if digest := snapshotPayloadDigest(payload); digest != t.lastAdminDigest {
+			hub.BroadcastAdmin(payload, store.Credentials().TokenSalt)
+			t.lastAdminDigest = digest
+		}
+	}
+	if hub.HasVariant(publicVariantBalanced) {
+		payload, err := json.Marshal(storeSnapshot(store))
+		if err != nil {
+			log.Printf("序列化节点快照失败: %v", err)
+		} else if digest := snapshotPayloadDigest(payload); digest != t.lastBalancedDigest {
+			hub.BroadcastVariant(payload, publicVariantBalanced)
+			t.lastBalancedDigest = digest
+		}
+	}
+	if store.reconcileProfiles(now) {
+		store.persistLogged()
+	}
+	// 启动宽限期内不生成离线事件、不写离线会话/历史：服务端自身停机期间节点 LastSeen
+	// 停留在旧值，若立即判定会形成离线告警风暴并污染 TSDB 离线历史。宽限期结束后恢复
+	// 正常判定（始终不重连的节点仍会被告警），宽限期内可一并推迟恢复类事件。
+	if !store.offlineGraceElapsed(now) {
+		return
+	}
+	store.ReconcileOfflineTracker(now)
+	targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
+	logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
+	if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
+		store.alertDeliveryWG.Add(1)
+		go func() {
+			defer store.alertDeliveryWG.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
+				}
+			}()
+			if len(targets.Channels) == 0 {
+				store.RecordAlertDelivery(offlineEvents, nil, true)
+				return
+			}
+			if len(offlineEvents) > 0 {
+				results := dispatchChannelNotices(targets.Channels, targets.SiteTitle, offlineEvents, buildAlertMessage, "告警")
+				if !allChannelNoticesOK(results) {
+					store.RecordAlertDelivery(offlineEvents, results, true)
+				}
+			}
+			if len(recoveredEvents) > 0 {
+				results := dispatchChannelNotices(targets.Channels, targets.SiteTitle, recoveredEvents, buildRecoveryMessage, "恢复通知")
+				if !allChannelNoticesOK(results) {
+					store.RecordAlertDelivery(recoveredEvents, results, false)
+				}
+			}
+		}()
+	}
+
+	// F4：CollectAlertEvents 之后评估告警规则（阈值类每 tick；expiry/traffic_quota
+	// 按节奏），同一 tick 同一规则的多节点事件合并为一条消息投递。
+	cadence := RuleEvalCadence{
+		ExpiryScan:  t.expiryScanDue(now),
+		TrafficScan: t.trafficEvalDue(now),
+	}
+	ruleBatches := store.CollectRuleEvents(now, cadence)
+	if cadence.ExpiryScan {
+		t.lastExpiryScan = now
+	}
+	if cadence.TrafficScan {
+		t.lastTrafficEval = now
+	}
+	if len(ruleBatches) > 0 {
+		logRuleNoticeEvents(ruleBatches)
+		store.alertDeliveryWG.Add(1)
+		go func(batches []RuleNoticeBatch) {
+			defer store.alertDeliveryWG.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("规则告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
+				}
+			}()
+			for _, batch := range batches {
+				if len(batch.Channels) == 0 {
+					store.RecordRuleDelivery(batch, nil)
+					continue
+				}
+				results := dispatchRuleBatchNotice(batch)
+				if !allChannelNoticesOK(results) {
+					store.RecordRuleDelivery(batch, results)
+				}
+			}
+		}(ruleBatches)
+	}
+}
+
+// offlineGraceElapsed 报告启动宽限期是否已过。startedAt 为零（测试/旧路径）视为已过，
+// 保持原有判定语义不变。
+func (s *Store) offlineGraceElapsed(now time.Time) bool {
+	s.mu.RLock()
+	startedAt := s.startedAt
+	s.mu.RUnlock()
+	if startedAt.IsZero() {
+		return true
+	}
+	return now.Sub(startedAt) >= startupOfflineGrace
+}
+
+// awaitGracefulDrain 在 Run 返回前等待关闭排空：先停 tick 循环并触发 HTTP 排空，再等
+// HTTP Shutdown 完成（或 5s 宽限到期），最后对告警投递 goroutine 做有界等待。返回后
+// Run 的 defer 才会释放 historyManager、数据目录锁与 TSDB，避免在途请求/告警 goroutine
+// 踩到已关闭的存储。
+func awaitGracefulDrain(shutdownDone <-chan struct{}, runCancel context.CancelFunc, tickDone <-chan struct{}, alerts *sync.WaitGroup) {
+	runCancel()
+	<-shutdownDone
+	<-tickDone
+	waitGroupWithTimeout(alerts, alertDeliveryDrainTimeout)
+}
+
+// waitGroupWithTimeout 等待 wg 归零，超时返回 false（不阻塞关闭）。
+func waitGroupWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	if wg == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
@@ -1109,6 +1310,15 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 	if s.applyAutoRenewLocked(profile, now) {
 		persist = true
 	}
+	// F4：按增量累加月度流量计数（agent 重启回绕时把新值当增量，到重置日清零）。
+	// B-01：传原始上报 stats——mergeNodeStatsStaticInfo 会把首份静态上报之后的
+	// 合并结果全部带上 StaticInfo=true，此前计数被守卫整体阻断（真实部署永不累计）。
+	// B-02：只有周期重置立即落盘；普通累加交给 shouldPersistLocked 的 10s 周期落盘。
+	if acceptStats {
+		if _, cycleReset := s.applyTrafficCounterLocked(stats.NodeID, profile, stats, now); cycleReset {
+			persist = true
+		}
+	}
 	if reconcileAgentUpdateWithStatsLocked(profile, storedStats, now) {
 		persist = true
 		updateReconciled = true
@@ -1215,21 +1425,20 @@ func mergeSingleGPUStaticInfo(current, incoming metrics.GPUInfo) metrics.GPUInfo
 }
 
 type AlertEvent struct {
-	NodeID            string
-	Display           string
-	OS                string
-	LastSeen          int64
-	OfflineSec        int64
-	RetryCount        int
-	DeliveredFeishu   bool
-	DeliveredTelegram bool
+	NodeID     string
+	Display    string
+	OS         string
+	LastSeen   int64
+	OfflineSec int64
+	RetryCount int
+	// Delivered 记录该事件已成功投递的渠道 ID（F5 泛化：只补发失败渠道）。
+	Delivered map[string]bool
 }
 
 type AlertTargets struct {
-	FeishuWebhook   string
-	TelegramToken   string
-	TelegramUserIDs []int64
-	SiteTitle       string
+	// Channels 为本次应投递的启用渠道（含深拷贝，锁外使用）。
+	Channels  []NotifyChannel
+	SiteTitle string
 }
 
 const offlineSessionDefaultThreshold = 5 * time.Minute
@@ -1382,17 +1591,13 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
 
+	// B-03：内置 offline 规则接入离线引擎——停用、范围、渠道设置生效。
+	rule := s.offlineAlertRuleLocked()
 	targets := AlertTargets{
-		FeishuWebhook:   strings.TrimSpace(s.settings.AlertWebhook),
-		TelegramToken:   strings.TrimSpace(s.settings.AlertTelegramToken),
-		TelegramUserIDs: normalizeTelegramUserIDs(slices.Clone(s.settings.AlertTelegramUserIDs)),
-		SiteTitle:       normalizeSiteTitle(s.settings.SiteTitle),
+		Channels:  ruleChannelsFor(rule, enabledNotifyChannels(s.settings)),
+		SiteTitle: normalizeSiteTitle(s.settings.SiteTitle),
 	}
-	if targets.TelegramToken == "" || len(targets.TelegramUserIDs) == 0 {
-		targets.TelegramToken = ""
-		targets.TelegramUserIDs = nil
-	}
-	alertDisabled := s.settings.AlertOfflineSec <= 0
+	alertDisabled := s.settings.AlertOfflineSec <= 0 || !rule.Enabled
 	threshold := s.offlineAlertThreshold()
 	offlineEvents := make([]AlertEvent, 0)
 	recoveredEvents := make([]AlertEvent, 0)
@@ -1414,6 +1619,13 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			}
 			continue
 		}
+		if !ruleScopeMatches(rule.Scope, nodeID, profile) {
+			if wasAlerted {
+				delete(s.alerted, nodeID)
+				needsPersist = true
+			}
+			continue
+		}
 		offlineFor := now.Sub(node.LastSeen)
 		if offlineFor < threshold {
 			if wasAlerted {
@@ -1427,20 +1639,18 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				if state.OfflineSince.IsZero() {
 					offlineSec = 0
 				}
-				deliveredFeishu, deliveredTelegram := false, false
+				var delivered map[string]bool
 				if state.RecoveryPending {
-					deliveredFeishu = state.DeliveredFeishu
-					deliveredTelegram = state.DeliveredTelegram
+					delivered = cloneNotifyBoolMap(state.Delivered)
 				}
 				recoveredEvents = append(recoveredEvents, AlertEvent{
-					NodeID:            nodeID,
-					Display:           display,
-					OS:                stats.OS,
-					LastSeen:          node.LastSeen.Unix(),
-					OfflineSec:        offlineSec,
-					RetryCount:        state.RetryCount,
-					DeliveredFeishu:   deliveredFeishu,
-					DeliveredTelegram: deliveredTelegram,
+					NodeID:     nodeID,
+					Display:    display,
+					OS:         stats.OS,
+					LastSeen:   node.LastSeen.Unix(),
+					OfflineSec: offlineSec,
+					RetryCount: state.RetryCount,
+					Delivered:  delivered,
 				})
 				delete(s.alerted, nodeID)
 				needsPersist = true
@@ -1453,8 +1663,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			}
 			if state.OfflineSince.Before(node.LastSeen) {
 				state.OfflineSince = node.LastSeen
-				state.DeliveredFeishu = false
-				state.DeliveredTelegram = false
+				state.Delivered = nil
 				state.RecoveryPending = false
 			}
 			stats := node.Stats
@@ -1463,13 +1672,12 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				offlineSec = 0
 			}
 			offlineEvents = append(offlineEvents, AlertEvent{
-				NodeID:            nodeID,
-				Display:           resolveAlertDisplay(profile, stats, nodeID),
-				OS:                stats.OS,
-				LastSeen:          node.LastSeen.Unix(),
-				OfflineSec:        offlineSec,
-				DeliveredFeishu:   state.DeliveredFeishu,
-				DeliveredTelegram: state.DeliveredTelegram,
+				NodeID:     nodeID,
+				Display:    resolveAlertDisplay(profile, stats, nodeID),
+				OS:         stats.OS,
+				LastSeen:   node.LastSeen.Unix(),
+				OfflineSec: offlineSec,
+				Delivered:  cloneNotifyBoolMap(state.Delivered),
 			})
 			state.NextRetryAt = time.Time{}
 			s.alerted[nodeID] = state
@@ -1516,21 +1724,21 @@ func alertRetryBackoff(retryCount int) time.Duration {
 	return backoff
 }
 
-func splitOwedChannels(events []AlertEvent) (feishu, telegram []AlertEvent) {
-	feishu = make([]AlertEvent, 0, len(events))
-	telegram = make([]AlertEvent, 0, len(events))
+// owedAlertEvents 按 channelID 过滤尚未投递成功的事件（只补发失败渠道）。
+func owedAlertEvents(events []AlertEvent, channelID string) []AlertEvent {
+	owed := make([]AlertEvent, 0, len(events))
 	for _, event := range events {
-		if !event.DeliveredFeishu {
-			feishu = append(feishu, event)
+		if event.Delivered[channelID] {
+			continue
 		}
-		if !event.DeliveredTelegram {
-			telegram = append(telegram, event)
-		}
+		owed = append(owed, event)
 	}
-	return feishu, telegram
+	return owed
 }
 
-func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bool, offline bool) {
+// RecordAlertDelivery 按 results（渠道 ID → 是否成功）记录投递进度；只有当本轮
+// 涉及的渠道全部送达时才取消重试，失败渠道进入退避补发。
+func (s *Store) RecordAlertDelivery(events []AlertEvent, results map[string]bool, offline bool) {
 	needsPersist := false
 	s.mu.Lock()
 	now := time.Now()
@@ -1540,13 +1748,24 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bo
 			if !ok {
 				continue
 			}
-			if feishuOK {
-				state.DeliveredFeishu = true
+			for channelID, success := range results {
+				if success {
+					if state.Delivered == nil {
+						state.Delivered = make(map[string]bool)
+					}
+					state.Delivered[channelID] = true
+				}
 			}
-			if telegramOK {
-				state.DeliveredTelegram = true
+			// results 为空表示当前没有可用渠道：保持旧语义，安排退避重试，
+			// 管理员补配渠道后仍能把未送达的告警补发出去。
+			allDelivered := len(results) > 0
+			for channelID := range results {
+				if !state.Delivered[channelID] {
+					allDelivered = false
+					break
+				}
 			}
-			if state.DeliveredFeishu && state.DeliveredTelegram {
+			if allDelivered {
 				continue
 			}
 			state.RetryCount++
@@ -1555,9 +1774,23 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bo
 			needsPersist = true
 			continue
 		}
-		feishuDelivered := event.DeliveredFeishu || feishuOK
-		telegramDelivered := event.DeliveredTelegram || telegramOK
-		if feishuDelivered && telegramDelivered {
+		delivered := cloneNotifyBoolMap(event.Delivered)
+		if delivered == nil {
+			delivered = make(map[string]bool)
+		}
+		for channelID, success := range results {
+			if success {
+				delivered[channelID] = true
+			}
+		}
+		allDelivered := len(results) > 0
+		for channelID := range results {
+			if !delivered[channelID] {
+				allDelivered = false
+				break
+			}
+		}
+		if allDelivered {
 			continue
 		}
 		if !ok {
@@ -1565,16 +1798,14 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, feishuOK, telegramOK bo
 				continue
 			}
 			state = AlertedState{
-				OfflineSince:      now.Add(-time.Duration(event.OfflineSec) * time.Second),
-				RetryCount:        event.RetryCount + 1,
-				DeliveredFeishu:   feishuDelivered,
-				DeliveredTelegram: telegramDelivered,
-				RecoveryPending:   true,
+				OfflineSince:    now.Add(-time.Duration(event.OfflineSec) * time.Second),
+				RetryCount:      event.RetryCount + 1,
+				Delivered:       delivered,
+				RecoveryPending: true,
 			}
 		} else {
 			if state.RecoveryPending {
-				state.DeliveredFeishu = feishuDelivered
-				state.DeliveredTelegram = telegramDelivered
+				state.Delivered = delivered
 			}
 			state.RetryCount++
 		}
@@ -1599,66 +1830,22 @@ func resolveAlertDisplay(profile *NodeProfile, stats metrics.NodeStats, nodeID s
 	return display
 }
 
-func sendFeishuEventNotice(webhook, siteTitle string, events []AlertEvent, build func(string, []AlertEvent) string, label string) bool {
-	if webhook == "" || len(events) == 0 {
-		return true
-	}
-	if err := sendFeishuText(webhook, build(siteTitle, events)); err != nil {
-		log.Printf("%s发送失败: %v", label, err)
-		return false
-	}
-	return true
-}
-
+// sendFeishuTest 维持旧测试推送语义（消息文案不变），内部改走 F5 的 feishu
+// Notifier（SSRF 防护客户端 + 可选签名）。
 func sendFeishuTest(webhook, siteTitle string) error {
 	message := fmt.Sprintf("【%s】告警测试 %s", normalizeSiteTitle(siteTitle), time.Now().Format("2006-01-02 15:04:05"))
-	return sendFeishuText(webhook, message)
-}
-
-func sendFeishuText(webhook, text string) error {
-	webhook = strings.TrimSpace(webhook)
-	if webhook == "" || strings.TrimSpace(text) == "" {
-		return errors.New("webhook 或消息为空")
-	}
-	if err := validateWebhookURL(webhook); err != nil {
+	notifier, err := newNotifier(NotifyChannel{
+		ID:      legacyFeishuChannelID,
+		Type:    notifyChannelTypeFeishu,
+		Enabled: true,
+		Secrets: map[string]string{"webhook": strings.TrimSpace(webhook)},
+	})
+	if err != nil {
 		return err
 	}
-	payload := map[string]any{
-		"msg_type": "text",
-		"content": map[string]string{
-			"text": text,
-		},
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("告警消息编码失败: %w", err)
-	}
-	req, err := http.NewRequest(http.MethodPost, webhook, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("告警请求创建失败: %s", telegramRequestErrorMessage(err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := sharedWebhookClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("告警发送失败: %s", telegramRequestErrorMessage(err))
-	}
-	defer resp.Body.Close()
-	body, _ := readResponseBodyLimited(resp.Body)
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook 响应错误: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var feishuResp struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if err := json.Unmarshal(body, &feishuResp); err != nil {
-		log.Printf("飞书 webhook 响应非 JSON: %.120s", strings.TrimSpace(string(body)))
-		return errors.New("飞书响应非 JSON，投递结果未知")
-	}
-	if feishuResp.Code != 0 {
-		return fmt.Errorf("飞书返回错误 code=%d: %s", feishuResp.Code, strings.TrimSpace(feishuResp.Msg))
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
+	defer cancel()
+	return notifier.Send(ctx, NotifyMessage{Text: message})
 }
 
 func buildEventMessage(siteTitle, title, lead, footer string, events []AlertEvent) string {
@@ -1824,6 +2011,7 @@ func cloneSettings(settings Settings) Settings {
 	settings.Groups = slices.Clone(settings.Groups)
 	settings.GroupTree = cloneGroupNodes(settings.GroupTree)
 	settings.TestCatalog = slices.Clone(settings.TestCatalog)
+	settings.NotifyChannels = cloneNotifyChannels(settings.NotifyChannels)
 	return settings
 }
 
@@ -2065,6 +2253,7 @@ func buildStoreSnapshot(s *Store, nodes []NodeView) Snapshot {
 		GeneratedAt: time.Now().Unix(),
 		Nodes:       nodes,
 		Groups:      s.SettingsGroups(),
+		GroupTree:   s.SettingsGroupTree(),
 		Settings:    s.PublicSettings(),
 	}
 	return snapshot
@@ -2232,6 +2421,51 @@ func (s *Store) AdminSnapshot() []NodeView {
 	return s.snapshotLocked(true)
 }
 
+// applyAdminTrafficView 填充管理端专属的流量用量字段（A-02）：traffic_used_bytes
+// 按当前计算方式（trafficUsedBytes），traffic_cycle_start 取 TrafficCounter 起点。
+// 仅在 AdminSnapshot 路径调用；nodeViewLocked 不填这两个字段，公开快照与
+// node_delta（公开 WS 载荷）序列化时因零值 + omitempty 而省略（红线 4）。
+func applyAdminTrafficView(view *NodeView, profile *NodeProfile) {
+	if profile == nil {
+		return
+	}
+	view.TrafficUsedBytes = trafficUsedBytes(profile)
+	if profile.TrafficCounter != nil {
+		view.TrafficCycleStart = profile.TrafficCounter.CycleStart
+	}
+}
+
+// applyAdminScopedTestsView 填充管理端专属的 scoped_test_ids（O-01）：范围下发
+// 带来的探测目录项 ID（按目录顺序；手动选择优先，已被节点手动选择的目录项不
+// 列入——此时该探测以手动选择形态呈现，间隔覆盖也以手动为准）。仅在
+// AdminSnapshot 路径调用；nodeViewLocked 不填该字段，公开快照与 node_delta
+// （公开 WS 载荷）序列化时因零值 + omitempty 而省略（红线 4）。
+func (s *Store) applyAdminScopedTestsView(view *NodeView, nodeID string, profile *NodeProfile) {
+	if profile == nil {
+		return
+	}
+	manual := make(map[string]struct{}, len(profile.TestSelections))
+	for _, sel := range profile.TestSelections {
+		if sel.TestID != "" {
+			manual[sel.TestID] = struct{}{}
+		}
+	}
+	var scoped []string
+	for _, item := range s.settings.TestCatalog {
+		if item.Scope == nil {
+			continue
+		}
+		if _, ok := manual[item.ID]; ok {
+			continue
+		}
+		if !ruleScopeMatches(*item.Scope, nodeID, profile) {
+			continue
+		}
+		scoped = append(scoped, item.ID)
+	}
+	view.ScopedTestIDs = scoped
+}
+
 func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 	views := make([]NodeView, 0, len(s.nodes))
 	now := time.Now()
@@ -2240,6 +2474,10 @@ func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 		seenNodes[node.Stats.NodeID] = struct{}{}
 		view, ok := s.nodeViewLocked(node.Stats.NodeID, now)
 		if ok {
+			if includeProfileOnly {
+				applyAdminTrafficView(&view, s.profiles[node.Stats.NodeID])
+				s.applyAdminScopedTestsView(&view, node.Stats.NodeID, s.profiles[node.Stats.NodeID])
+			}
 			views = append(views, view)
 		}
 	}
@@ -2249,6 +2487,8 @@ func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 				continue
 			}
 			if view, ok := profileOnlyNodeView(nodeID, profile); ok {
+				applyAdminTrafficView(&view, profile)
+				s.applyAdminScopedTestsView(&view, nodeID, profile)
 				views = append(views, view)
 			}
 		}
@@ -2330,6 +2570,9 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		ExpireAt:                 profile.ExpireAt,
 		AutoRenew:                profile.AutoRenew,
 		RenewIntervalSec:         profile.RenewIntervalSec,
+		TrafficLimitBytes:        profile.TrafficLimitBytes,
+		TrafficLimitType:         profile.TrafficLimitType,
+		TrafficResetDay:          profile.TrafficResetDay,
 		TestIntervalSec:          profile.TestIntervalSec,
 		TestSelections:           slices.Clone(profile.TestSelections),
 		AgentUpdateSupported:     false,
@@ -2425,6 +2668,9 @@ func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
 		ExpireAt:                 profile.ExpireAt,
 		AutoRenew:                profile.AutoRenew,
 		RenewIntervalSec:         profile.RenewIntervalSec,
+		TrafficLimitBytes:        profile.TrafficLimitBytes,
+		TrafficLimitType:         profile.TrafficLimitType,
+		TrafficResetDay:          profile.TrafficResetDay,
 		TestIntervalSec:          profile.TestIntervalSec,
 		TestSelections:           slices.Clone(profile.TestSelections),
 		AgentUpdateSupported:     updateSupported,
@@ -2457,6 +2703,63 @@ func (s *Store) SettingsGroups() []string {
 	groups := make([]string, len(s.settings.Groups))
 	copy(groups, s.settings.Groups)
 	return groups
+}
+
+// SettingsGroupTree 返回分组树的深拷贝。树中只有分组 / 标签名称，属于可公开数据
+// （F1：前台按树内顺序展示标签分区）。
+func (s *Store) SettingsGroupTree() []GroupNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneGroupNodes(s.settings.GroupTree)
+}
+
+// BuildVersion / BuildCommit 返回构建时注入的版本信息（F7 system/status）。
+// 两者在构造后不变，无需加锁。
+func (s *Store) BuildVersion() string {
+	if s == nil {
+		return ""
+	}
+	return s.buildVersion
+}
+
+func (s *Store) BuildCommit() string {
+	if s == nil {
+		return ""
+	}
+	return s.buildCommit
+}
+
+// StartedAt 返回服务端进程启动时间（F7 system/status；测试中的裸 Store 为零值，
+// 对应 started_at/uptime_sec 为 0）。
+func (s *Store) StartedAt() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	return s.startedAt
+}
+
+// StateFilePath 返回 state.json 的完整路径（F7 system/status 统计数据目录占用）。
+func (s *Store) StateFilePath() string {
+	if s == nil {
+		return ""
+	}
+	return s.dataPath
+}
+
+// AdminNodeIDs 返回全部已上报节点的 ID（含隐藏节点，不含仅建过 profile 的节点），
+// 按字典序稳定输出（F7 probes/overview 遍历所有节点聚合探测历史）。
+func (s *Store) AdminNodeIDs() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.nodes))
+	for nodeID := range s.nodes {
+		ids = append(ids, nodeID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (h *Hub) Add(conn *websocket.Conn, variant string, adminTokenSalt string, initialPayload []byte) (*hubClient, error) {
@@ -2561,6 +2864,27 @@ func (h *Hub) HasVariant(variant string) bool {
 	return false
 }
 
+// ClientCounts 返回当前 WS 连接数，按管理端 / 公开受众拆分（F7 system/status）。
+func (h *Hub) ClientCounts() (admin int, public int) {
+	if h == nil {
+		return 0, 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, client := range h.clients {
+		if client == nil {
+			continue
+		}
+		switch client.variant {
+		case adminVariant:
+			admin++
+		case publicVariantBalanced:
+			public++
+		}
+	}
+	return admin, public
+}
+
 func (h *Hub) snapshotClients() []*hubClient {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -2592,6 +2916,65 @@ func configureWSConn(conn *websocket.Conn) {
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	})
+}
+
+// publicWSQuota 是公开（未认证）WS 连接的进程级额度：全局上限 + 按真实客户端 IP 上限。
+// 在 Upgrade 之前尝试占用（超限直接 503，不支付快照序列化成本），占用成功后若建连失败
+// 立即释放；连接结束（client.done 关闭）时释放，释放函数幂等，保证每条连接只释放一次。
+type publicWSQuota struct {
+	mu          sync.Mutex
+	perIP       map[string]int
+	total       int
+	perIPLimit  int
+	globalLimit int
+}
+
+func newPublicWSQuota(perIPLimit, globalLimit int) *publicWSQuota {
+	return &publicWSQuota{
+		perIP:       make(map[string]int),
+		perIPLimit:  perIPLimit,
+		globalLimit: globalLimit,
+	}
+}
+
+// acquire 尝试占用一个公开连接额度。成功返回幂等的释放函数；全局或按 IP 超限时返回
+// (nil, false)。限额 <=0 表示该维度不限制。
+func (q *publicWSQuota) acquire(clientIP string) (func(), bool) {
+	if q == nil {
+		return func() {}, true
+	}
+	ip := strings.TrimSpace(clientIP)
+	if ip == "" {
+		ip = "unknown"
+	}
+	q.mu.Lock()
+	if q.globalLimit > 0 && q.total >= q.globalLimit {
+		q.mu.Unlock()
+		return nil, false
+	}
+	if q.perIPLimit > 0 && q.perIP[ip] >= q.perIPLimit {
+		q.mu.Unlock()
+		return nil, false
+	}
+	q.total++
+	q.perIP[ip]++
+	q.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			q.mu.Lock()
+			if q.total > 0 {
+				q.total--
+			}
+			if n := q.perIP[ip]; n > 1 {
+				q.perIP[ip] = n - 1
+			} else {
+				delete(q.perIP, ip)
+			}
+			q.mu.Unlock()
+		})
+	}, true
 }
 
 func heartbeatLoop(client *hubClient, hub *Hub) {
@@ -2793,22 +3176,26 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 }
 
 type NodeProfileUpdate struct {
-	Alias            *string          `json:"alias"`
-	Group            *string          `json:"group"`
-	Tags             *[]string        `json:"tags"`
-	Groups           *[]string        `json:"groups"`
-	Region           *string          `json:"region"`
-	DiskType         *string          `json:"disk_type"`
-	NetSpeedMbps     *int             `json:"net_speed_mbps"`
-	ExpireAt         *int64           `json:"expire_at"`
-	AutoRenew        *bool            `json:"auto_renew"`
-	HideFromDisplay  *bool            `json:"hide_from_display"`
-	HideFromCR       *bool            `json:"hide_from_cr"`
-	HideFromAll      *bool            `json:"hide_from_all"`
-	RenewIntervalSec *int64           `json:"renew_interval_sec"`
-	TestIntervalSec  *int             `json:"test_interval_sec"`
-	TestSelections   *[]TestSelection `json:"test_selections"`
-	AlertEnabled     *bool            `json:"alert_enabled"`
+	Alias            *string   `json:"alias"`
+	Group            *string   `json:"group"`
+	Tags             *[]string `json:"tags"`
+	Groups           *[]string `json:"groups"`
+	Region           *string   `json:"region"`
+	DiskType         *string   `json:"disk_type"`
+	NetSpeedMbps     *int      `json:"net_speed_mbps"`
+	ExpireAt         *int64    `json:"expire_at"`
+	AutoRenew        *bool     `json:"auto_renew"`
+	HideFromDisplay  *bool     `json:"hide_from_display"`
+	HideFromCR       *bool     `json:"hide_from_cr"`
+	HideFromAll      *bool     `json:"hide_from_all"`
+	RenewIntervalSec *int64    `json:"renew_interval_sec"`
+	// 流量配额（F4）：三字段与节点抽屉「流量配额」分组卡片一一对应。
+	TrafficLimitBytes *uint64          `json:"traffic_limit_bytes"`
+	TrafficLimitType  *string          `json:"traffic_limit_type"`
+	TrafficResetDay   *int             `json:"traffic_reset_day"`
+	TestIntervalSec   *int             `json:"test_interval_sec"`
+	TestSelections    *[]TestSelection `json:"test_selections"`
+	AlertEnabled      *bool            `json:"alert_enabled"`
 }
 
 func (s *Store) AdminPath() string {
@@ -2883,19 +3270,52 @@ func (s *Store) loginPolicy() (int, time.Duration, time.Duration) {
 	return limit, time.Duration(windowSec) * time.Second, time.Duration(lockSec) * time.Second
 }
 
-func loginAttemptKey(username, remoteAddr string) string {
-	user := strings.TrimSpace(username)
-	if user == "" {
-		user = "unknown"
+// loginAttemptKey 只按真实客户端 IP 分桶：用户名由攻击者控制，若参与键，轮换用户名即可
+// 获得全新额度并反复触发 dummy bcrypt；反代部署下若用 r.RemoteAddr 作为 host，则所有
+// 客户端共享同一个「用户名|代理IP」桶，知道管理员用户名者可 5 次错误密码锁死管理员。
+func loginAttemptKey(clientIP string) string {
+	ip := strings.TrimSpace(clientIP)
+	if ip == "" {
+		ip = "unknown"
 	}
-	host := strings.TrimSpace(remoteAddr)
-	if parsed, _, err := net.SplitHostPort(host); err == nil {
-		host = parsed
+	return "ip|" + ip
+}
+
+// clientIPFromRequest 解析真实客户端 IP。trustedProxyHeaders 为 true 时取
+// X-Forwarded-For 最右一个非空条目（可信代理追加的那一跳）；否则只用 RemoteAddr 的
+// host。XFF 条目必须能通过 net.ParseIP 校验，否则回退 RemoteAddr。默认（false）绝不
+// 读取 XFF——这是防伪造绕过的关键。
+func clientIPFromRequest(r *http.Request, trustedProxyHeaders bool) string {
+	if r == nil {
+		return "unknown"
 	}
+	if trustedProxyHeaders {
+		if ip := forwardedForClientIP(r.Header.Values("X-Forwarded-For")); ip != "" {
+			return ip
+		}
+	}
+	host := strings.TrimSpace(clientIPFromRemoteAddr(r.RemoteAddr))
 	if host == "" {
-		host = "unknown"
+		return "unknown"
 	}
-	return fmt.Sprintf("%s|%s", user, host)
+	return host
+}
+
+// forwardedForClientIP 返回 X-Forwarded-For 最右一个非空且合法（net.ParseIP）的条目；
+// 无合法条目时返回空串，调用方回退 RemoteAddr。多行头按出现顺序拼接后取最右。
+func forwardedForClientIP(values []string) string {
+	last := ""
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if candidate := strings.TrimSpace(part); candidate != "" {
+				last = candidate
+			}
+		}
+	}
+	if last == "" || net.ParseIP(last) == nil {
+		return ""
+	}
+	return last
 }
 
 func (s *Store) allowLoginAttempt(key string, now time.Time) (bool, time.Duration) {
@@ -2907,7 +3327,7 @@ func (s *Store) allowLoginAttempt(key string, now time.Time) (bool, time.Duratio
 	defer s.mu.Unlock()
 	attempt := s.loginAttempts[key]
 	if attempt == nil {
-		s.pruneLoginAttemptsLocked(now, window, lock)
+		s.maybePruneLoginAttemptsLocked(now, window, lock)
 		return true, 0
 	}
 	if !attempt.lockedUntil.IsZero() && now.Before(attempt.lockedUntil) {
@@ -2915,10 +3335,10 @@ func (s *Store) allowLoginAttempt(key string, now time.Time) (bool, time.Duratio
 	}
 	if window > 0 && !attempt.firstAt.IsZero() && now.Sub(attempt.firstAt) > window {
 		delete(s.loginAttempts, key)
-		s.pruneLoginAttemptsLocked(now, window, lock)
+		s.maybePruneLoginAttemptsLocked(now, window, lock)
 		return true, 0
 	}
-	s.pruneLoginAttemptsLocked(now, window, lock)
+	s.maybePruneLoginAttemptsLocked(now, window, lock)
 	return true, 0
 }
 
@@ -2929,8 +3349,12 @@ func (s *Store) recordLoginFailure(key string, now time.Time) (bool, time.Durati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loginAttempts == nil {
+		s.loginAttempts = make(map[string]*loginAttempt)
+	}
 	attempt := s.loginAttempts[key]
 	if attempt == nil {
+		s.ensureLoginAttemptCapacityLocked(now, window, lock)
 		attempt = &loginAttempt{firstAt: now}
 		s.loginAttempts[key] = attempt
 	}
@@ -2948,10 +3372,10 @@ func (s *Store) recordLoginFailure(key string, now time.Time) (bool, time.Durati
 	attempt.lastAt = now
 	if attempt.failCount >= limit {
 		attempt.lockedUntil = now.Add(lock)
-		s.pruneLoginAttemptsLocked(now, window, lock)
+		s.maybePruneLoginAttemptsLocked(now, window, lock)
 		return true, lock
 	}
-	s.pruneLoginAttemptsLocked(now, window, lock)
+	s.maybePruneLoginAttemptsLocked(now, window, lock)
 	return false, 0
 }
 
@@ -2959,6 +3383,76 @@ func (s *Store) clearLoginAttempts(key string) {
 	s.mu.Lock()
 	delete(s.loginAttempts, key)
 	s.mu.Unlock()
+}
+
+// allowLoginGlobalAttempt 施加进程级登录尝试预算：键固定为 loginGlobalAttemptKey（不含
+// 攻击者可控字段），使换用户名/换 IP 都无法突破全进程每窗口的 bcrypt 次数上界。超限时
+// 返回 false 与建议的 Retry-After。窗口复用 agent 限速窗口，由 runTickLoop 定期回收。
+func (s *Store) allowLoginGlobalAttempt(now time.Time) (bool, time.Duration) {
+	window := time.Duration(defaultLoginFailWindow) * time.Second
+	if !s.allowAgentRate(loginGlobalAttemptKey, window, loginGlobalAttemptLimit, now, false) {
+		return false, window
+	}
+	return true, 0
+}
+
+// maybePruneLoginAttemptsLocked 以摊还方式清理过期条目：每 loginAttemptPruneInterval
+// 次调用才做一次全表扫描，避免未认证流量在全局锁内持续触发 O(n) 扫描。
+// 过期语义仍由 allow/record 内的 window/lock 判定保证，清理只影响内存回收时机。
+func (s *Store) maybePruneLoginAttemptsLocked(now time.Time, window, lock time.Duration) {
+	s.loginPruneOps++
+	if s.loginPruneOps < loginAttemptPruneInterval {
+		return
+	}
+	s.loginPruneOps = 0
+	s.pruneLoginAttemptsLocked(now, window, lock)
+}
+
+// ensureLoginAttemptCapacityLocked 保证写入新键前表不会超过硬上限：先做一次过期清理，
+// 仍满则按最旧活跃时间淘汰一批。仅在插入新键时调用（此时必然需要腾空间），
+// 固定键（管理员）因此始终能写入，不会被上限拒之门外。
+func (s *Store) ensureLoginAttemptCapacityLocked(now time.Time, window, lock time.Duration) {
+	if len(s.loginAttempts) < maxLoginAttemptsEntries {
+		return
+	}
+	s.pruneLoginAttemptsLocked(now, window, lock)
+	if len(s.loginAttempts) < maxLoginAttemptsEntries {
+		return
+	}
+	s.evictOldestLoginAttemptsLocked(loginAttemptEvictBatch)
+}
+
+// evictOldestLoginAttemptsLocked 按最近活跃时间（lastAt/lockedUntil 的较大者）淘汰最旧的
+// batch 条记录，保证 map 大小有界。仅在表已达硬上限时调用。
+func (s *Store) evictOldestLoginAttemptsLocked(batch int) {
+	if batch <= 0 || len(s.loginAttempts) == 0 {
+		return
+	}
+	type attemptAge struct {
+		key string
+		at  time.Time
+	}
+	ages := make([]attemptAge, 0, len(s.loginAttempts))
+	for key, attempt := range s.loginAttempts {
+		var at time.Time
+		if attempt != nil {
+			at = attempt.lastAt
+			if at.IsZero() {
+				at = attempt.firstAt
+			}
+			if !attempt.lockedUntil.IsZero() && attempt.lockedUntil.After(at) {
+				at = attempt.lockedUntil
+			}
+		}
+		ages = append(ages, attemptAge{key: key, at: at})
+	}
+	sort.Slice(ages, func(i, j int) bool { return ages[i].at.Before(ages[j].at) })
+	if batch > len(ages) {
+		batch = len(ages)
+	}
+	for i := 0; i < batch; i++ {
+		delete(s.loginAttempts, ages[i].key)
+	}
 }
 
 func (s *Store) pruneLoginAttemptsLocked(now time.Time, window, lock time.Duration) {
@@ -3109,6 +3603,7 @@ func (s *Store) settingsViewLocked() SettingsView {
 		RegionGroupEnabled:    boolPointer(!s.settings.RegionGroupDisabled),
 		AlertOfflineSec:       s.settings.AlertOfflineSec,
 		AlertTelegramUserIDs:  slices.Clone(s.settings.AlertTelegramUserIDs),
+		NotifyChannels:        notifyChannelsForView(s.settings.NotifyChannels),
 		LoginFailLimit:        loginFailLimit,
 		LoginFailWindowSec:    s.settings.LoginFailWindowSec,
 		LoginLockSec:          s.settings.LoginLockSec,
@@ -3119,7 +3614,46 @@ func (s *Store) settingsViewLocked() SettingsView {
 		Groups:                slices.Clone(s.settings.Groups),
 		GroupTree:             cloneGroupNodes(s.settings.GroupTree),
 		TestCatalog:           slices.Clone(s.settings.TestCatalog),
+		AlertRules:            cloneAlertRules(s.settings.AlertRules),
+		AlertRuleStatus:       s.alertRuleStatusLocked(),
 	}
+}
+
+// alertRuleStatusLocked 聚合每条规则当前处于 FIRING 的节点数（含 0，
+// 供前端「正常 / 告警中 N 台」徽标直接取用）。
+func (s *Store) alertRuleStatusLocked() map[string]AlertRuleStatusView {
+	status := make(map[string]AlertRuleStatusView, len(s.settings.AlertRules))
+	for _, rule := range s.settings.AlertRules {
+		status[rule.ID] = AlertRuleStatusView{}
+	}
+	// B-03：内置 offline 规则由离线引擎（s.alerted）驱动，firing = 处于离线告警
+	// 状态的节点数；RecoveryPending 条目处于恢复通知补发阶段，不计入。
+	if _, hasOffline := status[offlineAlertRuleID]; hasOffline {
+		entry := status[offlineAlertRuleID]
+		for _, state := range s.alerted {
+			if !state.RecoveryPending {
+				entry.Firing++
+			}
+		}
+		status[offlineAlertRuleID] = entry
+	}
+	for key, state := range s.alertStates {
+		if state.State != ruleStateFiring {
+			continue
+		}
+		_, ruleID, ok := parseRuleStateKey(key)
+		if !ok {
+			continue
+		}
+		entry, exists := status[ruleID]
+		if !exists {
+			entry = AlertRuleStatusView{}
+			status[ruleID] = entry
+		}
+		entry.Firing++
+		status[ruleID] = entry
+	}
+	return status
 }
 
 func (s *Store) SettingsView() SettingsView {
@@ -3148,6 +3682,9 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 	view.AlertWebhook = ""
 	view.AlertTelegramToken = ""
 	view.AlertTelegramUserIDs = nil
+	// F5：导出时清空渠道 Secrets（视图本已置空，此处兜底）与 Config 中的
+	// chat_ids / to（收件人列表视同敏感信息）。
+	view.NotifyChannels = redactNotifyChannelsForExport(view.NotifyChannels)
 	view.AdminAuth = redactAdminAuthSettings(view.AdminAuth)
 	view.AISettings = redactAISettingsForExport(view.AISettings)
 	view.Commit = ""
@@ -3254,6 +3791,8 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	groups := slices.Clone(view.Groups)
 	groupTree := cloneGroupNodes(view.GroupTree)
 	testCatalog := slices.Clone(view.TestCatalog)
+	notifyChannels := notifyChannelsFromViewForUpdate(view.NotifyChannels)
+	alertRules := cloneAlertRules(view.AlertRules)
 
 	update := SettingsUpdate{
 		AdminPath:            stringPointer(adminPath),
@@ -3286,6 +3825,30 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	if secret := strings.TrimSpace(view.TurnstileSecretKey); secret != "" {
 		update.TurnstileSecretKey = stringPointer(secret)
 	}
+	// F5：只有导出文件确实携带渠道列表时才把 notify_channels 视为权威表示；
+	// F5 之前的导出文件没有该字段，此时保持 nil，让旧字段 → 渠道方向的同步
+	//（UpdateSettings 内）按旧字段重建迁移渠道，webhook/token 不丢。
+	if len(notifyChannels) > 0 {
+		update.NotifyChannels = &notifyChannels
+	}
+	// F4：导出文件确实携带规则列表时才视为权威表示（离线规则不可删除，导入后
+	// normalizeAlertRules 会保证其存在；F4 之前的导出文件没有该字段，保持 nil）。
+	if len(alertRules) > 0 {
+		update.AlertRules = &alertRules
+	}
+	return update
+}
+
+// notifyChannelsFromViewForUpdate 把视图形态的渠道转成更新载荷（丢弃视图专属的
+// SecretsSet 标记；Secrets 在视图中本已置空，由 UpdateSettings 按 ID 合并保留）。
+func notifyChannelsFromViewForUpdate(channels []NotifyChannel) []NotifyChannel {
+	if len(channels) == 0 {
+		return nil
+	}
+	update := cloneNotifyChannels(channels)
+	for i := range update {
+		update[i].SecretsSet = nil
+	}
 	return update
 }
 
@@ -3299,6 +3862,46 @@ func (s *Store) TelegramSettings() (string, []int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return strings.TrimSpace(s.settings.AlertTelegramToken), slices.Clone(s.settings.AlertTelegramUserIDs)
+}
+
+// NotifyChannelByID 返回指定 ID 渠道的深拷贝（不存在时返回 nil）。
+func (s *Store) NotifyChannelByID(id string) *NotifyChannel {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, channel := range s.settings.NotifyChannels {
+		if channel.ID != id {
+			continue
+		}
+		found := cloneNotifyChannel(channel)
+		return &found
+	}
+	return nil
+}
+
+// RecordChannelTest 写入指定渠道的测试推送结果（LastTest）。
+func (s *Store) RecordChannelTest(id string, result ChannelTestResult) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	updated := false
+	for i := range s.settings.NotifyChannels {
+		if s.settings.NotifyChannels[i].ID != id {
+			continue
+		}
+		s.settings.NotifyChannels[i].LastTest = &result
+		updated = true
+		break
+	}
+	s.mu.Unlock()
+	if updated {
+		s.persistLogged()
+	}
 }
 
 func (s *Store) SiteTitle() string {
@@ -3475,6 +4078,20 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AlertOfflineSec = offlineSec
 	}
+	// F4：内置 offline 规则的 duration_sec 始终镜像 AlertOfflineSec；本次请求未携带
+	// 规则列表时单独同步，携带时由 normalizeAlertRules 一并处理（且不可删除该规则）。
+	if update.AlertOfflineSec != nil && update.AlertRules == nil {
+		s.settings.AlertRules = syncOfflineAlertRuleDuration(s.settings.AlertRules, s.settings.AlertOfflineSec)
+	}
+	if update.AlertRules != nil {
+		rules, err := normalizeAlertRules(*update.AlertRules, s.settings.AlertOfflineSec)
+		if err != nil {
+			return fail(err)
+		}
+		s.settings.AlertRules = rules
+		// 规则变更后旧样本环语义失效（阈值/操作符可能已改），整体重建。
+		s.clearRuleSamplesLocked()
+	}
 	if update.AlertTelegramToken != nil {
 		value := strings.TrimSpace(*update.AlertTelegramToken)
 		if value != "" {
@@ -3490,6 +4107,33 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	if (s.settings.AlertTelegramToken != "" || len(s.settings.AlertTelegramUserIDs) > 0) &&
 		(s.settings.AlertTelegramToken == "" || len(s.settings.AlertTelegramUserIDs) == 0) {
 		return fail(errors.New("telegram token 与 telegram 用户 ID 需要同时配置"))
+	}
+	// F5：旧告警字段 ↔ 通知渠道双向同步。旧字段 → 渠道方向仅在本次请求没有
+	// 携带 notify_channels 时执行（携带渠道列表时该列表是权威表示，避免互相覆盖）。
+	if update.NotifyChannels == nil {
+		if update.AlertWebhook != nil {
+			upsertLegacyFeishuChannel(&s.settings, s.settings.AlertWebhook)
+		}
+		if update.AlertTelegramToken != nil || update.AlertTelegramUserIDs != nil {
+			upsertLegacyTelegramChannel(&s.settings, s.settings.AlertTelegramToken, s.settings.AlertTelegramUserIDs)
+		}
+	}
+	// 渠道方向：按 ID 合并（空 secret 保留旧值），规范化后写入；已记录的 LastTest
+	// 不随设置保存改动，仅测试推送接口写入。
+	if update.NotifyChannels != nil {
+		merged := mergeNotifyChannelSecrets(*update.NotifyChannels, s.settings.NotifyChannels)
+		merged = preserveChannelLastTest(merged, s.settings.NotifyChannels)
+		normalized, err := normalizeNotifyChannels(merged)
+		if err != nil {
+			return fail(err)
+		}
+		s.settings.NotifyChannels = normalized
+	}
+	// 渠道 → 旧字段：本次请求涉及任一告警表示时回填。Telegram Bot 轮询
+	// （TelegramSettings）与旧测试推送回退由此读到第一个启用渠道的取值。
+	if update.NotifyChannels != nil || update.AlertWebhook != nil ||
+		update.AlertTelegramToken != nil || update.AlertTelegramUserIDs != nil {
+		syncLegacyAlertFieldsFromChannels(&s.settings)
 	}
 	if update.LoginFailLimit != nil {
 		limit := *update.LoginFailLimit
@@ -3554,6 +4198,11 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AISettings = normalized
 	}
+	// F1：group_moves 必须在写入新树之前执行——先把节点归属从 From 迁到 To，
+	// 新树落地后再由 pruneProfileGroupSelectionsLocked 清掉映射到无效目标的条目。
+	if update.GroupMoves != nil {
+		s.applyProfileGroupMovesLocked(*update.GroupMoves)
+	}
 	if update.Groups != nil {
 		s.settings.Groups = normalizeGroups(*update.Groups)
 		if len(s.settings.GroupTree) == 0 {
@@ -3572,9 +4221,12 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.TestCatalog = catalog
 		s.markAgentConfigRefreshForCatalogChangeLocked(previousCatalog, catalog)
+		// O-01：任一目录项的 Scope 变化 → 对所有节点标记 agent 配置刷新（范围
+		// 会影响没有手动选择的节点，含新接入节点）。
+		s.markAgentConfigRefreshForScopeChangeLocked(previousCatalog, catalog)
 		s.pruneProfileTestSelectionsLocked()
 	}
-	if update.Groups != nil || update.GroupTree != nil {
+	if update.Groups != nil || update.GroupTree != nil || update.GroupMoves != nil {
 		s.pruneProfileGroupSelectionsLocked()
 	}
 	view = s.settingsViewLocked()
@@ -3677,6 +4329,12 @@ func preserveRedactedSensitiveSettings(update *SettingsUpdate, imported Settings
 	if strings.TrimSpace(imported.AlertTelegramToken) == "" {
 		update.AlertTelegramToken = nil
 		update.AlertTelegramUserIDs = nil
+	}
+	// F5：导出文件中的渠道 Secrets 与 chat_ids / to 均已脱敏为空；为空时按 ID
+	// 沿用现有配置，避免导入清掉收件人与密钥。
+	if update.NotifyChannels != nil {
+		preserved := preserveRedactedNotifyChannels(*update.NotifyChannels, existing.NotifyChannels)
+		update.NotifyChannels = &preserved
 	}
 	if update.AdminAuth != nil {
 		merged := preserveAdminAuthSecrets(*update.AdminAuth, existing.AdminAuth)
@@ -3837,13 +4495,31 @@ func (s *Store) registerAgentAuthToken(nodeID, bootstrapToken string, now time.T
 	}
 	s.mu.Lock()
 	expectedBootstrapToken := strings.TrimSpace(s.settings.AgentToken)
+	// 先校验 bootstrap token，再消费全局配额：isBootstrapAgentToken 是
+	// subtle.ConstantTimeCompare 的常数时间比较，无 I/O、无锁外开销，不构成新的
+	// 放大面。反过来（先扣配额）会让未认证的 /api/v1/agent/register 用非法 token
+	// 在 30 次/分钟内刷满 register:* 全局配额，使合法新节点持续拿到 429 卡在
+	// waiting_registration。
+	if expectedBootstrapToken != "" && !isBootstrapAgentToken(expectedBootstrapToken, bootstrapToken) {
+		// 但非法 token 也不能完全免于限流：运维可能通过 settings 配置较短的
+		// AgentToken，若不节流，未认证方可对公网注册接口无限制地暴破。这里用
+		// 独立的全局失败计数 register-invalid:* 约束猜测速率——它只被非法 token
+		// 消耗，不影响 register:*，所以合法新节点仍不会被刷 429。bootstrap token
+		// 是服务端唯一的，按 nodeID 分桶会被攻击者轮换 nodeID 绕过，因此必须
+		// 全局计数（HTTP 与 gRPC 两条注册路径在此汇聚）。
+		allowed := s.allowAgentRateLocked("register-invalid:*", agentRegisterWindow, defaultAgentRegisterInvalidLimit, now, false)
+		s.mu.Unlock()
+		if !allowed {
+			return "", agentRateLimitError()
+		}
+		return "", invalidBootstrapTokenError()
+	}
+	// 开放注册模式（未配置 AgentToken）token 门禁对所有人放行，此时全局配额是唯一
+	// 的准入前限流，必须继续消费；合法 token 之后的全部流程（含已存在节点的 token
+	// 补发分支与签发分支）同样由这里拦截。
 	if !s.allowAgentRateLocked("register:*", agentRegisterWindow, defaultAgentRegisterGlobalLimit, now, false) {
 		s.mu.Unlock()
 		return "", agentRateLimitError()
-	}
-	if expectedBootstrapToken != "" && !isBootstrapAgentToken(expectedBootstrapToken, bootstrapToken) {
-		s.mu.Unlock()
-		return "", invalidBootstrapTokenError()
 	}
 	if profile := s.profiles[nodeID]; profile != nil {
 		token := strings.TrimSpace(profile.AgentAuthToken)
@@ -4134,6 +4810,27 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 	}
 	if update.RenewIntervalSec != nil && *update.RenewIntervalSec > 0 {
 		profile.RenewIntervalSec = *update.RenewIntervalSec
+	}
+	// F4：流量配额配置（校验在 handler 完成：limit_type ∈ sum|max|up|down，
+	// reset_day ∈ 1–28 或 0 表示清空恢复默认）。
+	if update.TrafficLimitBytes != nil {
+		profile.TrafficLimitBytes = *update.TrafficLimitBytes
+	}
+	if update.TrafficLimitType != nil {
+		limitType := strings.TrimSpace(*update.TrafficLimitType)
+		if limitType == "" {
+			profile.TrafficLimitType = ""
+		} else {
+			profile.TrafficLimitType = normalizeTrafficLimitType(limitType)
+		}
+	}
+	if update.TrafficResetDay != nil {
+		resetDay := *update.TrafficResetDay
+		if resetDay == 0 {
+			profile.TrafficResetDay = 0
+		} else {
+			profile.TrafficResetDay = normalizeTrafficResetDay(resetDay)
+		}
 	}
 	if update.TestIntervalSec != nil && *update.TestIntervalSec > 0 {
 		profile.TestIntervalSec = *update.TestIntervalSec
@@ -4807,7 +5504,7 @@ func (s *Store) buildAgentConfigAtLocked(nodeID string, now time.Time, remoteUpd
 			TestIntervalSec: defaultTestIntervalSec,
 		}
 	}
-	tests := s.resolveTestsLocked(profile)
+	tests := s.resolveTestsLocked(nodeID, profile)
 	group, _ := primaryGroupTagsFromSelections(profile.Groups)
 	if group == "" {
 		group = strings.TrimSpace(profile.Group)
@@ -4900,6 +5597,7 @@ func (s *Store) snapshotPersistedLocked() PersistedData {
 		Nodes:           cloneNodeStates(s.nodes),
 		OfflineSessions: cloneOfflineSessions(s.offlineSessions),
 		Alerted:         cloneAlertedStates(s.alerted),
+		AlertStates:     cloneAlertStates(s.alertStates),
 	}
 	applyPendingPersistIntentsToSnapshot(&snapshot, s.pendingClearNodes, s.pendingNodeDeletes)
 	return snapshot
@@ -4914,6 +5612,7 @@ func applyPendingPersistIntentsToSnapshot(snapshot *PersistedData, pendingClearN
 		snapshot.Nodes = map[string]NodeState{}
 		snapshot.OfflineSessions = map[string]OfflineSessionState{}
 		snapshot.Alerted = map[string]AlertedState{}
+		snapshot.AlertStates = map[string]RuleAlertState{}
 		snapshot.PendingHistoryClear = true
 		snapshot.PendingHistoryDeletes = nil
 		return
@@ -4928,6 +5627,7 @@ func applyPendingPersistIntentsToSnapshot(snapshot *PersistedData, pendingClearN
 		delete(snapshot.Nodes, nodeID)
 		delete(snapshot.OfflineSessions, nodeID)
 		delete(snapshot.Alerted, nodeID)
+		deleteRuleAlertStatesForNode(snapshot.AlertStates, nodeID)
 		pendingDeletes = append(pendingDeletes, nodeID)
 	}
 	if len(pendingDeletes) > 0 {
@@ -5003,15 +5703,43 @@ func (s *Store) applyAutoRenewLocked(profile *NodeProfile, now time.Time) bool {
 	return true
 }
 
-func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestConfig {
-	if len(profile.TestSelections) == 0 {
-		return nil
+// resolveTestIntervalLocked 计算 (type, item, selection, profile) 的探测间隔。
+// F2：icmp 优先级 selection > item > 0（0 = 持续，跟随 agent tick），不回落到
+// profile.TestIntervalSec 或 defaultTestIntervalSec；tcp 回落链为
+// selection > item > profile > 默认。
+func resolveTestIntervalLocked(item TestCatalogItem, selInterval int, profile *NodeProfile) int {
+	if strings.ToLower(item.Type) == "tcp" {
+		if selInterval > 0 {
+			return selInterval
+		}
+		if item.IntervalSec > 0 {
+			return item.IntervalSec
+		}
+		if profile.TestIntervalSec > 0 {
+			return profile.TestIntervalSec
+		}
+		return defaultTestIntervalSec
 	}
+	if selInterval > 0 {
+		return selInterval
+	}
+	if item.IntervalSec > 0 {
+		return item.IntervalSec
+	}
+	return 0
+}
+
+// resolveTestsLocked 解析节点最终生效的探测集合（O-01：手动选择 ∪ 范围命中的
+// 目录项）。同一目录项既被手动选择又被范围命中时只出现一次，间隔用手动选择上的；
+// 顺序：先手动选择（原顺序），再范围命中项（按目录顺序）。范围匹配复用
+// ruleScopeMatches（含 D-05：exclude 两种模式都生效）。
+func (s *Store) resolveTestsLocked(nodeID string, profile *NodeProfile) []metrics.NetworkTestConfig {
 	catalog := make(map[string]TestCatalogItem, len(s.settings.TestCatalog))
 	for _, item := range s.settings.TestCatalog {
 		catalog[item.ID] = item
 	}
 	results := make([]metrics.NetworkTestConfig, 0, len(profile.TestSelections))
+	resolved := make(map[string]struct{}, len(profile.TestSelections))
 	for _, sel := range profile.TestSelections {
 		if sel.TestID == "" {
 			continue
@@ -5020,28 +5748,42 @@ func (s *Store) resolveTestsLocked(profile *NodeProfile) []metrics.NetworkTestCo
 		if !ok {
 			continue
 		}
-		interval := 0
-		if strings.ToLower(item.Type) == "tcp" {
-			if sel.IntervalSec > 0 {
-				interval = sel.IntervalSec
-			} else if item.IntervalSec > 0 {
-				interval = item.IntervalSec
-			} else if profile.TestIntervalSec > 0 {
-				interval = profile.TestIntervalSec
-			} else {
-				interval = defaultTestIntervalSec
-			}
+		results = append(results, metrics.NetworkTestConfig{
+			Name:        item.Name,
+			Type:        item.Type,
+			Host:        item.Host,
+			Port:        item.Port,
+			IntervalSec: resolveTestIntervalLocked(item, sel.IntervalSec, profile),
+		})
+		resolved[sel.TestID] = struct{}{}
+		if len(results) >= maxNetworkTestsPerNode {
+			return results
+		}
+	}
+	// O-01：范围命中且未被手动选择的目录项追加（无手动间隔，按 item / 类型回退）。
+	for _, item := range s.settings.TestCatalog {
+		if item.Scope == nil {
+			continue
+		}
+		if _, done := resolved[item.ID]; done {
+			continue
+		}
+		if !ruleScopeMatches(*item.Scope, nodeID, profile) {
+			continue
 		}
 		results = append(results, metrics.NetworkTestConfig{
 			Name:        item.Name,
 			Type:        item.Type,
 			Host:        item.Host,
 			Port:        item.Port,
-			IntervalSec: interval,
+			IntervalSec: resolveTestIntervalLocked(item, 0, profile),
 		})
 		if len(results) >= maxNetworkTestsPerNode {
 			break
 		}
+	}
+	if len(results) == 0 {
+		return nil
 	}
 	return results
 }
@@ -5068,7 +5810,7 @@ func normalizeTestSelections(catalog []TestCatalogItem, selections []TestSelecti
 		if id == "" {
 			continue
 		}
-		item, ok := valid[id]
+		_, ok := valid[id]
 		if !ok {
 			continue
 		}
@@ -5076,11 +5818,9 @@ func normalizeTestSelections(catalog []TestCatalogItem, selections []TestSelecti
 			continue
 		}
 		seen[id] = struct{}{}
+		// F2：icmp 不再强制清零，interval 原样保留（负数钳到 0）。
 		interval := sel.IntervalSec
 		if interval < 0 {
-			interval = 0
-		}
-		if strings.ToLower(item.Type) == "icmp" {
 			interval = 0
 		}
 		result = append(result, TestSelection{
@@ -5107,6 +5847,67 @@ func catalogItemsByID(items []TestCatalogItem) map[string]TestCatalogItem {
 	return result
 }
 
+// alertScopesValueEqual 按（规范化后的）值比较两个 AlertScope。Scope 为指针字段，
+// 直接 == 只比指针地址——保存路径每次 normalize 都会构造新指针，内容相同的
+// scope 会被误判为变化。
+func alertScopesValueEqual(a, b *AlertScope) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Mode == b.Mode &&
+		slices.Equal(a.Nodes, b.Nodes) &&
+		slices.Equal(a.Groups, b.Groups) &&
+		slices.Equal(a.Exclude, b.Exclude)
+}
+
+// testCatalogItemsEqual 按（规范化后的）值比较两个目录项（含 Scope）。
+func testCatalogItemsEqual(a, b TestCatalogItem) bool {
+	return a.ID == b.ID &&
+		a.Name == b.Name &&
+		a.Type == b.Type &&
+		a.Host == b.Host &&
+		a.Port == b.Port &&
+		a.IntervalSec == b.IntervalSec &&
+		alertScopesValueEqual(a.Scope, b.Scope)
+}
+
+// testCatalogScopeChanged 判断前后目录中任一目录项的 Scope 是否变化（新增带
+// scope 的项 / 删除带 scope 的项 / scope 内容变化均算）。
+func testCatalogScopeChanged(previous, next []TestCatalogItem) bool {
+	previousByID := catalogItemsByID(previous)
+	nextByID := catalogItemsByID(next)
+	for id, item := range nextByID {
+		previousItem, hadPrevious := previousByID[id]
+		if !hadPrevious {
+			if item.Scope != nil {
+				return true
+			}
+			continue
+		}
+		if !alertScopesValueEqual(previousItem.Scope, item.Scope) {
+			return true
+		}
+	}
+	for id, item := range previousByID {
+		if _, hasNext := nextByID[id]; !hasNext && item.Scope != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// markAgentConfigRefreshForScopeChangeLocked 在任一目录项 Scope 变化时对所有
+// 节点标记 agent 配置刷新（O-01）：范围变化会影响「无手动选择的节点」（旧函数
+// 只覆盖有手动选择的节点），因此对所有节点标记。
+func (s *Store) markAgentConfigRefreshForScopeChangeLocked(previous, next []TestCatalogItem) {
+	if !testCatalogScopeChanged(previous, next) {
+		return
+	}
+	for nodeID := range s.profiles {
+		s.markAgentConfigRefreshLocked(nodeID)
+	}
+}
+
 func (s *Store) markAgentConfigRefreshForCatalogChangeLocked(previous, next []TestCatalogItem) {
 	if len(s.profiles) == 0 {
 		return
@@ -5124,7 +5925,9 @@ func (s *Store) markAgentConfigRefreshForCatalogChangeLocked(previous, next []Te
 			}
 			previousItem, hadPrevious := previousByID[id]
 			nextItem, hasNext := nextByID[id]
-			if !hasNext || !hadPrevious || previousItem != nextItem {
+			// O-01：比较改为按值（testCatalogItemsEqual）——Scope 是指针字段，
+			// 旧的 struct != 会把内容相同的规范化 scope 误判为变化。
+			if !hasNext || !hadPrevious || !testCatalogItemsEqual(previousItem, nextItem) {
 				s.markAgentConfigRefreshLocked(nodeID)
 				break
 			}
@@ -5154,6 +5957,93 @@ func (s *Store) pruneProfileGroupSelectionsLocked() {
 			profile.Group = group
 			profile.Tags = tags
 		}
+	}
+}
+
+// groupMoveRule 是分组级迁移规则（From 为分组名）：命中的 selection 整体替换
+// 分组前缀，保留原有标签；selection 本身无标签时落到 To 的标签（若有）。
+type groupMoveRule struct {
+	fromGroup string
+	toGroup   string
+	toTag     string
+}
+
+// applyProfileGroupMovesLocked 按 F1 的 group_moves 把节点归属从 From 迁移到 To：
+//   - From 为分组（"A"）：该分组下所有归属整体替换前缀（"A"→"B"、"A:t"→"B:t"）；
+//   - From 为标签（"A:t"）：仅精确匹配该条归属，替换为 To。
+//
+// 映射产生的重复条目会被去掉；映射到新树中不存在的目标由随后的
+// pruneProfileGroupSelectionsLocked 清理。分组会随 AgentConfig 下发，受影响
+// 节点需标记 agent 配置刷新。须在写入新分组树之前调用。
+func (s *Store) applyProfileGroupMovesLocked(moves []GroupMove) {
+	if len(moves) == 0 {
+		return
+	}
+	groupRules := make([]groupMoveRule, 0, len(moves))
+	tagRules := make(map[string]string, len(moves))
+	for _, move := range moves {
+		fromGroup, fromTag := parseGroupSelection(move.From)
+		toGroup, toTag := parseGroupSelection(move.To)
+		if fromGroup == "" || toGroup == "" || (fromGroup == toGroup && fromTag == toTag) {
+			continue
+		}
+		if fromTag == "" {
+			groupRules = append(groupRules, groupMoveRule{fromGroup: fromGroup, toGroup: toGroup, toTag: toTag})
+			continue
+		}
+		tagRules[fromGroup+"\x00"+fromTag] = canonicalGroupSelection(toGroup, toTag)
+	}
+	if len(groupRules) == 0 && len(tagRules) == 0 {
+		return
+	}
+	for nodeID, profile := range s.profiles {
+		if profile == nil || len(profile.Groups) == 0 {
+			continue
+		}
+		mapped := make([]string, 0, len(profile.Groups))
+		seen := make(map[string]struct{}, len(profile.Groups))
+		changed := false
+		for _, selection := range profile.Groups {
+			next := selection
+			group, tag := parseGroupSelection(selection)
+			if group != "" {
+				if tag != "" {
+					if target, ok := tagRules[group+"\x00"+tag]; ok {
+						next = target
+					}
+				}
+				if next == selection {
+					for _, rule := range groupRules {
+						if group != rule.fromGroup {
+							continue
+						}
+						nextTag := tag
+						if nextTag == "" {
+							nextTag = rule.toTag
+						}
+						next = canonicalGroupSelection(rule.toGroup, nextTag)
+						break
+					}
+				}
+			}
+			if _, dup := seen[next]; dup {
+				changed = true
+				continue
+			}
+			seen[next] = struct{}{}
+			if next != selection {
+				changed = true
+			}
+			mapped = append(mapped, next)
+		}
+		if !changed {
+			continue
+		}
+		profile.Groups = mapped
+		group, tags := primaryGroupTagsFromSelections(profile.Groups)
+		profile.Group = group
+		profile.Tags = tags
+		s.markAgentConfigRefreshLocked(nodeID)
 	}
 }
 
@@ -5579,6 +6469,22 @@ func handleAdminUpdateNodeProfileRequest(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
+	// F4：流量配额字段校验（计算方式与每月重置日）。
+	if update.TrafficLimitType != nil {
+		switch strings.TrimSpace(*update.TrafficLimitType) {
+		case "", "sum", "max", "up", "down":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "traffic_limit_type 仅支持 sum、max、up、down"})
+			return
+		}
+	}
+	if update.TrafficResetDay != nil {
+		day := *update.TrafficResetDay
+		if day != 0 && (day < 1 || day > 28) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "traffic_reset_day 需在 1 - 28 之间"})
+			return
+		}
+	}
 	if _, ok, err := store.UpdateProfile(nodeID, update); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "保存失败，落盘异常，请检查磁盘后重试"})
 		return
@@ -5644,12 +6550,52 @@ var agentReleaseCache = struct {
 	entries map[string]agentReleaseCacheEntry
 }{entries: map[string]agentReleaseCacheEntry{}}
 
+// agentReleaseCacheKey 把节点平台计入缓存键：ReleaseInfo 里已按平台挑好 AssetName/
+// DownloadURL，只按 version 做键会让第一个节点的平台污染其他平台节点的选包结果。
+func agentReleaseCacheKey(version, goos, goarch string) string {
+	return version + "\x00" + goos + "\x00" + goarch
+}
+
+// resolveAgentPlatform 从节点上报的 stats 推导一键升级的选包目标平台。判断方式与
+// resolveAgentUpdateMode 保持一致（按 stats.OS 标签子串识别平台，normalizeOSLabel
+// 会把 darwin 归一成 "macOS …"）。stats 缺失（OS 为空）时返回空串，由 updater 回退到
+// 服务端自身平台——即老 Agent 未上报 OS/Arch 时的既有行为，不劣化。
+//
+// 发布矩阵只有 linux/darwin/windows/freebsd 四种平台（build-release.yml），因此除
+// windows/darwin/freebsd 外的标签只可能是 Linux 发行版名，linux 必须作为兜底：Linux
+// Agent 上报的 stats.OS 取自 gopsutil host.Platform（发行版名，如 "ubuntu 22.04"、
+// "debian 12"、"alpine 3.19"），并不含 "linux" 子串；若把兜底改成空串，Linux 节点会
+// 退化成"按服务端平台选包"，非 Linux 服务端管理 Linux Agent 时会选错包。反过来，
+// freebsd 必须显式匹配：FreeBSD 的 Platform 是 kern.ostype（"freebsd …"），不显式
+// 匹配就会落进 linux 兜底，导致 FreeBSD 节点被下发 linux 包。
+func resolveAgentPlatform(stats metrics.NodeStats) (string, string) {
+	osLabel := strings.ToLower(strings.TrimSpace(stats.OS))
+	var goos string
+	switch {
+	case osLabel == "":
+		goos = ""
+	case strings.Contains(osLabel, "windows"):
+		goos = "windows"
+	case strings.Contains(osLabel, "macos"), strings.Contains(osLabel, "darwin"), strings.Contains(osLabel, "os x"):
+		goos = "darwin"
+	case strings.Contains(osLabel, "freebsd"):
+		goos = "freebsd"
+	default:
+		goos = "linux"
+	}
+	// arch 直接透传 stats.Arch（normalizeArch 已归一成 amd64/arm64/arm/386，
+	// arm→armv7 由 updater.AssetNameFor 处理）；为空则让 updater 回退。
+	return goos, strings.TrimSpace(stats.Arch)
+}
+
 func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (updater.ReleaseInfo, error) {
 	version := strings.TrimSpace(stats.AgentVersion)
+	goos, goarch := resolveAgentPlatform(stats)
+	cacheKey := agentReleaseCacheKey(version, goos, goarch)
 	now := time.Now()
 
 	agentReleaseCache.Lock()
-	if entry, ok := agentReleaseCache.entries[version]; ok && now.Before(entry.expiresAt) {
+	if entry, ok := agentReleaseCache.entries[cacheKey]; ok && now.Before(entry.expiresAt) {
 		agentReleaseCache.Unlock()
 		return entry.info, entry.err
 	}
@@ -5666,11 +6612,13 @@ func defaultAgentReleaseChecker(ctx context.Context, stats metrics.NodeStats) (u
 	agentReleaseCache.Unlock()
 
 	client := updater.NewClient(updater.DefaultRepo, updater.KindAgent, version)
+	client.GOOS = goos
+	client.GOARCH = goarch
 	info, err := client.CheckLatest(ctx)
 
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		agentReleaseCache.Lock()
-		agentReleaseCache.entries[version] = agentReleaseCacheEntry{info: info, err: err, expiresAt: now.Add(agentReleaseCacheTTL)}
+		agentReleaseCache.entries[cacheKey] = agentReleaseCacheEntry{info: info, err: err, expiresAt: now.Add(agentReleaseCacheTTL)}
 		agentReleaseCache.Unlock()
 	}
 	return info, err

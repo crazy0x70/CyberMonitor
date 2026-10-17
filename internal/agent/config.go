@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,7 @@ type runtimeConfig struct {
 	alias                   string
 	group                   string
 	tests                   []metrics.NetworkTestConfig
+	localTests              []metrics.NetworkTestConfig
 	interval                time.Duration
 	allowPrivateRemoteTests bool
 }
@@ -75,10 +77,12 @@ func newRuntimeConfig(cfg Config) *runtimeConfig {
 	if interval <= 0 {
 		interval = DefaultTestInterval
 	}
+	localTests := slices.Clone(cfg.NetTests)
 	return &runtimeConfig{
 		alias:                   cfg.NodeAlias,
 		group:                   cfg.NodeGroup,
-		tests:                   cfg.NetTests,
+		tests:                   slices.Clone(localTests),
+		localTests:              localTests,
 		interval:                interval,
 		allowPrivateRemoteTests: cfg.AllowPrivateRemoteTests,
 	}
@@ -97,8 +101,15 @@ func (r *runtimeConfig) Update(remote RemoteConfig) {
 	if remote.TestIntervalSec > 0 {
 		r.interval = time.Duration(remote.TestIntervalSec) * time.Second
 	}
-	if remote.Tests != nil {
+	// The remote config is authoritative for every successful fetch. An empty
+	// remote test set (nil or zero-length; the wire cannot distinguish them)
+	// means the administrator cleared this node's tests, so fall back to the
+	// local -net-tests targets. Local tests are trusted and never marked
+	// PublicOnly.
+	if len(remote.Tests) > 0 {
 		r.tests = markRemoteNetworkTests(remote.Tests, !r.allowPrivateRemoteTests)
+	} else {
+		r.tests = slices.Clone(r.localTests)
 	}
 }
 

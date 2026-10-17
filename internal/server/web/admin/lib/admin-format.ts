@@ -12,6 +12,39 @@ export function formatVersionLabel(value?: string | null) {
   return /^\d/.test(normalized) ? `v${normalized}` : normalized;
 }
 
+// 与前台 monitor.js formatBytes 同规格（1024 进制，B→TB）。
+export function formatBinaryBytes(bytes: number | null | undefined) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value < 0) {
+    value = 0;
+  }
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[index]}`;
+}
+
+// 运行时长（中文单位）：「1 天 5 小时」/「3 小时 12 分钟」/「5 分钟」/「42 秒」。
+export function formatUptimeZh(totalSeconds: number | null | undefined) {
+  const total = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) {
+    return `${days} 天 ${hours} 小时`;
+  }
+  if (hours > 0) {
+    return `${hours} 小时 ${minutes} 分钟`;
+  }
+  if (minutes > 0) {
+    return `${minutes} 分钟`;
+  }
+  return `${total} 秒`;
+}
+
 export function toDateTimeLocalValue(value?: number) {
   if (!value) return "";
   const date = new Date(value * 1000);
@@ -29,17 +62,6 @@ export function parseDateTimeLocalValue(value: string) {
     return 0;
   }
   return Math.floor(timestamp / 1000);
-}
-
-export function parseTelegramUserIds(raw: string) {
-  return Array.from(
-    new Set(
-      raw
-        .split(/[,，\s]+/)
-        .map((item) => Number.parseInt(item.trim(), 10))
-        .filter((item) => Number.isFinite(item) && item > 0),
-    ),
-  );
 }
 
 export function getErrorMessage(error: unknown, fallback: string) {
@@ -79,6 +101,13 @@ function shouldReplaceNodeView(existing: NodeView | undefined, candidate: NodeVi
   return candidateLastSeen >= existingLastSeen;
 }
 
+// R-03：这些字段只由管理端快照下发，node_delta 推送（公开视图）不含。
+const ADMIN_ONLY_NODE_FIELDS = [
+  "scoped_test_ids",
+  "traffic_used_bytes",
+  "traffic_cycle_start",
+] as const;
+
 export function upsertNodeView(current: NodeView[], node: NodeView) {
   const nodeID = resolveNodeId(node).trim();
   if (!nodeID) {
@@ -92,12 +121,35 @@ export function upsertNodeView(current: NodeView[], node: NodeView) {
     return current;
   }
   const next = [...current];
-  next[index] = node;
+  const merged: NodeView = { ...node };
+  for (const field of ADMIN_ONLY_NODE_FIELDS) {
+    if (merged[field] === undefined) {
+      Object.assign(merged, { [field]: current[index][field] });
+    }
+  }
+  next[index] = merged;
   return next;
 }
 
 export function resolveNodeName(node: NodeView) {
   return node.alias || node.stats.node_alias || node.stats.node_name || node.stats.node_id;
+}
+
+// B-06（D-02）：磁盘使用率 = Σ已用 / Σ总量（服务器总硬盘口径，Agent 已过滤并
+// 去重分区）；总量为 0 / 无分区时返回 null（未知），与服务端 nodeDiskUsage 同口径。
+export function nodeDiskPercent(
+  stats: NodeView["stats"],
+): number | null {
+  let total = 0;
+  let used = 0;
+  for (const partition of stats?.disk || []) {
+    total += Number(partition?.total || 0);
+    used += Number(partition?.used || 0);
+  }
+  if (!Number.isFinite(total) || !Number.isFinite(used) || total <= 0) {
+    return null;
+  }
+  return (used / total) * 100;
 }
 
 export function resolveNodeIdentitySummary(node: NodeView) {
@@ -236,23 +288,39 @@ export type AdminPage =
   | "logs";
 
 export const ADMIN_PAGE_QUERY_KEY = "page";
+export const ADMIN_SECTION_QUERY_KEY = "section";
 
-export function adminPageHref(page: AdminPage) {
+export function adminPageHref(page: AdminPage, section?: string | null) {
+  const normalizedSection = String(section || "").trim();
   if (typeof window === "undefined") {
-    return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+    const pagePart = page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+    return normalizedSection
+      ? `${pagePart}&${ADMIN_SECTION_QUERY_KEY}=${encodeURIComponent(normalizedSection)}`
+      : pagePart;
   }
   let nextURL: URL;
   try {
     nextURL = new URL(window.location.href);
   } catch {
 
-    return page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+    const fallbackPart = page === "dashboard" ? "/" : `/?${ADMIN_PAGE_QUERY_KEY}=${page}`;
+    return normalizedSection
+      ? `${fallbackPart}&${ADMIN_SECTION_QUERY_KEY}=${encodeURIComponent(normalizedSection)}`
+      : fallbackPart;
   }
   if (page === "dashboard") {
     nextURL.searchParams.delete(ADMIN_PAGE_QUERY_KEY);
   } else {
     nextURL.searchParams.set(ADMIN_PAGE_QUERY_KEY, page);
   }
+  // 未显式带分区的导航（跨页/无分区页）清除 section 与 hash：
+  // hash 是被 section 查询参数取代的旧锚点形式，跨页残留会串页（R7）。
+  if (normalizedSection) {
+    nextURL.searchParams.set(ADMIN_SECTION_QUERY_KEY, normalizedSection);
+  } else {
+    nextURL.searchParams.delete(ADMIN_SECTION_QUERY_KEY);
+  }
+  nextURL.hash = "";
   return `${nextURL.pathname}${nextURL.search}${nextURL.hash}`;
 }
 

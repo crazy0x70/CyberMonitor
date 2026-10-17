@@ -6,6 +6,7 @@ const statOnline = document.getElementById("stat-online");
 const statOffline = document.getElementById("stat-offline");
 const statNetUsage = document.getElementById("stat-net-usage");
 const statNetRate = document.getElementById("stat-net-rate");
+const statOnlineTotal = document.getElementById("stat-online-total");
 const brandTitle = document.getElementById("brand-title");
 const brandSubtitle = document.getElementById("brand-subtitle");
 const siteIcon = document.getElementById("site-icon");
@@ -25,6 +26,8 @@ const PUBLIC_I18N = {
     statOnline: "在线服务器",
     statOffline: "离线服务器",
     statNetwork: "网络信息",
+    netTotal: "累计",
+    netRate: "实时",
     groupTabsLabel: "节点分组导航",
     emptyWaitingTitle: "等待节点接入",
     emptyWaitingBody: "请启动 Agent 并指向当前管理端地址。",
@@ -51,10 +54,10 @@ const PUBLIC_I18N = {
     downloadTotal: "累计下载",
     firstReport: "首次上报",
     lastReport: "末次上报",
-    detailGroupBasic: "基本信息",
+    // P-04（第 5 轮）：分组标题与首字段「状态」重名，分组标题改为「运行」
+    detailGroupStatus: "运行",
     detailGroupHardware: "硬件",
-    detailGroupLoadNet: "负载与网络",
-    detailGroupMeta: "记录",
+    detailGroupNetwork: "网络",
     hostname: "主机名",
     publicIP: "公网 IP",
     cpuUsage: "CPU 使用率",
@@ -67,8 +70,8 @@ const PUBLIC_I18N = {
     deployModeDocker: "Docker",
     process: "进程",
     connection: "连接",
-    smooth: "平滑",
-    smoothToggle: "切换平滑",
+    clip: "削峰",
+    clipToggle: "切换削峰",
     online: "在线",
     offline: "离线",
     processCount: "当前进程数",
@@ -78,6 +81,8 @@ const PUBLIC_I18N = {
     historyErrorLabel: "网络连通性历史加载失败，等待下一次刷新后重试",
     historyErrorTitle: "网络连通性历史加载失败",
     historyErrorBody: "等待下一次刷新后重试",
+    latencyEmptyTitle: "暂无延迟数据",
+    latencyEmptyBody: "配置探测节点后显示",
     current: "当前",
     loss: "丢包",
     lossRate: "丢包率",
@@ -105,6 +110,8 @@ const PUBLIC_I18N = {
     statOnline: "Online servers",
     statOffline: "Offline servers",
     statNetwork: "Network",
+    netTotal: "Total",
+    netRate: "Live",
     groupTabsLabel: "Node group navigation",
     emptyWaitingTitle: "Waiting for nodes",
     emptyWaitingBody: "Start the Agent and point it to this control server.",
@@ -131,10 +138,9 @@ const PUBLIC_I18N = {
     downloadTotal: "Total download",
     firstReport: "First report",
     lastReport: "Last report",
-    detailGroupBasic: "Basic info",
+    detailGroupStatus: "Runtime",
     detailGroupHardware: "Hardware",
-    detailGroupLoadNet: "Load & network",
-    detailGroupMeta: "Records",
+    detailGroupNetwork: "Network",
     hostname: "Hostname",
     publicIP: "Public IP",
     cpuUsage: "CPU usage",
@@ -147,8 +153,8 @@ const PUBLIC_I18N = {
     deployModeDocker: "Docker",
     process: "Processes",
     connection: "Connections",
-    smooth: "Smooth",
-    smoothToggle: "Toggle smoothing",
+    clip: "Clip spikes",
+    clipToggle: "Toggle spike clipping",
     online: "Online",
     offline: "Offline",
     processCount: "Current process count",
@@ -158,6 +164,8 @@ const PUBLIC_I18N = {
     historyErrorLabel: "Network connectivity history failed to load. Waiting for the next refresh.",
     historyErrorTitle: "Network connectivity history failed to load",
     historyErrorBody: "Waiting for the next refresh",
+    latencyEmptyTitle: "No latency data yet",
+    latencyEmptyBody: "Shows once probe nodes are configured",
     current: "Current",
     loss: "Loss",
     lossRate: "Packet loss",
@@ -250,7 +258,7 @@ const state = {
   testHistoryGeneration: new Map(),
   testHistoryRetryTimers: new Map(),
   testRange: new Map(),
-  testSmooth: new Map(),
+  testClip: new Map(),
   selectedTests: new Map(),
   historyMaxLastAt: new Map(),
   publicSettingsSignature: "",
@@ -267,8 +275,12 @@ const state = {
   snapshotFallbackTimer: null,
   snapshotFetchInflight: null,
   renderFrame: 0,
+  renderTimer: null,
   realtimeStatus: new Map(),
   groupTabSignature: "",
+  // F1（第 4 轮）：分组树里每个分组的标签顺序（Map<group, string[]>），
+  // 来自快照 group_tree；标签分区按树内顺序展示，树外标签按字母序排后。
+  groupTagOrder: new Map(),
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
@@ -282,8 +294,14 @@ const WS_RECONNECT_BASE_DELAY = 500;
 const WS_RECONNECT_MAX_DELAY = 8000;
 const WS_WATCHDOG_MS = 15000;
 const PUBLIC_SNAPSHOT_FALLBACK_INTERVAL_MS = 3000;
+const PUBLIC_SNAPSHOT_STALE_MS = 15000;
+const RENDER_FALLBACK_MS = 1000;
 const PUBLIC_NODE_STALE_GRACE_SECONDS = 12;
-const LATENCY_SMOOTH_ALPHA = 0.2;
+// S5/M-03：动效开关 —— reduce 时不拦截 summary 点击，保留原生瞬时展开 / 收起
+const MOTION_ALLOWED = window.matchMedia("(prefers-reduced-motion: no-preference)");
+// M-02：入场编排最多覆盖前 12 张（其余直接显示）、每张间隔 40ms
+const NODE_INTRO_MAX = 12;
+const NODE_INTRO_STAGGER_MS = 40;
 
 function normalizePublicLocale(value) {
   return String(value || "").trim().toLowerCase().replace("_", "-") === "en-us"
@@ -383,6 +401,22 @@ function safeLocalStorage() {
   }
 }
 
+// 值未变时不写 DOM，避免替换文本节点导致选区丢失与无谓重排
+function setText(el, value) {
+  const next = String(value);
+  if (el && el.textContent !== next) {
+    el.textContent = next;
+  }
+}
+
+// 值未变时不写 DOM，避免替换文本节点导致选区丢失与无谓重排
+function setHTML(el, markup) {
+  if (el && el.__cmMarkup !== markup) {
+    el.__cmMarkup = markup;
+    el.innerHTML = markup;
+  }
+}
+
 function syncViewStateToURL(replace = false) {
   const nextLocation = buildViewURL(state.selectedGroup, state.statusFilter);
   const currentLocation = `${window.location.pathname}${window.location.search}${window.location.hash}`;
@@ -460,11 +494,26 @@ function shouldHandleLocalNavigation(event) {
 }
 
 function scheduleRender() {
-  if (state.renderFrame) return;
-  state.renderFrame = window.requestAnimationFrame(() => {
-    state.renderFrame = 0;
+  if (state.renderFrame || state.renderTimer) return;
+  let flushed = false;
+  const flush = () => {
+    if (flushed) return;
+    flushed = true;
+    if (state.renderFrame) {
+      window.cancelAnimationFrame(state.renderFrame);
+      state.renderFrame = 0;
+    }
+    if (state.renderTimer) {
+      window.clearTimeout(state.renderTimer);
+      state.renderTimer = null;
+    }
     render();
-  });
+  };
+  state.renderFrame = window.requestAnimationFrame(flush);
+  // rAF 在隐藏文档里会被挂起，导致 DOM（以及 card._lastNode）停止更新；若回调被丢弃
+  // 还会让 renderFrame 永远非 0，scheduleRender 从此变成永久空操作——只能靠刷新恢复。
+  // 因此始终挂一个 timeout 兜底，谁先到谁生效。
+  state.renderTimer = window.setTimeout(flush, RENDER_FALLBACK_MS);
 }
 
 function refreshOpenNodeHistoryViews(nodeId, options = {}) {
@@ -654,8 +703,23 @@ function hasHealthySocket() {
   );
 }
 
+// R-01（第 4 轮裁定）：HTTP 兜底的触发依据是「WS 断开」或「超过 15s 未收到任何
+// WS 消息（包括心跳）」，不能用「15s 未应用快照」——服务端只在数据变化时推送快照，
+// 节点数为 0 或数据无变化时长时间没有新快照属正常；按旧依据判断会让 WS 完全健康的
+// 页面也每 3s 打一次 /api/v1/public/snapshot，等于变相轮询。
+function hasFreshSnapshotData() {
+  const socket = state.wsConnection;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  if (!state.wsLastMessageAt) {
+    return false;
+  }
+  return Date.now() - state.wsLastMessageAt <= PUBLIC_SNAPSHOT_STALE_MS;
+}
+
 async function fetchPublicSnapshotFallback() {
-  if (hasHealthySocket()) {
+  if (hasFreshSnapshotData()) {
     return;
   }
   await fetchPublicSnapshot();
@@ -925,6 +989,24 @@ function rebuildMergedSnapshotState() {
     const name = String(item || "").trim();
     if (name) mergedGroups.add(name);
   });
+  const groupTagOrder = new Map();
+  ((Array.isArray(snapshot?.group_tree) && snapshot.group_tree) || []).forEach(
+    (entry) => {
+      const name =
+        entry && typeof entry === "object"
+          ? String(entry.name || "").trim()
+          : "";
+      if (!name || groupTagOrder.has(name)) return;
+      const tags = (Array.isArray(entry.children) ? entry.children : [])
+        .map((child) =>
+          child && typeof child === "object"
+            ? String(child.name || "").trim()
+            : ""
+        )
+        .filter(Boolean);
+      groupTagOrder.set(name, tags);
+    }
+  );
 
   mergedNodes.forEach((node) => {
     const displayId = resolveDisplayNodeId(node, "").trim();
@@ -938,6 +1020,7 @@ function rebuildMergedSnapshotState() {
   state.lastNodes = mergedNodes;
   state.nodeByDisplayId = nodeByDisplayId;
   state.settingsGroups = Array.from(mergedGroups);
+  state.groupTagOrder = groupTagOrder;
 
   applyPublicSettings(snapshot?.settings || {});
 
@@ -1059,6 +1142,7 @@ function render() {
   const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
 
   updateStats(state.lastNodes);
+  syncStatFilterSelection();
   updateEmptyState(visibleNodes.length, groupNodes.length);
   const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
   if (state.renderMode !== mode) {
@@ -1072,11 +1156,12 @@ function render() {
 }
 
 function updateEmptyState(visibleCount, totalCount) {
+  // P-08（第 4 轮）：用 hidden 属性控制显隐，不写内联 display，
+  // 避免 display: block 覆盖 .empty 的 grid + justify-items: center
+  empty.hidden = visibleCount > 0;
   if (visibleCount > 0) {
-    empty.style.display = "none";
     return;
   }
-  empty.style.display = "block";
   if (totalCount > 0 && state.selectedGroup !== DEFAULT_GROUP) {
     empty.querySelector("h2").textContent = t("emptyGroupTitle");
     empty.querySelector("p").textContent = t("emptyGroupBody");
@@ -1576,9 +1661,9 @@ function cleanupDetachedHistory(nodes) {
       changed = true;
     }
   }
-  for (const id of state.testSmooth.keys()) {
+  for (const id of state.testClip.keys()) {
     if (!activeNodeIDs.has(id)) {
-      state.testSmooth.delete(id);
+      state.testClip.delete(id);
       changed = true;
     }
   }
@@ -1881,6 +1966,20 @@ const statTotalCard = statTotal ? statTotal.closest(".stat-card") : null;
 const statOnlineCard = statOnline ? statOnline.closest(".stat-card") : null;
 const statOfflineCard = statOffline ? statOffline.closest(".stat-card") : null;
 
+/* P-04 第 4 条 + P-05（第 4 轮）：当前筛选项的纯展示标记（样式在 CSS）。
+   筛选为「全部」时不显示选中态；仅在线 / 离线选中时对应卡片显示 */
+function syncStatFilterSelection() {
+  if (statTotalCard) {
+    statTotalCard.classList.remove("active");
+  }
+  if (statOnlineCard) {
+    statOnlineCard.classList.toggle("active", state.statusFilter === "online");
+  }
+  if (statOfflineCard) {
+    statOfflineCard.classList.toggle("active", state.statusFilter === "offline");
+  }
+}
+
 if (statTotalCard) {
   statTotalCard.addEventListener("click", () => {
     applyViewState({ statusFilter: "all" }, { history: "push" });
@@ -1900,6 +1999,9 @@ if (statOfflineCard) {
 window.addEventListener("popstate", () => {
   applyViewState(readViewStateFromURL());
 });
+
+// P-03（第 4 轮）：窗口尺寸变化时重算分组栏溢出态
+window.addEventListener("resize", updateGroupTabsOverflow);
 
 function rangeSeconds(key) {
   const match = RANGE_OPTIONS.find((item) => item.key === key);
@@ -2117,6 +2219,19 @@ function renderGroupTabs(groups) {
       button.setAttribute("href", buildViewURL(button.dataset.group || DEFAULT_GROUP, state.statusFilter));
     }
   });
+  updateGroupTabsOverflow();
+}
+
+// P-03（第 4 轮）：分组栏只在真正溢出（scrollWidth > clientWidth）时加 .is-overflowing，
+// CSS 借此切换两端渐隐遮罩；渲染后与窗口 resize 时各判断一次
+function updateGroupTabsOverflow() {
+  if (!groupTabs) {
+    return;
+  }
+  groupTabs.classList.toggle(
+    "is-overflowing",
+    groupTabs.scrollWidth > groupTabs.clientWidth
+  );
 }
 
 function filterNodesByGroup(nodes, group) {
@@ -2161,6 +2276,42 @@ function normalizeTagList(tags) {
   return list;
 }
 
+/* P-04 第 5 条：网络信息卡小指标块的箭头（SF Symbols 风格 arrow.up / arrow.down） */
+const NET_ARROW_UP_MARKUP =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"></path><path d="m5 12 7-7 7 7"></path></svg>';
+const NET_ARROW_DOWN_MARKUP =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"></path><path d="m19 12-7 7-7-7"></path></svg>';
+
+function splitNetValueText(value) {
+  const text = String(value || "");
+  const spaceIndex = text.indexOf(" ");
+  if (spaceIndex < 0) {
+    return { num: text, unit: "" };
+  }
+  return { num: text.slice(0, spaceIndex), unit: text.slice(spaceIndex + 1) };
+}
+
+function netStatItemMarkup(direction, value) {
+  const { num, unit } = splitNetValueText(value);
+  const arrow = direction === "up" ? NET_ARROW_UP_MARKUP : NET_ARROW_DOWN_MARKUP;
+  // P-01（第 5 轮）：窄卡内数值被 ellipsis 截断时，title 提供完整值（如「↑ 15.1 GB」）
+  const arrowText = direction === "up" ? "↑" : "↓";
+  return (
+    `<span class="stat-net-item" title="${arrowText} ${value}">` +
+    `<span class="stat-net-arrow ${direction}" aria-hidden="true">${arrow}</span>` +
+    `<span class="num">${num}</span>` +
+    (unit ? `<span class="stat-net-unit">${unit}</span>` : "") +
+    `</span>`
+  );
+}
+
+function netStatBlockMarkup(label, upText, downText) {
+  return (
+    `<span class="stat-net-label">${label}</span>` +
+    `<span class="stat-net-pair">${netStatItemMarkup("up", upText)}${netStatItemMarkup("down", downText)}</span>`
+  );
+}
+
 function updateStats(nodes) {
   let online = 0;
   let totalUpRate = 0;
@@ -2181,14 +2332,29 @@ function updateStats(nodes) {
 
   const total = nodes.length;
   const offline = total - online;
-  statTotal.textContent = String(total);
-  statOnline.textContent = String(online);
-  statOffline.textContent = String(offline);
+  setText(statTotal, String(total));
+  setText(statOnline, String(online));
+  setText(statOffline, String(offline));
+  if (statOnlineTotal) {
+    setText(statOnlineTotal, `/ ${total}`);
+  }
 
-  statNetUsage.textContent = `↑ ${formatBytes(totalUp)} / ↓ ${formatBytes(totalDown)}`;
-  statNetRate.textContent = `↑ ${formatRate(totalUpRate)} / ↓ ${formatRate(
-    totalDownRate
-  )}`;
+  // S6（0.1.1 裁定）：健康度色温 —— 存在离线即 degraded。
+  // CSS 按 html[data-health] 切换 --canvas-tint-b（淡琥珀，过渡 --dur-5），不做数值插值
+  const health = offline > 0 ? "degraded" : "ok";
+  if (document.documentElement.dataset.health !== health) {
+    document.documentElement.dataset.health = health;
+  }
+
+  // P-04 第 5 条：两个小指标块（累计 / 实时），展示层拆 span，数值与格式不变
+  setHTML(
+    statNetUsage,
+    netStatBlockMarkup(t("netTotal"), formatBytes(totalUp), formatBytes(totalDown))
+  );
+  setHTML(
+    statNetRate,
+    netStatBlockMarkup(t("netRate"), formatRate(totalUpRate), formatRate(totalDownRate))
+  );
 }
 
 function upsertRenderedCard(container, node, id, animationIndex) {
@@ -2196,15 +2362,21 @@ function upsertRenderedCard(container, node, id, animationIndex) {
   if (!card) {
     card = createCard();
     state.nodes.set(id, card);
-    card.classList.add("animate");
-    card.addEventListener(
-      "animationend",
-      () => {
+    // M-02：入场编排 —— 仅前 12 张以 40ms 间隔入场（--dur-4 见 CSS），
+    // 其余直接显示。只认 rise 入场动画，避免后代动画的 animationend 误清
+    if (animationIndex < NODE_INTRO_MAX) {
+      card.classList.add("animate");
+      card.style.animationDelay = `${animationIndex * NODE_INTRO_STAGGER_MS}ms`;
+      const onIntroEnd = (event) => {
+        if (event.target !== card || event.animationName !== "rise") {
+          return;
+        }
         card.classList.remove("animate");
-      },
-      { once: true }
-    );
-    card.style.animationDelay = `${animationIndex * 0.03}s`;
+        card.style.animationDelay = "";
+        card.removeEventListener("animationend", onIntroEnd);
+      };
+      card.addEventListener("animationend", onIntroEnd);
+    }
   }
   const historySig = latestHistoryAtForNode(id);
   if (
@@ -2340,12 +2512,40 @@ function groupNodesByTag(nodes, group) {
   });
   const sorted = Array.from(groups.entries())
     .map(([tag, list]) => ({ tag, nodes: list }))
-    .sort((a, b) => {
-      if (a.tag === t("unconfigured")) return 1;
-      if (b.tag === t("unconfigured")) return -1;
-      return a.tag.localeCompare(b.tag, "zh-Hans-CN");
-    });
+    .sort(tagSectionOrderComparator(group));
   return sorted;
+}
+
+// F1（第 4 轮）：标签分区的排序规则——
+//  1. 分组树里配置过的标签按树内顺序排前；
+//  2. 不在树里的标签排在树内标签之后，按 localeCompare；
+//  3. 「未配置」始终最后；
+//  4. 地区分组（C&R）没有树，保持字母序。
+function tagSectionOrderComparator(group) {
+  const unconfigured = t("unconfigured");
+  const treeOrder =
+    group === REGION_GROUP ? null : state.groupTagOrder.get(group) || null;
+  const orderIndex = new Map();
+  if (treeOrder) {
+    treeOrder.forEach((tag, index) => {
+      if (!orderIndex.has(tag)) orderIndex.set(tag, index);
+    });
+  }
+  return (a, b) => {
+    if (a.tag === unconfigured) return 1;
+    if (b.tag === unconfigured) return -1;
+    if (orderIndex.size > 0) {
+      const aInTree = orderIndex.has(a.tag);
+      const bInTree = orderIndex.has(b.tag);
+      if (aInTree && bInTree) {
+        return orderIndex.get(a.tag) - orderIndex.get(b.tag);
+      }
+      if (aInTree !== bInTree) {
+        return aInTree ? -1 : 1;
+      }
+    }
+    return a.tag.localeCompare(b.tag, "zh-Hans-CN");
+  };
 }
 
 function summaryMetricsHTML() {
@@ -2375,28 +2575,55 @@ function summaryMetricsHTML() {
 }
 
 function detailInfoRowsHTML() {
-  const rows = [
-    ["status", "detail-status"],
-    ["uptime", "detail-uptime"],
-    ["remaining", "detail-remaining"],
-    ["arch", "detail-arch"],
-    ["memory", "detail-mem"],
-    ["disk", "detail-disk"],
-    ["region", "detail-region"],
-    ["os", "detail-os"],
-    ["gpu", "detail-gpu"],
-    ["load", "detail-load"],
-    ["uploadTotal", "detail-upload"],
-    ["downloadTotal", "detail-download"],
-    ["firstReport", "detail-first"],
-    ["lastReport", "detail-last"],
+  // E-06（0.1.2）：纯数值字段的 <strong> 加 class="num" 走等宽数字字体；
+  // 状态、地区、系统、架构、CPU、GPU 等文本字段保持 UI 字体。
+  // P-09（0.1.2）：字段按「状态 / 硬件 / 网络」分组重排并插入组标题，
+  // 只调整顺序与层级，所有 data-field 属性与 fields.* 引用保持不变。
+  const groups = [
+    {
+      titleKey: "detailGroupStatus",
+      rows: [
+        ["status", "detail-status"],
+        ["uptime", "detail-uptime", "num"],
+        ["remaining", "detail-remaining", "num"],
+        ["firstReport", "detail-first", "num"],
+        ["lastReport", "detail-last", "num"],
+      ],
+    },
+    {
+      titleKey: "detailGroupHardware",
+      rows: [
+        ["arch", "detail-arch"],
+        ["os", "detail-os"],
+        ["CPU", "detail-cpu", "raw"],
+        ["gpu", "detail-gpu"],
+        ["memory", "detail-mem", "num"],
+        ["disk", "detail-disk", "num"],
+      ],
+    },
+    {
+      titleKey: "detailGroupNetwork",
+      rows: [
+        ["region", "detail-region"],
+        ["load", "detail-load", "num"],
+        ["uploadTotal", "detail-upload", "num"],
+        ["downloadTotal", "detail-download", "num"],
+      ],
+    },
   ];
 
-  rows.splice(8, 0, ["CPU", "detail-cpu", "raw"]);
-  return rows
+  const rowHTML = ([labelKey, field, flag]) =>
+    `<div class="info-row"><span>${flag === "raw" ? labelKey : t(labelKey)}</span><strong data-field="${field}"${
+      flag === "num" ? ' class="num"' : ""
+    }>--</strong></div>`;
+
+  return groups
     .map(
-      ([labelKey, field, raw]) =>
-        `<div class="info-row"><span>${raw ? labelKey : t(labelKey)}</span><strong data-field="${field}">--</strong></div>`
+      (group) => `
+        <div class="detail-group">
+          <div class="detail-group-title">${t(group.titleKey)}</div>
+          <div class="detail-group-grid">${group.rows.map(rowHTML).join("")}</div>
+        </div>`
     )
     .join("");
 }
@@ -2414,34 +2641,36 @@ function createCard() {
       <div class="node-summary-left">
         <div class="node-title">
           <span class="node-name" data-field="name"></span>
-          <span class="status-dot" data-field="status-dot"></span>
+          <span class="status-dot" data-field="status-dot" role="img"></span>
         </div>
         <div class="node-meta">
           <span class="node-meta-text" data-field="meta"></span>
+          <span class="node-meta-text node-meta-gpu is-gpu-line" data-field="gpu-meta"><span class="gpu-badge"></span><span class="gpu-meta-text" data-field="gpu-meta-text"></span></span>
         </div>
       </div>
       <div class="node-summary-metrics">${summaryMetricsHTML()}</div>
       <div class="node-summary-right">
-        <div class="summary-right-line" data-field="summary-uptime"></div>
+        <div class="summary-right-line" data-field="summary-uptime"><span class="uptime-label"></span><span class="num"></span></div>
         <div class="summary-right-line" data-field="summary-tests"></div>
       </div>
     </summary>
     <div class="node-details">
-      <div class="detail-info">${detailInfoRowsHTML()}</div>
+      <div class="node-details-inner">
+        <div class="detail-info">${detailInfoRowsHTML()}</div>
         <div class="network-section">
         <div class="network-chart">
           <div class="network-chart-toolbar">
             <div class="network-controls">
-              <div class="smooth-control">
-                <span class="smooth-control-label">${t("smooth")}</span>
+              <div class="clip-control">
+                <span class="clip-control-label">${t("clip")}</span>
                 <button
                   type="button"
-                  class="smooth-toggle"
-                  data-field="test-smooth"
-                  aria-label="${t("smoothToggle")}"
+                  class="clip-toggle"
+                  data-field="test-clip"
+                  aria-label="${t("clipToggle")}"
                 >
-                  <span class="smooth-toggle-track">
-                    <span class="smooth-toggle-thumb"></span>
+                  <span class="clip-toggle-track">
+                    <span class="clip-toggle-thumb"></span>
                   </span>
                 </button>
               </div>
@@ -2454,9 +2683,10 @@ function createCard() {
         </div>
         <div class="network-cards" data-field="test-cards"></div>
       </div>
+      <!-- P-04（第 5 轮）：删除底部「已运行」（与详情「运行时间」重复），保留「更新」 -->
       <div class="footer">
-        <div data-field="uptime">--</div>
-        <div data-field="last-seen">--</div>
+        <div data-field="last-seen"><span class="last-seen-label"></span><span class="num"></span></div>
+      </div>
       </div>
     </div>
   `));
@@ -2477,6 +2707,8 @@ function createCard() {
     ] = el;
   });
   fields.networkSection = card.querySelector(".network-section");
+  fields.gpuMetaBadge = card.querySelector(".gpu-badge");
+  fields.detailsEl = card.querySelector(".node-details");
 
   fields.rangeButtons = new Map();
   RANGE_OPTIONS.forEach((item) => {
@@ -2500,8 +2732,19 @@ function createCard() {
   card.addEventListener("toggle", () => {
     if (!card.open) {
       card._historySignature = "";
+      // M-03 / P-12（第 4 轮）：关闭分支同时清掉两个状态类，
+      // 避免被中断的展开 / 收起在 details 上留下残留
+      card._fields.detailsEl?.classList.remove("is-open", "is-collapsing");
       return;
     }
+    // M-03：展开动画 —— 等一帧让「以 0fr 折叠态渲染」先生效，再切 is-open 触发过渡；
+    // 若此刻已在收起（is-collapsing），不要抢状态
+    requestAnimationFrame(() => {
+      const detailsEl = card._fields.detailsEl;
+      if (detailsEl && !detailsEl.classList.contains("is-collapsing")) {
+        detailsEl.classList.add("is-open");
+      }
+    });
     if (!card._lastNode || !card._nodeId) {
       return;
     }
@@ -2511,6 +2754,50 @@ function createCard() {
     }
     renderCardDetails(card, card._lastNode, card._nodeId);
     card._historySignature = historySignature;
+  });
+  // M-03：收起动画 —— summary 默认点击会让浏览器立即取消子内容渲染，高度无从过渡。
+  // 拦截点击、保持 open=true 播完 0fr 收起（--dur-2）后再真正关闭。
+  // reduce 时（MOTION_ALLOWED 不匹配）不拦截，走原生瞬时切换
+  card.querySelector(".node-summary").addEventListener("click", (event) => {
+    if (!MOTION_ALLOWED.matches) {
+      return;
+    }
+    const detailsEl = card._fields.detailsEl;
+    if (detailsEl.classList.contains("is-collapsing")) {
+      // 收起途中再点：取消收起、恢复展开（open 仍为 true）
+      event.preventDefault();
+      detailsEl.classList.remove("is-collapsing");
+      detailsEl.classList.add("is-open");
+      return;
+    }
+    if (!card.open) {
+      return; // 原生展开：open=true → toggle 监听里启动 0fr→1fr 过渡
+    }
+    event.preventDefault();
+    detailsEl.classList.remove("is-open");
+    detailsEl.classList.add("is-collapsing");
+    const finishCollapse = () => {
+      if (!detailsEl.classList.contains("is-collapsing")) {
+        return; // 已被重新展开取消
+      }
+      detailsEl.classList.remove("is-collapsing");
+      detailsEl.classList.remove("is-open");
+      card.open = false; // toggle 监听会照常重置 _historySignature
+    };
+    detailsEl.addEventListener(
+      "transitionend",
+      (transitionEvent) => {
+        if (
+          transitionEvent.target === detailsEl &&
+          transitionEvent.propertyName === "grid-template-rows"
+        ) {
+          finishCollapse();
+        }
+      },
+      { once: true }
+    );
+    // 兜底：transitionend 因中断以外的原因未触发时也要能关上（--dur-2 = 200ms + 缓冲）
+    window.setTimeout(finishCollapse, 320);
   });
   return card;
 }
@@ -2526,38 +2813,62 @@ function updateCard(card, node, nodeId) {
 
   const displayName = resolveDisplayName(node, stats);
   const flag = flagEmoji(node.region);
-  fields.name.textContent = `${flag}${displayName}`.trim();
+  const nameText = `${flag}${displayName}`.trim();
+  setText(fields.name, nameText);
+  // 名称在卡片内单行截断，完整内容通过 title 保留
+  fields.name.title = nameText;
 
-  fields.meta.textContent = [
-    stats.os || "--",
-    stats.arch || "--",
-    formatGPUSummaryMeta(stats.gpu),
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // GPU 摘要单独成行展示（内容与原先拼接在系统/架构之后的文本一致），避免与系统信息挤在同一行被截断
+  const metaText = [stats.os || "--", stats.arch || "--"].join(" · ");
+  const gpuMetaText = formatGPUSummaryMeta(stats.gpu);
+  setText(fields.meta, metaText);
+  fields.meta.title = metaText;
+  // P-06 第 3 条：「GPU」前缀拆成小徽标，型号与占用率接在其后（纯展示拆分）
+  const gpuLabel = t("gpu");
+  if (gpuMetaText.startsWith(gpuLabel)) {
+    setText(fields.gpuMetaBadge, gpuLabel);
+    setText(
+      fields.gpuMetaText,
+      gpuMetaText
+        .slice(gpuLabel.length)
+        .replace(/^\s*·\s*/, "")
+    );
+  } else {
+    setText(fields.gpuMetaBadge, "");
+    setText(fields.gpuMetaText, gpuMetaText);
+  }
+  fields.gpuMeta.title = gpuMetaText;
+  fields.gpuMeta.hidden = !gpuMetaText;
 
   const statusValue = resolveNodeStatus(node);
   const status = statusValue === "offline" ? t("offline") : t("online");
   fields.statusDot.classList.toggle("offline", statusValue === "offline");
+  // 仅视觉钩子：离线卡片整体弱化；状态点带可读标签，不只依赖颜色区分
+  card.classList.toggle("is-offline", statusValue === "offline");
+  fields.statusDot.setAttribute("aria-label", status);
+  fields.statusDot.title = status;
 
   const cpuPercent = clamp(cpu.usage_percent || 0);
-  fields.cpuSummary.textContent = `${cpuPercent.toFixed(0)}%`;
+  setText(fields.cpuSummary, `${cpuPercent.toFixed(0)}%`);
   if (fields.cpuMini) {
     fields.cpuMini.style.width = `${cpuPercent}%`;
   }
+  setMetricLevel(fields.cpuMini, cpuPercent);
 
   const memPercent = clamp(mem.used_percent || 0);
-  fields.memSummary.textContent = `${memPercent.toFixed(0)}%`;
+  setText(fields.memSummary, `${memPercent.toFixed(0)}%`);
   if (fields.memMini) {
     fields.memMini.style.width = `${memPercent}%`;
   }
+  setMetricLevel(fields.memMini, memPercent);
 
   const diskAgg = aggregateDisk(diskList);
   const diskPercent = clamp(diskAgg.percent);
-  fields.diskSummary.textContent = `${diskPercent.toFixed(0)}%`;
+  setText(fields.diskSummary, `${diskPercent.toFixed(0)}%`);
   if (fields.diskMini) {
     fields.diskMini.style.width = `${diskPercent}%`;
   }
+  setMetricLevel(fields.diskMini, diskPercent);
 
   const netSpeed =
     Number.isFinite(node.net_speed_mbps) && node.net_speed_mbps > 0
@@ -2565,54 +2876,73 @@ function updateCard(card, node, nodeId) {
       : stats.net_speed_mbps;
   const hasNetSpeed = Number.isFinite(netSpeed) && netSpeed > 0;
   const netPercent = hasNetSpeed ? calcNetPercent(net, netSpeed) : 0;
-  fields.netSummary.textContent = hasNetSpeed ? `${netPercent.toFixed(0)}%` : "";
+  setText(fields.netSummary, hasNetSpeed ? `${netPercent.toFixed(0)}%` : "");
   if (fields.netMini) {
     fields.netMini.style.width = `${hasNetSpeed ? netPercent : 0}%`;
   }
+  setMetricLevel(fields.netMini, hasNetSpeed ? netPercent : 0);
 
-  fields.cpuMeta.textContent = "";
-  fields.memMeta.textContent = formatBytes(mem.total || 0);
-  fields.diskMeta.textContent = formatDiskMeta(node, stats, diskAgg.total);
-  fields.netMeta.textContent = `↑ ${formatRate(net.tx_bytes_per_sec)} · ↓ ${formatRate(
-    net.rx_bytes_per_sec
-  )}`;
+  setText(fields.cpuMeta, "");
+  setText(fields.memMeta, formatBytes(mem.total || 0));
+  setText(fields.diskMeta, formatDiskMeta(node, stats, diskAgg));
+  // 每个方向内部用不换行空格连接，窄卡换行只发生在「·」处，不把数值与单位拆开
+  const nowrap = (text) => text.replace(/ /g, "\u00a0");
+  setText(
+    fields.netMeta,
+    `${nowrap(`↑ ${formatRate(net.tx_bytes_per_sec)}`)} · ${nowrap(`↓ ${formatRate(net.rx_bytes_per_sec)}`)}`
+  );
 
   card._nodeId = nodeId;
   card._lastNode = node;
 
   const uptimeText = formatUptime(stats.uptime_sec || 0);
-  fields.uptime.textContent = `${t("runningPrefix")} ${uptimeText}`;
-  fields.lastSeen.textContent = `${t("updatedPrefix")} ${formatTime(node.last_seen || 0)}`;
-  fields.summaryUptime.textContent = `${t("runningPrefix")} ${uptimeText}`;
-  fields.summaryTests.textContent = formatRemainingSummary(
-    node.expire_at || 0,
-    node.auto_renew,
-    node.renew_interval_sec || 0
+  // P-04（第 5 轮）：卡片底部「已运行」已删除，运行时间只在详情与 summary 右列显示
+  // E-06 / Check 2：前缀（本地化文案）与时间拆 span，时间走 .num 等宽，前缀保持 UI 字体
+  setText(fields.lastSeen.querySelector(".last-seen-label"), `${t("updatedPrefix")} `);
+  setText(fields.lastSeen.querySelector(".num"), formatTime(node.last_seen || 0));
+  setText(fields.summaryUptime.querySelector(".uptime-label"), `${t("runningPrefix")} `);
+  setText(fields.summaryUptime.querySelector(".num"), uptimeText);
+  setText(
+    fields.summaryTests,
+    formatRemainingSummary(node.expire_at || 0, node.auto_renew, node.renew_interval_sec || 0)
   );
 
-  fields.detailStatus.textContent = status;
-  fields.detailUptime.textContent = uptimeText;
-  fields.detailArch.textContent = stats.arch || "--";
-  fields.detailOS.textContent = stats.os || "--";
-  fields.detailCPU.textContent = formatCPUModel(cpu);
-  fields.detailGPU.textContent = formatGPUDetails(stats.gpu);
-  fields.detailLoad.textContent = formatLoad(cpu);
-  fields.detailMem.textContent = `${formatBytes(mem.used)} / ${formatBytes(
+  setDetailText(fields.detailStatus, status);
+  setDetailText(fields.detailUptime, uptimeText);
+  setDetailText(fields.detailArch, stats.arch || "--");
+  setDetailText(fields.detailOS, stats.os || "--");
+  setDetailText(fields.detailCPU, formatCPUModel(cpu));
+  setDetailText(fields.detailGPU, formatGPUDetails(stats.gpu));
+  setDetailText(fields.detailLoad, formatLoad(cpu));
+  setDetailText(fields.detailMem, `${formatBytes(mem.used)} / ${formatBytes(
     mem.total
-  )}`;
-  fields.detailDisk.textContent = `${formatBytes(diskAgg.used)} / ${formatBytes(
-    diskAgg.total
-  )} ${formatDiskType(node, stats)}`;
-  fields.detailRegion.textContent = formatRegion(node.region);
-  fields.detailRemaining.textContent = formatRemaining(
+  )}`);
+  // P-05（第 5 轮）：类型未填时不再追加「未知」占位，只显示「已用 / 总量」
+  const diskTypeLabel = formatDiskType(node, stats);
+  setDetailText(
+    fields.detailDisk,
+    `${formatBytes(diskAgg.used)} / ${formatBytes(diskAgg.total)}${
+      diskTypeLabel ? ` ${diskTypeLabel}` : ""
+    }`
+  );
+  setDetailText(fields.detailRegion, formatRegion(node.region));
+  // P-04（第 5 轮）：地区未设置（原显示「—」）时整行隐藏
+  setDetailRowHidden(fields.detailRegion, !String(node.region || "").trim());
+  const remainingText = formatRemaining(
     node.expire_at || 0,
     node.auto_renew,
     node.renew_interval_sec || 0
   );
-  fields.detailUpload.textContent = formatBytes(net.bytes_sent);
-  fields.detailDownload.textContent = formatBytes(net.bytes_recv);
-  fields.detailFirst.textContent = formatTimeFull(node.first_seen || 0);
-  fields.detailLast.textContent = formatTimeFull(node.last_seen || 0);
+  setDetailText(fields.detailRemaining, remainingText);
+  // P-04（第 5 轮）：剩余时间未设置（原显示「未设置」）时整行隐藏
+  setDetailRowHidden(fields.detailRemaining, remainingText === t("unset"));
+  // 0.1.2 E-06：剩余时间只在为数值（时长，数字开头）时用 .num；
+  // 未设置 / 已到期 / 续费中 这类状态文案回落 UI 字体
+  fields.detailRemaining.classList.toggle("num", /^[0-9]/.test(remainingText));
+  setDetailText(fields.detailUpload, formatBytes(net.bytes_sent));
+  setDetailText(fields.detailDownload, formatBytes(net.bytes_recv));
+  setDetailText(fields.detailFirst, formatTimeFull(node.first_seen || 0));
+  setDetailText(fields.detailLast, formatTimeFull(node.last_seen || 0));
   updateTestHistory(nodeId, tests);
 
   const historySignature = buildCardHistorySignature(node, nodeId);
@@ -2638,7 +2968,11 @@ function hasConfiguredNetworkTestPolicy(node) {
   if (Array.isArray(node.test_selections) && node.test_selections.length > 0) {
     return true;
   }
-  return false;
+  // Agent 以 -net-tests 启动参数配置探测项时，服务端不落 test_selections，
+  // 但上报结果里带 network_tests。只认 test_selections 会让这些节点整块
+  // 「网络连通性」区域被隐藏，曲线图随之消失。
+  const reported = node.stats?.network_tests;
+  return Array.isArray(reported) && reported.length > 0;
 }
 
 function clearNetworkSection(fields) {
@@ -2652,12 +2986,12 @@ function clearNetworkSection(fields) {
 
 function renderNetworkLoadingState(fields) {
   resetNetworkChartInteractions(fields);
+  // P-10 加载态：骨架结构，无可见文字（文案转由 aria-label 提供给读屏）；扫光动画留 S5
   fields.testChart.replaceChildren(parseMarkup(`
-    <div class="network-loading-state">
+    <div class="network-loading-state" role="status" aria-label="${t("networkLoading")}">
       <span></span>
       <span></span>
       <span></span>
-      <strong>${t("networkLoading")}</strong>
     </div>
   `));
   fields.testCards.innerHTML = "";
@@ -2671,10 +3005,10 @@ function resetNetworkChartInteractions(fields) {
     }
     fields.testChart.onmousemove = null;
   }
-  if (fields.testSmooth) {
-    fields.testSmooth.disabled = true;
-    fields.testSmooth.classList.remove("active");
-    fields.testSmooth.setAttribute("aria-pressed", "false");
+  if (fields.testClip) {
+    fields.testClip.disabled = true;
+    fields.testClip.classList.remove("active");
+    fields.testClip.setAttribute("aria-pressed", "false");
   }
   if (fields.testTooltip) {
     fields.testTooltip.classList.remove("visible");
@@ -2686,10 +3020,18 @@ function resetNetworkChartInteractions(fields) {
 
 function renderNetworkHistoryErrorChart(fields) {
   resetNetworkChartInteractions(fields);
+  // P-12 错误态：--danger-tint 图标方块 + 标题 + 说明（0.1.2：不做重试按钮）
   fields.testChart.replaceChildren(parseMarkup(`
     <div class="network-empty-state" role="status" aria-live="polite" aria-label="${t("historyErrorLabel")}">
+      <span class="state-icon-block is-error" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path>
+          <path d="M12 9v4"></path>
+          <path d="M12 17h.01"></path>
+        </svg>
+      </span>
       <strong>${t("historyErrorTitle")}</strong>
-      <span>${t("historyErrorBody")}</span>
+      <span class="state-sub">${t("historyErrorBody")}</span>
     </div>
   `));
 }
@@ -2784,7 +3126,7 @@ function buildCardHistorySignature(node, nodeId) {
     hasConfiguredNetworkTestPolicy(node) ? "1" : "0",
     Array.isArray(stats?.network_tests) ? stats.network_tests.length : 0,
     activeRange,
-    state.testSmooth.get(nodeId) ? "1" : "0",
+    state.testClip.get(nodeId) ? "1" : "0",
     latestHistoryAt,
   ].join("|");
 }
@@ -2804,12 +3146,13 @@ function renderNetworkSection(fields, nodeId) {
     baseTests.length > 0
       ? baseTests
       : buildTestsFromHistory(renderHistoryMap);
-  const smoothEnabled = Boolean(state.testSmooth.get(nodeId));
+  const clipEnabled = Boolean(state.testClip.get(nodeId));
   renderRangeTabs(fields, activeRange);
-  renderSmoothToggle(fields, nodeId, smoothEnabled);
+  renderClipToggle(fields, nodeId, clipEnabled);
   fields.testCards.innerHTML = "";
 
   const seriesList = [];
+  const seriesRawValues = [];
   const colors = [];
   const labels = [];
   const now = Math.floor(Date.now() / 1000);
@@ -2861,11 +3204,15 @@ function renderNetworkSection(fields, nodeId) {
       minGapSec: interpolationBaseGap,
       maxGapSecCap: Math.max(interpolationBaseGap * 6, 60),
     });
-    const latencySeries = smoothEnabled
-      ? applyEWMA(interpolatedLatency, LATENCY_SMOOTH_ALPHA)
-      : interpolatedLatency.slice();
+    // P-03（第 5 轮）：削峰（D-01 默认关闭）替换原 EWMA 平滑。
+    // raw 记录被替换点的原始值，供 tooltip 显示「削峰后值（原始 原始值）」
+    const clipped = clipEnabled
+      ? clipLatencySpikes(interpolatedLatency)
+      : { series: interpolatedLatency.slice(), raw: new Map() };
+    const latencySeries = clipped.series;
     if (entry.focused && hasSeriesData(latencySeries)) {
       seriesList.push(latencySeries);
+      seriesRawValues.push(clipped.raw);
       colors.push(entry.color);
       labels.push(entry.label);
     }
@@ -2929,6 +3276,7 @@ function renderNetworkSection(fields, nodeId) {
     colors,
     timeSeries,
     fields.testChart ? Math.max(320, Math.round(fields.testChart.clientWidth)) : 680,
+    seriesRawValues,
   );
   fields.testChart.replaceChildren(parseMarkup(chart.svg));
   setupLatencyHover(fields, chart.meta, labels);
@@ -2952,18 +3300,18 @@ function buildRenderedTestGrid(rangeKey, rangeSec, rangeEndSec, testEntries) {
   );
 }
 
-function renderSmoothToggle(fields, nodeId, enabled) {
-  const button = fields.testSmooth;
+function renderClipToggle(fields, nodeId, enabled) {
+  const button = fields.testClip;
   if (!button) return;
   button.disabled = false;
   button.classList.toggle("active", enabled);
   button.setAttribute("aria-pressed", enabled ? "true" : "false");
   button.onclick = () => {
-    const next = !Boolean(state.testSmooth.get(nodeId));
+    const next = !Boolean(state.testClip.get(nodeId));
     if (next) {
-      state.testSmooth.set(nodeId, true);
+      state.testClip.set(nodeId, true);
     } else {
-      state.testSmooth.delete(nodeId);
+      state.testClip.delete(nodeId);
     }
     renderNetworkSection(fields, nodeId);
   };
@@ -3195,23 +3543,66 @@ function resolveLatencyInterpolationGapSec(times, validIndices, options = {}) {
   return Math.min(derivedGapSec * multiplier, maxGapSecCap);
 }
 
-function applyEWMA(series, alpha = LATENCY_SMOOTH_ALPHA) {
-  if (!Array.isArray(series) || series.length === 0) {
-    return [];
-  }
-  const normalizedAlpha = Math.min(Math.max(Number(alpha) || 0, 0.05), 1);
-  const result = [];
-  let carry = null;
-  series.forEach((value) => {
-    const numeric = normalizeNumber(value);
-    if (numeric === null) {
-      result.push(null);
-      return;
+// P-03（第 5 轮）：Hampel 滤波削峰 —— 只削孤立的向上尖峰；连续劣化保留。
+// 返回 { series, raw }，raw 为 Map<index, 原始值>，仅包含被替换的点。
+// 算法：对每个非 null 点取 [i-half, i+half] 窗口（window=7）内的非 null 值（不足 3 个跳过），
+// 求中位数 med 与 MAD；阈值 t = max(k * 1.4826 * MAD, floorMs, med * 0.5)；
+// x_i - med > t 标记越限；窗口内越限点数 > 窗口内非 null 点数的一半视为持续劣化不替换；
+// 否则替换为 med 并记录 raw。只削向上的值，不修改向下的值、不修改 null。
+function clipLatencySpikes(series, { window = 7, k = 3, floorMs = 5 } = {}) {
+  const half = Math.max(1, Math.floor(Number(window) / 2));
+  const values = Array.isArray(series) ? series : [];
+  const result = values.slice();
+  const raw = new Map();
+  const marks = new Array(values.length).fill(null);
+
+  const medianOf = (list) => {
+    const sorted = list.slice().sort((left, right) => left - right);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2
+      ? sorted[mid]
+      : (sorted[mid - 1] + sorted[mid]) / 2;
+  };
+
+  for (let i = 0; i < values.length; i += 1) {
+    const x = normalizeNumber(values[i]);
+    if (x === null) continue;
+    const windowValues = [];
+    for (
+      let j = Math.max(0, i - half);
+      j <= Math.min(values.length - 1, i + half);
+      j += 1
+    ) {
+      const v = normalizeNumber(values[j]);
+      if (v !== null) windowValues.push(v);
     }
-    carry = carry === null ? numeric : carry + normalizedAlpha * (numeric - carry);
-    result.push(carry);
-  });
-  return result;
+    if (windowValues.length < 3) continue;
+    const med = medianOf(windowValues);
+    const mad = medianOf(windowValues.map((v) => Math.abs(v - med)));
+    const threshold = Math.max(k * 1.4826 * mad, floorMs, med * 0.5);
+    marks[i] = { med, outlier: x - med > threshold };
+  }
+
+  for (let i = 0; i < values.length; i += 1) {
+    const mark = marks[i];
+    if (!mark || !mark.outlier) continue;
+    let outlierCount = 0;
+    let nonNullCount = 0;
+    for (
+      let j = Math.max(0, i - half);
+      j <= Math.min(values.length - 1, i + half);
+      j += 1
+    ) {
+      if (normalizeNumber(values[j]) === null) continue;
+      nonNullCount += 1;
+      if (marks[j] && marks[j].outlier) outlierCount += 1;
+    }
+    if (outlierCount > nonNullCount / 2) continue;
+    raw.set(i, values[i]);
+    result[i] = mark.med;
+  }
+
+  return { series: result, raw };
 }
 
 function updateTestHistory(nodeId, tests) {
@@ -3297,7 +3688,25 @@ function updateTestHistory(nodeId, tests) {
   }
 }
 
-function buildLatencyChart(seriesList, colors, times, chartWidth) {
+// 图表实例计数：每个卡片的 <defs> 渐变 id 需要全页唯一，避免多卡相互引用错乱
+let latencyChartUid = 0;
+
+// E-09：延迟图表空态 —— 居中 activity 图标 + 主副文案 + 淡网格背景（样式见 styles.css）
+function latencyEmptyStateHTML() {
+  return `
+    <div class="sparkline-empty" role="status">
+      <span class="state-icon-block" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"></path>
+        </svg>
+      </span>
+      <strong>${t("latencyEmptyTitle")}</strong>
+      <span class="state-sub">${t("latencyEmptyBody")}</span>
+    </div>
+  `;
+}
+
+function buildLatencyChart(seriesList, colors, times, chartWidth, rawValues) {
 
   const width = chartWidth > 0 ? chartWidth : 680;
   const height = 220;
@@ -3306,7 +3715,7 @@ function buildLatencyChart(seriesList, colors, times, chartWidth) {
     .map((series) => (Array.isArray(series) ? series : []))
     .filter((series) => series.length > 0);
   if (!normalized.length) {
-    return { svg: '<div class="sparkline-empty">--</div>', meta: null };
+    return { svg: latencyEmptyStateHTML(), meta: null };
   }
 
   let maxLen = 0;
@@ -3320,7 +3729,7 @@ function buildLatencyChart(seriesList, colors, times, chartWidth) {
     .filter((value) => value !== null && value !== undefined && Number.isFinite(value));
   const yScale = computeLatencyYTicks(flatValues);
   if (!yScale) {
-    return { svg: '<div class="sparkline-empty">--</div>', meta: null };
+    return { svg: latencyEmptyStateHTML(), meta: null };
   }
   const { ticks: yTicks, maxValue } = yScale;
 
@@ -3352,6 +3761,10 @@ function buildLatencyChart(seriesList, colors, times, chartWidth) {
       )}</text>`
     : "";
 
+  latencyChartUid += 1;
+  const chartUid = latencyChartUid;
+  const areaDefs = [];
+  const areas = [];
   const lines = paddedSeries
     .map((series, idx) => {
       const path = buildLinePath(
@@ -3364,17 +3777,46 @@ function buildLatencyChart(seriesList, colors, times, chartWidth) {
       );
       if (!path) return "";
       const color = colors[idx] || "#4f7cff";
-      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.2" />`;
+      // P-10 第 3 条：线下 12% 同色渐变填充（linearGradient 从线色到透明）
+      const gradientId = `latency-area-${chartUid}-${idx}`;
+      areaDefs.push(
+        `<linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">` +
+          `<stop offset="0" stop-color="${color}" stop-opacity="0.12" />` +
+          `<stop offset="1" stop-color="${color}" stop-opacity="0" />` +
+          `</linearGradient>`
+      );
+      const areaPath = buildAreaPath(
+        series,
+        stepX,
+        padding,
+        plotWidth,
+        plotHeight,
+        maxValue
+      );
+      if (areaPath) {
+        areas.push(
+          `<path class="latency-area" d="${areaPath}" fill="url(#${gradientId})" />`
+        );
+      }
+      return `<path d="${path}" fill="none" stroke="${color}" stroke-width="1.75" />`;
     })
     .join("");
 
   const svg = `
     <svg class="latency-chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+      <defs>${areaDefs.join("")}</defs>
       <g class="latency-grid">${gridLines.join("")}</g>
       <g class="latency-axis">${yLabels.join("")}${xLabels}</g>
+      <g class="latency-areas">${areas.join("")}</g>
       <g class="latency-lines">${lines}</g>
     </svg>
   `;
+  // P-03（第 5 轮）：rawValues[idx] 是该序列被削峰替换点的 Map<原序列 index, 原始值>。
+  // padSeries 在序列头部补 null，offset 记录补齐量，tooltip 用 padded 索引换算回原索引。
+  const rawMeta = normalized.map((series, idx) => ({
+    offset: Math.max(0, maxLen - series.length),
+    raw: Array.isArray(rawValues) && rawValues[idx] instanceof Map ? rawValues[idx] : null,
+  }));
   return {
     svg,
     meta: {
@@ -3386,6 +3828,7 @@ function buildLatencyChart(seriesList, colors, times, chartWidth) {
       plotHeight,
       width,
       colors: colors.slice(),
+      rawValues: rawMeta,
     },
   };
 }
@@ -3530,7 +3973,17 @@ function buildLatencyTooltipRows(meta, labels, hoverIndex) {
       if (value === null || value === undefined) return null;
       const color = meta.colors[idx] || "#4f7cff";
       const name = labels[idx] || t("unnamed");
-      return { color, name, value: formatLatency(value) };
+      // P-03（第 5 轮）：该点被削峰替换时，显示「削峰后值（原始 原始值）」
+      const rawMeta = Array.isArray(meta.rawValues) ? meta.rawValues[idx] : null;
+      const rawValue =
+        rawMeta && rawMeta.raw instanceof Map
+          ? rawMeta.raw.get(hoverIndex - rawMeta.offset)
+          : undefined;
+      const valueText =
+        rawValue === undefined
+          ? formatLatency(value)
+          : `${formatLatency(value)}（原始 ${formatLatency(rawValue)}）`;
+      return { color, name, value: valueText };
     })
     .filter(Boolean)
 }
@@ -3655,6 +4108,43 @@ function buildLinePath(series, stepX, padding, plotWidth, plotHeight, maxValue) 
       ? `L${x.toFixed(1)},${y.toFixed(1)}`
       : `M${x.toFixed(1)},${y.toFixed(1)}`;
     segment.push(command);
+  });
+  flushSegment();
+  return segments.join(" ");
+}
+
+// P-10 第 3 条：折线下方的渐变填充区域 —— 沿折线闭合到绘图区底边；
+// 与 buildLinePath 同一套坐标换算，单点线段无法构成面积，直接跳过
+function buildAreaPath(series, stepX, padding, plotWidth, plotHeight, maxValue) {
+  const baseline = (padding.top + plotHeight).toFixed(1);
+  const segments = [];
+  let segment = [];
+  let firstX = 0;
+  let lastX = 0;
+
+  const flushSegment = () => {
+    if (segment.length > 1) {
+      segments.push(
+        `${segment.join(" ")} L${lastX.toFixed(1)},${baseline} L${firstX.toFixed(1)},${baseline} Z`
+      );
+    }
+    segment = [];
+  };
+
+  series.forEach((value, index) => {
+    if (value === null || value === undefined) {
+      flushSegment();
+      return;
+    }
+    const x = padding.left + index * stepX;
+    const y = padding.top + plotHeight - (value / maxValue) * plotHeight;
+    if (!segment.length) {
+      firstX = x;
+    }
+    lastX = x;
+    segment.push(
+      `${segment.length ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`
+    );
   });
   flushSegment();
   return segments.join(" ");
@@ -3828,6 +4318,44 @@ function formatCPUModel(cpu) {
   return parts.length ? parts.join(" · ") : "--";
 }
 
+// P-08 第 3 条（0.1.2 裁定）：阈值只用于样式 —— 写宽度的同时维护所属指标块的
+// dataset.level（≥90 为 hot、≥80 为 warn、否则删除），CSS 按 [data-level] 着色
+function setMetricLevel(miniEl, percent) {
+  const block = miniEl?.closest(".summary-metric");
+  if (!block) return;
+  if (percent >= 90) {
+    block.dataset.level = "hot";
+  } else if (percent >= 80) {
+    block.dataset.level = "warn";
+  } else {
+    delete block.dataset.level;
+  }
+}
+
+// P-09：「--」空值占位显示为全角破折号「—」并用 .empty-value（--label-4）降噪；
+// 长值完整内容放 title（CSS line-clamp: 2 截断）
+function setDetailText(el, text) {
+  if (!el) return;
+  const value = String(text ?? "");
+  const empty = value === "--";
+  setText(el, empty ? "—" : value);
+  el.classList.toggle("empty-value", empty);
+  if (empty) {
+    el.removeAttribute("title");
+  } else {
+    el.title = value;
+  }
+}
+
+// P-04（第 5 轮）：值为空的字段整行隐藏（不显示占位）。由渲染函数判断，
+// 不用 CSS 隐藏；行内 display 由 JS 设置 / 清空（.info-row 的 display:flex
+// 会覆盖 [hidden] 的 UA 样式，故不用 hidden 属性）
+function setDetailRowHidden(el, hidden) {
+  if (!el) return;
+  const row = el.closest(".info-row");
+  if (row) row.style.display = hidden ? "none" : "";
+}
+
 function formatGPUSummaryMeta(gpus) {
   const items = Array.isArray(gpus) ? gpus : [];
   if (items.length === 0) {
@@ -3886,17 +4414,18 @@ function stripCPUFrequency(raw) {
   return value.replace(/\s*\d+(?:\.\d+)?\s*GHz$/i, "").trim();
 }
 
+// P-05（第 5 轮）：未填磁盘类型时返回空串，不再显示「未知」占位
 function formatDiskType(node, stats) {
   const raw = (node?.disk_type || stats?.disk_type || "").trim();
-  return raw || t("unknown");
+  return raw;
 }
 
-function formatDiskMeta(node, stats, total) {
+// P-05（第 5 轮）：摘要改为「已用 / 总量」（数据来自 aggregateDisk，与百分比同源，D-02）；
+// 填了类型时「NVMe · 651 GB / 994 GB」，未填只显示容量
+function formatDiskMeta(node, stats, agg) {
   const typeLabel = formatDiskType(node, stats);
-  if (Number.isFinite(total) && total > 0) {
-    return `${typeLabel} · ${formatBytes(total)} ${t("totalSuffix")}`;
-  }
-  return typeLabel;
+  const capacity = `${formatBytes(agg?.used || 0)} / ${formatBytes(agg?.total || 0)}`;
+  return typeLabel ? `${typeLabel} · ${capacity}` : capacity;
 }
 
 function calcNetPercent(net, speedMbps) {
@@ -4092,6 +4621,19 @@ updateFooter();
 loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);
 startPublicSnapshotFallbackPolling();
+
+// 标签页被浏览器冻结/丢弃过定时器后，切回前台要立刻补一次渲染与快照，
+// 不能等下一个轮询周期；顺带把可能已静默的 socket 重新连上。
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    return;
+  }
+  scheduleRender();
+  if (!hasHealthySocket()) {
+    void fetchPublicSnapshot();
+    connectWS();
+  }
+});
 
 fetchPublicSnapshot().finally(() => {
   connectWS();
