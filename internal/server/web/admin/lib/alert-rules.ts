@@ -60,6 +60,29 @@ const ALERT_METRIC_SPEC_MAP = new Map(ALERT_METRIC_SPECS.map((spec) => [spec.val
 // 与后端 defaultExpiryLeadDay* 一致的默认提醒点。
 export const DEFAULT_EXPIRY_LEAD_DAYS = [7, 3, 1];
 
+// 与后端 defaultAlertRuleRatio 一致：窗口内越限时间占比门槛。UI 不暴露该值，
+// 但抽屉说明与条件文案按规则实际值展示（老规则缺省为 0.7）。
+export const DEFAULT_ALERT_RULE_RATIO = 0.7;
+
+export function normalizeRuleRatio(value: number | undefined | null): number {
+  const ratio = Number(value);
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    return DEFAULT_ALERT_RULE_RATIO;
+  }
+  return Math.min(1, ratio);
+}
+
+// 告警门槛（%）与恢复门槛（%）：恢复门槛 = min(1-ratio, ratio/2)，与后端
+// ruleRecoverMaxRatio 同一公式（ratio=0.7 → 告警 70%、恢复 30%）。
+export function ruleAlertRatioPct(rule: AlertRuleDraft): number {
+  return Math.round(normalizeRuleRatio(rule.ratio) * 100);
+}
+
+export function ruleRecoverRatioPct(rule: AlertRuleDraft): number {
+  const ratio = normalizeRuleRatio(rule.ratio);
+  return Math.round(Math.min(1 - ratio, ratio / 2) * 100);
+}
+
 // 持续时间选项（F4 定稿：立即 / 1 / 3 / 5 / 10 / 30 分钟）。
 const RULE_DURATION_OPTIONS: Array<{ value: string; minutes: number; label: string }> = [
   { value: "0", minutes: 0, label: "立即" },
@@ -135,6 +158,9 @@ export type AlertRuleDraft = {
   op: string;
   threshold: string;
   durationSec: number;
+  // 窗口内越限时间占比门槛（后端 ratio，缺省 0.7）。UI 不提供编辑器，只在
+  // 抽屉说明与条件文案里按实际值展示，保存时原样回传不丢信息。
+  ratio: number;
   scopeMode: "all" | "include";
   scopeNodes: string[];
   scopeGroups: string[];
@@ -163,6 +189,7 @@ export function makeRuleDraft(rule: AlertRule): AlertRuleDraft {
     op: rule.op === "lt" ? "lt" : "gt",
     threshold: alertThresholdToInput(metric, rule.threshold),
     durationSec: Math.max(0, Math.round(Number(rule.duration_sec || 0))),
+    ratio: normalizeRuleRatio(rule.ratio),
     scopeMode: rule.scope?.mode === "include" ? "include" : "all",
     scopeNodes: [...(rule.scope?.nodes || [])],
     scopeGroups: [...(rule.scope?.groups || [])],
@@ -212,6 +239,7 @@ export function buildRulePayload(draft: AlertRuleDraft): AlertRule {
     op: draft.op === "lt" ? "lt" : "gt",
     threshold,
     duration_sec: draft.durationSec,
+    ratio: draft.ratio,
     scope,
     channel_ids: draft.channelIds.length > 0 ? draft.channelIds : undefined,
     notify_recover: draft.notifyRecover,
@@ -294,7 +322,8 @@ export function ruleConditionText(rule: AlertRuleDraft): string {
   const probeSuffix = spec.needsProbe && rule.probeName ? `（${rule.probeName}）` : "";
   let condition = `${spec.label}${probeSuffix} ${op} ${thresholdText}`;
   if (rule.durationSec > 0) {
-    condition += ` · 持续 ${Math.round(rule.durationSec / 60)} 分钟`;
+    // 窗口类规则判的是“窗口内越限时间占比”，不是连续越限：不说「持续」。
+    condition += ` · 近 ${Math.max(1, Math.round(rule.durationSec / 60))} 分钟内 ${ruleAlertRatioPct(rule)}% 时间越限`;
   }
   return condition;
 }

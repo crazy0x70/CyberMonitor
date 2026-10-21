@@ -26,9 +26,9 @@ export const adminSectionHeaderClass =
 
 export const adminMutedTextClass = "text-[var(--label-2)]";
 
-// A-06 第 6 条：错误文字 12px --danger，前置 12px exclamationmark.circle 图标（currentColor 着色）
+// A-06 第 6 条：错误文字 12px --danger-text，前置 12px exclamationmark.circle 图标（currentColor 着色）
 export const adminFieldErrorClass =
-  "flex items-start gap-1.5 text-xs font-medium leading-relaxed text-[var(--danger)] before:mt-px before:inline-block before:size-3 before:shrink-0 before:bg-current before:content-[''] before:[mask-image:url('data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2024%2024%27%20fill=%27none%27%20stroke=%27black%27%20stroke-width=%272%27%20stroke-linecap=%27round%27%20stroke-linejoin=%27round%27%3E%3Ccircle%20cx=%2712%27%20cy=%2712%27%20r=%2710%27%2F%3E%3Cline%20x1=%2712%27%20y1=%278%27%20x2=%2712%27%20y2=%2712%27%2F%3E%3Cline%20x1=%2712%27%20y1=%2712.01%27%20x2=%2712%27%20y2=%2716%27%2F%3E%3C/svg%3E')] before:[mask-size:100%_100%] before:[mask-repeat:no-repeat]";
+  "flex items-start gap-1.5 text-xs font-medium leading-relaxed text-[var(--danger-text)] before:mt-px before:inline-block before:size-3 before:shrink-0 before:bg-current before:content-[''] before:[mask-image:url('data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2024%2024%27%20fill=%27none%27%20stroke=%27black%27%20stroke-width=%272%27%20stroke-linecap=%27round%27%20stroke-linejoin=%27round%27%3E%3Ccircle%20cx=%2712%27%20cy=%2712%27%20r=%2710%27%2F%3E%3Cline%20x1=%2712%27%20y1=%278%27%20x2=%2712%27%20y2=%2712%27%2F%3E%3Cline%20x1=%2712%27%20y1=%2712.01%27%20x2=%2712%27%20y2=%2716%27%2F%3E%3C/svg%3E')] before:[mask-size:100%_100%] before:[mask-repeat:no-repeat]";
 
 export const adminHelpTextClass =
   "text-xs leading-relaxed text-[var(--label-2)]";
@@ -87,9 +87,9 @@ export const adminActionButtonClass =
 export const adminCompactActionButtonClass =
   `${adminOutlineButtonClass} inline-flex items-center justify-center gap-1.5 h-9 whitespace-nowrap px-4 text-xs font-medium leading-none`;
 
-// A-05 危险按钮：次级按钮外观 + --danger 字，悬停 --danger-tint 底
+// A-05 危险按钮：次级按钮外观 + --danger-text 字，悬停 --danger-tint 底
 export const adminDangerOutlineButtonClass =
-  "h-9 rounded-full border border-[var(--hairline)] bg-[var(--mat-control-bg)] text-[var(--danger)] outline-none shadow-[inset_0_1px_0_var(--glass-edge)] [-webkit-backdrop-filter:var(--blur-ultrathin)] [backdrop-filter:var(--blur-ultrathin)] [transition:transform_var(--dur-1),scale_var(--dur-1),background-color_var(--dur-2),border-color_var(--dur-2),box-shadow_var(--dur-2)] hover:border-[var(--hairline-strong)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger)] active:scale-[0.97] focus-visible:ring-[3px] focus-visible:ring-[var(--accent-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:pointer-events-none disabled:opacity-50";
+  "h-9 rounded-full border border-[var(--hairline)] bg-[var(--mat-control-bg)] text-[var(--danger-text)] outline-none shadow-[inset_0_1px_0_var(--glass-edge)] [-webkit-backdrop-filter:var(--blur-ultrathin)] [backdrop-filter:var(--blur-ultrathin)] [transition:transform_var(--dur-1),scale_var(--dur-1),background-color_var(--dur-2),border-color_var(--dur-2),box-shadow_var(--dur-2)] hover:border-[var(--hairline-strong)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger-text)] active:scale-[0.97] focus-visible:ring-[3px] focus-visible:ring-[var(--accent-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:pointer-events-none disabled:opacity-50";
 
 // A-05 文字按钮：无底无框 --accent-text 字，悬停出现 --accent-tint 胶囊底，箭头悬停 translateX(2px)
 export const adminTextButtonClass =
@@ -155,9 +155,9 @@ export const adminSidebarIconButtonClass =
 export const adminThemeToggleButtonClass =
   "h-9 w-9 rounded-full border border-[var(--hairline)] bg-[var(--mat-control-bg)] text-[var(--label-2)] shadow-[inset_0_1px_0_var(--glass-edge)] outline-none [backdrop-filter:var(--blur-ultrathin)] transition-[background-color,color] duration-[var(--dur-2)] hover:bg-[rgba(255,255,255,0.85)] hover:text-[var(--label-1)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] dark:hover:bg-[rgba(255,255,255,0.12)] dark:hover:text-[var(--label-1)]";
 
-// A-02 底部工具区「退出登录」：与一级菜单项同规格的 32px 行，悬停文字图标转 --danger
+// A-02 底部工具区「退出登录」：与一级菜单项同规格的 32px 行，悬停文字图标转 --danger-text
 export const adminSidebarSecondaryButtonClass =
-  "h-8 w-full justify-start rounded-[var(--r-sm)] px-2.5 text-[13px] font-medium text-[var(--label-2)] outline-none transition-colors duration-[var(--dur-2)] hover:bg-[rgba(0,0,0,0.04)] hover:text-[var(--danger)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] dark:hover:bg-[rgba(255,255,255,0.06)] dark:hover:text-[var(--danger)]";
+  "h-8 w-full justify-start rounded-[var(--r-sm)] px-2.5 text-[13px] font-medium text-[var(--label-2)] outline-none transition-colors duration-[var(--dur-2)] hover:bg-[rgba(0,0,0,0.04)] hover:text-[var(--danger-text)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] dark:hover:bg-[rgba(255,255,255,0.06)] dark:hover:text-[var(--danger-text)]";
 
 export const adminSubtleOutlineBadgeClass =
   "border-slate-200/80 text-slate-500 dark:border-neutral-700/80 dark:text-neutral-400";

@@ -7,6 +7,7 @@
 ## 功能
 
 - **实时状态页**：每秒刷新每台节点的在线状态、CPU、内存、磁盘、GPU 和网络，并提供 TCP / ICMP 延迟与丢包曲线（1 小时 / 1 天 / 1 周）。支持深浅色主题和中英文。
+- **AI 运维助手**：用自然语言询问整个集群的情况；它参考的快照里包含每台节点最近 1 小时 / 1 天 / 1 周的 CPU、内存和网络历史摘要。
 - **管理后台**：节点分组和标签、到期时间、每月流量配额，以及按节点选择要执行的探测。
 - **告警**：可对 CPU、内存、磁盘、GPU、带宽、连接数、探测延迟 / 丢包、到期和流量配额设置规则，另有节点离线告警。通过 Telegram、飞书、钉钉、企业微信、Slack、Bark 或邮件通知，恢复时也会提醒。
 - **一键更新**：在管理后台更新服务端和全部 Agent。
@@ -51,7 +52,7 @@ Compose 示例见 [server-example.yml](./server-example.yml)。
 
 ### 2. 添加机器
 
-在管理后台打开 **节点管理**，**Agent 快速接入** 面板里有已经填好服务端地址和 Token 的命令，在每台要监控的机器上运行即可：
+在管理后台打开 **节点管理**，**Agent 快速接入** 面板里有已经填好服务端地址和 Token 的命令，在每台要监控的机器上运行即可。已有节点后该面板会折叠成 **接入新节点** 按钮，还没有节点时保持展开：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o one-click.sh
@@ -71,7 +72,7 @@ docker run -d --name cyber-monitor-agent --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-agent:latest
 ```
 
-几秒后节点就会出现在状态页上。Compose 示例见 [agent-example.yml](./agent-example.yml)。
+几秒后节点就会出现在状态页上。Compose 示例见 [agent-example.yml](./agent-example.yml)。Linux 上安装脚本需要 root 权限，已以 root 运行时可去掉 `sudo`。
 
 ## 升级
 
@@ -120,7 +121,7 @@ powershell -ExecutionPolicy Bypass -File .\one-click.ps1 uninstall-server -KeepD
 | 服务配置 | `/etc/cybermonitor/*.conf` | `~/CyberMonitor/etc/*.conf` | Windows 服务设置 |
 | 服务端日志 | `data/server.log`，也可在管理后台 **日志查看** 页查看 | 同左 | 同左 |
 
-备份时复制数据目录即可，里面包含设置、节点和历史数据。
+备份时复制数据目录即可，里面包含设置、节点和历史数据。历史数据按类型分目录存放：`data/history/network/`（探测延迟与丢包）、`data/history/offline/`（离线事件）、`data/history/resource/`（CPU、内存、网络，供 AI 运维助手分析）。资源历史的保留期在 **基础设置 → 系统信息 → 资源历史保留** 里选择 1 / 7 / 30 天，修改后立即生效。
 
 ## 配置
 
@@ -182,6 +183,14 @@ sudo systemctl start cyber-monitor-server
 **Agent 通过 IPv6 连不上 CDN。** 修复主机的 IPv6 路由，或把服务端域名固定到 IPv4：Docker 用 `--add-host monitor.example.com:<IPv4>`，其他情况写入 `/etc/hosts`。
 
 **把状态页放到静态托管。** 把 `internal/server/web/public/` 上传到任意静态托管，并把 `index.html` 里的 `<meta name="cm-api-base">` 改成服务端地址。
+
+**通知发送失败，提示「目标 … 是内网/保留地址，已被安全策略拒绝」。** 服务端默认拒绝解析到内网或保留地址的通知目标。常见原因有两种：服务器所在机器使用了 Clash、Surge、OpenClash 等 fake-ip 代理（公网域名被解析到 `198.18.0.0/15`），或目标本来就是内网自建服务（自建 Bark、自建 Telegram Bot API、内网 SMTP）。在该渠道的设置里开启 **允许内网地址** 即可，开关在 **通知告警 → 渠道设置** 的渠道抽屉里，所有渠道类型（含邮件）都有。
+
+**告警规则的「持续时间」怎么判定？** 持续时间是窗口统计，不是「连续越限多久」：窗口内超过约 70% 的时间越限才告警，越限时间降到约 30% 以下才恢复。两者之间是滞回带，规则保持当前状态，所以指标在阈值附近波动时不会反复发送告警和恢复通知。选 **立即** 则每次采样都判定。
+
+**迁移到新服务器。** 复制数据目录仍是推荐方式（见「文件位置」）。如果改用 **基础设置 → 系统信息 → 配置备份 → 导出配置**：导出的文件不含密钥，webhook 地址、Bot Token、邮件密码、会话 ID 和收件地址都已被清空；在新服务器导入后需要到 **通知告警 → 渠道设置** 重新填写。仍缺必填项的渠道会标出「缺少必填项」，这类渠道发不出告警。
+
+**接入命令里的地址是 localhost 或 127.0.0.1。** 未填写 Agent 对接地址时，命令里的地址取当前访问管理后台的地址，只用于生成命令，不会保存。如果 Agent 访问不到该地址（例如通过反向代理访问后台、只在本机打开后台，或内外网地址不同），请在 **基础设置 → 接入配置** 填写 **Agent 对接地址**；地址仅本机可达时页面也会提示。分端口模式（`-public-listen`）下，建议值使用展示页端口。
 
 ## 从源码构建
 

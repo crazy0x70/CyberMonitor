@@ -69,11 +69,13 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 	// 公开流量饱和时管理后台仍能建连。
 	publicWSQuota := newPublicWSQuota(publicWSPerIPLimit, publicWSGlobalLimit)
 
-	// 分端口模式下，Agent 接入点为空时用 public 端口地址兜底（settings/export/import 统一走这里）。
-	fillAgentEndpoint := func(view *SettingsView) {
-		if splitMode && strings.TrimSpace(view.AgentEndpoint) == "" {
-			view.AgentEndpoint = cfg.PublicAddr
+	// 推断的 Agent 对接地址只用于展示与生成安装命令；不写回 agent_endpoint、
+	// 不导出（推断值一旦被回传保存会因不是合法 URL 或与部署不符而报错）。
+	fillAgentEndpointSuggestion := func(r *http.Request, view *SettingsView) {
+		if view == nil || strings.TrimSpace(view.AgentEndpoint) != "" {
+			return
 		}
+		view.AgentEndpointSuggestion = suggestAgentEndpoint(r, splitMode, cfg.PublicAddr, trustedProxyHeaders)
 	}
 
 	publicMux = http.NewServeMux()
@@ -241,7 +243,8 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 
-		rangeKey, from, to, err := parsePublicHistoryRange(r.URL.Query().Get("range"), time.Now())
+		rawRange := r.URL.Query().Get("range")
+		rangeKey, from, to, err := parsePublicHistoryRange(rawRange, time.Now())
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -347,7 +350,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 		switch r.Method {
 		case http.MethodGet:
 			view := store.SettingsView()
-			fillAgentEndpoint(&view)
+			fillAgentEndpointSuggestion(r, &view)
 			writeJSON(w, http.StatusOK, view)
 		case http.MethodPatch, http.MethodPut:
 			var update SettingsUpdate
@@ -364,7 +367,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 				return
 			}
-			fillAgentEndpoint(&view)
+			fillAgentEndpointSuggestion(r, &view)
 			if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 				log.Printf("更新设置后刷新会话 cookie 失败: %v", err)
 			}
@@ -473,7 +476,6 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		payload := store.ExportConfig()
-		fillAgentEndpoint(&payload.Settings)
 		data, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "export failed"})
@@ -505,7 +507,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		fillAgentEndpoint(&view)
+		fillAgentEndpointSuggestion(r, &view)
 		if err := refreshAdminSessionCookie(w, r, cfg.JWTSecret, store, trustedProxyHeaders); err != nil {
 			log.Printf("导入配置后刷新会话 cookie 失败: %v", err)
 		}

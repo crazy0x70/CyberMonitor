@@ -280,6 +280,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["比较符", "Operator"],
   ["持续时间", "Duration"],
   ["立即", "Immediately"],
+  ["每次采样即判定", "Judged on every sample"],
   ["请选择探测目标…", "Select a probe target..."],
   ["请选择探测目标。", "Select a probe target."],
   ["请输入规则名称。", "Enter a rule name."],
@@ -373,6 +374,12 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["多个手机号请使用逗号分隔。", "Separate multiple phone numbers with commas."],
   ["多个收件地址请使用逗号分隔。", "Separate multiple recipient addresses with commas."],
   ["停用后该渠道不再发送任何告警通知。", "When disabled, this channel no longer sends alert notifications."],
+  // 渠道抽屉「允许内网地址」开关（后端按 Config["allow_private"] 选择校验与发送客户端）。
+  ["允许内网地址", "Allow private network addresses"],
+  [
+    "目标解析到内网或保留地址时放行；仅对可信目标开启。",
+    "Allow targets that resolve to private or reserved addresses. Enable only for trusted targets.",
+  ],
   ["请输入 Bot Token。", "Enter the bot token."],
   ["请输入至少一个会话 ID。", "Enter at least one chat ID."],
   ["请输入 Webhook 地址。", "Enter the webhook URL."],
@@ -401,32 +408,32 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["确认删除分组？", "Delete this group?"],
   ["暂无标签", "No tags yet"],
   ["删除标签", "Delete tag"],
-  ["探测节点名称不能为空。", "Probe name cannot be empty."],
-  ["探测节点名称包含非法字符。", "Probe name contains invalid characters."],
-  ["探测节点地址不能为空。", "Probe target cannot be empty."],
-  ["探测节点地址格式不正确。", "Probe target format is invalid."],
+  ["探测目标名称不能为空。", "Probe name cannot be empty."],
+  ["探测目标名称包含非法字符。", "Probe name contains invalid characters."],
+  ["探测目标地址不能为空。", "Probe target cannot be empty."],
+  ["探测目标地址格式不正确。", "Probe target format is invalid."],
   ["持续", "Continuous"],
   ["服务端探测配置已更新，当前未保存修改已保留。", "Server-side probe configuration changed. Your unsaved edits were kept."],
-  ["探测节点已添加", "Probe added"],
-  ["探测节点已更新", "Probe updated"],
-  ["探测节点已移除", "Probe removed"],
-  ["探测节点配置已保存", "Probe configuration saved"],
-  ["保存探测节点配置失败", "Failed to save probe configuration"],
-  ["新增探测节点", "Add probe"],
-  ["暂无探测节点", "No probes yet"],
-  ["未命名探测节点", "Unnamed probe"],
+  ["探测目标已添加", "Probe added"],
+  ["探测目标已更新", "Probe updated"],
+  ["探测目标已移除", "Probe removed"],
+  ["探测目标配置已保存", "Probe configuration saved"],
+  ["保存探测目标配置失败", "Failed to save probe configuration"],
+  ["新增探测目标", "Add probe"],
+  ["暂无探测目标", "No probes yet"],
+  ["未命名探测目标", "Unnamed probe"],
   ["目标", "Target"],
   ["协议", "Protocol"],
   ["间隔", "Interval"],
-  ["编辑探测节点", "Edit probe"],
+  ["编辑探测目标", "Edit probe"],
   ["名称", "Name"],
   ["类型", "Type"],
   ["目标地址", "Target address"],
   ["端口", "Port"],
   ["探测间隔（秒）", "Probe interval (seconds)"],
   ["留空或填 0 为持续探测。", "Leave blank or enter 0 for continuous probing."],
-  ["保存探测节点", "Save probe"],
-  ["确认删除探测节点？", "Delete this probe?"],
+  ["保存探测目标", "Save probe"],
+  ["确认删除探测目标？", "Delete this probe?"],
   ["按月续费", "Monthly renewal"],
   ["按季度续费", "Quarterly renewal"],
   ["按半年续费", "Half-year renewal"],
@@ -439,6 +446,12 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["服务端节点配置已更新，当前未保存修改已保留。请取消后重新打开再保存。", "Server-side node configuration changed. Your unsaved edits were kept. Cancel and reopen before saving."],
   ["请选择节点后再执行更新", "Select a node before updating"],
   ["当前 Agent 已禁用远程更新", "Remote Agent updates are disabled"],
+  // A-19②：批量 Agent 更新的原因分组（服务端 resolveAgentUpdateUnsupportedReason
+  // 的原文；没有对应词条的，例如 Docker 部署提示，保持原文）。
+  ["当前 Agent 未上报远程更新能力", "This Agent has not reported remote update capability"],
+  ["不支持远程更新", "Remote updates not supported"],
+  ["没有可远程更新的节点", "No node supports remote updates"],
+  ["下发失败", "Dispatch failed"],
   ["当前节点还没有上报 Agent 版本", "This node has not reported an Agent version"],
   ["当前 Agent 已是最新版", "Agent is already latest"],
 
@@ -462,6 +475,10 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["搜索节点", "Search nodes"],
   ["刷新节点", "Refresh nodes"],
   ["Agent 快速接入", "Quick Agent onboarding"],
+  ["接入新节点", "Connect new node"],
+  ["收起", "Collapse"],
+  ["对接地址未配置", "Agent endpoint not configured"],
+  ["当前对接地址仅本机可访问", "The current endpoint is only reachable from this host"],
   ["单击复制完整命令，拖拽可自由选择局部内容", "Click to copy the full command. Drag to select part of it."],
   ["服务器管理", "Server management"],
   ["当前还没有节点接入。", "No nodes have connected yet."],
@@ -508,11 +525,29 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["磁盘类型", "Disk type"],
   ["带宽（Mbps）", "Bandwidth (Mbps)"],
   ["探测下发策略", "Probe dispatch policy"],
-  ["请先在“探测设置”页配置探测节点。", "Configure probe nodes on the Probes page first."],
+  ["请先在“探测设置”页配置探测目标。", "Configure probe targets on the Probes page first."],
   // O-01：探测目标「下发范围」（探测设置抽屉 / 列表「下发」列 / 节点抽屉标注）。
   ["下发范围", "Deployment scope"],
   ["不下发", "Do not deploy"],
   ["下发", "Delivery"],
+  // P1：探测目标未下发到任何节点时的列表提示与抽屉说明。
+  ["未下发", "Not deployed"],
+  [
+    "未下发到任何节点，不会产生探测数据",
+    "Not deployed to any node; no probe data will be generated.",
+  ],
+  [
+    "由节点抽屉手动选择，未设置下发范围",
+    "Selected manually in node settings; no deployment scope set",
+  ],
+  [
+    "不下发时该目标不会在任何节点运行；如需在单个节点上使用，可在节点抽屉中手动选择。",
+    "When not deployed, this target runs on no node. To use it on one node, select it manually in that node's settings.",
+  ],
+  [
+    "打开目标后，在「下发范围」选择「全部节点」或指定节点/分组即可生效。",
+    "Open the target and choose \"All nodes\" or specific nodes/groups under Deployment scope.",
+  ],
   ["来自探测设置", "From probe settings"],
   ["固定执行", "Fixed execution"],
   ["生命周期与告警", "Lifecycle & alerts"],
@@ -589,10 +624,15 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["例如：443…", "Example: 443..."],
   ["地区代码无效：请输入两位字母代码（如 SG / JP / HK）。", "Invalid region code: enter a two-letter code (e.g. SG / JP / HK)."],
   ["两位代码，如 SG / JP / HK", "Two-letter code, e.g. SG / JP / HK"],
-  ["没有可下发更新的节点", "No nodes available for update"],
   ["命令已内嵌当前配置的 Agent Token，复制后即可直接执行。", "The command embeds the configured Agent token and is ready to run once copied."],
   ["尚未配置 Agent Token：请先在基础设置的接入配置中填写，命令占位符将自动替换为真实 Token。", "No Agent token configured: fill it in under Basic settings first; the command placeholder will be replaced with the real token."],
-  ["请先在基础设置的接入配置中填写 Agent 对接地址。", "Fill in the Agent endpoint under Basic settings first."],
+  // 接入配置横幅分段文案：i18n 逐文本节点精确匹配，所以拆开的每段都单独登记。
+  ["尚未配置 Agent 对接地址：", "No Agent endpoint configured: "],
+  ["请在", "Fill it in under "],
+  ["中填写。", "."],
+  ["已使用当前访问地址", "Using the current access address "],
+  ["；如果 Agent 无法访问该地址，请在", "; if the Agent cannot reach it, fill it in under "],
+  ["该地址仅本机可访问，其他机器无法通过它接入。", "This address is only reachable from this machine, so other machines cannot connect through it."],
   ["在 C&R 视图显示", "Show in C&R view"],
   ["在 ALL 视图显示", "Show in ALL view"],
   ["分组名称与展示页固定标签冲突，请换一个名称。", "Group name conflicts with a fixed monitor page label; choose another name."],
@@ -602,12 +642,22 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["保留", "Keep"],
   ["双空=停用", "Both empty = disabled"],
   ["已配置（留空保持不变）", "Configured (leave blank to keep)"],
-  ["尚未配置任何通知渠道：所有告警都不会发出。请先在渠道设置中添加并启用通知渠道。", "No notification channels configured: no alerts will be sent at all. Add and enable a channel under Channels first."],
   ["尚未配置任何通知渠道：", "No notification channels configured: "],
   // A-08：横幅文案从「节点离线时」改为「所有告警」；规则「渠道」列新增两态文字。
-  ["所有告警都不会发出。请先在渠道设置中添加并启用通知渠道。", "No alerts will be sent at all. Add and enable a channel under Channels first."],
+  // 「渠道设置」为可点击入口，因此句子拆成独立文本节点登记。
+  ["所有告警都不会发出。请先在", "No alerts will be sent. Add and enable a channel under "],
+  ["中添加并启用通知渠道。", " first."],
   ["全部渠道", "All channels"],
   ["无可用渠道", "No channels available"],
+  // P1：必填项不全的启用渠道（配置导出不含密钥，导入后渠道看似正常但发不出）。
+  ["缺少必填项", "Missing required fields"],
+  ["部分渠道缺少必填项", "Some channels are missing required fields"],
+  ["所有启用渠道都缺少必填项：", "All enabled channels are missing required fields: "],
+  ["所有告警都不会发出。请先补全", "No alerts will be sent. Complete the required fields under "],
+  ["后重新保存。", " and save again."],
+  // 部分渠道缺必填：英文开头带空格，因为前一句的可删句点后直接接文案。
+  ["请前往", " Fill in the missing fields under "],
+  ["补全。", " and save."],
   ["清除", "Clear"],
   // 节点抽屉「到期时间」「告警设置」两卡文案（第 6 轮 M-04 / M-05）。
   ["截止时间", "Deadline"],
@@ -684,7 +734,7 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["完成", "Done"],
   ["验证与获取模型使用当前抽屉内的端点与密钥；端点改动需先完成并保存后再验证存储密钥。", "Testing and fetching models use the endpoint and key currently in this drawer. Save endpoint changes before testing a stored key."],
   ["目标列表", "Target list"],
-  ["暂无探测节点，点击右上角「新增探测节点」开始。", "No probes yet. Click \"Add probe\" at the top right to start."],
+  ["暂无探测目标，点击右上角「新增探测目标」开始。", "No probes yet. Click \"Add probe\" at the top right to start."],
   ["配置探测目标的基础信息与协议参数。", "Configure the probe target's basic information and protocol parameters."],
   ["允许的用户名", "Allowed usernames"],
   ["分区导航", "Section navigation"],
@@ -692,8 +742,6 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["重置后留空 = 保留当前 Secret，不会清空。", "Leave blank after a reset to keep the current secret; it is never cleared."],
   ["显示与标注", "Display & labels"],
   ["全部更新", "Update all"],
-  ["确认对全部", "Dispatch Agent updates to all"],
-  ["台节点下发 Agent 更新？", "nodes?"],
   ["确认下发", "Confirm dispatch"],
   ["秒", "sec"],
   ["点击复制完整接入命令，也可拖选部分文本手动复制", "Click to copy the full onboarding command, or drag to select part of the text"],
@@ -713,11 +761,26 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["告警中", "Alerting"],
   ["一切正常", "All clear"],
   ["暂无探测数据", "No probe data"],
+  // 网络连通性表只保留有探测目标的节点，其余节点在表尾汇总（动态计数见下方
+  // pattern 表）；全部节点都没配目标时用空态给出直达设置页的入口。
+  ["还没有节点在运行探测", "No node is running probes yet"],
+  ["去探测设置", "Configure probes"],
   ["可用率", "Availability"],
   ["平均延迟", "Avg latency"],
   ["丢包", "Loss"],
   ["运行时长", "Uptime"],
   ["数据目录占用", "Data directory usage"],
+  // 资源历史（CPU / 内存 / 网络）保留设置
+  ["资源历史", "Resource history"],
+  ["资源历史保留", "Resource history retention"],
+  ["1 天", "1 day"],
+  ["7 天", "7 days"],
+  ["30 天", "30 days"],
+  ["选择保留期…", "Select retention…"],
+  [
+    "每 30 秒记录节点 CPU、内存、网络，供 AI 运维助手分析历史；修改后立即生效，缩短保留期会删除更早的数据。",
+    "CPU, memory and network are recorded every 30 seconds per node for the AI operations assistant to analyse history. Changes apply immediately; shortening retention deletes older data.",
+  ],
   ["WS 连接（后台 / 前台）", "WS connections (admin / public)"],
   ["1 小时", "1 hour"],
   ["24 小时", "24 hours"],
@@ -726,10 +789,70 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["提交", "Commit"],
   ["Go 版本", "Go version"],
   ["启动时间", "Started at"],
+  // 数据可信度：实时连接 / 接口失败时的降级文案（断线横幅、首页实时指示、
+  // 告警中 KPI、探测表重试、日志同步失败）。
+  ["实时连接已断开：", "Live connection lost:"],
+  ["数据可能已过期，正在自动重连。", "Data may be stale. Reconnecting automatically."],
+  ["连接中", "Connecting"],
+  ["连接中断", "Disconnected"],
+  ["状态不可用", "Status unavailable"],
+  ["数据可能已过期", "Data may be stale"],
+  ["加载中…", "Loading…"],
+  ["探测数据加载失败", "Failed to load probe data"],
+  ["探测数据加载失败，请重试", "Failed to load probe data. Try again."],
+  ["重试加载探测数据", "Retry loading probe data"],
+  ["重试加载主控状态", "Retry loading host status"],
+  ["重试", "Retry"],
+  ["同步失败，正在重试", "Sync failed, retrying"],
+  ["同步失败，显示最后一次成功获取的日志", "Sync failed. Showing the last successful fetch."],
+  // 零节点首次使用：首页不再把未接入显示成健康态，并给出下一步。
+  ["接入引导", "Onboarding"],
+  ["还没有节点接入", "No nodes connected yet"],
+  [
+    "在「节点管理」复制接入命令，到目标服务器运行即可完成接入。",
+    "Copy the install command from Nodes and run it on the target server.",
+  ],
+  [
+    "先在「基础设置 → 接入配置」填写 Agent 对接地址，再复制接入命令。",
+    "First set the agent endpoint in Settings → Access, then copy the install command.",
+  ],
+  ["去接入节点", "Connect a node"],
+  ["填写对接地址", "Set endpoint"],
+  ["复制命令", "Copy command"],
+  ["节点与分组数据加载失败，当前选项可能不完整。", "Failed to load node and group data. Options may be incomplete."],
+  ["重试加载下发范围", "Retry loading scope data"],
+  ["加载失败", "Load failed"],
+  ["该渠道仍被告警规则引用", "This channel is used by alert rules"],
+  [
+    "删除后引用该渠道的规则会同步移除该渠道。",
+    "Deleting it also removes it from the rules that reference it.",
+  ],
+  [
+    "删除后这些规则将改为发送到全部已启用渠道：",
+    "After deletion these rules will send to all enabled channels:",
+  ],
+  ["以下规则将不再发送到该渠道：", "These rules will no longer send to this channel:"],
+  ["仍然删除", "Delete anyway"],
+  ["渠道已删除", "Channel deleted"],
+  ["部分渠道已删除", "Some channels deleted"],
+  ["渠道已停用", "Channel disabled"],
+  ["部分渠道已停用", "Some channels disabled"],
+  ["部分渠道不可用", "Some channels unavailable"],
+  ["已停用的渠道不会收到通知。", "Disabled channels will not receive notifications."],
+  ["有渠道已删除，请取消勾选后再保存。", "A referenced channel was deleted. Uncheck it before saving."],
+  ["尚未接入节点", "No nodes yet"],
+  [
+    "接入节点后，这里会显示 CPU、内存、磁盘使用率 ≥ 80% 的节点",
+    "After a node connects, nodes with CPU, memory, or disk usage ≥ 80% will appear here.",
+  ],
 ] as const;
 
 const zhToEn = new Map<string, string>(ADMIN_ZH_TO_EN_ENTRIES);
-const enToZh = new Map<string, string>(ADMIN_ZH_TO_EN_ENTRIES.map(([zh, en]) => [en, zh]));
+// 反向表按 trim 后的英文建键：translateExact 查表前会 trim，而部分英文条目本身
+// 带首尾空格（如分段横幅片段），不 trim 会让英文→中文切换时这些片段无法回译。
+const enToZh = new Map<string, string>(
+  ADMIN_ZH_TO_EN_ENTRIES.map(([zh, en]) => [en.trim(), zh] as [string, string]),
+);
 
 const ADMIN_TEXT_PATTERNS: Array<{
   zh: RegExp;
@@ -766,6 +889,12 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toEn: (match) => `Live sync ${match[1]}`,
     en: /^Live sync\s+(.+)$/,
     toZh: (match) => `实时同步 ${match[1]}`,
+  },
+  {
+    zh: /^已删除的渠道\s+·\s+(.+)$/,
+    toEn: (match) => `Deleted channel · ${match[1]}`,
+    en: /^Deleted channel\s+·\s+(.+)$/,
+    toZh: (match) => `已删除的渠道 · ${match[1]}`,
   },
   {
     zh: /^路径:\s*(.*)$/,
@@ -871,6 +1000,21 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toZh: (match) => `${match[1]} 个分组`,
   },
   {
+    // P1：没有下发范围、由节点抽屉手动选择的节点数。
+    zh: /^(\d+)\s+个节点（手动）$/,
+    toEn: (match) => `${match[1]} ${match[1] === "1" ? "node" : "nodes"} (manual)`,
+    en: /^(\d+)\s+(?:node|nodes) \(manual\)$/,
+    toZh: (match) => `${match[1]} 个节点（手动）`,
+  },
+  {
+    // P1：探测设置列表顶部的未下发提示。
+    zh: /^(\d+)\s+个探测目标未下发到任何节点，不会产生探测数据。$/,
+    toEn: (match) =>
+      `${match[1]} ${match[1] === "1" ? "probe is" : "probes are"} not deployed to any node and will not generate probe data.`,
+    en: /^(\d+)\s+probes? (?:is|are) not deployed to any node and will not generate probe data\.$/,
+    toZh: (match) => `${match[1]} 个探测目标未下发到任何节点，不会产生探测数据。`,
+  },
+  {
     zh: /^(\d+)\s+个标签$/,
     toEn: (match) => `${match[1]} tags`,
     en: /^(\d+)\s+tags$/,
@@ -889,22 +1033,22 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toZh: (match) => `共 ${match[1]} 个有效标签`,
   },
   {
-    zh: /^已选\s+(\d+)\s+个探测节点。\s+其中\s+(\d+)\s+个 TCP 节点使用了自定义间隔。$/,
+    zh: /^已选\s+(\d+)\s+个探测目标。\s+其中\s+(\d+)\s+个 TCP 目标使用了自定义间隔。$/,
     toEn: (match) => `${match[1]} probes selected. ${match[2]} TCP probes use a custom interval.`,
     en: /^(\d+)\s+probes selected\.\s+(\d+)\s+TCP probes use a custom interval\.$/,
-    toZh: (match) => `已选 ${match[1]} 个探测节点。 其中 ${match[2]} 个 TCP 节点使用了自定义间隔。`,
+    toZh: (match) => `已选 ${match[1]} 个探测目标。 其中 ${match[2]} 个 TCP 目标使用了自定义间隔。`,
   },
   {
-    zh: /^已选\s+(\d+)\s+个探测节点。$/,
+    zh: /^已选\s+(\d+)\s+个探测目标。$/,
     toEn: (match) => `${match[1]} probes selected.`,
     en: /^(\d+)\s+probes selected\.$/,
-    toZh: (match) => `已选 ${match[1]} 个探测节点。`,
+    toZh: (match) => `已选 ${match[1]} 个探测目标。`,
   },
   {
-    zh: /^其中\s+(\d+)\s+个 TCP 节点使用了自定义间隔。$/,
+    zh: /^其中\s+(\d+)\s+个 TCP 目标使用了自定义间隔。$/,
     toEn: (match) => `${match[1]} TCP probes use a custom interval.`,
     en: /^(\d+)\s+TCP probes use a custom interval\.$/,
-    toZh: (match) => `其中 ${match[1]} 个 TCP 节点使用了自定义间隔。`,
+    toZh: (match) => `其中 ${match[1]} 个 TCP 目标使用了自定义间隔。`,
   },
   {
     zh: /^(\d+)\s+秒$/,
@@ -975,12 +1119,23 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toZh: (match) => `流量配额 ≥ ${match[1]}%`,
   },
   {
-    zh: /^(.+?)\s+(>|<)\s+([0-9.]+)\s*(%|℃|ms|个|Mbps)?\s*·\s*持续\s+(\d+)\s+分钟$/,
+    // 窗口类阈值规则的条件描述：「CPU 使用率 > 90% · 近 5 分钟内 70% 时间越限」。
+    // 不说“持续 N 分钟”：判的是窗口内越限时间占比，不是连续越限。
+    zh: /^(.+?)\s+(>|<)\s+([0-9.]+)\s*(%|℃|ms|个|Mbps)?\s*·\s*近\s+(\d+)\s+分钟内\s+(\d+)%\s+时间越限$/,
     toEn: (match) =>
-      `${translateSegment(match[1], "en-US")} ${match[2]} ${match[3]}${translateRuleUnit(match[4])} · for ${match[5]} min`,
-    en: /^(.+?)\s+(>|<)\s+([0-9.]+)\s*(%|°C|ms|Mbps)?\s*·\s*for\s+(\d+)\s+min$/,
+      `${translateSegment(match[1], "en-US")} ${match[2]} ${match[3]}${translateRuleUnit(match[4])} · over ${match[6]}% of the last ${match[5]} min`,
+    en: /^(.+?)\s+(>|<)\s+([0-9.]+)\s*(%|°C|ms|Mbps)?\s*·\s*over\s+(\d+)%\s+of\s+the\s+last\s+(\d+)\s+min$/,
     toZh: (match) =>
-      `${translateSegment(match[1], "zh-CN")} ${match[2]} ${match[3]}${translateRuleUnitToZh(match[4])} · 持续 ${match[5]} 分钟`,
+      `${translateSegment(match[1], "zh-CN")} ${match[2]} ${match[3]}${translateRuleUnitToZh(match[4])} · 近 ${match[6]} 分钟内 ${match[5]}% 时间越限`,
+  },
+  {
+    // 规则抽屉「持续时间」下方的判定口径说明（按规则实际 ratio 展示）。
+    zh: /^窗口内超过\s+(\d+)%\s+的时间越限才告警，越限时间降到\s+(\d+)%\s+以下才恢复，避免偶发波动反复通知。$/,
+    toEn: (match) =>
+      `Alerts trigger only when more than ${match[1]}% of the window is over the threshold, and clear once it drops to ${match[2]}% or below. This prevents repeated notifications from brief fluctuations.`,
+    en: /^Alerts trigger only when more than\s+(\d+)%\s+of the window is over the threshold, and clear once it drops to\s+(\d+)%\s+or below\. This prevents repeated notifications from brief fluctuations\.$/,
+    toZh: (match) =>
+      `窗口内超过 ${match[1]}% 的时间越限才告警，越限时间降到 ${match[2]}% 以下才恢复，避免偶发波动反复通知。`,
   },
   {
     zh: /^(.+?)\s+(>|<)\s+([0-9.]+)\s*(%|℃|ms|个|Mbps)?$/,
@@ -1178,18 +1333,49 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toZh: (match) => `失败 ${match[1]}`,
   },
   {
-    zh: /^批量更新完成：(.+)$/,
+    // 末尾接「；失败原因」时不在这里吞掉整句：留给 translateExact 按「；」拆分逐句翻译。
+    zh: /^批量更新完成：([^；]+)$/,
     toEn: (match) =>
       `Bulk update completed: ${match[1]
         .split("，")
         .map((part) => translateSegment(part.trim(), "en-US"))
         .join(", ")}`,
-    en: /^Bulk update completed: (.+)$/,
+    en: /^Bulk update completed: ([^;]+)$/,
     toZh: (match) =>
       `批量更新完成：${match[1]
         .split(", ")
         .map((part) => translateSegment(part.trim(), "zh-CN"))
         .join("，")}`,
+  },
+  // A-19②：批量 Agent 更新确认框——目标台数与无法远程更新的台数、原因分组
+  // （模板字符串是单一文本节点，整句走模式匹配）。
+  {
+    zh: /^确认对\s+(\d+)\s+台节点下发 Agent 更新？$/,
+    toEn: (match) =>
+      `Dispatch Agent updates to ${match[1]} ${Number(match[1]) === 1 ? "node" : "nodes"}?`,
+    en: /^Dispatch Agent updates to (\d+) nodes?\?$/,
+    toZh: (match) => `确认对 ${match[1]} 台节点下发 Agent 更新？`,
+  },
+  {
+    zh: /^另有\s+(\d+)\s+台无法远程更新$/,
+    toEn: (match) =>
+      `${match[1]} ${Number(match[1]) === 1 ? "node" : "nodes"} cannot be updated remotely`,
+    en: /^(\d+) nodes? cannot be updated remotely$/,
+    toZh: (match) => `另有 ${match[1]} 台无法远程更新`,
+  },
+  // 原因分组项「<原因> <台数> 台」：原因逐条走精确表，未收录时保持原文。
+  {
+    zh: /^([^；]+?)\s+(\d+)\s+台$/,
+    toEn: (match) =>
+      `${translateSegment(match[1], "en-US")} (${match[2]} ${Number(match[2]) === 1 ? "node" : "nodes"})`,
+    en: /^([^;]+?)\s+\((\d+) nodes?\)$/,
+    toZh: (match) => `${translateSegment(match[1], "zh-CN")} ${match[2]} 台`,
+  },
+  {
+    zh: /^等\s+(\d+)\s+类原因$/,
+    toEn: (match) => `${match[1]} more ${Number(match[1]) === 1 ? "category" : "categories"}`,
+    en: /^(\d+) more categories?$/,
+    toZh: (match) => `等 ${match[1]} 类原因`,
   },
   {
     zh: /^例如：(\d+)…$/,
@@ -1286,6 +1472,50 @@ const ADMIN_TEXT_PATTERNS: Array<{
     toEn: (match) => `Across ${match[1]} node${Number(match[1]) === 1 ? "" : "s"}`,
     en: /^Across (\d+) nodes?$/,
     toZh: (match) => `涉及 ${match[1]} 台节点`,
+  },
+  // F7 网络连通性表尾：未配置探测目标的节点计数（动态数字）。
+  {
+    zh: /^另有\s+(\d+)\s+个节点未配置探测目标$/,
+    toEn: (match) =>
+      `${match[1]} ${Number(match[1]) === 1 ? "node has" : "nodes have"} no probe targets configured`,
+    en: /^(\d+) nodes? (?:has|have) no probe targets configured$/,
+    toZh: (match) => `另有 ${match[1]} 个节点未配置探测目标`,
+  },
+  // P1：必填项缺失的渠道悬停提示。字段名逐个走精确表（设备 Key / Webhook 地址等），
+  // 避免英文界面下在中文名单里夹杂。
+  {
+    zh: /^缺少必填项：(.+)$/,
+    toEn: (match) =>
+      `Missing required fields: ${match[1]
+        .split("、")
+        .map((label) => zhToEn.get(label.trim()) || label.trim())
+        .join(", ")}`,
+    en: /^Missing required fields:\s*(.+)$/,
+    toZh: (match) =>
+      `缺少必填项：${match[1]
+        .split(",")
+        .map((label) => enToZh.get(label.trim()) || label.trim())
+        .join("、")}`,
+  },
+  // P1：导入配置后的渠道密钥计数（单复数）。
+  {
+    zh: /^(\d+)\s+个通知渠道需要重新填写密钥$/,
+    toEn: (match) =>
+      `${match[1]} notification ${
+        match[1] === "1" ? "channel needs its keys re-entered" : "channels need their keys re-entered"
+      }`,
+    en: /^(\d+)\s+notification channels? (?:needs its keys re-entered|need their keys re-entered)$/,
+    toZh: (match) => `${match[1]} 个通知渠道需要重新填写密钥`,
+  },
+  // P1：告警页横幅——部分启用渠道缺必填项（单复数）。
+  {
+    zh: /^(\d+)\s+个渠道缺少必填项，告警无法通过它们发出。$/,
+    toEn: (match) =>
+      `${match[1]} ${
+        match[1] === "1" ? "channel is" : "channels are"
+      } missing required fields; alerts cannot be sent through ${match[1] === "1" ? "it" : "them"}.`,
+    en: /^(\d+)\s+channels? (?:is|are) missing required fields; alerts cannot be sent through (?:it|them)\.$/,
+    toZh: (match) => `${match[1]} 个渠道缺少必填项，告警无法通过它们发出。`,
   },
 ];
 

@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"math"
 	"net/http"
@@ -267,24 +266,6 @@ func agentRateLimitError() *agentAPIError {
 	return &agentAPIError{statusCode: http.StatusTooManyRequests, message: "rate limit exceeded"}
 }
 
-func (a *agentAPI) broadcastNodeDelta(nodeID string) {
-	if a.hub == nil {
-		return
-	}
-	if !a.hub.HasVariant(publicVariantBalanced) && !a.hub.HasVariant(adminVariant) {
-		return
-	}
-	delta, ok := a.store.PublicNodeDeltaIfChanged(nodeID)
-	if !ok {
-		return
-	}
-	data, err := json.Marshal(delta)
-	if err != nil {
-		return
-	}
-	a.hub.BroadcastAllVariants(data, a.store.Credentials().TokenSalt)
-}
-
 func (a *agentAPI) broadcastSnapshot() {
 	broadcastStoreSnapshot(a.hub, a.store)
 }
@@ -316,7 +297,8 @@ func (a *agentAPI) ingest(payload metrics.NodeStats, token string) (bool, *agent
 	if recoveryCandidate != nil {
 		a.store.completeOfflineRecovery(*recoveryCandidate)
 	}
-	a.broadcastNodeDelta(payload.NodeID)
+	// 常规 ingest 不再广播 node_delta：每个 tick 的脱敏全量快照是唯一推送渠道，
+	// 逐节点 delta 与快照内容重复，白白放大出站流量。
 	if updateReconciled {
 		a.broadcastSnapshot()
 	}

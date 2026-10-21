@@ -70,6 +70,7 @@ import {
   getErrorMessage,
 } from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
+import { missingSecretChannelsNotice } from "@/lib/notify-channels";
 
 export interface BasicSettingsProps {
   settings: SettingsView | null;
@@ -115,6 +116,13 @@ function formatRuntimeStartedAt(startedAt?: number) {
 const localeOptions = [
   { value: "zh-CN", label: "简体中文" },
   { value: "en-US", label: "English" },
+];
+
+// 资源历史保留天数（服务端只接受 1 / 7 / 30，其它值保存会被拒绝）。
+const resourceHistoryDayOptions = [
+  { value: "1", label: "1 天" },
+  { value: "7", label: "7 天" },
+  { value: "30", label: "30 天" },
 ];
 
 function normalizeLocaleValue(value?: string) {
@@ -209,6 +217,7 @@ function basicSettingsDraft(settings: SettingsView | null) {
     loginFailLimit: String(settings?.login_fail_limit || 0),
     loginFailWindow: toMinuteFieldValue(settings?.login_fail_window_sec),
     loginLockMinutes: toMinuteFieldValue(settings?.login_lock_sec),
+    resourceHistoryDays: String(settings?.resource_history_days || 7),
     adminAuth: adminAuthDraft(settings),
   };
 }
@@ -350,6 +359,7 @@ export default function BasicSettings({
     loginFailLimit,
     loginFailWindow,
     loginLockMinutes,
+    resourceHistoryDays,
     adminAuth: adminAuthDraftValue,
   } = basicDraft;
   const [isSaving, setIsSaving] = useState(false);
@@ -489,6 +499,7 @@ export default function BasicSettings({
     if (loginLockMinutes.trim() !== "") {
       payload.login_lock_sec = Math.max(Number.parseInt(loginLockMinutes, 10) || 0, 0) * 60;
     }
+    payload.resource_history_days = Number.parseInt(resourceHistoryDays, 10) || 7;
 
     return payload;
   };
@@ -573,6 +584,12 @@ export default function BasicSettings({
         if (response.settings?.admin_path) {
           messages.push(`后台路径已更新为 ${response.settings.admin_path}`);
         }
+        // P1：导出配置不含密钥，导入后必填项不全的渠道会静默失败；直接告知需要
+        // 重新填写多少条，引导到渠道设置补全（与 App 的提示共用同一处文案）。
+        const missingSecretNotice = missingSecretChannelsNotice(response.settings);
+        if (missingSecretNotice) {
+          messages.push(missingSecretNotice);
+        }
         return messages.join("；");
       },
       onSuccess: (response) => {
@@ -637,7 +654,7 @@ export default function BasicSettings({
     systemVersionStatus.tone === "accent"
       ? "text-[var(--accent-text)]"
       : systemVersionStatus.tone === "danger"
-        ? "text-[var(--danger)]"
+        ? "text-[var(--danger-text)]"
         : "text-[var(--label-2)]";
 
   const handleCheckSystemUpdate = () => {
@@ -1058,7 +1075,7 @@ export default function BasicSettings({
                 value={agentEndpoint}
                 disabled={isBusy}
                 onChange={handleTextFieldChange("agentEndpoint")}
-                placeholder="例如：https://monitor.example.com…"
+                placeholder={settings?.agent_endpoint_suggestion || "例如：https://monitor.example.com…"}
               />
             </AdminGroupedFieldRow>
             <AdminGroupedFieldRow
@@ -1284,7 +1301,7 @@ export default function BasicSettings({
                   <AlertDialogTrigger className={adminTextButtonClass} type="button" disabled={isBusy}>
                     导入…
                   </AlertDialogTrigger>
-                  <AlertDialogContent className={adminDialogContentClass}>
+                  <AlertDialogContent className={adminDialogContentClass} variant="danger">
                     <AlertDialogHeader className={adminDialogHeaderClass}>
                       <AlertDialogTitle>确认导入配置？当前环境凭证与 Agent 运行时任务会保留。</AlertDialogTitle>
                     </AlertDialogHeader>
@@ -1318,6 +1335,46 @@ export default function BasicSettings({
                 }
               }}
             />
+          </AdminSectionPanel>
+
+          {/* 资源历史保留：节点 CPU / 内存 / 网络每 30 秒记录一个点，仅供 AI 运维助手分析；改设置即时生效。 */}
+          <AdminSectionPanel label="资源历史" title="资源历史">
+            <AdminGroupedCard>
+              <AdminGroupedFieldRow
+                label="资源历史保留"
+                htmlFor="resource-history-days"
+                hint="每 30 秒记录节点 CPU、内存、网络，供 AI 运维助手分析历史；修改后立即生效，缩短保留期会删除更早的数据。"
+              >
+                <Select
+                  value={resourceHistoryDays}
+                  disabled={isBusy}
+                  onValueChange={(value) => {
+                    if (isBusy) {
+                      return;
+                    }
+                    updateBasicDraft("resourceHistoryDays", String(value || "7"));
+                  }}
+                >
+                  <SelectTrigger
+                    id="resource-history-days"
+                    size="sm"
+                    className={cn(adminSelectTriggerClass, "w-full sm:w-40")}
+                  >
+                    <SelectValue placeholder="选择保留期…">
+                      {resourceHistoryDayOptions.find((item) => item.value === resourceHistoryDays)?.label ||
+                        resourceHistoryDays}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent className={adminSelectContentClass}>
+                    {resourceHistoryDayOptions.map((item) => (
+                      <SelectItem key={item.value} value={item.value}>
+                        {item.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </AdminGroupedFieldRow>
+            </AdminGroupedCard>
           </AdminSectionPanel>
 
           {/* F3 卡片 3「运行信息」：每行左侧标签、右侧值（data-text 右对齐）；

@@ -96,15 +96,15 @@
 
       <main id="public-main-content">
       <section class="stats-grid">
-        <button class="stat-card stat-filter-button" type="button" data-filter="all">
+        <button class="stat-card stat-filter-button" type="button" data-filter="all" aria-pressed="true">
           <div class="stat-label" data-i18n="statTotal">服务器总数</div>
           <div class="stat-value"><span class="stat-dot blue"></span><span id="stat-total">0</span></div>
         </button>
-        <button class="stat-card stat-filter-button" type="button" data-filter="online">
+        <button class="stat-card stat-filter-button" type="button" data-filter="online" aria-pressed="false">
           <div class="stat-label" data-i18n="statOnline">在线服务器</div>
           <div class="stat-value"><span class="stat-dot green"></span><span id="stat-online">0</span><span class="stat-sub" id="stat-online-total">/ 0</span></div>
         </button>
-        <button class="stat-card stat-filter-button" type="button" data-filter="offline">
+        <button class="stat-card stat-filter-button" type="button" data-filter="offline" aria-pressed="false">
           <div class="stat-label" data-i18n="statOffline">离线服务器</div>
           <div class="stat-value"><span class="stat-dot red"></span><span id="stat-offline">0</span></div>
         </button>

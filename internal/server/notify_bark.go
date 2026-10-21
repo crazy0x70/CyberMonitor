@@ -3,7 +3,8 @@ package server
 // bark 渠道发送器（F5）：POST {server_url}/push，JSON 载荷
 // {device_key,title,body,group,level,sound,icon}；成功条件响应 code==200。
 // 默认 server_url https://api.day.app、group「CyberMonitor」、level
-// timeSensitive。发送走 SSRF 防护客户端（notifySendHTTP），不跟随重定向。
+// timeSensitive。发送默认走 SSRF 防护客户端（notifySendHTTP），不跟随重定向；
+// Config["allow_private"]==true 时改用 allow-private 客户端（自建 server_url）。
 
 import (
 	"context"
@@ -29,12 +30,13 @@ var barkLevels = map[string]struct{}{
 }
 
 type barkNotifier struct {
-	endpoint  string
-	deviceKey string
-	group     string
-	level     string
-	sound     string
-	icon      string
+	endpoint     string
+	deviceKey    string
+	group        string
+	level        string
+	sound        string
+	icon         string
+	allowPrivate bool
 }
 
 func newBarkNotifier(ch NotifyChannel) (Notifier, error) {
@@ -46,7 +48,7 @@ func newBarkNotifier(ch NotifyChannel) (Notifier, error) {
 	if serverURL == "" {
 		serverURL = defaultBarkServerURL
 	}
-	if err := notifyValidateWebhookURL(serverURL); err != nil {
+	if err := notifyValidateChannelURL(ch, serverURL); err != nil {
 		return nil, err
 	}
 	group := strings.TrimSpace(ch.Config["group"])
@@ -61,12 +63,13 @@ func newBarkNotifier(ch NotifyChannel) (Notifier, error) {
 		return nil, errors.New("bark level 需为 active/timeSensitive/passive/critical")
 	}
 	return &barkNotifier{
-		endpoint:  strings.TrimRight(serverURL, "/") + "/push",
-		deviceKey: deviceKey,
-		group:     group,
-		level:     level,
-		sound:     strings.TrimSpace(ch.Config["sound"]),
-		icon:      strings.TrimSpace(ch.Config["icon"]),
+		endpoint:     strings.TrimRight(serverURL, "/") + "/push",
+		deviceKey:    deviceKey,
+		group:        group,
+		level:        level,
+		sound:        strings.TrimSpace(ch.Config["sound"]),
+		icon:         strings.TrimSpace(ch.Config["icon"]),
+		allowPrivate: notifyChannelAllowsPrivate(ch),
 	}, nil
 }
 
@@ -88,7 +91,7 @@ func (n *barkNotifier) Send(ctx context.Context, msg NotifyMessage) error {
 	if n.icon != "" {
 		payload["icon"] = n.icon
 	}
-	_, respBody, err := postNotifyJSON(ctx, n.endpoint, payload)
+	_, respBody, err := postNotifyJSON(ctx, n.endpoint, payload, n.allowPrivate)
 	if err != nil {
 		return err
 	}

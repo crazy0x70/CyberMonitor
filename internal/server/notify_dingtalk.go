@@ -3,8 +3,8 @@ package server
 // 钉钉渠道发送器（F5）：配置 sign_secret 时按文档加签——ts 毫秒；
 // sign = urlencode(base64(HmacSHA256(key=secret, msg=ts+"\n"+secret)))，URL 追加
 // &timestamp=&sign=；body {"msgtype":"markdown","markdown":{"title","text"},
-// "at":{…}}；成功条件 errcode==0。发送走 SSRF 防护客户端（notifySendHTTP），
-// 不跟随重定向。
+// "at":{…}}；成功条件 errcode==0。发送默认走 SSRF 防护客户端（notifySendHTTP），
+// 不跟随重定向；Config["allow_private"]==true 时改用 allow-private 客户端。
 
 import (
 	"context"
@@ -21,10 +21,11 @@ import (
 )
 
 type dingtalkNotifier struct {
-	webhook    string
-	signSecret string
-	atMobiles  []string
-	atAll      bool
+	webhook      string
+	signSecret   string
+	atMobiles    []string
+	atAll        bool
+	allowPrivate bool
 }
 
 func newDingtalkNotifier(ch NotifyChannel) (Notifier, error) {
@@ -32,7 +33,7 @@ func newDingtalkNotifier(ch NotifyChannel) (Notifier, error) {
 	if webhook == "" {
 		return nil, errors.New("钉钉 webhook 未配置")
 	}
-	if err := notifyValidateWebhookURL(webhook); err != nil {
+	if err := notifyValidateChannelURL(ch, webhook); err != nil {
 		return nil, err
 	}
 	atAll := false
@@ -44,10 +45,11 @@ func newDingtalkNotifier(ch NotifyChannel) (Notifier, error) {
 		atAll = value
 	}
 	return &dingtalkNotifier{
-		webhook:    webhook,
-		signSecret: strings.TrimSpace(ch.Secrets["sign_secret"]),
-		atMobiles:  splitNotifyList(ch.Config["at_mobiles"]),
-		atAll:      atAll,
+		webhook:      webhook,
+		signSecret:   strings.TrimSpace(ch.Secrets["sign_secret"]),
+		atMobiles:    splitNotifyList(ch.Config["at_mobiles"]),
+		atAll:        atAll,
+		allowPrivate: notifyChannelAllowsPrivate(ch),
 	}, nil
 }
 
@@ -71,7 +73,7 @@ func (n *dingtalkNotifier) Send(ctx context.Context, msg NotifyMessage) error {
 		},
 	}
 	endpoint := dingtalkSignedWebhook(n.webhook, time.Now().UnixMilli(), n.signSecret)
-	_, respBody, err := postNotifyJSON(ctx, endpoint, payload)
+	_, respBody, err := postNotifyJSON(ctx, endpoint, payload, n.allowPrivate)
 	if err != nil {
 		return err
 	}

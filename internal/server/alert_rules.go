@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cyber_monitor/internal/metrics"
@@ -237,6 +238,32 @@ func normalizeAlertRules(rules []AlertRule, offlineSec int64) ([]AlertRule, erro
 		normalized = append([]AlertRule{builtinOfflineAlertRule(offlineSec)}, normalized...)
 	}
 	return normalized, nil
+}
+
+// validateAlertRuleChannelRefs 校验规则引用的通知渠道都还存在（保存/导入时用）。
+// 规则引用已删除渠道后既不会发送也不会报错，等于静默改写规则语义，因此拒绝保存；
+// 加载旧 state.json 不走这里（历史数据可能已带失效引用，不能阻止启动）。
+func validateAlertRuleChannelRefs(rules []AlertRule, channels []NotifyChannel) error {
+	if len(rules) == 0 {
+		return nil
+	}
+	exists := make(map[string]struct{}, len(channels))
+	for _, channel := range channels {
+		exists[channel.ID] = struct{}{}
+	}
+	for _, rule := range rules {
+		for _, channelID := range rule.ChannelIDs {
+			if _, ok := exists[channelID]; ok {
+				continue
+			}
+			name := strings.TrimSpace(rule.Name)
+			if name == "" {
+				name = rule.ID
+			}
+			return fmt.Errorf("告警规则「%s」引用了不存在的通知渠道：%s", name, channelID)
+		}
+	}
+	return nil
 }
 
 func normalizeAlertRule(rule AlertRule, offlineSec int64) (AlertRule, error) {
@@ -560,17 +587,78 @@ func appendRuleSample(samples []ruleSample, at time.Time, violated bool, duratio
 	return samples
 }
 
-// evaluateSampleWindow 判定窗口结论：窗口内越限时间 > ratio × window 即 fail。
-// durationSec <= 0 表示单次采样即判定（取最新样本）。
-func evaluateSampleWindow(samples []ruleSample, now time.Time, durationSec int64, ratio float64) bool {
+// ruleSampleWindow 是一次窗口判定结果：ready 表示样本是否已覆盖整个窗口（可判定）；
+// violated 是窗口内越限时长；pending 是 duration_sec<=0（单次采样判定）时最新样本
+// 是否越限（此时 window 为 0）。越限占比既用于告警/恢复判定，也用于告警文案。
+type ruleSampleWindow struct {
+	ready    bool
+	window   time.Duration
+	violated time.Duration
+	pending  bool
+}
+
+// ratio 返回窗口内越限时间占比（0..1）；单次采样判定按 0/1 返回。
+func (w ruleSampleWindow) ratio() float64 {
+	if w.window <= 0 {
+		if w.pending {
+			return 1
+		}
+		return 0
+	}
+	return float64(w.violated) / float64(w.window)
+}
+
+// exceeds 判断窗口内越限时间是否超过 limit 比例的窗口（严格大于）。limit>=1 表示
+// 「整个窗口持续越限」，用精确时间比较，避免浮点乘法把 100% 变成永远达不到的门槛；
+// limit<=0 时只要窗口内有过越限就算超过（即 !exceeds 要求整窗无越限）。
+// 单次采样判定只看最新样本。
+func (w ruleSampleWindow) exceeds(limit float64) bool {
+	if w.window <= 0 {
+		return w.pending
+	}
+	switch {
+	case limit >= 1:
+		return w.violated >= w.window
+	case limit <= 0:
+		return w.violated > 0
+	}
+	return w.violated > time.Duration(float64(w.window)*limit)
+}
+
+// ruleRecoverMaxRatio 返回恢复门槛：恢复要求越限占比 ≤ 该比例，即
+// min(1-ratio, ratio/2)。ratio=0.7 → 0.3（占 70% 告警、降到 30% 以下才恢复）、
+// ratio=0.5 → 0.25、ratio=1 → 0（整个窗口都不越限才恢复）。
+// 告警与恢复共用同一门槛时，越限占比在门槛附近抖动会反复告警/恢复刷屏；
+// 两者之间就是滞回带：保持原状态、不产生事件、不推进 Repeat/补发调度。
+func ruleRecoverMaxRatio(alertRatio float64) float64 {
+	recover := alertRatio / 2
+	if rest := 1 - alertRatio; rest < recover {
+		recover = rest
+	}
+	if recover < 0 {
+		return 0
+	}
+	return recover
+}
+
+// evaluateSampleWindow 汇总窗口为 [now-duration, now] 的越限时长：ready 表示样本
+// 是否已覆盖整个窗口（可判定），结论由调用方按告警/恢复两个门槛判定。
+// durationSec <= 0 表示单次采样即判定（取最新样本，恒 ready，无窗口）。最新样本在
+// now 不贡献时长，carry-in 样本按窗口起点裁剪。
+func evaluateSampleWindow(samples []ruleSample, now time.Time, durationSec int64) ruleSampleWindow {
 	if len(samples) == 0 {
-		return false
+		return ruleSampleWindow{}
 	}
 	if durationSec <= 0 {
-		return samples[len(samples)-1].violated
+		return ruleSampleWindow{ready: true, pending: samples[len(samples)-1].violated}
 	}
 	window := time.Duration(durationSec) * time.Second
 	windowStart := now.Add(-window)
+	// 窗口未就绪：最早样本必须已覆盖到窗口起点（含），否则窗口内有一段没有样本，
+	// 结论不可信——调用方据此保持原状态，不做任何状态转换。
+	if samples[0].at.After(windowStart) {
+		return ruleSampleWindow{window: window}
+	}
 	var violatedTime time.Duration
 	for i, sample := range samples {
 		segmentStart := sample.at
@@ -585,7 +673,16 @@ func evaluateSampleWindow(samples []ruleSample, now time.Time, durationSec int64
 			violatedTime += segmentEnd.Sub(segmentStart)
 		}
 	}
-	return violatedTime > time.Duration(float64(window)*ratio)
+	return ruleSampleWindow{ready: true, window: window, violated: violatedTime}
+}
+
+// ruleAlertRatio 把窗口占比挂到事件上；单次采样判定没有窗口，返回 nil。
+func ruleAlertRatio(rule AlertRule, window ruleSampleWindow) *float64 {
+	if rule.DurationSec <= 0 {
+		return nil
+	}
+	ratio := window.ratio()
+	return &ratio
 }
 
 // ===== 评估引擎 =====
@@ -617,7 +714,34 @@ type RuleAlertEvent struct {
 	Days        int     // expiry：剩余天数
 	ExpireDate  string  // expiry（本地日期）
 	DurationSec int64   // 告警：规则持续窗口；恢复：实际持续时长
-	Delivered   map[string]bool
+	// ViolatedRatio 是阈值类窗口规则触发那一刻的窗口内越限时间占比（0..1），
+	// 告警/恢复文案据此说「近 N 内 X% 时间越限」。nil 表示没有记录：单次采样
+	// 判定（duration_sec<=0）没有窗口，或旧 state.json 的补发事件。
+	ViolatedRatio *float64
+	Delivered     map[string]bool
+	// EventID 是本条事件的内部标识（不落盘、不对外）：投递异步，回执返回时
+	// 同一 (node, rule) 可能已产生新事件，RecordRuleDelivery 只接受与当前
+	// state.EventID 相等的事件，避免迟到回执污染新事件。旧 state 与旧事件都
+	// 为空字符串时仍按原语义生效（向后兼容）。
+	EventID string
+	// Retry 标记该事件来自失败补发（内部字段，不落盘、不对外）：日志只在事件
+	// 首次产生时记录一次，退避补发不再重复记录成新事件。
+	Retry bool
+	// RecoverySnapshotMissing 为恢复补发的内部标记（不落盘、不对外）：表示该待
+	// 补发状态来自旧 state.json，没有恢复快照，消息只能显示未知而不伪造数值。
+	RecoverySnapshotMissing bool
+	// ValueUnknown 标记该事件的「当前值」不成立（内部字段，不落盘、不对外）：节点
+	// 离线或指标缺失时的补发/Repeat 只有上次上报值或零值可用，文案据此显示“当前值
+	// 未知”，不把陈旧值/零值当成当前值（与恢复快照同一原则：不编造数值）。
+	ValueUnknown bool
+}
+
+// ruleEventSeq 保证同一纳秒内多次调用也能得到不同的 EventID。
+var ruleEventSeq atomic.Uint64
+
+// newRuleEventID 生成一条通知事件的唯一标识（时间戳 + 进程内自增序号）。
+func newRuleEventID(now time.Time) string {
+	return strconv.FormatInt(now.UnixNano(), 10) + "-" + strconv.FormatUint(ruleEventSeq.Add(1), 10)
 }
 
 // RuleNoticeBatch 是同一 tick 中同一规则（同一种通知类型）的合并批次。
@@ -818,74 +942,113 @@ func (s *Store) evaluateThresholdRuleLocked(rule AlertRule, nodeIDs []string, no
 		key := ruleStateKey(nodeID, rule.ID)
 		state, hasState := s.alertStates[key]
 
-		// 待恢复补发：OK 状态但上一轮恢复通知未送达全部渠道。
+		// 待恢复补发：OK 状态但上一轮恢复通知未送达全部渠道。恢复素材只读恢复瞬间
+		// 的快照（RecoveryValue/RecoveryDurationSec），不用补发时刻的当前值，也不
+		// 用 now-FiringSince 推算时长；旧 state.json 缺失快照时标记为未知。
 		if hasState && state.State == ruleStateOK && ruleNotifyRetryDue(state, now) {
 			event := RuleAlertEvent{
 				RuleID: rule.ID, NodeID: nodeID,
-				Display:     resolveAlertDisplay(profile, node.Stats, nodeID),
-				DurationSec: int64(now.Sub(state.FiringSince).Seconds()),
-				Delivered:   cloneNotifyBoolMap(state.Delivered),
+				Display:       resolveAlertDisplay(profile, node.Stats, nodeID),
+				ViolatedRatio: cloneFloat64Ptr(state.ViolatedRatio), // 同一恢复事件的快照
+				Delivered:     cloneNotifyBoolMap(state.Delivered),
+				EventID:       state.EventID, // 同一恢复事件的补发
+				Retry:         true,
 			}
-			if state.FiringSince.IsZero() {
-				event.DurationSec = 0
+			if state.RecoveryValue != nil && state.RecoveryDurationSec != nil {
+				event.Value = *state.RecoveryValue
+				event.DurationSec = *state.RecoveryDurationSec
+			} else {
+				event.RecoverySnapshotMissing = true
 			}
 			recoveryEvents = append(recoveryEvents, event)
 			state.NextRetryAt = time.Time{}
 			s.alertStates[key] = state
+			changed = true
 			continue
 		}
 
 		value, known := alertMetricValue(rule.Metric, rule.ProbeName, node.Stats)
 		offline := now.Sub(node.LastSeen) >= offlineThreshold
-		if !known || offline {
-			// unknown：保持上一个状态，不触发也不恢复，不追加样本。
-			continue
-		}
-		violated := alertValueViolated(rule, value)
-		samples := appendRuleSample(s.ruleSamples[key], now, violated, rule.DurationSec)
-		s.ruleSamples[key] = samples
-		fail := evaluateSampleWindow(samples, now, rule.DurationSec, rule.Ratio)
-
+		var window ruleSampleWindow
 		switch {
-		case fail && (!hasState || state.State != ruleStateFiring):
-			// OK→FIRING：发告警。
-			alertEvents = append(alertEvents, RuleAlertEvent{
-				RuleID: rule.ID, NodeID: nodeID,
-				Display:     resolveAlertDisplay(profile, node.Stats, nodeID),
-				Value:       value,
-				DurationSec: rule.DurationSec,
-			})
-			next := RuleAlertState{
-				State:          ruleStateFiring,
-				FiringSince:    now,
-				LastNotifiedAt: now,
+		case offline:
+			// offline：断开窗口——清空样本环、保留状态机（不做窗口内的状态转换）。
+			// 若保留旧样本，节点切回来首样本会把整段空档当成持续越限。
+			delete(s.ruleSamples, key)
+		case known:
+			// 长时间 unknown 后重新 known：样本环会跨越整段空档，carry-in 会把空档
+			// 当成持续越限/持续正常。空档超过一个窗口长度时先清空，让窗口重新预热。
+			// duration_sec<=0 为单次采样判定，不受空档影响。
+			if rule.DurationSec > 0 {
+				if samples := s.ruleSamples[key]; len(samples) > 0 {
+					if now.Sub(samples[len(samples)-1].at) > time.Duration(rule.DurationSec)*time.Second {
+						delete(s.ruleSamples, key)
+					}
+				}
 			}
-			if rule.Repeat == alertRepeatBackoff {
-				next.NextRepeatAt = now.Add(alertRepeatFirstInterval)
-			}
-			s.alertStates[key] = next
-			changed = true
-		case fail && state.State == ruleStateFiring:
-			// FIRING 维持：优先失败补发，其次按 Repeat 重发。
+			violated := alertValueViolated(rule, value)
+			samples := appendRuleSample(s.ruleSamples[key], now, violated, rule.DurationSec)
+			s.ruleSamples[key] = samples
+			window = evaluateSampleWindow(samples, now, rule.DurationSec)
+		}
+		// 告警门槛与恢复门槛分开：两者之间为滞回带。firing=false 且 recovered=false
+		// 时不做状态转换（既不 OK→FIRING，也不 FIRING→OK），避免越限占比在门槛附近
+		// 抖动时告警→恢复→告警刷屏；但 FIRING 的补发与 Repeat 仍照常推进（见下方）。
+		// 单次采样判定没有窗口，两个门槛都退化为「最新样本是否越限」，行为与滞回前
+		// 一致。
+		firing := window.exceeds(rule.Ratio)
+		recovered := window.ready && !window.exceeds(ruleRecoverMaxRatio(rule.Ratio))
+		// 本次窗口占比：新告警/恢复事件与状态快照共用；补发沿用快照而非重算。
+		// nil 表示没有可信占比：窗口未就绪，或单次采样判定（没有窗口）。
+		var currentRatio *float64
+		if window.ready {
+			currentRatio = ruleAlertRatio(rule, window)
+		}
+
+		// FIRING 维持：失败补发与 Repeat 重发不受窗口就绪影响。服务重启（样本环
+		// 不落盘）、保存规则后清环、节点离线 / 断连 / 指标缺失时窗口都在重新预热
+		// （UI 上最长一个窗口），而告警状态其实仍是 FIRING：若把补发/重发放在就绪
+		// 判断之后，这段时间里首次失败的告警永远补不出去，Repeat 也会停摆。
+		// 节点离线时也照常补发与 Repeat：阈值告警与离线告警是两条独立通道，前者
+		// 仍未解除；事件里的 ValueUnknown 让文案只说“当前值未知”，不拿上次上报值
+		// 冒充当前值。已到恢复门槛（recovered）时不补发，交给下面的 FIRING→OK。
+		valueUnknown := offline || !known
+		if hasState && state.State == ruleStateFiring && !recovered {
 			if ruleNotifyRetryDue(state, now) {
 				alertEvents = append(alertEvents, RuleAlertEvent{
 					RuleID: rule.ID, NodeID: nodeID,
-					Display:     resolveAlertDisplay(profile, node.Stats, nodeID),
-					Value:       value,
-					DurationSec: rule.DurationSec,
-					Delivered:   cloneNotifyBoolMap(state.Delivered),
+					Display:       resolveAlertDisplay(profile, node.Stats, nodeID),
+					Value:         value,
+					ValueUnknown:  valueUnknown,
+					ViolatedRatio: cloneFloat64Ptr(state.ViolatedRatio), // 同一事件的补发
+					DurationSec:   rule.DurationSec,
+					Delivered:     cloneNotifyBoolMap(state.Delivered),
+					EventID:       state.EventID, // 同一事件的补发
+					Retry:         true,
 				})
 				// 失败补发不算 Repeat 重发：不推进 LastNotifiedAt，保证倍增基数
 				// step = NextRepeatAt - LastNotifiedAt 不被补发压缩（文档：15min
 				// 起 ×2，上限 24h；补发紧邻 NextRepeatAt 到期时尤甚）。
 				state.NextRetryAt = time.Time{}
 				s.alertStates[key] = state
+				changed = true
 			} else if !state.NextRepeatAt.IsZero() && !now.Before(state.NextRepeatAt) {
+				// Repeat 重发是一条新事件：生成新 EventID 并作废旧的在途回执。
+				// 窗口未就绪时没有本次占比，沿用 state 里触发那一刻的快照，不用
+				// 零值窗口算出一个无意义的百分比。
+				repeatRatio := cloneFloat64Ptr(state.ViolatedRatio)
+				if window.ready {
+					repeatRatio = cloneFloat64Ptr(currentRatio)
+				}
+				repeatID := newRuleEventID(now)
 				alertEvents = append(alertEvents, RuleAlertEvent{
 					RuleID: rule.ID, NodeID: nodeID,
-					Display:     resolveAlertDisplay(profile, node.Stats, nodeID),
-					Value:       value,
-					DurationSec: rule.DurationSec,
+					Display:       resolveAlertDisplay(profile, node.Stats, nodeID),
+					Value:         value,
+					ValueUnknown:  valueUnknown,
+					ViolatedRatio: repeatRatio,
+					DurationSec:   rule.DurationSec,
+					EventID:       repeatID,
 				})
 				step := state.NextRepeatAt.Sub(state.LastNotifiedAt)
 				if step <= 0 {
@@ -895,14 +1058,60 @@ func (s *Store) evaluateThresholdRuleLocked(rule AlertRule, nodeIDs []string, no
 				if interval > alertRepeatMaxInterval {
 					interval = alertRepeatMaxInterval
 				}
+				state.EventID = repeatID
+				state.ViolatedRatio = cloneFloat64Ptr(repeatRatio)
 				state.Delivered = nil
 				state.RetryCount = 0
 				state.NextRetryAt = time.Time{}
 				state.LastNotifiedAt = now
 				state.NextRepeatAt = now.Add(interval)
 				s.alertStates[key] = state
+				changed = true
 			}
-		case !fail && hasState && state.State == ruleStateFiring:
+		}
+
+		if offline {
+			continue
+		}
+		if !known {
+			// unknown（节点在线但指标缺失，例如 TCP 探测超时把 LatencyMs 置空）：
+			// 只跳过本 tick 的样本与状态转换，不追加样本、不清空样本环。清空会让
+			// 「高延迟 + 偶发超时」的不稳定链路永远凑不满窗口，延迟规则永不触发。
+			// 上面的补发/Repeat 已按 NextRetryAt / NextRepeatAt 照常处理。
+			continue
+		}
+		if !window.ready {
+			// 窗口未就绪（例如重启/保存规则后样本环被清空）：不做 OK→FIRING、
+			// FIRING→OK 任何状态转换，状态原样保留。FIRING 的补发/Repeat 已在上方
+			// 处理，OK 的待恢复补发已按 NextRetryAt 处理。
+			continue
+		}
+
+		switch {
+		case firing && (!hasState || state.State != ruleStateFiring):
+			// OK→FIRING：发告警。新事件生成新 EventID，旧的在途回执随之作废。
+			eventID := newRuleEventID(now)
+			alertEvents = append(alertEvents, RuleAlertEvent{
+				RuleID: rule.ID, NodeID: nodeID,
+				Display:       resolveAlertDisplay(profile, node.Stats, nodeID),
+				Value:         value,
+				ViolatedRatio: cloneFloat64Ptr(currentRatio),
+				DurationSec:   rule.DurationSec,
+				EventID:       eventID,
+			})
+			next := RuleAlertState{
+				State:          ruleStateFiring,
+				FiringSince:    now,
+				LastNotifiedAt: now,
+				EventID:        eventID,
+				ViolatedRatio:  cloneFloat64Ptr(currentRatio),
+			}
+			if rule.Repeat == alertRepeatBackoff {
+				next.NextRepeatAt = now.Add(alertRepeatFirstInterval)
+			}
+			s.alertStates[key] = next
+			changed = true
+		case recovered && hasState && state.State == ruleStateFiring:
 			// FIRING→OK：按 NotifyRecover 发恢复。
 			duration := int64(now.Sub(state.FiringSince).Seconds())
 			if state.FiringSince.IsZero() {
@@ -912,17 +1121,29 @@ func (s *Store) evaluateThresholdRuleLocked(rule AlertRule, nodeIDs []string, no
 			// 告警的渠道会被认为无需恢复通知。
 			event := RuleAlertEvent{
 				RuleID: rule.ID, NodeID: nodeID,
-				Display:     resolveAlertDisplay(profile, node.Stats, nodeID),
-				Value:       value,
-				DurationSec: duration,
+				Display:       resolveAlertDisplay(profile, node.Stats, nodeID),
+				Value:         value,
+				ViolatedRatio: cloneFloat64Ptr(currentRatio),
+				DurationSec:   duration,
 			}
 			if rule.NotifyRecover {
+				// 恢复是另一条新事件：生成新 EventID 让告警阶段在途的回执作废。
+				newID := newRuleEventID(now)
+				event.EventID = newID
 				recoveryEvents = append(recoveryEvents, event)
 				state.State = ruleStateOK
+				state.EventID = newID
 				state.NextRetryAt = time.Time{}
 				state.NextRepeatAt = time.Time{}
 				state.Delivered = nil
 				state.RetryCount = 0
+				// 恢复快照：补发/重试只读这里的 value 与时长，不随补发时刻的
+				// 当前值变化。
+				snapshotValue := value
+				snapshotDuration := duration
+				state.RecoveryValue = &snapshotValue
+				state.ViolatedRatio = cloneFloat64Ptr(currentRatio)
+				state.RecoveryDurationSec = &snapshotDuration
 				s.alertStates[key] = state
 			} else {
 				delete(s.alertStates, key)
@@ -984,8 +1205,12 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 				}
 			}
 			if daysLeft > minSent {
-				// 到期时间被后移：重置提醒点。
+				// 到期时间被后移：重置提醒点。这是持久化字段的变更，当 tick 没命中
+				// 任何 lead day 时也要落盘，否则重置丢失，之后的提醒点会被旧值去重
+				// 而静默跳过。
 				state.SentLeadDays = nil
+				s.alertStates[key] = state
+				changed = true
 			}
 		}
 		hit := 0
@@ -999,9 +1224,12 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 		display := resolveAlertDisplay(profile, node.Stats, nodeID)
 		if hit > 0 {
 			if !slices.Contains(state.SentLeadDays, hit) {
+				// 新 lead day 是一条新提醒：生成新 EventID 并重置回执。
+				leadDayID := newRuleEventID(now)
 				events = append(events, RuleAlertEvent{
 					RuleID: rule.ID, NodeID: nodeID, Display: display,
 					Value: float64(daysLeft), Days: daysLeft, ExpireDate: expireDate,
+					EventID: leadDayID,
 				})
 				state.SentLeadDays = append(state.SentLeadDays, hit)
 				state.State = ruleStateFiring
@@ -1009,6 +1237,11 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 					state.FiringSince = now
 				}
 				state.LastNotifiedAt = now
+				state.EventID = leadDayID
+				// 新 lead day 是一条新提醒：回执从头开始，不继承上一个提醒的送达记录。
+				state.Delivered = nil
+				state.RetryCount = 0
+				state.NextRetryAt = time.Time{}
 				s.alertStates[key] = state
 				changed = true
 			} else if ruleNotifyRetryDue(state, now) {
@@ -1017,10 +1250,13 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 					RuleID: rule.ID, NodeID: nodeID, Display: display,
 					Value: float64(daysLeft), Days: daysLeft, ExpireDate: expireDate,
 					Delivered: cloneNotifyBoolMap(state.Delivered),
+					EventID:   state.EventID, // 同一提醒的补发
+					Retry:     true,
 				})
 				state.NextRetryAt = time.Time{}
 				state.LastNotifiedAt = now
 				s.alertStates[key] = state
+				changed = true
 			}
 			continue
 		}
@@ -1028,6 +1264,8 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 			// 已不在提醒点：回到 OK（保留 SentLeadDays 供当日重复扫描去重）。
 			state.State = ruleStateOK
 			state.FiringSince = time.Time{}
+			// 回 OK 也是一次事件切换：更换 EventID 作废在途回执。
+			state.EventID = newRuleEventID(now)
 			s.alertStates[key] = state
 			changed = true
 		}
@@ -1078,9 +1316,12 @@ func (s *Store) collectTrafficQuotaEventsLocked(rule AlertRule, now time.Time) (
 		step := trafficQuotaStepFor(pct, startPct)
 		display := resolveAlertDisplay(profile, node.Stats, nodeID)
 		if step > state.LastStepPct {
+			// 新台阶是一条新提醒：生成新 EventID 并重置回执。
+			stepID := newRuleEventID(now)
 			events = append(events, RuleAlertEvent{
 				RuleID: rule.ID, NodeID: nodeID, Display: display,
 				Value: pct, UsedBytes: used, QuotaBytes: profile.TrafficLimitBytes,
+				EventID: stepID,
 			})
 			state.LastStepPct = step
 			state.State = ruleStateFiring
@@ -1088,6 +1329,11 @@ func (s *Store) collectTrafficQuotaEventsLocked(rule AlertRule, now time.Time) (
 				state.FiringSince = now
 			}
 			state.LastNotifiedAt = now
+			state.EventID = stepID
+			// 新台阶是一条新提醒：回执从头开始，不继承旧台阶的送达记录/重试计数。
+			state.Delivered = nil
+			state.RetryCount = 0
+			state.NextRetryAt = time.Time{}
 			s.alertStates[key] = state
 			changed = true
 			continue
@@ -1098,15 +1344,20 @@ func (s *Store) collectTrafficQuotaEventsLocked(rule AlertRule, now time.Time) (
 				RuleID: rule.ID, NodeID: nodeID, Display: display,
 				Value: pct, UsedBytes: used, QuotaBytes: profile.TrafficLimitBytes,
 				Delivered: cloneNotifyBoolMap(state.Delivered),
+				EventID:   state.EventID, // 同一台阶的补发
+				Retry:     true,
 			})
 			state.NextRetryAt = time.Time{}
 			state.LastNotifiedAt = now
 			s.alertStates[key] = state
+			changed = true
 		}
 		if hasState && state.State == ruleStateFiring && step <= 0 {
 			// 使用率回到起报线以下：静默回到 OK（无恢复通知）。
 			state.State = ruleStateOK
 			state.FiringSince = time.Time{}
+			// 回 OK 也是一次事件切换：更换 EventID 作废在途回执。
+			state.EventID = newRuleEventID(now)
 			s.alertStates[key] = state
 			changed = true
 		}
@@ -1195,6 +1446,8 @@ func (s *Store) resetTrafficStepStatesLocked(nodeID string) {
 		state.NextRetryAt = time.Time{}
 		state.Delivered = nil
 		state.RetryCount = 0
+		// 周期重置也是一次事件切换：更换 EventID 作废在途回执。
+		state.EventID = newRuleEventID(time.Now())
 		s.alertStates[key] = state
 	}
 }
@@ -1304,6 +1557,51 @@ func dispatchRuleBatchNotice(batch RuleNoticeBatch) map[string]bool {
 	return results
 }
 
+// ruleDisplayName 返回日志里使用的规则名（空名/仅控制字符时回退 ID）：
+// formatAlertValue 会去掉控制字符与换行，避免内部换行把一行日志拆成多行；
+// 它先去空白再删控制字符，故这里再 trim 一次，让「控制字符 + 空格」也回退 ID。
+func ruleDisplayName(rule AlertRule) string {
+	name := strings.TrimSpace(formatAlertValue(rule.Name, ""))
+	if name == "" {
+		return rule.ID
+	}
+	return name
+}
+
+// countFreshRuleEvents 统计批次里首次产生（非失败补发）的事件数。
+func countFreshRuleEvents(events []RuleAlertEvent) int {
+	fresh := 0
+	for _, event := range events {
+		if !event.Retry {
+			fresh++
+		}
+	}
+	return fresh
+}
+
+// deliverRuleBatches 投递一个 tick 产出的规则批次并记录回执（runOnce 的规则投递
+// 循环提取为可测函数）：
+//   - 无渠道时记一条可排查的日志，并保持原有语义按 nil 结果推进状态（安排退避
+//     补发，便于补配渠道后补发未送达的事件）；
+//   - 有渠道时无论全部成功还是部分失败都写回执：全部成功同样要落盘完成态（取消
+//     重试、保留/删除状态），不能只在失败时记录导致完成态丢失。
+func deliverRuleBatches(store *Store, batches []RuleNoticeBatch) {
+	for _, batch := range batches {
+		if len(batch.Channels) == 0 {
+			// 规则引用的渠道全部被删除/停用时，事件会被状态机消费却一条都发不出去，
+			// 必须留下可排查的日志（管理后台「日志」页可见）。只对首次产生的事件
+			// 记一条；补发批次不再重复打印，避免同一事件每次退避重试都刷一条。
+			if fresh := countFreshRuleEvents(batch.Events); fresh > 0 {
+				log.Printf("告警未发送：规则「%s」没有可用的通知渠道（%d 条事件）", ruleDisplayName(batch.Rule), fresh)
+			}
+			store.RecordRuleDelivery(batch, nil)
+			continue
+		}
+		results := dispatchRuleBatchNotice(batch)
+		store.RecordRuleDelivery(batch, results)
+	}
+}
+
 func owedRuleAlertEvents(events []RuleAlertEvent, channelID string) []RuleAlertEvent {
 	owed := make([]RuleAlertEvent, 0, len(events))
 	for _, event := range events {
@@ -1318,6 +1616,9 @@ func owedRuleAlertEvents(events []RuleAlertEvent, channelID string) []RuleAlertE
 // RecordRuleDelivery 按 results（渠道 ID → 是否成功）记录批次内事件的投递进度：
 // 只有全部渠道送达才取消重试；阈值类告警保持 FIRING（等待 Repeat/恢复），恢复与
 // 事件类规则（expiry 已过提醒点、流量台阶已记）送达后按各自语义收敛。
+// 只接受与当前 state.EventID 严格相等的事件：投递期间同一 (node, rule) 可能已产生
+// 新事件（新台阶/新 lead day/再次 FIRING/恢复），迟到的旧事件回执一律忽略。旧
+// state 与旧事件都为空字符串时仍按原语义生效（向后兼容）。
 func (s *Store) RecordRuleDelivery(batch RuleNoticeBatch, results map[string]bool) {
 	needsPersist := false
 	s.mu.Lock()
@@ -1326,6 +1627,10 @@ func (s *Store) RecordRuleDelivery(batch RuleNoticeBatch, results map[string]boo
 		key := ruleStateKey(event.NodeID, event.RuleID)
 		state, ok := s.alertStates[key]
 		if !ok {
+			continue
+		}
+		if state.EventID != event.EventID {
+			// 迟到回执：状态已轮转到另一条事件，不得写回执/重试/删除。
 			continue
 		}
 		for channelID, success := range results {
@@ -1371,14 +1676,18 @@ func (s *Store) RecordRuleDelivery(batch RuleNoticeBatch, results map[string]boo
 	}
 }
 
-// logRuleNoticeEvents 输出评估事件日志（不含敏感信息）。
+// logRuleNoticeEvents 输出评估事件日志（不含敏感信息）。只有首次产生的事件
+// 记一行：失败补发（RuleAlertEvent.Retry）不重复记录；规则名缺失时回退 ID。
 func logRuleNoticeEvents(batches []RuleNoticeBatch) {
 	for _, batch := range batches {
 		for _, event := range batch.Events {
+			if event.Retry {
+				continue
+			}
 			reportLogger.Printf("[%s] 规则告警（%s/%s）：%s（node=%s）",
 				batch.SiteTitle,
 				string(batch.Kind),
-				batch.Rule.ID,
+				ruleDisplayName(batch.Rule),
 				formatAlertValue(event.Display, "未命名节点"),
 				formatAlertValue(event.NodeID, "unknown"),
 			)
@@ -1426,43 +1735,111 @@ func buildRuleNoticeMessage(batch RuleNoticeBatch, events []RuleAlertEvent) stri
 
 	meta := alertRuleMetricTable[rule.Metric]
 	condition := ruleConditionText(rule)
+	// 窗口类阈值规则（duration_sec>0）：告警主信息是判定依据（窗口内越限时间占比），
+	// 瞬时值降为括号里的次要信息。否则用户会把低于阈值的瞬时值当成“告警值”，
+	// 也会把“持续 1 分钟”读成“连续 1 分钟越限”。
+	windowAlert := rule.DurationSec > 0
 	if batch.Kind == ruleNoticeRecovery {
 		if len(events) == 1 {
-			return fmt.Sprintf("【%s】✅ 已恢复 · %s · %s 当前 %s，持续 %s",
+			if events[0].RecoverySnapshotMissing {
+				// 旧 state.json 的待补发状态没有恢复快照：不拿当前值/时刻伪造。
+				return fmt.Sprintf("【%s】✅ 已恢复 · %s · %s 恢复时数值未知，持续时长未知",
+					siteTitle, rule.Name, events[0].Display)
+			}
+			return fmt.Sprintf("【%s】✅ 已恢复 · %s · %s 当前 %s，持续 %s%s",
 				siteTitle, rule.Name, events[0].Display,
 				formatRuleMetricValue(rule.Metric, meta, events[0].Value),
 				formatAlertDuration(events[0].DurationSec),
+				ruleRecoveredRatioText(rule, events[0].ViolatedRatio),
 			)
 		}
 		lines := []string{fmt.Sprintf("【%s】✅ 已恢复 · %s", siteTitle, rule.Name)}
 		for _, event := range events {
-			lines = append(lines, fmt.Sprintf("• %s 当前 %s，持续 %s",
+			if event.RecoverySnapshotMissing {
+				lines = append(lines, fmt.Sprintf("• %s 恢复时数值未知，持续时长未知", event.Display))
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("• %s 当前 %s，持续 %s%s",
 				event.Display,
 				formatRuleMetricValue(rule.Metric, meta, event.Value),
 				formatAlertDuration(event.DurationSec),
+				ruleRecoveredRatioText(rule, event.ViolatedRatio),
+			))
+		}
+		return strings.Join(lines, "\n")
+	}
+	if windowAlert {
+		if len(events) == 1 {
+			return fmt.Sprintf("【%s】⚠️ %s · %s %s（%s）",
+				siteTitle, rule.Name, events[0].Display,
+				ruleWindowAlertText(rule, events[0].ViolatedRatio),
+				ruleAlertValueText(rule, meta, events[0]),
+			)
+		}
+		lines := []string{fmt.Sprintf("【%s】⚠️ %s", siteTitle, rule.Name)}
+		for _, event := range events {
+			lines = append(lines, fmt.Sprintf("• %s %s（%s）",
+				event.Display,
+				ruleWindowAlertText(rule, event.ViolatedRatio),
+				ruleAlertValueText(rule, meta, event),
 			))
 		}
 		return strings.Join(lines, "\n")
 	}
 	if len(events) == 1 {
-		return fmt.Sprintf("【%s】⚠️ %s · %s 当前 %s（%s）",
+		return fmt.Sprintf("【%s】⚠️ %s · %s %s（%s）",
 			siteTitle, rule.Name, events[0].Display,
-			formatRuleMetricValue(rule.Metric, meta, events[0].Value),
+			ruleAlertValueText(rule, meta, events[0]),
 			condition,
 		)
 	}
 	lines := []string{fmt.Sprintf("【%s】⚠️ %s", siteTitle, rule.Name)}
 	for _, event := range events {
-		lines = append(lines, fmt.Sprintf("• %s 当前 %s（%s）",
+		lines = append(lines, fmt.Sprintf("• %s %s（%s）",
 			event.Display,
-			formatRuleMetricValue(rule.Metric, meta, event.Value),
+			ruleAlertValueText(rule, meta, event),
 			condition,
 		))
 	}
 	return strings.Join(lines, "\n")
 }
 
-// ruleConditionText 生成「阈值 >90%，持续 5 分钟」这类条件描述。
+// ruleAlertValueText 生成告警文案里的「当前值」片段。节点离线或指标缺失时的补发与
+// Repeat 只有上次上报值或零值可用，此时说“当前值未知”，不拿陈旧值当当前值。
+func ruleAlertValueText(rule AlertRule, meta alertMetricMeta, event RuleAlertEvent) string {
+	if event.ValueUnknown {
+		return "当前值未知"
+	}
+	return "当前 " + formatRuleMetricValue(rule.Metric, meta, event.Value)
+}
+
+// ruleWindowAlertText 生成窗口类阈值告警的主信息：「近 1分钟内 82% 时间 >30.0%」。
+// 占比取告警事件记录的窗口值（补发沿用快照，不重算）；旧 state.json 的补发事件
+// 没有占比记录，退化为「近 1分钟内超过 70% 时间 >30.0%」，不编造数字。
+func ruleWindowAlertText(rule AlertRule, violatedRatio *float64) string {
+	meta := alertRuleMetricTable[rule.Metric]
+	op := ">"
+	if rule.Op == alertOpLT {
+		op = "<"
+	}
+	threshold := formatRuleMetricValue(rule.Metric, meta, rule.Threshold)
+	window := formatAlertDuration(rule.DurationSec)
+	if violatedRatio == nil {
+		return fmt.Sprintf("近 %s内超过 %s 时间 %s%s", window, formatAlertRatio(rule.Ratio), op, threshold)
+	}
+	return fmt.Sprintf("近 %s内 %s 时间 %s%s", window, formatAlertRatio(*violatedRatio), op, threshold)
+}
+
+// ruleRecoveredRatioText 给恢复文案补一句判定依据：「（近 1分钟内 12% 时间越限）」。
+// 单次采样规则没有窗口，旧 state.json 的补发没有占比快照，均返回空字符串。
+func ruleRecoveredRatioText(rule AlertRule, violatedRatio *float64) string {
+	if rule.DurationSec <= 0 || violatedRatio == nil {
+		return ""
+	}
+	return fmt.Sprintf("（近 %s内 %s 时间越限）", formatAlertDuration(rule.DurationSec), formatAlertRatio(*violatedRatio))
+}
+
+// ruleConditionText 生成「阈值 >90%，近 5分钟内 70% 时间越限」这类条件描述。
 func ruleConditionText(rule AlertRule) string {
 	meta := alertRuleMetricTable[rule.Metric]
 	op := ">"
@@ -1472,9 +1849,21 @@ func ruleConditionText(rule AlertRule) string {
 	threshold := formatRuleMetricValue(rule.Metric, meta, rule.Threshold)
 	condition := fmt.Sprintf("阈值 %s%s", op, threshold)
 	if rule.DurationSec > 0 {
-		condition += fmt.Sprintf("，持续 %s", formatAlertDuration(rule.DurationSec))
+		// 不说「持续」：窗口类规则判的是“窗口内越限时间占比”，不是连续越限。
+		condition += fmt.Sprintf("，近 %s内 %s 时间越限", formatAlertDuration(rule.DurationSec), formatAlertRatio(rule.Ratio))
 	}
 	return condition
+}
+
+// formatAlertRatio 把 0..1 的占比格式化为整数百分比（占比保留整数即可，不吹精度）。
+func formatAlertRatio(ratio float64) string {
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	return strconv.FormatFloat(math.Round(ratio*100), 'f', 0, 64) + "%"
 }
 
 // formatRuleMetricValue 按指标单位格式化数值；net_in/net_out 以 B/s 存储但按

@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -25,6 +25,9 @@ type AdminDataTableProps<Row> = {
   emptyLabel: ReactNode;
   ariaLabel: string;
   className?: string;
+  // 卡片内的底部说明条（与表格同一张卡）：用于「另有 N 个未配置」这类表尾
+  // 汇总。不传时保持原有结构（滚动容器直接铺满卡片）。
+  footer?: ReactNode;
   // 覆盖 <table> 自身样式，典型用途：列宽之和较大的表格在窄屏下声明更大的最小宽度。
   tableClassName?: string;
 
@@ -47,8 +50,8 @@ export type AdminStatusBadgeTone = "ok" | "danger" | "warn" | "accent" | "neutra
 
 const adminStatusBadgeToneClass: Record<AdminStatusBadgeTone, string> = {
   ok: "bg-[var(--ok-tint)] text-[var(--ok)]",
-  danger: "bg-[var(--danger-tint)] text-[var(--danger)]",
-  warn: "bg-[var(--warn-tint)] text-[var(--warn)]",
+  danger: "bg-[var(--danger-tint)] text-[var(--danger-text)]",
+  warn: "bg-[var(--warn-tint)] text-[var(--warn-text)]",
   accent: "bg-[var(--accent-tint)] text-[var(--accent-text)]",
   neutral: "bg-[var(--surface-sunken)] text-[var(--label-2)]",
 };
@@ -70,6 +73,7 @@ export function AdminDataTable<Row>({
   emptyLabel,
   ariaLabel,
   className,
+  footer,
   tableClassName,
   scrollClassName,
   stickyHeader = false,
@@ -82,26 +86,41 @@ export function AdminDataTable<Row>({
   // A-05 第 6 条：滚动容器在 scrollHeight > clientHeight + 1 且未滚到底时加
   // is-scrollable 类（配合恒挂的 [&.is-scrollable]:mask… 做 16px 底部渐隐），
   // 在 ResizeObserver 与 scroll 事件中更新。默认容器不可纵向滚动，恒不触发。
+  // 无障碍：容器一旦实际可滚动（横向或纵向），axe scrollable-region-focusable 要求
+  // 它能被键盘聚焦。因此同一观测里同步 scrollable 状态，仅在可滚动时授予
+  // tabIndex=0 + role="region"（附带 aria-label），避免不可滚动的表多出空 tab 停靠点。
+  // 观测对象必须同时包含容器与 <table> 本身：容器尺寸被固定时（h-full / max-h 限高、
+  // 或首页卡片绝对定位），数据行晚到只会撑高内容、容器自身尺寸不变，只观测容器会漏掉
+  // 「现在才变成可滚动」这一刻。
+  // 渐隐类也走 state 而非 classList 直改：React 重渲染写回 className 时会把命令式加上的
+  // 类抹掉（时机与 setScrollable 的渲染同步），造成数据到达后恰好在顶部却无渐隐。
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const tableRef = useRef<HTMLTableElement | null>(null);
+  const [scrollable, setScrollable] = useState(false);
+  const [tailHidden, setTailHidden] = useState(false);
   useEffect(() => {
     const el = scrollRef.current;
+    const table = tableRef.current;
     if (!el) {
       return;
     }
     const update = () => {
-      const scrollable =
-        el.scrollHeight > el.clientHeight + 1 &&
-        el.scrollTop + el.clientHeight < el.scrollHeight - 1;
-      el.classList.toggle("is-scrollable", scrollable);
+      const overflowY = el.scrollHeight > el.clientHeight + 1;
+      const scrollableNow = overflowY || el.scrollWidth > el.clientWidth + 1;
+      const tailHiddenNow = overflowY && el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+      setScrollable((prev) => (prev === scrollableNow ? prev : scrollableNow));
+      setTailHidden((prev) => (prev === tailHiddenNow ? prev : tailHiddenNow));
     };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(el);
+    if (table) {
+      observer.observe(table);
+    }
     el.addEventListener("scroll", update, { passive: true });
     return () => {
       observer.disconnect();
       el.removeEventListener("scroll", update);
-      el.classList.remove("is-scrollable");
     };
   }, []);
 
@@ -125,16 +144,28 @@ export function AdminDataTable<Row>({
     >
       {/* A-13 第 1 条：w-full 保证表头/表格铺满卡片宽度；thead 的背景落在各 th 上。
           A-05：scrollClassName 作用于该滚动容器；is-scrollable 由上方 effect 按需
-          切换，底部 16px 渐隐提示可继续滚动。 */}
+          切换（尾部仍有内容时显示底部 16px 渐隐）。 */}
       <div
         ref={scrollRef}
+        {...(scrollable
+          ? {
+              tabIndex: 0,
+              role: "region",
+              "aria-label": ariaLabel,
+            }
+          : {})}
         className={cn(
           "w-full max-md:overflow-x-auto",
           "[&.is-scrollable]:[mask-image:linear-gradient(to_bottom,black_calc(100%-16px),transparent)]",
+          tailHidden && "is-scrollable",
+          // 可滚动时可用键盘聚焦，沿用现有焦点环（--primary-ring），内缩避免被卡片圆角裁切
+          scrollable &&
+            "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--primary-ring)]",
           scrollClassName,
         )}
       >
         <table
+          ref={tableRef}
           aria-label={ariaLabel}
           className={cn(
             "w-full border-separate border-spacing-0 text-sm",
@@ -259,6 +290,11 @@ export function AdminDataTable<Row>({
           </tbody>
         </table>
       </div>
+      {footer ? (
+        <div className="flex min-w-0 items-center gap-2 rounded-b-[var(--r-lg)] border-t border-[var(--hairline)] px-4 py-2 text-[12px] text-[var(--label-3)]">
+          {footer}
+        </div>
+      ) : null}
     </div>
   );
 }

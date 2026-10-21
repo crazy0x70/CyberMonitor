@@ -173,6 +173,9 @@ function buildProbeScope(mode: ProbeScopeMode, nodes: string[], groups: string[]
 type ProbeDraft = { uid: string; item: TestCatalogItem };
 
 export interface ProbeSettingsProps {
+  // App 实时维护的节点列表：列表「下发」列据此区分「N 个节点（手动）」与「未下发」
+  // （节点抽屉手动选择存在 NodeView.test_selections）。
+  nodes: NodeView[];
   testCatalog: TestCatalogItem[];
   onDirtyChange?: (dirty: boolean) => void;
   saving?: boolean;
@@ -262,7 +265,9 @@ function toFormState(item?: TestCatalogItem): ProbeFormState {
       ? String(normalizeInterval(item?.interval_sec))
       : "",
     // O-01：下发范围草稿（exclude 两种模式都保留，重存不丢失——D-05）。
-    scopeMode: probeScopeModeOf(item?.scope),
+    // 新建目标默认「全部节点」：默认「不下发」会让保存后什么都不发生；编辑存量
+    // 条目时保持其现有范围（不做数据迁移）。
+    scopeMode: item ? probeScopeModeOf(item.scope) : "all",
     scopeNodes: cleanScopeList(item?.scope?.nodes),
     scopeGroups: cleanScopeList(item?.scope?.groups),
     scopeExclude: cleanScopeList(item?.scope?.exclude),
@@ -360,16 +365,16 @@ function validateProbeForm(formState: ProbeFormState): ProbeValidationResult {
   const host = formState.host.trim();
 
   if (!name) {
-    return { field: "name", error: "探测节点名称不能为空。" };
+    return { field: "name", error: "探测目标名称不能为空。" };
   }
   if (/[<>"'`]/.test(name)) {
-    return { field: "name", error: "探测节点名称包含非法字符。" };
+    return { field: "name", error: "探测目标名称包含非法字符。" };
   }
   if (!host) {
-    return { field: "host", error: "探测节点地址不能为空。" };
+    return { field: "host", error: "探测目标地址不能为空。" };
   }
   if (/[<>"'`]/.test(host) || !isValidHost(host)) {
-    return { field: "host", error: "探测节点地址格式不正确。" };
+    return { field: "host", error: "探测目标地址格式不正确。" };
   }
 
   // F2：ICMP 与 TCP 都可配置间隔，校验逻辑共用；0 = ICMP 持续 / TCP 5 秒。
@@ -450,9 +455,10 @@ function formatProbeInterval(item: TestCatalogItem) {
   return resolveProbeType(item) === "tcp" ? `${DEFAULT_TCP_INTERVAL} 秒` : "持续";
 }
 
-// O-01：「下发」列文案——不下发 → 「—」；全部节点 → 「全部节点」；
-// 分组 / 节点 → 「N 个分组」/「N 个节点」（groups 非空优先，与抽屉模式推导一致）。
-function formatProbeDelivery(item: TestCatalogItem) {
+// O-01：「下发」列文案——全部节点 → 「全部节点」；分组 / 节点 → 「N 个分组」/
+// 「N 个节点」（groups 非空优先，与抽屉模式推导一致）。没有下发范围时返回 null，
+// 由列表区分「节点手动选择」与「未下发」。
+function formatProbeDelivery(item: TestCatalogItem): string | null {
   const scope = item.scope;
   const mode = String(scope?.mode || "").trim();
   if (mode === "all") {
@@ -468,18 +474,38 @@ function formatProbeDelivery(item: TestCatalogItem) {
       return `${nodes.length} 个节点`;
     }
   }
-  return "—";
+  return null;
+}
+
+// 在节点抽屉「探测下发策略」里手动选择该目标的节点数（NodeView.test_selections）。
+// 仅在目标没有下发范围时用于判定「手动下发 / 未下发」。
+function countManualProbeNodes(nodes: NodeView[], testID?: string): number {
+  const id = String(testID || "").trim();
+  if (!id) {
+    return 0;
+  }
+  let count = 0;
+  for (const node of nodes) {
+    if ((node.test_selections || []).some((selection) => selection?.test_id === id)) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 // 探测目标账本列：地址等宽、间隔数字右对齐；无逐条启停数据，删除
-// 动作收进抽屉底栏（与 ServerManagement 的删除位一致）。
-const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
+// 动作收进抽屉底栏（与 ServerManagement 的删除位一致）。「下发」列需要节点的实时
+// test_selections，因此按节点列表构建（App 传入，不另起轮询）。
+function buildProbeTableColumns(
+  nodes: NodeView[],
+): ReadonlyArray<AdminDataTableColumn<ProbeDraft>> {
+  const columns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
   {
     key: "name",
     label: "名称",
     render: (draft) => (
       <span className="text-sm font-medium text-[var(--label-1)]">
-        {draft.item.name || "未命名探测节点"}
+        {draft.item.name || "未命名探测目标"}
       </span>
     ),
   },
@@ -505,11 +531,32 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
   {
     key: "delivery",
     label: "下发",
-    render: (draft) => (
-      <span className="text-[13px] text-[var(--label-2)]">
-        {formatProbeDelivery(draft.item)}
-      </span>
-    ),
+    render: (draft) => {
+      const delivery = formatProbeDelivery(draft.item);
+      if (delivery) {
+        return <span className="text-[13px] text-[var(--label-2)]">{delivery}</span>;
+      }
+      // 没有下发范围：节点抽屉里手动选过它仍会探测；一点都没有则不会产生数据。
+      const manualNodes = countManualProbeNodes(nodes, draft.item.id);
+      if (manualNodes > 0) {
+        return (
+          <span
+            className="text-[13px] text-[var(--label-2)]"
+            title="由节点抽屉手动选择，未设置下发范围"
+          >
+            {`${manualNodes} 个节点（手动）`}
+          </span>
+        );
+      }
+      return (
+        <span
+          className="text-[13px] font-medium text-[var(--warn-text)]"
+          title="未下发到任何节点，不会产生探测数据"
+        >
+          未下发
+        </span>
+      );
+    },
   },
   {
     key: "interval",
@@ -519,9 +566,12 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeDraft>> = [
       <span className="tabular-nums text-[var(--label-2)]">{formatProbeInterval(draft.item)}</span>
     ),
   },
-];
+  ];
+  return columns;
+}
 
 export default function ProbeSettings({
+  nodes,
   testCatalog,
   onDirtyChange,
   saving = false,
@@ -548,6 +598,19 @@ export default function ProbeSettings({
     [drafts],
   );
   const isBusy = isSaving || saving;
+
+  // P1：没有下发范围、也没有节点手动选择的目标不会产生任何探测数据——列表列与
+  // 卡片顶部提示都基于这份实时节点数据（App 传入，不另起轮询）。
+  const tableColumns = useMemo(() => buildProbeTableColumns(nodes), [nodes]);
+  const undeliveredProbeCount = useMemo(
+    () =>
+      drafts.filter(
+        (draft) =>
+          !formatProbeDelivery(draft.item) &&
+          countManualProbeNodes(nodes, draft.item.id) === 0,
+      ).length,
+    [drafts, nodes],
+  );
 
   const [sourceSignature, absorbSourceSignature, discardDraft] = useDraftReconcile({
     draftSignature: currentDraftSignature,
@@ -603,12 +666,17 @@ export default function ProbeSettings({
   // 拉取失败不阻塞其他字段编辑（多选器显示空态，重开抽屉重试）。
   const [scopeData, setScopeData] = useState<{ nodes: NodeView[]; groupTree: GroupNode[] } | null>(null);
   const [scopeDataLoading, setScopeDataLoading] = useState(false);
+  // 加载失败不能伪装成“暂无节点/分组”：保留上一次成功数据，并在抽屉内给出
+  // 明确的失败提示与重试入口。reloadKey 用于重试同一抽屉。
+  const [scopeError, setScopeError] = useState(false);
+  const [scopeReloadKey, setScopeReloadKey] = useState(0);
   useEffect(() => {
     if (!isDrawerOpen) {
       return;
     }
     let cancelled = false;
     setScopeDataLoading(true);
+    setScopeError(false);
     void (async () => {
       try {
         const [nodesSnapshot, settingsView] = await Promise.all([fetchNodes(), fetchSettings()]);
@@ -617,10 +685,12 @@ export default function ProbeSettings({
             nodes: nodesSnapshot?.nodes || [],
             groupTree: settingsView?.group_tree || [],
           });
+          setScopeError(false);
         }
       } catch {
         if (!cancelled) {
-          setScopeData(null);
+          // 保留已有选项（可能是上一次打开时的数据），仅标记可能不完整。
+          setScopeError(true);
         }
       } finally {
         if (!cancelled) {
@@ -631,7 +701,7 @@ export default function ProbeSettings({
     return () => {
       cancelled = true;
     };
-  }, [isDrawerOpen]);
+  }, [isDrawerOpen, scopeReloadKey]);
 
   const scopeNodeOptions = (scopeData?.nodes || [])
     .map((node) => {
@@ -716,7 +786,7 @@ export default function ProbeSettings({
       );
     });
     closeDrawer();
-    toast.success(editingUid === null ? "探测节点已添加" : "探测节点已更新");
+    toast.success(editingUid === null ? "探测目标已添加" : "探测目标已更新");
   };
 
   const handleDelete = (uid: string) => {
@@ -731,7 +801,7 @@ export default function ProbeSettings({
     }
     setDrafts((current) => current.filter((draft) => draft.uid !== uid));
     clearPendingDelete();
-    toast.success("探测节点已移除");
+    toast.success("探测目标已移除");
   };
 
   const runAction = useAsyncAction();
@@ -747,8 +817,8 @@ export default function ProbeSettings({
     const payload = normalizeCatalog(drafts.map((draft) => draft.item));
     void runAction({
       action: () => onSave(payload),
-      fallbackError: "保存探测节点配置失败",
-      successToast: "探测节点配置已保存",
+      fallbackError: "保存探测目标配置失败",
+      successToast: "探测目标配置已保存",
       onSuccess: (savedSettings) => {
         const canonicalCatalog = normalizeCatalog(savedSettings.test_catalog || payload);
         setDrafts(canonicalCatalog.map(attachUid));
@@ -781,7 +851,7 @@ export default function ProbeSettings({
                 </Button>
               </>
             ) : null}
-            {/* A-12 / 0.1.2：保存入口与「有未保存的修改」徽标移入浮动保存条，页头只留「新增探测节点」。 */}
+            {/* A-12 / 0.1.2：保存入口与「有未保存的修改」徽标移入浮动保存条，页头只留「新增探测目标」。 */}
             <Button
               variant="outline"
               className={`${adminActionButtonClass} h-9 min-w-[140px] flex-1 gap-1.5 px-4 font-medium sm:flex-none`}
@@ -789,7 +859,7 @@ export default function ProbeSettings({
               disabled={isBusy}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
-              新增探测节点
+              新增探测目标
             </Button>
           </>
         }
@@ -799,18 +869,31 @@ export default function ProbeSettings({
         title="目标列表"
         icon={<Radio className="h-4 w-4 text-[var(--label-3)]" />}
       >
+        {undeliveredProbeCount > 0 ? (
+          <div
+            role="status"
+            className="mb-3 rounded-[var(--r-sm)] bg-[var(--warn-tint)] px-3 py-2 text-[13px] leading-relaxed text-[var(--label-2)]"
+          >
+            <p className="font-medium text-[var(--warn-text)]">
+              {`${undeliveredProbeCount} 个探测目标未下发到任何节点，不会产生探测数据。`}
+            </p>
+            <p className="mt-1">
+              打开目标后，在「下发范围」选择「全部节点」或指定节点/分组即可生效。
+            </p>
+          </div>
+        ) : null}
         <AdminDataTable
           ariaLabel="探测目标"
-          columns={probeTableColumns}
+          columns={tableColumns}
           rows={drafts}
           rowKey={(draft) => draft.uid}
           onRowClick={(draft) => openDrawer(draft)}
           emptyLabel={
-            // E-11 / A-16 / 0.1.2：空态用 AdminEmptyState，主按钮复用页头「新增探测节点」
+            // E-11 / A-16 / 0.1.2：空态用 AdminEmptyState，主按钮复用页头「新增探测目标」
             // 同一个 onClick（openDrawer()），不新增逻辑。
             <AdminEmptyState
               icon={<Radio aria-hidden="true" />}
-              title="暂无探测节点"
+              title="暂无探测目标"
               description="添加探测目标后，展示页节点详情中将显示到各目标的延迟图表。"
               action={
                 <Button
@@ -819,7 +902,7 @@ export default function ProbeSettings({
                   disabled={isBusy}
                 >
                   <Plus className="h-4 w-4" aria-hidden="true" />
-                  新增探测节点
+                  新增探测目标
                 </Button>
               }
             />
@@ -846,7 +929,7 @@ export default function ProbeSettings({
             closeDrawer();
           }
         }}
-        title={editingUid === null ? "新增探测节点" : "编辑探测节点"}
+        title={editingUid === null ? "新增探测目标" : "编辑探测目标"}
         description={
           editingDraft
             ? `${resolveProbeType(editingDraft.item).toUpperCase()} · ${formatProbeTarget(
@@ -882,9 +965,9 @@ export default function ProbeSettings({
                     </Button>
                   )}
                 />
-                <AlertDialogContent className={adminDialogContentClass}>
+                <AlertDialogContent className={adminDialogContentClass} variant="danger">
                   <AlertDialogHeader className={adminDialogHeaderClass}>
-                    <AlertDialogTitle>确认删除探测节点？</AlertDialogTitle>
+                    <AlertDialogTitle>确认删除探测目标？</AlertDialogTitle>
                   </AlertDialogHeader>
                   <AlertDialogFooter className={adminDialogFooterClass}>
                     <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
@@ -923,7 +1006,7 @@ export default function ProbeSettings({
                 onClick={handleDrawerSave}
                 disabled={isBusy}
               >
-                {editingUid === null ? "新增探测节点" : "保存探测节点"}
+                {editingUid === null ? "新增探测目标" : "保存探测目标"}
               </Button>
             </div>
           </div>
@@ -1122,8 +1205,33 @@ export default function ProbeSettings({
                   <SelectItem value="nodes">指定节点</SelectItem>
                 </SelectContent>
               </Select>
+              {formState.scopeMode === "none" ? (
+                <p className={adminHelpTextClass}>
+                  不下发时该目标不会在任何节点运行；如需在单个节点上使用，可在节点抽屉中手动选择。
+                </p>
+              ) : null}
               {scopeDataLoading ? (
                 <p className={adminHelpTextClass}>正在加载数据…</p>
+              ) : null}
+              {scopeError && formState.scopeMode !== "none" ? (
+                <div
+                  role="status"
+                  className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[var(--r-sm)] bg-[var(--warn-tint)] px-3 py-2 text-[13px] text-[var(--label-2)]"
+                >
+                  <span className="min-w-0 flex-1">
+                    节点与分组数据加载失败，当前选项可能不完整。
+                  </span>
+                  <Button
+                    aria-label="重试加载下发范围"
+                    className="h-8 shrink-0 px-2.5 text-xs"
+                    size="sm"
+                    title="重试加载下发范围"
+                    variant="outline"
+                    onClick={() => setScopeReloadKey((current) => current + 1)}
+                  >
+                    重试
+                  </Button>
+                </div>
               ) : null}
               {formError?.field === "scope" ? (
                 <p id="probe-scope-error" className={adminFieldErrorClass} aria-live="polite">
@@ -1137,7 +1245,7 @@ export default function ProbeSettings({
               <RuleMultiSelect
                 id="probe-scope-groups"
                 summary={`已选 ${formState.scopeGroups.length} 项`}
-                emptyText={scopeGroupOptions.length === 0 ? "暂无分组" : "未选择"}
+                emptyText={scopeGroupOptions.length === 0 ? (scopeError && !scopeData ? "加载失败" : "暂无分组") : "未选择"}
                 options={scopeGroupOptions}
                 selected={formState.scopeGroups}
                 disabled={isBusy || scopeDataLoading}
@@ -1150,7 +1258,7 @@ export default function ProbeSettings({
               <RuleMultiSelect
                 id="probe-scope-nodes"
                 summary={`已选 ${formState.scopeNodes.length} 个节点`}
-                emptyText={scopeNodeOptions.length === 0 ? "暂无节点" : "未选择"}
+                emptyText={scopeNodeOptions.length === 0 ? (scopeError && !scopeData ? "加载失败" : "暂无节点") : "未选择"}
                 options={scopeNodeOptions}
                 selected={formState.scopeNodes}
                 disabled={isBusy || scopeDataLoading}
@@ -1163,7 +1271,7 @@ export default function ProbeSettings({
               <RuleMultiSelect
                 id="probe-scope-exclude"
                 summary={`已选 ${formState.scopeExclude.length} 个节点`}
-                emptyText={scopeNodeOptions.length === 0 ? "暂无节点" : "未选择"}
+                emptyText={scopeNodeOptions.length === 0 ? (scopeError && !scopeData ? "加载失败" : "暂无节点") : "未选择"}
                 options={scopeNodeOptions}
                 selected={formState.scopeExclude}
                 disabled={isBusy || scopeDataLoading}

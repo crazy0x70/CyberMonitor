@@ -19,17 +19,23 @@ type seriesQuerier interface {
 }
 
 func hasMatchingSeries(db seriesQuerier, matchers ...*labels.Matcher) (bool, error) {
+	return hasMatchingSeriesSince(db, allSeriesMint, matchers...)
+}
+
+// hasMatchingSeriesSince 与 hasMatchingSeries 相同，但只统计 mint 之后的样本：
+// 调用方可用它把保留期 cutoff 直接作用到「是否有历史」的判断上。
+func hasMatchingSeriesSince(db seriesQuerier, mint int64, matchers ...*labels.Matcher) (bool, error) {
 	if db == nil {
 		return false, nil
 	}
-	querier, err := db.Querier(allSeriesMint, allSeriesMaxt)
+	querier, err := db.Querier(mint, allSeriesMaxt)
 	if err != nil {
 		return false, err
 	}
 	defer querier.Close()
 
 	seriesSet := querier.Select(context.Background(), false, &storage.SelectHints{
-		Start: allSeriesMint,
+		Start: mint,
 		End:   allSeriesMaxt,
 	}, matchers...)
 	for seriesSet.Next() {

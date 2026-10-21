@@ -103,8 +103,10 @@
     --ok: #1fa855;
     --ok-tint: rgba(31, 168, 85, 0.12);
     --warn: #e08600;
+    --warn-text: #8a5a00;
     --warn-tint: rgba(224, 134, 0, 0.12);
     --danger: #e5383b;
+    --danger-text: #b02225;
     --danger-tint: rgba(229, 56, 59, 0.10);
 
     /* 数据条专用（指标语义色，比状态色更柔） */
@@ -269,7 +271,9 @@
 
     --ok: #34d27b;
     --warn: #ffb340;
+    --warn-text: var(--warn);
     --danger: #ff5d5f;
+    --danger-text: var(--danger);
 
     --meter-track: rgba(118, 118, 128, 0.24);
 

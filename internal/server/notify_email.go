@@ -2,8 +2,9 @@ package server
 
 // 邮件渠道发送器（F5）：net/smtp 投递；Subject 与发件人名用 mime.QEncoding 编码；
 // 正文为 multipart/alternative（text/plain + text/html）；security 支持
-// starttls（默认）/ tls（465 隐式 TLS）/ none。拨号复用受限拨号器
-// （restrictedCallbackDialContext，SSRF 防护）。
+// starttls（默认）/ tls（465 隐式 TLS）/ none。拨号默认复用受限拨号器
+// （restrictedCallbackDialContext，SSRF 防护）；Config["allow_private"]==true 时
+// 改用不限地址的普通拨号器（内网/自建 SMTP）。
 
 import (
 	"bytes"
@@ -29,15 +30,20 @@ const (
 // 解析后私网/环回地址拒绝），测试可替换为普通拨号器直连本地假 SMTP 服务。
 var notifySMTPDialContext callbackDialContext = restrictedCallbackDialContext(defaultCallbackResolver, defaultCallbackDialer)
 
+// notifySMTPDialContextAllowPrivate 是渠道开启“允许内网地址”后的拨号接缝：
+// 不做地址判定（沿用相同的 5s 拨号超时），使内网/自建 SMTP 可达。
+var notifySMTPDialContextAllowPrivate callbackDialContext = defaultCallbackDialer
+
 type emailNotifier struct {
-	host     string
-	port     int
-	security string
-	username string
-	password string
-	from     string
-	fromName string
-	to       []string
+	host         string
+	port         int
+	security     string
+	username     string
+	password     string
+	from         string
+	fromName     string
+	to           []string
+	allowPrivate bool
 }
 
 func newEmailNotifier(ch NotifyChannel) (Notifier, error) {
@@ -76,14 +82,15 @@ func newEmailNotifier(ch NotifyChannel) (Notifier, error) {
 		}
 	}
 	return &emailNotifier{
-		host:     host,
-		port:     port,
-		security: security,
-		username: strings.TrimSpace(ch.Config["username"]),
-		password: strings.TrimSpace(ch.Secrets["password"]),
-		from:     from,
-		fromName: strings.TrimSpace(ch.Config["from_name"]),
-		to:       recipients,
+		host:         host,
+		port:         port,
+		security:     security,
+		username:     strings.TrimSpace(ch.Config["username"]),
+		password:     strings.TrimSpace(ch.Secrets["password"]),
+		from:         from,
+		fromName:     strings.TrimSpace(ch.Config["from_name"]),
+		to:           recipients,
+		allowPrivate: notifyChannelAllowsPrivate(ch),
 	}, nil
 }
 
@@ -98,9 +105,13 @@ func (n *emailNotifier) Send(ctx context.Context, msg NotifyMessage) error {
 	}
 	message := buildEmailMessage(n.from, n.fromName, n.to, subject, body, boundary)
 
-	conn, err := notifySMTPDialContext(ctx, "tcp", net.JoinHostPort(n.host, strconv.Itoa(n.port)))
+	dial := notifySMTPDialContext
+	if n.allowPrivate {
+		dial = notifySMTPDialContextAllowPrivate
+	}
+	conn, err := dial(ctx, "tcp", net.JoinHostPort(n.host, strconv.Itoa(n.port)))
 	if err != nil {
-		return fmt.Errorf("邮件服务器连接失败: %s", telegramRequestErrorMessage(err))
+		return fmt.Errorf("邮件服务器连接失败: %s", telegramRequestErrorMessage(decorateNotifyPrivateTargetError(err)))
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -151,8 +162,9 @@ func (n *emailNotifier) Send(ctx context.Context, msg NotifyMessage) error {
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("邮件提交失败: %s", telegramRequestErrorMessage(err))
 	}
-	// DATA 已被服务器接受（250），QUIT 失败不影响投递结果，忽略。
-	return client.Quit()
+	// DATA 已被服务器接受（250），QUIT 失败不影响投递结果，忽略，避免重发。
+	_ = client.Quit()
+	return nil
 }
 
 // notifyEmailBoundary 生成随机 boundary（字母数字，header 安全）。

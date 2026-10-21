@@ -27,7 +27,7 @@ const buttonVariants = cva(
           "text-[var(--label-1)] hover:bg-[var(--accent-tint)] hover:text-[var(--label-1)] disabled:opacity-50",
         // 危险：次级外观 + --danger 字，悬停 --danger-tint 底
         destructive:
-          "border-[var(--hairline)] bg-[var(--mat-control-bg)] text-[var(--danger)] shadow-[inset_0_1px_0_var(--glass-edge)] [-webkit-backdrop-filter:var(--blur-ultrathin)] [backdrop-filter:var(--blur-ultrathin)] hover:border-[var(--hairline-strong)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger)] disabled:opacity-50",
+          "border-[var(--hairline)] bg-[var(--mat-control-bg)] text-[var(--danger-text)] shadow-[inset_0_1px_0_var(--glass-edge)] [-webkit-backdrop-filter:var(--blur-ultrathin)] [backdrop-filter:var(--blur-ultrathin)] hover:border-[var(--hairline-strong)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger-text)] disabled:opacity-50",
         // 文字按钮：无底无框 --accent-text，悬停 --accent-tint 胶囊，箭头 translateX(2px)
         link: "border-transparent bg-none text-[var(--accent-text)] hover:bg-[var(--accent-tint)] hover:[&_svg]:translate-x-0.5 disabled:opacity-50",
       },

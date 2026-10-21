@@ -14,6 +14,16 @@ import { AdminDrawer } from "@/components/admin-drawer";
 import { AdminEmptyState } from "@/components/admin-empty-state";
 import { AlertRuleDrawer } from "@/components/alert-rule-drawer";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   BarkIcon,
   DingtalkIcon,
   FeishuIcon,
@@ -60,6 +70,11 @@ import {
   adminCompactActionButtonClass,
   adminDangerBadgeClass,
   adminDangerOutlineButtonClass,
+  adminDialogCancelClass,
+  adminDialogContentClass,
+  adminDialogDangerActionClass,
+  adminDialogFooterClass,
+  adminDialogHeaderClass,
   adminDrawerSectionTitleClass,
   adminFieldErrorClass,
   adminInputClass,
@@ -74,6 +89,15 @@ import {
   adminTextButtonClass,
 } from "@/lib/admin-ui";
 import { adminPageSections, resolveAdminSection } from "@/lib/admin-sections";
+import {
+  CHANNEL_TYPES,
+  CHANNEL_TYPE_SPECS,
+  missingRequiredChannelFields,
+  normalizeChannelType,
+  validateChannelDraft,
+  type ChannelFieldSpec,
+  type NotifyChannelType,
+} from "@/lib/notify-channels";
 import type {
   AlertTestPayload,
   ChannelTestResult,
@@ -83,6 +107,7 @@ import type {
   SettingsView,
 } from "@/lib/admin-types";
 import {
+  DEFAULT_ALERT_RULE_RATIO,
   OFFLINE_ALERT_RULE_ID,
   buildRulePayload,
   copyRuleDraft,
@@ -101,278 +126,8 @@ import {
 // 保存 notify_channels 后旧字段由服务端双向同步（红线：旧数据必须能加载）。
 // =====================================================================
 
-// F5 定稿的 7 种渠道类型。
-export type NotifyChannelType =
-  | "telegram"
-  | "feishu"
-  | "bark"
-  | "slack"
-  | "dingtalk"
-  | "wecom"
-  | "email";
-
-// 校验错误文案（doc 指定）。
-const INVALID_HTTPS_URL_ERROR = "请输入有效的 https 地址。";
-const INVALID_HTTP_URL_ERROR = "请输入有效的 http 或 https 地址。";
-const EMAIL_PORT_RANGE_ERROR = "端口需为 1 - 65535。";
-
-// 渠道抽屉中单个字段的渲染与校验规格（字段 key 与后端 Config/Secrets map 对应）。
-interface ChannelFieldSpec {
-  key: string;
-  label: string;
-  // 必填：草稿值为空且（敏感字段）服务端也未配置过时，字段下方报错。
-  required?: boolean;
-  requiredError?: string;
-  // 敏感字段：保存后 View 中不可见（secrets_set 标记已配置），输入框留空保持不变。
-  secret?: boolean;
-  placeholder?: string;
-  hint?: string;
-  // URL 字段：非空时校验协议。
-  url?: "https" | "http";
-  // 数值字段范围（端口）。
-  numericRange?: { min: number; max: number };
-  options?: Array<{ value: string; label: string }>;
-  // Select 草稿值为空时的展示与保存回落值（与后端 Notifier 的缺省一致）。
-  defaultOption?: string;
-  switch?: boolean;
-}
-
-interface ChannelGroupSpec {
-  title: string;
-  fields: ChannelFieldSpec[];
-}
-
-interface ChannelTypeSpec {
-  groups: ChannelGroupSpec[];
-  // 新建渠道时的 Config 默认值（与后端各 Notifier 的缺省一致）。
-  defaults?: Record<string, string>;
-}
-
-// 7 种渠道的字段规格（evolution_log.md F5 字段表；* 为必填，🔒 为敏感字段）。
-const CHANNEL_TYPE_SPECS: Record<NotifyChannelType, ChannelTypeSpec> = {
-  telegram: {
-    groups: [
-      {
-        title: "凭据",
-        fields: [
-          {
-            key: "bot_token",
-            label: "Bot Token",
-            required: true,
-            secret: true,
-            requiredError: "请输入 Bot Token。",
-            placeholder: "例如：123456789:ABC…",
-          },
-          {
-            key: "api_endpoint",
-            label: "API 地址",
-            url: "http",
-            placeholder: "https://api.telegram.org",
-            hint: "留空使用 https://api.telegram.org。",
-          },
-        ],
-      },
-      {
-        title: "会话",
-        fields: [
-          {
-            key: "chat_ids",
-            label: "会话 ID",
-            required: true,
-            requiredError: "请输入至少一个会话 ID。",
-            hint: "多个会话 ID 请使用逗号分隔。",
-          },
-          {
-            key: "message_thread_id",
-            label: "话题 ID",
-            hint: "留空发送到主会话。",
-          },
-        ],
-      },
-    ],
-  },
-  feishu: {
-    groups: [
-      {
-        title: "飞书",
-        fields: [
-          {
-            key: "webhook",
-            label: "Webhook 地址",
-            required: true,
-            secret: true,
-            url: "https",
-            requiredError: "请输入 Webhook 地址。",
-            placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/…",
-          },
-          { key: "sign_secret", label: "签名密钥", secret: true },
-        ],
-      },
-    ],
-  },
-  bark: {
-    groups: [
-      {
-        title: "Bark",
-        fields: [
-          {
-            key: "server_url",
-            label: "服务器地址",
-            url: "http",
-            placeholder: "https://api.day.app",
-            hint: "留空使用 https://api.day.app。",
-          },
-          {
-            key: "device_key",
-            label: "设备 Key",
-            required: true,
-            secret: true,
-            requiredError: "请输入设备 Key。",
-          },
-          { key: "group", label: "分组", placeholder: "CyberMonitor" },
-          {
-            key: "level",
-            label: "通知级别",
-            defaultOption: "timeSensitive",
-            options: [
-              { value: "active", label: "active" },
-              { value: "timeSensitive", label: "timeSensitive" },
-              { value: "passive", label: "passive" },
-              { value: "critical", label: "critical" },
-            ],
-          },
-          { key: "sound", label: "声音" },
-          { key: "icon", label: "图标", url: "http", placeholder: "https://…" },
-        ],
-      },
-    ],
-    defaults: { level: "timeSensitive" },
-  },
-  slack: {
-    groups: [
-      {
-        title: "Slack",
-        fields: [
-          {
-            key: "webhook",
-            label: "Webhook 地址",
-            required: true,
-            secret: true,
-            url: "https",
-            requiredError: "请输入 Webhook 地址。",
-            placeholder: "https://hooks.slack.com/services/…",
-          },
-        ],
-      },
-    ],
-  },
-  dingtalk: {
-    groups: [
-      {
-        title: "钉钉",
-        fields: [
-          {
-            key: "webhook",
-            label: "Webhook 地址",
-            required: true,
-            secret: true,
-            url: "https",
-            requiredError: "请输入 Webhook 地址。",
-            placeholder: "https://oapi.dingtalk.com/robot/send?access_token=…",
-          },
-          { key: "sign_secret", label: "签名密钥", secret: true },
-          {
-            key: "at_mobiles",
-            label: "@手机号",
-            hint: "多个手机号请使用逗号分隔。",
-          },
-          { key: "at_all", label: "@所有人", switch: true },
-        ],
-      },
-    ],
-  },
-  wecom: {
-    groups: [
-      {
-        title: "企业微信",
-        fields: [
-          {
-            key: "webhook",
-            label: "Webhook 地址",
-            required: true,
-            secret: true,
-            url: "https",
-            requiredError: "请输入 Webhook 地址。",
-            placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…",
-          },
-          {
-            key: "mentioned_mobiles",
-            label: "@手机号",
-            hint: "多个手机号请使用逗号分隔。",
-          },
-        ],
-      },
-    ],
-  },
-  email: {
-    groups: [
-      {
-        title: "服务器",
-        fields: [
-          {
-            key: "host",
-            label: "SMTP 服务器",
-            required: true,
-            requiredError: "请输入 SMTP 服务器地址。",
-            placeholder: "smtp.example.com",
-          },
-          {
-            key: "port",
-            label: "端口",
-            required: true,
-            requiredError: "请输入端口号。",
-            numericRange: { min: 1, max: 65535 },
-            placeholder: "587",
-          },
-          {
-            key: "security",
-            label: "连接安全",
-            defaultOption: "starttls",
-            options: [
-              { value: "starttls", label: "starttls" },
-              { value: "tls", label: "tls（465）" },
-              { value: "none", label: "none" },
-            ],
-          },
-          { key: "username", label: "用户名" },
-          { key: "password", label: "密码", secret: true },
-        ],
-      },
-      {
-        title: "收发",
-        fields: [
-          {
-            key: "from",
-            label: "发件地址",
-            required: true,
-            requiredError: "请输入发件地址。",
-            placeholder: "monitor@example.com",
-          },
-          { key: "from_name", label: "发件人名称" },
-          {
-            key: "to",
-            label: "收件地址",
-            required: true,
-            requiredError: "请输入至少一个收件地址。",
-            hint: "多个收件地址请使用逗号分隔。",
-            placeholder: "ops@example.com",
-          },
-        ],
-      },
-    ],
-    defaults: { port: "587", security: "starttls" },
-  },
-};
+// 字段规格表与必填判定在 lib/notify-channels.ts：页面、告警策略渠道列与配置导入
+// 提示共用同一份口径。类型展示元数据（类型名 / 图标）留在本页。
 
 // 类型展示元数据：类型名与图标（A-04：除邮件外均为官方品牌标识，Slack 保留
 // lucide Hash——官方 Logo 包无法获取，见 evolution_log.md §12.4）。
@@ -408,7 +163,6 @@ const CHANNEL_TYPE_META: Record<NotifyChannelType, { label: string; icon: Compon
   },
 };
 
-const CHANNEL_TYPES = Object.keys(CHANNEL_TYPE_SPECS) as NotifyChannelType[];
 
 // =====================================================================
 // F4「告警策略」分区：告警规则列表（规则抽屉与元数据已抽到
@@ -453,23 +207,6 @@ type AlertSettingsDraft = {
   rules: AlertRuleDraft[];
 };
 
-function isValidHTTPURL(value: string) {
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-function isValidHTTPSURL(value: string) {
-  try {
-    return new URL(value).protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 // 逗号分隔列表修剪（摘要统计用）。
 function splitConfigList(raw: string | undefined): string[] {
   if (!raw) {
@@ -491,10 +228,6 @@ function generateChannelID(): string {
     id += alphabet[byte % alphabet.length];
   }
   return `c_${id}`;
-}
-
-function normalizeChannelType(raw: string | undefined): NotifyChannelType {
-  return CHANNEL_TYPES.some((type) => type === raw) ? (raw as NotifyChannelType) : "telegram";
 }
 
 function makeChannelDrafts(settings: SettingsView | null): ChannelDraft[] {
@@ -581,40 +314,23 @@ function channelDisplayName(channel: ChannelDraft): string {
   return name || CHANNEL_TYPE_META[channel.type].label;
 }
 
-// 单渠道草稿校验：必填为空 / URL 协议 / 端口范围。返回 字段 key → 错误文案。
-function validateChannelDraft(channel: ChannelDraft): Record<string, string> {
-  const errors: Record<string, string> = {};
-  const spec = CHANNEL_TYPE_SPECS[channel.type];
-  for (const group of spec.groups) {
-    for (const field of group.fields) {
-      const value = ((field.secret ? channel.secrets[field.key] : channel.config[field.key]) || "").trim();
-      if (!value) {
-        if (field.required && !(field.secret && channel.secretsSet[field.key])) {
-          errors[field.key] = field.requiredError || `请输入${field.label}。`;
-        }
-        continue;
-      }
-      if (field.url === "https" && !isValidHTTPSURL(value)) {
-        errors[field.key] = INVALID_HTTPS_URL_ERROR;
-        continue;
-      }
-      if (field.url === "http" && !isValidHTTPURL(value)) {
-        errors[field.key] = INVALID_HTTP_URL_ERROR;
-        continue;
-      }
-      if (field.numericRange) {
-        const port = Number(value);
-        if (
-          !Number.isInteger(port) ||
-          port < field.numericRange.min ||
-          port > field.numericRange.max
-        ) {
-          errors[field.key] = EMAIL_PORT_RANGE_ERROR;
-        }
-      }
-    }
-  }
-  return errors;
+// 必填项缺失（P1）：必填口径完全来自 lib/notify-channels.ts（与 validateChannelDraft
+// 共用同一个判定），不在这里另列规则。缺失字段清单用于列表徒标、横幅与抽屉预填错误。
+function channelMissingFields(channel: ChannelDraft): ChannelFieldSpec[] {
+  return missingRequiredChannelFields(
+    channel.type,
+    channel.config,
+    channel.secrets,
+    channel.secretsSet,
+  );
+}
+
+// 规则列表 / 删除确认的显示名：空名称按指标给默认文案（内置离线规则固定“节点离线”）。
+function ruleDisplayName(rule: AlertRuleDraft): string {
+  return (
+    rule.name.trim() ||
+    (rule.metric === OFFLINE_ALERT_RULE_ID ? "节点离线" : "未命名规则")
+  );
 }
 
 // 保存载荷：视图/草稿 → 后端 NotifyChannel 更新形态（只带非空值；secrets_set 与
@@ -637,6 +353,11 @@ function buildChannelPayload(channel: ChannelDraft): NotifyChannel {
         target[field.key] = value;
       }
     }
+  }
+  // allow_private 不在 CHANNEL_TYPE_SPECS 字段表中，需显式复制：开启才写 "true"，
+  // 关闭不写（服务端保存时整表替换 config，缺键即关闭）。保存与测试推送共用本函数。
+  if (channel.config.allow_private === "true") {
+    payload.config!.allow_private = "true";
   }
   if (channel.secretsClear.length > 0) {
     payload.secrets_clear = [...channel.secretsClear];
@@ -693,6 +414,48 @@ function ChannelTestStatusBadge({ lastTest }: { lastTest: ChannelTestResult | nu
   );
 }
 
+// 必填项不全的启用渠道（P1）：徒标优先级高于测试状态——缺密钥时「未测试 / 正常」
+// 不具有参考意义。title 列出缺少的字段，与抽屉里的必填错误一致。
+function ChannelRequiredFieldsBadge({ missing }: { missing: ChannelFieldSpec[] }) {
+  return (
+    <span
+      title={`缺少必填项：${missing.map((field) => field.label).join("、")}`}
+      className="inline-flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[color-mix(in_srgb,var(--warn)_35%,transparent)] bg-[var(--warn-tint)] px-2.5 text-xs font-medium text-[var(--warn-text)]"
+    >
+      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-[var(--warn)]" />
+      缺少必填项
+    </span>
+  );
+}
+
+// 告警页顶部提示横幅（A-14 样式）：未配置渠道 / 渠道缺必填项共用。
+function ChannelNoticeBanner({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-start gap-4 rounded-[var(--r-md)] bg-[var(--warn-tint)] px-4 py-3">
+      <span
+        aria-hidden="true"
+        className="flex size-5 shrink-0 items-center justify-center rounded-full bg-[var(--warn)] text-xs font-semibold leading-none text-white"
+      >
+        !
+      </span>
+      <p className="text-[13px] leading-relaxed">{children}</p>
+    </div>
+  );
+}
+
+// 横幅里的可点击入口；文案「渠道设置」由 i18n 精确匹配。
+function ChannelSettingsLink({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline rounded-[var(--r-sm)] font-medium text-[var(--accent-text)] underline decoration-[color-mix(in_srgb,var(--accent-text)_45%,transparent)] underline-offset-2 transition-colors duration-150 hover:text-[var(--accent)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
+    >
+      渠道设置
+    </button>
+  );
+}
+
 // E-01 / A-07 第 1 条：分区图标方块的图标与分区专属底色，随 h1 展示在页头左侧。
 // evolution_log.md 第 4 节图标表：告警策略 BellRing·橙 / 渠道设置 Send·蓝。
 const SECTION_ICON_META: Record<string, { icon: ReactNode; background: string }> = {
@@ -709,21 +472,56 @@ const SECTION_ICON_META: Record<string, { icon: ReactNode; background: string }>
 // 规则列表「渠道」列（A-08）：未指定渠道时显示「全部渠道」文字；没有任何启用
 // 渠道时显示「无可用渠道」（--warn）；指定渠道时仍显示渠道类型小图标，最多 3 个
 // 加「+N」（channel_ids 为空 = 全部已启用渠道）。
+// P1：必填项不全的启用渠道同样不可投递，与停用/删除一样从可用目标中剔出——所选
+// 渠道全部缺必填时显示「无可用渠道」。
 function RuleChannelIcons({ rule, channels }: { rule: AlertRuleDraft; channels: ChannelDraft[] }) {
-  if (rule.channelIds.length === 0) {
-    if (channels.every((channel) => !channel.enabled)) {
-      return <span className="text-[13px] text-[var(--warn)]">无可用渠道</span>;
+  const isUsable = (channel: ChannelDraft) =>
+    channel.enabled && channelMissingFields(channel).length === 0;
+  const channelIds = Array.from(new Set(rule.channelIds));
+  if (channelIds.length === 0) {
+    if (channels.every((channel) => !isUsable(channel))) {
+      return <span className="text-[13px] text-[var(--warn-text)]">无可用渠道</span>;
     }
     return <span className="text-[13px] text-[var(--label-2)]">全部渠道</span>;
   }
-  const resolved = rule.channelIds
+  const resolved = channelIds
     .map((id) => channels.find((channel) => channel.id === id))
     .filter((channel): channel is ChannelDraft => Boolean(channel));
-  if (resolved.length === 0) {
-    return <span className="text-[13px] text-[var(--label-4)]">—</span>;
+  const missingCount = channelIds.length - resolved.length;
+  // 停用或必填不全的渠道不会被投递；只展示可投递渠道作为“可用目标”，其余单独提示。
+  const usable = resolved.filter(isUsable);
+  const disabledCount = resolved.filter((channel) => !channel.enabled).length;
+  const incompleteCount = resolved.filter(
+    (channel) => channel.enabled && channelMissingFields(channel).length > 0,
+  ).length;
+
+  // 渠道列表非空（上面已处理空列表）时，usable 为空的成因只可能是渠道被删除、
+  // 停用和/或必填不全：三个计数覆盖了全部 channelIds，因此下面的分支不需要再兜
+  // 一个「—」返回。
+  if (usable.length === 0) {
+    if (missingCount > 0 && disabledCount === 0 && incompleteCount === 0) {
+      return <span className="text-[13px] text-[var(--warn-text)]">渠道已删除</span>;
+    }
+    if (disabledCount > 0 && missingCount === 0 && incompleteCount === 0) {
+      return <span className="text-[13px] text-[var(--warn-text)]">渠道已停用</span>;
+    }
+    return <span className="text-[13px] text-[var(--warn-text)]">无可用渠道</span>;
   }
-  const shown = resolved.slice(0, 3);
-  const rest = resolved.length - shown.length;
+
+  const shown = usable.slice(0, 3);
+  const rest = usable.length - shown.length;
+  const issueText =
+    missingCount > 0 && (disabledCount > 0 || incompleteCount > 0)
+      ? "部分渠道不可用"
+      : missingCount > 0
+        ? "部分渠道已删除"
+        : disabledCount > 0 && incompleteCount > 0
+          ? "部分渠道不可用"
+          : disabledCount > 0
+            ? "部分渠道已停用"
+            : incompleteCount > 0
+              ? "部分渠道缺少必填项"
+              : "";
   return (
     <span className="inline-flex items-center gap-1">
       {shown.map((channel) => (
@@ -735,6 +533,9 @@ function RuleChannelIcons({ rule, channels }: { rule: AlertRuleDraft; channels: 
       ))}
       {rest > 0 ? (
         <span className="text-[11px] font-semibold text-[var(--label-3)]">+{rest}</span>
+      ) : null}
+      {issueText ? (
+        <span className="text-[13px] text-[var(--warn-text)]">{issueText}</span>
       ) : null}
     </span>
   );
@@ -777,6 +578,23 @@ export default function NotificationAlert({
   // F4 规则草稿与抽屉：rules 为本页草稿（含行内启停开关的改动）；ruleForm 是抽屉
   // 当前编辑的规则（表单副本在共享组件内独立维护，「完成」才写回 rules）。
   const [rules, setRules] = useState<AlertRuleDraft[]>(initialDraft.rules);
+  // 删除被告警规则引用的渠道前先确认影响；引用关系来自当前规则草稿。
+  const [pendingChannelDelete, setPendingChannelDelete] = useState<ChannelDraft | null>(null);
+  const pendingChannelReferences = useMemo(
+    () =>
+      pendingChannelDelete
+        ? rules.filter((rule) => rule.channelIds.includes(pendingChannelDelete.id))
+        : [],
+    [pendingChannelDelete, rules],
+  );
+  // 删除渠道会同步从规则草稿移除该渠道：channelIds 变空表示“全部已启用渠道”，
+  // 其余规则只是不再发送到该渠道，两者影响不同，确认框分开列出。
+  const pendingChannelFallbackRules = pendingChannelReferences.filter(
+    (rule) => new Set(rule.channelIds).size <= 1,
+  );
+  const pendingChannelDropRules = pendingChannelReferences.filter(
+    (rule) => new Set(rule.channelIds).size > 1,
+  );
   const [ruleForm, setRuleForm] = useState<AlertRuleDraft | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
@@ -819,9 +637,17 @@ export default function NotificationAlert({
     alertSections.find((item) => item.id === activeSection)?.label || alertSections[0].label;
   const activeSectionIconMeta = SECTION_ICON_META[activeSection || ""];
 
-  // 横幅条件（F5）：已保存的渠道中没有任何启用渠道时提示（渠道设置与告警策略
-  // 两个分区顶部都会渲染本横幅）。
-  const hasEnabledChannel = (settings?.notify_channels ?? []).some((channel) => channel.enabled);
+  // 横幅条件（F5）：没有任何启用渠道时提示（渠道设置与告警策略两个分区顶部都会
+  // 渲染本横幅）。
+  // P1：必填项不全的启用渠道无法投递（配置导出不含密钥，导入后渠道看起来正常但
+  // 每次发送都会失败）。两者都用草稿计算：增删渠道 / 输入密钥后徒标与横幅即时变化。
+  const channelCompleteness = useMemo(() => {
+    const enabledChannels = channels.filter((channel) => channel.enabled);
+    const incompleteCount = enabledChannels.filter(
+      (channel) => channelMissingFields(channel).length > 0,
+    ).length;
+    return { enabledCount: enabledChannels.length, incompleteCount };
+  }, [channels]);
 
   // 存在校验错误的分区上报给侧栏红点；fieldErrors 清空（保存成功/修正输入）后自动消失。
   useEffect(() => {
@@ -979,6 +805,25 @@ export default function NotificationAlert({
     setDrawerTestResult(null);
   };
 
+  // 列表行打开抽屉（P1）：必填项不全时直接把错误显示在对应字段下方，
+  // 用户一打开就知道缺什么，而不是等到保存校验才看到。
+  const openChannelDrawerFromRow = (channel: ChannelDraft) => {
+    const missing = channelMissingFields(channel);
+    if (missing.length > 0) {
+      setFieldErrors((current) => {
+        const next = { ...current };
+        for (const field of missing) {
+          const key = channelFieldErrorKey(channel.id, field.key);
+          if (!next[key]) {
+            next[key] = field.requiredError || `请输入${field.label}。`;
+          }
+        }
+        return next;
+      });
+    }
+    openChannelDrawer(channel.id);
+  };
+
   const closeChannelDrawer = () => {
     setEditingChannelId(null);
     setDrawerTestResult(null);
@@ -1071,13 +916,43 @@ export default function NotificationAlert({
     openChannelDrawer(draft.id);
   };
 
+  const removeChannelNow = (channelId: string) => {
+    setChannels((current) => current.filter((channel) => channel.id !== channelId));
+    closeChannelDrawer();
+    clearChannelFieldErrors(channelId);
+  };
+
   const removeChannel = (channelId: string) => {
     if (isBusy) {
       return;
     }
-    setChannels((current) => current.filter((channel) => channel.id !== channelId));
-    closeChannelDrawer();
-    clearChannelFieldErrors(channelId);
+    const channel = channels.find((item) => item.id === channelId);
+    if (!channel) {
+      return;
+    }
+    if (rules.some((rule) => rule.channelIds.includes(channelId))) {
+      setPendingChannelDelete(channel);
+      return;
+    }
+    removeChannelNow(channelId);
+  };
+
+  // 确认删除：从所有规则草稿里同步移除该渠道 ID，避免保存后规则引用已删除渠道
+  // （后端会拒绝保存，且空引用会被当成“全部已启用渠道”而改写语义）。
+  const confirmChannelDelete = () => {
+    const channel = pendingChannelDelete;
+    if (!channel) {
+      return;
+    }
+    setRules((current) =>
+      current.map((rule) =>
+        rule.channelIds.includes(channel.id)
+          ? { ...rule, channelIds: rule.channelIds.filter((id) => id !== channel.id) }
+          : rule,
+      ),
+    );
+    removeChannelNow(channel.id);
+    setPendingChannelDelete(null);
   };
 
   // ---- F4 规则草稿编辑（抽屉表单在共享组件内独立编辑，「完成」才写回 rules 草稿） ----
@@ -1107,7 +982,7 @@ export default function NotificationAlert({
     if (isBusy) {
       return;
     }
-    // 默认形态对齐文档示例：「CPU > 90% · 持续 5 分钟」。
+    // 默认形态对齐文档示例：「CPU > 90%，近 5 分钟内 70% 时间越限」。
     setRuleForm({
       id: generateRuleID(),
       name: "",
@@ -1116,6 +991,7 @@ export default function NotificationAlert({
       op: "gt",
       threshold: "90",
       durationSec: 300,
+      ratio: DEFAULT_ALERT_RULE_RATIO,
       scopeMode: "all",
       scopeNodes: [],
       scopeGroups: [],
@@ -1261,23 +1137,40 @@ export default function NotificationAlert({
         title={activeSectionLabel}
       />
 
-      {!hasEnabledChannel ? (
+      {channelCompleteness.enabledCount === 0 ? (
         // F5：没有任何启用渠道时在「渠道设置」「告警策略」两分区顶部提示（A-14 横幅样式）。
-        <div className="flex items-start gap-4 rounded-[var(--r-md)] bg-[var(--warn-tint)] px-4 py-3">
-          <span
-            aria-hidden="true"
-            className="flex size-5 shrink-0 items-center justify-center rounded-full bg-[var(--warn)] text-xs font-semibold leading-none text-white"
-          >
-            !
+        <ChannelNoticeBanner>
+          <span className="font-semibold text-[var(--label-1)]">尚未配置任何通知渠道：</span>
+          <span className="text-[var(--label-2)]">
+            {/* A-08：改为「所有告警都不会发出」（不只离线告警）；
+                分段文案各自独立文本节点（i18n 逐节点匹配），带「渠道设置」跳转入口。 */}
+            {"所有告警都不会发出。请先在"}
+            <ChannelSettingsLink onClick={() => onRequestSectionChange?.("channels")} />
+            {"中添加并启用通知渠道。"}
           </span>
-          <p className="text-[13px] leading-relaxed">
-            <span className="font-semibold text-[var(--label-1)]">尚未配置任何通知渠道：</span>
+        </ChannelNoticeBanner>
+      ) : channelCompleteness.incompleteCount > 0 ? (
+        // P1：存在必填项不全的启用渠道。全部不完整时等同于「没有可用渠道」，
+        // 部分不完整时给较轻的提示。
+        <ChannelNoticeBanner>
+          {channelCompleteness.incompleteCount === channelCompleteness.enabledCount ? (
+            <>
+              <span className="font-semibold text-[var(--label-1)]">所有启用渠道都缺少必填项：</span>
+              <span className="text-[var(--label-2)]">
+                {"所有告警都不会发出。请先补全"}
+                <ChannelSettingsLink onClick={() => onRequestSectionChange?.("channels")} />
+                {"后重新保存。"}
+              </span>
+            </>
+          ) : (
             <span className="text-[var(--label-2)]">
-              {/* A-08：改为「所有告警都不会发出」（不只离线告警），其余文字不变。 */}
-              所有告警都不会发出。请先在渠道设置中添加并启用通知渠道。
+              {`${channelCompleteness.incompleteCount} 个渠道缺少必填项，告警无法通过它们发出。`}
+              {"请前往"}
+              <ChannelSettingsLink onClick={() => onRequestSectionChange?.("channels")} />
+              {"补全。"}
             </span>
-          </p>
-        </div>
+          )}
+        </ChannelNoticeBanner>
       ) : null}
 
       {activeSection === "policy" ? (
@@ -1321,7 +1214,7 @@ export default function NotificationAlert({
                     <span className="text-[13px] font-medium text-[var(--label-2)]">分钟</span>
                   </div>
                   {offlineMinutesError ? (
-                    <p id="offline-minutes-error" className="text-xs font-medium text-[var(--status-danger)] sm:text-right" aria-live="polite">
+                    <p id="offline-minutes-error" className="text-xs font-medium text-[var(--danger-text)] sm:text-right" aria-live="polite">
                       {offlineMinutesError}
                     </p>
                   ) : null}
@@ -1361,8 +1254,7 @@ export default function NotificationAlert({
                       className="text-sm font-medium"
                       data-admin-i18n-skip={rule.name.trim() ? true : undefined}
                     >
-                      {rule.name.trim() ||
-                        (rule.metric === OFFLINE_ALERT_RULE_ID ? "节点离线" : "未命名规则")}
+                      {ruleDisplayName(rule)}
                     </span>
                   ),
                 },
@@ -1501,6 +1393,8 @@ export default function NotificationAlert({
               channels.map((channel) => {
                 const meta = CHANNEL_TYPE_META[channel.type];
                 const summary = channelSummary(channel);
+                // P1：启用但必填不全的渠道看起来「未测试」却永远发不出去，徒标优先。
+                const missingFields = channel.enabled ? channelMissingFields(channel) : [];
                 return (
                   <div
                     key={channel.id}
@@ -1509,11 +1403,11 @@ export default function NotificationAlert({
                     <div
                       role="button"
                       tabIndex={0}
-                      onClick={() => openChannelDrawer(channel.id)}
+                      onClick={() => openChannelDrawerFromRow(channel)}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {
                           event.preventDefault();
-                          openChannelDrawer(channel.id);
+                          openChannelDrawerFromRow(channel);
                         }
                       }}
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-md py-1 pr-1 pl-1 outline-none hover:bg-[rgba(0,0,0,0.025)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)] dark:hover:bg-[rgba(255,255,255,0.05)]"
@@ -1539,7 +1433,11 @@ export default function NotificationAlert({
                         </span>
                       </span>
                     </div>
-                    <ChannelTestStatusBadge lastTest={channel.lastTest} />
+                    {missingFields.length > 0 ? (
+                      <ChannelRequiredFieldsBadge missing={missingFields} />
+                    ) : (
+                      <ChannelTestStatusBadge lastTest={channel.lastTest} />
+                    )}
                     <button
                       type="button"
                       className={cn(adminTextButtonClass, "h-8 shrink-0 px-2.5 text-[13px]")}
@@ -1560,7 +1458,7 @@ export default function NotificationAlert({
                       aria-label="编辑渠道"
                       className="flex size-8 shrink-0 items-center justify-center rounded-full text-[var(--label-4)] outline-none transition-colors duration-[var(--dur-2)] hover:text-[var(--label-2)] focus-visible:ring-2 focus-visible:ring-[var(--primary-ring)]"
                       disabled={isBusy}
-                      onClick={() => openChannelDrawer(channel.id)}
+                      onClick={() => openChannelDrawerFromRow(channel)}
                     >
                       <ChevronRight aria-hidden="true" className="h-4 w-4" />
                     </button>
@@ -1615,7 +1513,7 @@ export default function NotificationAlert({
                     "mb-2.5 text-[13px] font-medium leading-relaxed",
                     drawerTestResult.ok
                       ? "text-[var(--status-ok)]"
-                      : "text-[var(--danger)]",
+                      : "text-[var(--danger-text)]",
                   )}
                 >
                   {drawerTestResult.ok
@@ -1700,6 +1598,28 @@ export default function NotificationAlert({
                         disabled={isBusy}
                         onCheckedChange={(checked) =>
                           handleChannelEnabledChange(channel, Boolean(checked))
+                        }
+                      />
+                    </AdminGroupedSwitchRow>
+                    {/* 允许内网地址：后端按 Config["allow_private"]=="true" 选择
+                        静态校验 / 发送客户端 / 邮件 dialer；此处不经 CHANNEL_TYPE_SPECS
+                        字段表，直接写 config 任意键。 */}
+                    <AdminGroupedSwitchRow
+                      label="允许内网地址"
+                      htmlFor="notify-channel-allow-private"
+                      hint="目标解析到内网或保留地址时放行；仅对可信目标开启。"
+                    >
+                      <Switch
+                        id="notify-channel-allow-private"
+                        checked={channel.config.allow_private === "true"}
+                        disabled={isBusy}
+                        onCheckedChange={(on) =>
+                          patchChannel(channel.id, {
+                            config: {
+                              ...channel.config,
+                              allow_private: on ? "true" : "",
+                            },
+                          })
                         }
                       />
                     </AdminGroupedSwitchRow>
@@ -1836,7 +1756,7 @@ export default function NotificationAlert({
                                     className={cn(
                                       adminTextButtonClass,
                                       "h-9 shrink-0 whitespace-nowrap",
-                                      !clearing && "text-[var(--danger)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger)]",
+                                      !clearing && "text-[var(--danger-text)] hover:bg-[var(--danger-tint)] hover:text-[var(--danger-text)]",
                                     )}
                                     disabled={isBusy}
                                     onClick={() =>
@@ -1884,6 +1804,61 @@ export default function NotificationAlert({
           onClose={closeRuleDrawer}
         />
       ) : null}
+
+      <AlertDialog
+        open={pendingChannelDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingChannelDelete(null);
+          }
+        }}
+      >
+        <AlertDialogContent className={adminDialogContentClass} variant="danger">
+          <AlertDialogHeader className={adminDialogHeaderClass}>
+            <AlertDialogTitle>该渠道仍被告警规则引用</AlertDialogTitle>
+            <AlertDialogDescription>
+              删除后引用该渠道的规则会同步移除该渠道。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="max-h-48 space-y-2 overflow-y-auto px-6 text-[13px] leading-relaxed text-[var(--label-1)]">
+            {pendingChannelFallbackRules.length > 0 ? (
+              <div>
+                <p className="text-[var(--warn-text)]">
+                  删除后这些规则将改为发送到全部已启用渠道：
+                </p>
+                <ul className="mt-1 space-y-1">
+                  {pendingChannelFallbackRules.map((rule) => (
+                    <li key={rule.id} data-admin-i18n-skip={rule.name.trim() ? true : undefined}>
+                      {ruleDisplayName(rule)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {pendingChannelDropRules.length > 0 ? (
+              <div>
+                <p>以下规则将不再发送到该渠道：</p>
+                <ul className="mt-1 space-y-1">
+                  {pendingChannelDropRules.map((rule) => (
+                    <li key={rule.id} data-admin-i18n-skip={rule.name.trim() ? true : undefined}>
+                      {ruleDisplayName(rule)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+          <AlertDialogFooter className={adminDialogFooterClass}>
+            <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className={adminDialogDangerActionClass}
+              onClick={confirmChannelDelete}
+            >
+              仍然删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

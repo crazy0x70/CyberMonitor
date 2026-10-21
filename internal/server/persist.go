@@ -40,6 +40,17 @@ const (
 	maxTestCatalogItems    = 512
 )
 
+// defaultResourceHistoryDays 是资源历史保留天数的默认值。
+const defaultResourceHistoryDays = 7
+
+// normalizeResourceHistoryDays 把非法值收敛到默认值（加载旧配置 / 读取公开设置用）。
+func normalizeResourceHistoryDays(days int) int {
+	if history.ValidResourceRetentionDays(days) {
+		return days
+	}
+	return defaultResourceHistoryDays
+}
+
 var secureRandomReader io.Reader = rand.Reader
 
 type Settings struct {
@@ -76,44 +87,50 @@ type Settings struct {
 	Groups             []string          `json:"groups,omitempty"`
 	GroupTree          []GroupNode       `json:"group_tree,omitempty"`
 	TestCatalog        []TestCatalogItem `json:"test_catalog,omitempty"`
+	// ResourceHistoryDays 是资源历史（CPU / 内存 / 网络）的保留天数，允许 1/7/30。
+	ResourceHistoryDays int `json:"resource_history_days,omitempty"`
 	// AlertRules 是 F4 引入的告警规则模型；加载时保证含且仅含一条 metric=offline
 	// 的内置规则（不可删除，duration_sec 始终镜像 AlertOfflineSec）。
 	AlertRules []AlertRule `json:"alert_rules,omitempty"`
 }
 
 type SettingsView struct {
-	AdminPath             string  `json:"admin_path"`
-	AdminUser             string  `json:"admin_user"`
-	TurnstileSiteKey      string  `json:"turnstile_site_key,omitempty"`
-	TurnstileSecretKey    string  `json:"turnstile_secret_key,omitempty"`
-	AgentEndpoint         string  `json:"agent_endpoint,omitempty"`
-	AgentToken            string  `json:"agent_token,omitempty"`
-	AgentTokenSet         bool    `json:"agent_token_set,omitempty"`
-	SiteTitle             string  `json:"site_title,omitempty"`
-	SiteIcon              string  `json:"site_icon,omitempty"`
-	SiteBackgroundImage   string  `json:"site_background_image,omitempty"`
-	HomeTitle             string  `json:"home_title,omitempty"`
-	HomeSubtitle          string  `json:"home_subtitle,omitempty"`
-	Locale                string  `json:"locale,omitempty"`
-	RegionGroupEnabled    *bool   `json:"region_group_enabled,omitempty"`
-	AlertWebhook          string  `json:"alert_webhook,omitempty"`
-	AlertWebhookSet       bool    `json:"alert_webhook_set,omitempty"`
-	AlertOfflineSec       int64   `json:"alert_offline_sec,omitempty"`
-	AlertTelegramToken    string  `json:"alert_telegram_token,omitempty"`
-	AlertTelegramTokenSet bool    `json:"alert_telegram_token_set,omitempty"`
-	AlertTelegramUserIDs  []int64 `json:"alert_telegram_user_ids,omitempty"`
+	AdminPath          string `json:"admin_path"`
+	AdminUser          string `json:"admin_user"`
+	TurnstileSiteKey   string `json:"turnstile_site_key,omitempty"`
+	TurnstileSecretKey string `json:"turnstile_secret_key,omitempty"`
+	AgentEndpoint      string `json:"agent_endpoint,omitempty"`
+	// AgentEndpointSuggestion 是按当前请求推断的 Agent 对接地址：只用于展示与
+	// 生成安装命令，不写回 agent_endpoint、不导出。
+	AgentEndpointSuggestion string  `json:"agent_endpoint_suggestion,omitempty"`
+	AgentToken              string  `json:"agent_token,omitempty"`
+	AgentTokenSet           bool    `json:"agent_token_set,omitempty"`
+	SiteTitle               string  `json:"site_title,omitempty"`
+	SiteIcon                string  `json:"site_icon,omitempty"`
+	SiteBackgroundImage     string  `json:"site_background_image,omitempty"`
+	HomeTitle               string  `json:"home_title,omitempty"`
+	HomeSubtitle            string  `json:"home_subtitle,omitempty"`
+	Locale                  string  `json:"locale,omitempty"`
+	RegionGroupEnabled      *bool   `json:"region_group_enabled,omitempty"`
+	AlertWebhook            string  `json:"alert_webhook,omitempty"`
+	AlertWebhookSet         bool    `json:"alert_webhook_set,omitempty"`
+	AlertOfflineSec         int64   `json:"alert_offline_sec,omitempty"`
+	AlertTelegramToken      string  `json:"alert_telegram_token,omitempty"`
+	AlertTelegramTokenSet   bool    `json:"alert_telegram_token_set,omitempty"`
+	AlertTelegramUserIDs    []int64 `json:"alert_telegram_user_ids,omitempty"`
 	// NotifyChannels 为视图形态：Secrets 置空，改以 SecretsSet 标记已配置的敏感字段。
-	NotifyChannels     []NotifyChannel   `json:"notify_channels,omitempty"`
-	LoginFailLimit     int               `json:"login_fail_limit,omitempty"`
-	LoginFailWindowSec int64             `json:"login_fail_window_sec,omitempty"`
-	LoginLockSec       int64             `json:"login_lock_sec,omitempty"`
-	AdminAuth          AdminAuthSettings `json:"admin_auth,omitempty"`
-	AISettings         AISettings        `json:"ai_settings,omitempty"`
-	Version            string            `json:"version,omitempty"`
-	Commit             string            `json:"commit,omitempty"`
-	Groups             []string          `json:"groups,omitempty"`
-	GroupTree          []GroupNode       `json:"group_tree,omitempty"`
-	TestCatalog        []TestCatalogItem `json:"test_catalog,omitempty"`
+	NotifyChannels      []NotifyChannel   `json:"notify_channels,omitempty"`
+	LoginFailLimit      int               `json:"login_fail_limit,omitempty"`
+	LoginFailWindowSec  int64             `json:"login_fail_window_sec,omitempty"`
+	LoginLockSec        int64             `json:"login_lock_sec,omitempty"`
+	AdminAuth           AdminAuthSettings `json:"admin_auth,omitempty"`
+	AISettings          AISettings        `json:"ai_settings,omitempty"`
+	Version             string            `json:"version,omitempty"`
+	Commit              string            `json:"commit,omitempty"`
+	Groups              []string          `json:"groups,omitempty"`
+	GroupTree           []GroupNode       `json:"group_tree,omitempty"`
+	TestCatalog         []TestCatalogItem `json:"test_catalog,omitempty"`
+	ResourceHistoryDays int               `json:"resource_history_days,omitempty"`
 	// AlertRules（F4）：规则为非敏感配置，View 原样返回；alert_rule_status 为运行时
 	// 聚合（每条规则当前处于 FIRING 的节点数），导入时被忽略。
 	AlertRules      []AlertRule                    `json:"alert_rules,omitempty"`
@@ -149,6 +166,7 @@ type SettingsUpdate struct {
 	GroupTree            *[]GroupNode       `json:"group_tree"`
 	GroupMoves           *[]GroupMove       `json:"group_moves,omitempty"`
 	TestCatalog          *[]TestCatalogItem `json:"test_catalog"`
+	ResourceHistoryDays  *int               `json:"resource_history_days"`
 	// AlertRules（F4）：nil 表示本次请求不改规则；非 nil 时为完整规则列表（含内置
 	// offline 规则的处理见 normalizeAlertRules）。
 	AlertRules *[]AlertRule `json:"alert_rules,omitempty"`
@@ -316,6 +334,21 @@ type RuleAlertState struct {
 	// SentLeadDays 为 expiry 提醒去重（已发送的 lead day）。到期时间后移导致
 	// daysLeft 回升超过已记录值时整体清零（见 collectExpiryEventsLocked）。
 	SentLeadDays []int `json:"sent_lead_days,omitempty"`
+	// RecoveryValue / RecoveryDurationSec 是 FIRING→OK 瞬间的恢复快照：恢复通知
+	// 补发与重试只读快照，不用补发时刻的当前值，也不重新推算时长。旧 state.json
+	// 没有这两个字段，加载后为 nil（补发文案显示未知，不伪造）。
+	RecoveryValue       *float64 `json:"recovery_value,omitempty"`
+	RecoveryDurationSec *int64   `json:"recovery_duration_sec,omitempty"`
+	// ViolatedRatio 是当前状态对应事件（阈值告警或恢复）的窗口内越限时间占比
+	// （0..1）：告警文案说“近 N 内 X% 时间越限”就用它，失败补发沿用触发那一刻的
+	// 值而不是重新计算。单次采样判定（duration_sec<=0）没有窗口，为空。旧
+	// state.json 没有该字段，加载后为 nil（文案退化为条件描述，不编造百分比）。
+	ViolatedRatio *float64 `json:"violated_ratio,omitempty"`
+	// EventID 标识本状态当前对应的那一条通知事件（告警/恢复/台阶/lead day）。
+	// 投递是异步的，回执返回时同一 (node, rule) 可能已产生新事件；回执只在
+	// state.EventID 与事件 ID 相等时生效，避免迟到回执污染新事件。旧 state.json
+	// 没有该字段，加载后为空字符串，与同样为空的事件 ID 匹配（向后兼容）。
+	EventID string `json:"event_id,omitempty"`
 }
 
 // AlertRuleStatusView 是 SettingsView.alert_rule_status 的条目：某规则当前处于
@@ -1092,6 +1125,15 @@ func cloneAlertStates(states map[string]RuleAlertState) map[string]RuleAlertStat
 func cloneRuleAlertState(state RuleAlertState) RuleAlertState {
 	state.Delivered = cloneNotifyBoolMap(state.Delivered)
 	state.SentLeadDays = slices.Clone(state.SentLeadDays)
+	state.ViolatedRatio = cloneFloat64Ptr(state.ViolatedRatio)
+	if state.RecoveryValue != nil {
+		value := *state.RecoveryValue
+		state.RecoveryValue = &value
+	}
+	if state.RecoveryDurationSec != nil {
+		duration := *state.RecoveryDurationSec
+		state.RecoveryDurationSec = &duration
+	}
 	return state
 }
 
@@ -1159,6 +1201,7 @@ func initSettings(cfg Config) (Settings, error) {
 		Groups:               []string{},
 		GroupTree:            []GroupNode{},
 		TestCatalog:          []TestCatalogItem{},
+		ResourceHistoryDays:  defaultResourceHistoryDays,
 	}
 	ensureOfflineAlertRule(&settings)
 	return settings, nil
@@ -1261,6 +1304,7 @@ func mergeSettings(existing, fallback Settings) (Settings, error) {
 	if existing.TestCatalog == nil {
 		existing.TestCatalog = fallback.TestCatalog
 	}
+	existing.ResourceHistoryDays = normalizeResourceHistoryDays(existing.ResourceHistoryDays)
 
 	// F5：加载迁移——NotifyChannels 为空时由旧告警字段合成迁移渠道；随后旧字段
 	// 始终从启用渠道回填，保证两套表示一致（Telegram Bot 轮询读 TelegramSettings()）。
@@ -1327,7 +1371,9 @@ func syncLegacyAlertFieldsFromChannels(settings *Settings) {
 			continue
 		}
 		token := strings.TrimSpace(channel.Secrets["bot_token"])
-		userIDs := parseNotifyChatIDs(channel.Config["chat_ids"])
+		// 旧字段 AlertTelegramUserIDs 是 Bot 命令授权名单，只保留正的用户 ID：
+		// 负数群/频道 chat_id 不得进入授权范围。
+		userIDs := normalizeTelegramUserIDs(parseNotifyChatIDs(channel.Config["chat_ids"]))
 		if token == "" || len(userIDs) == 0 {
 			continue
 		}
@@ -1546,6 +1592,15 @@ func cloneNotifyBoolMap(raw map[string]bool) map[string]bool {
 	return cloned
 }
 
+// cloneFloat64Ptr 复制可选数值快照（nil 保持 nil）。
+func cloneFloat64Ptr(raw *float64) *float64 {
+	if raw == nil {
+		return nil
+	}
+	value := *raw
+	return &value
+}
+
 // notifyChannelsForView 生成视图形态：Secrets 置空，改以 SecretsSet 标记已配置；
 // SecretsClear 仅请求载体（B-08），返回前同样置空。
 func notifyChannelsForView(channels []NotifyChannel) []NotifyChannel {
@@ -1739,17 +1794,24 @@ func joinTelegramChatIDs(ids []int64) string {
 	return strings.Join(parts, ",")
 }
 
-// parseNotifyChatIDs 解析逗号分隔的 chat_ids 配置（容忍空白与重复）。
+// parseNotifyChatIDs 解析逗号分隔的 chat_ids 配置（容忍空白与重复）：接受非零
+// 有符号 int64——Telegram 群/超级群/频道的 chat_id 为负数，与私聊用户 ID（正数）
+// 共用该配置；0、空项、非整数与溢出项过滤，去重后保留首次出现顺序。
 func parseNotifyChatIDs(raw string) []int64 {
+	seen := make(map[int64]struct{})
 	var ids []int64
 	for _, part := range strings.Split(raw, ",") {
 		value, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
-		if err != nil || value <= 0 {
+		if err != nil || value == 0 {
 			continue
 		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
 		ids = append(ids, value)
 	}
-	return normalizeTelegramUserIDs(ids)
+	return ids
 }
 
 func normalizeAdminPath(path string) (string, error) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -252,7 +253,29 @@ type aiServerSummary struct {
 	OfflineSummary    *aiOfflineSummary      `json:"offline_summary,omitempty"`
 	NetworkTests      []aiNetworkTestSummary `json:"network_tests,omitempty"`
 	NetworkTestTrends []aiNetworkTrend       `json:"network_test_trends,omitempty"`
+	ResourceHistory   []aiResourceWindow     `json:"resource_history,omitempty"`
 	Diagnostics       []string               `json:"diagnostics,omitempty"`
+}
+
+// aiResourceWindow 是单个时间窗口内的资源历史摘要：只给平均值、峰值与峰值时间，
+// 不回传原始序列（避免快照体积随时间窗口膨胀）。数值直接来自存储层已保存的 30 秒点
+// （不经过面向图表的降采样）：avg 是窗口内真实点的等权平均，max 是这些点中的最大值，
+// max_at 是该点的采集时间，window_start 是窗口内首个真实样本时间（不是请求窗口
+// 起点或降采样桶起点）。samples 是窗口内点最多的序列的样本数。
+type aiResourceWindow struct {
+	Window  string          `json:"window"`
+	Samples int             `json:"samples"`
+	Start   int64           `json:"window_start,omitempty"`
+	CPU     aiResourceStats `json:"cpu_percent"`
+	Memory  aiResourceStats `json:"mem_percent"`
+	Rx      aiResourceStats `json:"rx_bytes_per_sec"`
+	Tx      aiResourceStats `json:"tx_bytes_per_sec"`
+}
+
+type aiResourceStats struct {
+	Avg   float64 `json:"avg"`
+	Max   float64 `json:"max"`
+	MaxAt int64   `json:"max_at,omitempty"`
 }
 
 type aiOfflineSummary struct {
@@ -713,6 +736,8 @@ func buildAISystemPrompt(custom string) string {
 		"只能基于给定的数据回答问题，不要编造不存在的信息。",
 		"如果数据不足以回答，请直接说明原因。",
 		"回答简洁，必要时给出服务器名称和 ID，并指出关键指标依据。",
+		"resource_history 是采集数据汇总出的 CPU / 内存 / 网络历史摘要（各时间窗口的平均值、峰值及峰值时间），回答「负载峰值出现在什么时候」「过去一天平均情况」这类问题时直接用它。平均值与峰值都取自保存的 30 秒平均点，max_at 是峰值那个点的采集时间，window_start 是窗口内首个样本时间。",
+		"diagnostics 里出现 *_unavailable（例如 resource_history_unavailable:7d）表示对应历史数据缺失，不要当成 0。",
 	}
 	if strings.TrimSpace(custom) != "" {
 		lines = append(lines, fmt.Sprintf("管理员提示: %s", strings.TrimSpace(custom)))
@@ -727,6 +752,12 @@ func buildAIUserPrompt(ctx context.Context, store *Store, question string) (stri
 		return "", err
 	}
 	return fmt.Sprintf("问题: %s\n数据(JSON): %s", question, payload), nil
+}
+
+// aiSummaryResult 由并发 goroutine 通过 channel 回传，避免多个 goroutine 直接写同一个切片。
+type aiSummaryResult struct {
+	index   int
+	summary aiServerSummary
 }
 
 func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
@@ -746,6 +777,8 @@ func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 		wg        sync.WaitGroup
 		sem       = make(chan struct{}, aiSnapshotConcurrency)
 		completed atomic.Int32
+		// 结果通过缓冲 channel 回收，切片只在主 goroutine 写。
+		results = make(chan aiSummaryResult, len(nodes))
 	)
 	for i := range nodes {
 		if ctx.Err() != nil {
@@ -760,11 +793,15 @@ func buildAISnapshot(ctx context.Context, store *Store) aiSnapshot {
 				return
 			}
 			defer func() { <-sem }()
-			servers[i] = buildAIServerSummary(ctx, node, offlineStore, store, snapshotTime)
+			results <- aiSummaryResult{index: i, summary: buildAIServerSummary(ctx, node, offlineStore, store, snapshotTime)}
 			completed.Add(1)
 		}(i, nodes[i])
 	}
 	wg.Wait()
+	close(results)
+	for result := range results {
+		servers[result.index] = result.summary
+	}
 	truncated := completed.Load() < int32(len(nodes))
 	filtered := servers[:0]
 	for _, server := range servers {
@@ -796,13 +833,21 @@ func buildAIServerSummary(ctx context.Context, node NodeView, offlineStore *hist
 	testSummaries, testsByKey := buildAINetworkTestSummaries(stats.NetworkTests)
 	networkHistory, networkHistoryUnavailable := queryAINetworkHistory(ctx, store, stats.NodeID, snapshotTime)
 	testTrends := buildAINetworkTrendSummaries(testsByKey, networkHistory)
-	diagnostics := make([]string, 0, 2)
+	resourceHistory, resourceUnavailable := buildAIResourceHistory(
+		ctx,
+		store,
+		stats.NodeID,
+		snapshotTime,
+		store.ResourceHistoryDays(),
+	)
+	diagnostics := make([]string, 0, 3+len(resourceUnavailable))
 	if networkHistoryUnavailable {
 		diagnostics = append(diagnostics, "network_history_unavailable")
 	}
 	if offlineHistoryUnavailable {
 		diagnostics = append(diagnostics, "offline_history_unavailable")
 	}
+	diagnostics = append(diagnostics, resourceHistoryDiagnostics(resourceUnavailable)...)
 
 	return aiServerSummary{
 		ServerID:          node.ServerID,
@@ -837,6 +882,7 @@ func buildAIServerSummary(ctx context.Context, node NodeView, offlineStore *hist
 		OfflineSummary:    offlineSummary,
 		NetworkTests:      testSummaries,
 		NetworkTestTrends: testTrends,
+		ResourceHistory:   resourceHistory,
 		Diagnostics:       diagnostics,
 	}
 }
@@ -888,6 +934,130 @@ func queryAINetworkHistory(ctx context.Context, store *Store, nodeID string, now
 		return nil, false
 	}
 	return entries, false
+}
+
+// aiResourceHistoryWindows 是资源历史摘要的时间窗口；超出保留期的窗口不输出。
+var aiResourceHistoryWindows = []struct {
+	Key      string
+	Duration time.Duration
+}{
+	{Key: "1h", Duration: time.Hour},
+	{Key: "24h", Duration: 24 * time.Hour},
+	{Key: "7d", Duration: 7 * 24 * time.Hour},
+}
+
+// aiResourceStatsQuerier 是 AI 资源摘要依赖的最小查询接口：生产实现是
+// history.ResourceStore，测试可用它单独注入某个窗口失败。
+type aiResourceStatsQuerier interface {
+	QueryResourceStats(ctx context.Context, nodeID string, from, to time.Time) (*history.ResourceStatsEntry, error)
+}
+
+func resolveAIResourceStore(store *Store) aiResourceStatsQuerier {
+	if store == nil {
+		return nil
+	}
+	store.mu.RLock()
+	historyManager := store.historyManager
+	store.mu.RUnlock()
+	if historyManager == nil {
+		return nil
+	}
+	resourceStore := historyManager.ResourceStore()
+	if resourceStore == nil {
+		return nil
+	}
+	return resourceStore
+}
+
+// resourceHistoryDiagnostics 把查询失败的窗口名拼成诊断标记（resource_history_unavailable:7d），
+// 与 network_history_unavailable 一样带进快照，便于模型区分「没有数据」与「没查到」。
+func resourceHistoryDiagnostics(failedWindows []string) []string {
+	diagnostics := make([]string, 0, len(failedWindows))
+	for _, key := range failedWindows {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		diagnostics = append(diagnostics, "resource_history_unavailable:"+key)
+	}
+	return diagnostics
+}
+
+// buildAIResourceHistory 汇总节点的 CPU / 内存 / 网络资源历史：每个可用窗口给平均值、
+// 峰值与峰值时间，以及样本数。统计直走 ResourceStore 已保存的 30 秒点（不经降采样），
+// 并发与超时沿用 buildAISnapshot 的 aiSnapshotConcurrency / ctx。
+// failedWindows 是查询失败的窗口名：成功的窗口照常保留，只要有一个窗口失败就返回，
+// 供 buildAIServerSummary 写成 resource_history_unavailable:<窗口> 诊断；查询成功但
+// 无数据时返回空切片，同样不输出窗口。
+func buildAIResourceHistory(ctx context.Context, store *Store, nodeID string, now time.Time, retentionDays int) ([]aiResourceWindow, []string) {
+	return buildAIResourceHistoryWith(ctx, resolveAIResourceStore(store), nodeID, now, retentionDays)
+}
+
+func buildAIResourceHistoryWith(ctx context.Context, resourceStore aiResourceStatsQuerier, nodeID string, now time.Time, retentionDays int) ([]aiResourceWindow, []string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || resourceStore == nil {
+		return nil, nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	retention := time.Duration(retentionDays) * 24 * time.Hour
+	windows := make([]aiResourceWindow, 0, len(aiResourceHistoryWindows))
+	var failed []string
+	for _, window := range aiResourceHistoryWindows {
+		// 超出保留期的窗口没有可信数据，直接不给，而不是给出只有尾部数据的平均值。
+		if retentionDays > 0 && window.Duration > retention {
+			continue
+		}
+		stats, err := resourceStore.QueryResourceStats(ctx, nodeID, now.Add(-window.Duration), now)
+		if err != nil {
+			failed = append(failed, window.Key)
+			if ctx.Err() != nil {
+				return windows, failed
+			}
+			log.Printf("AI 资源历史查询失败 node=%s window=%s: %v", nodeID, window.Key, err)
+			continue
+		}
+		if summary, ok := summarizeAIResourceWindow(window.Key, stats); ok {
+			windows = append(windows, summary)
+		}
+	}
+	return windows, failed
+}
+
+func summarizeAIResourceWindow(key string, stats *history.ResourceStatsEntry) (aiResourceWindow, bool) {
+	if stats == nil || stats.MaxCount() == 0 {
+		return aiResourceWindow{}, false
+	}
+	return aiResourceWindow{
+		Window:  key,
+		Samples: stats.MaxCount(),
+		Start:   stats.FirstSampleAt(),
+		CPU:     summarizeAIResourceSeries(stats.CPU, 1),
+		Memory:  summarizeAIResourceSeries(stats.Memory, 1),
+		Rx:      summarizeAIResourceSeries(stats.Rx, 0),
+		Tx:      summarizeAIResourceSeries(stats.Tx, 0),
+	}, true
+}
+
+// summarizeAIResourceSeries 把存储层统计转成快照字段；precision 是保留的小数位数
+// （百分比 1 位、速率取整），避免快照里出现一长串无意义小数。
+func summarizeAIResourceSeries(series history.ResourceSeriesStats, precision int) aiResourceStats {
+	if series.Count == 0 {
+		return aiResourceStats{}
+	}
+	return aiResourceStats{
+		Avg:   roundTo(series.Avg(), precision),
+		Max:   roundTo(series.Max, precision),
+		MaxAt: series.MaxAt,
+	}
+}
+
+func roundTo(value float64, precision int) float64 {
+	factor := math.Pow(10, float64(precision))
+	return math.Round(value*factor) / factor
 }
 
 func resolveAIOfflineStore(store *Store) *history.OfflineStore {

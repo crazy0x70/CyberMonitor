@@ -55,10 +55,14 @@
   --accent-ring: rgba(10, 100, 255, 0.40);
 
   --ok: #1fa855;
+  /* 小号文字颜色令牌：#1fa855 在 11px 白底只有 3.1:1，功能文字改用 --ok-text */
+  --ok-text: #0f7a3d;
   --ok-tint: rgba(31, 168, 85, 0.12);
   --warn: #e08600;
+  --warn-text: #8a5a00;
   --warn-tint: rgba(224, 134, 0, 0.12);
   --danger: #e5383b;
+  --danger-text: #b02225;
   --danger-tint: rgba(229, 56, 59, 0.10);
 
   /* 数据条专用（指标语义色，比状态色更柔） */
@@ -236,8 +240,11 @@ html[data-theme="dark"] {
   --accent-ring: rgba(61, 139, 255, 0.5);
 
   --ok: #34d27b;
+  --ok-text: var(--ok);
   --warn: #ffb340;
+  --warn-text: var(--warn);
   --danger: #ff5d5f;
+  --danger-text: var(--danger);
   --meter-track: rgba(118, 118, 128, 0.24);
 
   /* 4.2 材质 · 深色 */
@@ -757,6 +764,9 @@ html[data-theme="dark"] .control-menu-item:hover {
   color: inherit;
   appearance: none;
   cursor: pointer;
+  /* 当前筛选项不显示选中色（三张卡与「服务器总数」视觉一致），状态只写在 aria-pressed 里；
+     同时抑制移动端点按时的系统蓝色点击高亮，避免被误读成选中色 */
+  -webkit-tap-highlight-color: transparent;
 }
 
 .stat-filter-button:focus-visible {
@@ -767,14 +777,6 @@ html[data-theme="dark"] .control-menu-item:hover {
 .stat-filter-button:hover {
   border-color: var(--hairline-strong);
   background-color: color-mix(in srgb, var(--label-1) 3%, var(--surface-raised));
-}
-
-/* 当前筛选项：F-03（第 6 轮，D-08）—— 选中只用边框色 + 背景淡染色表达，
-   沿用 .stat-card 基础阴影，边框始终 1px，选中前后不产生布局位移；
-   「全部」不显示选中态（monitor.js 只给在线 / 离线加 active） */
-.stat-filter-button.active {
-  border-color: var(--accent);
-  background-color: color-mix(in srgb, var(--accent) 6%, var(--surface-raised));
 }
 
 /* P-01（第 5 轮）：标题 15px / 600 / --label-1，是卡片中字号最大的文字；
@@ -1169,7 +1171,7 @@ html[data-theme="dark"] .group-tab.active {
   padding: 0 8px;
   border-radius: var(--r-full);
   background: var(--danger-tint);
-  color: var(--danger);
+  color: var(--danger-text);
   font-size: var(--fs-2xs);
   font-weight: 600;
   line-height: 1;
@@ -1406,11 +1408,11 @@ html[data-theme="dark"] .group-tab.active {
 /* P-08 第 3 条（0.1.2 裁定做）：阈值色只作用于样式。
    monitor.js 在写宽度处同步维护 .summary-metric 的 data-level（≥90 hot / ≥80 warn） */
 .summary-metric[data-level="warn"] .summary-value {
-  color: var(--warn);
+  color: var(--warn-text);
 }
 
 .summary-metric[data-level="hot"] .summary-value {
-  color: var(--danger);
+  color: var(--danger-text);
 }
 
 .summary-metric[data-level="hot"] .summary-fill {
@@ -1496,8 +1498,8 @@ html[data-theme="dark"] .group-tab.active {
   display: none;
 }
 
-/* M-03：详情区拆为双层 —— .node-details 承载分隔线与高度编排（grid-template-rows，
-   见 S5 动效区），padding 移入 .node-details-inner 以便 0fr 时一并折叠 */
+/* M-03：详情区拆为双层 —— .node-details 承载分隔线与高度编排（像素高度过渡，
+   见 S5 动效区），padding 移入 .node-details-inner，收起时可被一并裁掉 */
 .node-details {
   border-top: 1px solid var(--hairline);
 }
@@ -1635,7 +1637,7 @@ html[data-theme="dark"] .group-tab.active {
 }
 
 .status.offline {
-  color: var(--danger);
+  color: var(--danger-text);
   background: var(--danger-tint);
 }
 
@@ -2010,17 +2012,17 @@ html[data-theme="dark"] .range-btn.active {
 
 /* P-10（第 4 轮）：状态色令牌化 + 字重 500（原 300 在浅色底上不达 AA） */
 .network-card-latency.latency-good {
-  color: var(--ok);
+  color: var(--ok-text);
   font-weight: 500;
 }
 
 .network-card-latency.latency-warn {
-  color: var(--warn);
+  color: var(--warn-text);
   font-weight: 500;
 }
 
 .network-card-latency.latency-bad {
-  color: var(--danger);
+  color: var(--danger-text);
   font-weight: 500;
 }
 
@@ -2181,14 +2183,19 @@ html[data-theme="dark"] .range-btn.active {
   background: linear-gradient(90deg, transparent, var(--hairline), transparent);
 }
 
+/* P-13 / a11y：链接与周围文字仅靠颜色区分不达 3:1（link-in-text-block），
+   常态即带 1px 下划线（修饰色取 currentColor，随链接文字走，保持低调），悬停文字加深 */
 .site-footer a {
   color: var(--label-2);
-  text-decoration: none;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentColor;
+  text-underline-offset: 3px;
 }
 
 .site-footer a:hover {
   color: var(--label-1);
-  text-decoration: underline;
+  text-decoration-color: currentColor;
   text-decoration-thickness: 1px;
   text-underline-offset: 3px;
 }
@@ -2332,7 +2339,7 @@ html[data-theme="dark"] .range-btn.active {
 }
 
 .error {
-  color: var(--danger); /* P-10（第 4 轮）：写死色令牌化 */
+  color: var(--danger-text); /* P-10（第 4 轮）：写死色令牌化 */
   font-size: 12px;
   min-height: 16px;
 }
@@ -2378,32 +2385,28 @@ html[data-theme="dark"] .range-btn.active {
     animation: rise var(--dur-4) var(--ease-out) both;
   }
 
-  /* M-03：卡片展开 —— 详情区高度 grid-template-rows 0fr→1fr（--dur-3 --ease-spring），
-     收起 --dur-2；折叠区与详情间分隔线随展开渐显。
-     .is-open / .is-collapsing 由 monitor.js 在 toggle / summary 点击时切换 */
+  /* M-03：卡片展开 —— 高度改用显式像素高度过渡：monitor.js 在点击瞬间测量详情区当前
+     像素高度，用 WAAPI 补间到 0 / 目标高度，动画结束后清掉内联高度回到 auto 自适应。
+     这里只管终态、分隔线和内容淡入淡出。
+     不再过渡 grid-template-rows 的 fr 值：fr 轨道每帧都要重解整棵详情子树的
+     max-content，且与 .node-details-inner 的 padding-block 过渡互相耦合，实测点击后
+     连续 3 帧（约 46ms）几何完全不变，随后单帧跳 184px（见第 12 轮验证数据）。 */
   .node-card > .node-details {
-    display: grid;
-    grid-template-rows: 0fr;
+    height: 0;
+    overflow: hidden;
     border-top-color: transparent;
-    transition:
-      grid-template-rows var(--dur-2) var(--ease-out),
-      border-color var(--dur-2) var(--ease-out);
+    transition: border-color var(--dur-2) var(--ease-out);
   }
 
   .node-card > .node-details.is-open {
-    grid-template-rows: 1fr;
+    height: auto;
+    overflow: visible;
     border-top-color: var(--hairline);
-    transition:
-      grid-template-rows var(--dur-3) var(--ease-spring),
-      border-color var(--dur-3) var(--ease-out);
+    transition: border-color var(--dur-3) var(--ease-out);
   }
 
-  /* 收起动画期间 open 仍为 true，需要压过可能的同优先级规则 */
-  .node-card[open] > .node-details.is-collapsing {
-    grid-template-rows: 0fr;
-    border-top-color: transparent;
-  }
-
+  /* 折叠态内边距保持 --space-3（高度为 0 时由 .node-details 裁掉），
+     不再让内边距参与高度变化：它是旧 fr 方案卡住首帧的原因之一 */
   .node-card > .node-details .node-details-inner {
     overflow: hidden;
     opacity: 0;
@@ -2413,7 +2416,7 @@ html[data-theme="dark"] .range-btn.active {
   /* 内容延迟 60ms 淡入（条目数值，无对应动效令牌） */
   .node-card > .node-details.is-open .node-details-inner {
     opacity: 1;
-    transition-delay: 60ms;
+    transition: opacity var(--dur-2) var(--ease-out) 60ms;
   }
 
   /* M-05：在线状态点呼吸 —— box-shadow 扩散 0→6px、透明度 .35→0，2.4s 循环；

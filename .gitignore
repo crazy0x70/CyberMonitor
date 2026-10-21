@@ -43,6 +43,7 @@ go.work.sum
 .serena/
 .codex/
 .agents/
+.pi/
 output/
 internal/server/web/admin/node_modules/
 internal/server/web/admin/.DS_Store

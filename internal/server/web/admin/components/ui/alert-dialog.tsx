@@ -45,13 +45,18 @@ function AlertDialogOverlay({
 // 注意：组件内置样式排列在页面传入 className 之后（cn(className, internal)）——
 // 页面历史传入的 adminDialogContentClass（p-0 / 旧底色 / 旧投影）会被本规格整体取代，
 // 这正是「确认弹窗统一 macOS alert」的落地方式；追加型类（定位、宽度微调）仍可传入。
+// variant="danger" 供删除、放弃修改等危险确认框显式声明，顶部图标圆切危险色板；
+// 以前靠 :has([data-slot=alert-dialog-action][class*='text-[var(--danger)]']) 探测，
+// 但危险按钮实际传的是 adminDialogDangerActionClass（rose 底白字），从不匹配。
 function AlertDialogContent({
   className,
   size = "default",
+  variant = "default",
   children,
   ...props
 }: AlertDialogPrimitive.Popup.Props & {
   size?: "default" | "sm"
+  variant?: "default" | "danger"
 }) {
   return (
     <AlertDialogPortal>
@@ -59,6 +64,7 @@ function AlertDialogContent({
       <AlertDialogPrimitive.Popup
         data-slot="alert-dialog-content"
         data-size={size}
+        data-variant={variant}
         className={cn(
           className,
           // 玻璃弹窗底：--mat-sheet-bg + --blur-thick + 上沿内高光 + --shadow-4，圆角 --r-2xl，内边距 24px。
@@ -66,12 +72,12 @@ function AlertDialogContent({
           // dark:border-[var(--hairline)] 同理压掉调用方残留的 dark:border-neutral-800/60。
           "group/alert-dialog-content fixed top-1/2 left-1/2 z-50 grid w-[min(400px,calc(100%-2rem))] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[var(--r-2xl)] border border-[var(--hairline)] bg-[var(--mat-sheet-bg)] p-6 text-center text-[var(--label-1)] dark:border-[var(--hairline)]",
           "shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-4)]! [-webkit-backdrop-filter:var(--blur-thick)] [backdrop-filter:var(--blur-thick)] outline-none",
-          // 顶部 48px 图标圆的色板：保存/通用 --accent-tint 底 + --accent 图标；
-          // 删除/危险场景当确认按钮为 danger 色（adminDialogDangerActionClass 含 text-[var(--danger)]）时
-          // 自动切 --danger-tint / --danger（纯 CSS :has 检测，无 JS；检测不到时回落主色，无害）
-          "[--alert-media-bg:var(--accent-tint)] [--alert-media-fg:var(--accent)]",
-          "[:has([data-slot=alert-dialog-action][class*='text-[var(--danger)]'])]:[--alert-media-bg:var(--danger-tint)]",
-          "[:has([data-slot=alert-dialog-action][class*='text-[var(--danger)]'])]:[--alert-media-fg:var(--danger)]",
+          // 顶部 48px 图标圆的色板：保存/通用 --accent-tint 底 + --accent 图标；危险场景
+          // --danger-tint 底 + --danger-text 图标（浅色 #b02225 / 深色 --danger，对比度达标）。
+          // 变量按 variant 直接给出，不依赖类名探测。
+          variant === "danger"
+            ? "[--alert-media-bg:var(--danger-tint)] [--alert-media-fg:var(--danger-text)]"
+            : "[--alert-media-bg:var(--accent-tint)] [--alert-media-fg:var(--accent)]",
           // 进入：scale(.96) translateY(8px)→0 + opacity，--dur-4 --ease-spring；退出：--dur-2 淡出 + scale(.98)
           "transition-none duration-100",
           "data-open:animate-in data-open:fade-in data-open:[--tw-enter-scale:0.96] data-open:[--tw-enter-translate-y:0.5rem] data-open:duration-[var(--dur-4)] data-open:ease-[var(--ease-spring)]",
@@ -80,7 +86,7 @@ function AlertDialogContent({
         {...props}
       >
         {/* A-11 第 3 条：顶部 48px 图标圆，由组件自动渲染（页面无需逐个接入）；
-            保存/通用 --accent-tint、删除 --danger-tint（由上方 :has 检测切换） */}
+            保存/通用 --accent-tint、危险确认框 --danger-tint（由 variant 决定） */}
         <div
           data-slot="alert-dialog-media"
           aria-hidden="true"

@@ -24,6 +24,7 @@ import {
   Sun,
   Server,
   Settings,
+  WifiOff,
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -67,6 +68,7 @@ import {
   testAlertChannels,
   testAIProvider,
 } from "@/lib/admin-api";
+import type { AdminSocketStatus } from "@/lib/admin-api";
 import type {
   AlertTestPayload,
   AIProviderConfig,
@@ -91,7 +93,6 @@ import {
   formatVersionLabel,
   getErrorMessage,
   shouldHandleAdminNavigation,
-  upsertNodeView,
   type AdminPage,
 } from "@/lib/admin-format";
 import {
@@ -109,6 +110,7 @@ import {
   writeStoredAdminLocale,
   type AdminLocale,
 } from "@/lib/admin-i18n";
+import { missingSecretChannelsNotice } from "@/lib/notify-channels";
 import {
   adminDialogCancelClass,
   adminDialogContentClass,
@@ -520,18 +522,20 @@ type AdminSectionErrors = Partial<Record<Page, readonly string[]>>;
 const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 
+// 站点图标是品牌标识，旁边总跟着可见站点名文字（侧栏 / 顶栏 / 登录卡标题），
+// 因此按装饰性图片处理：alt 留空，避免屏幕阅读器把同一个名字读两遍（image-redundant-alt）。
 function BrandIcon({
   siteIcon,
-  siteTitle,
   sizeClass = "h-5 w-5",
 }: {
   siteIcon: string;
-  siteTitle: string;
+  // 保留在 props 里供调用方继续传值（当前不参与渲染）
+  siteTitle?: string;
   sizeClass?: string;
 }) {
   return (
     <img
-      alt={siteTitle}
+      alt=""
       className={`h-full w-full object-cover ${sizeClass}`}
       src={siteIcon || DEFAULT_SITE_ICON}
       width={40}
@@ -788,6 +792,12 @@ export default function App() {
   const [publicSettings, setPublicSettings] = useState<BootPublicSettings | null>(() => BOOT_PAYLOAD.settings || null);
   const [systemUpdateInfo, setSystemUpdateInfo] = useState<SystemUpdateInfo | null>(null);
   const [nodes, setNodes] = useState<NodeView[]>([]);
+  // 节点列表是否已经有一次权威结果（REST 或 WS 快照）。首页的零节点引导只在
+  // 确认“确实没有节点”后显示，避免已有节点时因节点请求晚到而闪现引导卡。
+  const [nodesLoaded, setNodesLoaded] = useState(false);
+  // 实时连接状态：由 connectAdminSocket 的 onStatus 驱动（connecting / open / closed），
+  // 用于顶部断线横幅与首页实时指示，避免断线时仍显示健康态。
+  const [socketStatus, setSocketStatus] = useState<AdminSocketStatus>("connecting");
   const [currentPage, setCurrentPage] = useState<Page>(() => resolveInitialPage());
   // 设置类页面（settings/alerts）的当前分区；其余页面（含 ai 运维助手单页）恒为 null。
   const [currentSection, setCurrentSection] = useState<string | null>(() =>
@@ -1066,6 +1076,7 @@ export default function App() {
     setSettings(null);
     setSystemUpdateInfo(null);
     setNodes([]);
+    setNodesLoaded(false);
     setHasUnsavedPageChanges(false);
     setPendingPageNavigation(null);
     setUnsavedDialogOpen(false);
@@ -1085,6 +1096,7 @@ export default function App() {
       loadAllRequestRef.current += 1;
       setSettings(null);
       setNodes([]);
+      setNodesLoaded(false);
       setLoading(false);
       setLoadError(null);
       return;
@@ -1125,6 +1137,7 @@ export default function App() {
         return;
       }
       setNodes(nodesResult.data.nodes || []);
+      setNodesLoaded(true);
     } catch (error) {
       if (!isCurrentLoad()) {
         return;
@@ -1306,12 +1319,15 @@ export default function App() {
     if (!token) {
       socketRef.current?.close();
       socketRef.current = null;
+      setSocketStatus("connecting");
       return;
     }
+    setSocketStatus("connecting");
     const socket = connectAdminSocket(
       (snapshot) => {
         if (Array.isArray(snapshot.nodes)) {
           setNodes(snapshot.nodes);
+          setNodesLoaded(true);
         }
         const snapshotSettings = publicSettingsFromSnapshot(snapshot.settings);
         if (snapshotSettings) {
@@ -1329,9 +1345,7 @@ export default function App() {
           });
         }
       },
-      (node) => {
-        setNodes((current) => upsertNodeView(current, node));
-      },
+      { onStatus: setSocketStatus },
     );
     socketRef.current = socket;
     return () => {
@@ -1379,6 +1393,7 @@ export default function App() {
           return;
         }
         setNodes(snapshot.nodes || []);
+        setNodesLoaded(true);
       } catch (error) {
         if (loadAllRequestRef.current !== requestID) {
           return;
@@ -1443,7 +1458,14 @@ export default function App() {
         }
         setStoredAdminToken("session");
         setToken("session");
-        void refreshNodesAfterMutation(adminText(nextLocale, "配置已导入"), nextLocale);
+        // P1：导出配置不含密钥，导入后可能留下必填项不全的通知渠道（服务端不会
+        // 主动提示）。与 BasicSettings 的导入提示共用同一处文案，指引用户补全。
+        const missingSecretNotice = missingSecretChannelsNotice(data.settings);
+        const importedLabel = adminText(nextLocale, "配置已导入");
+        void refreshNodesAfterMutation(
+          missingSecretNotice ? `${importedLabel}；${missingSecretNotice}` : importedLabel,
+          nextLocale,
+        );
         if (data.settings?.admin_path) {
           const nextAdminPath = adminAppLocation(data.settings.admin_path);
           if (nextAdminPath) {
@@ -1468,6 +1490,7 @@ export default function App() {
           return;
         }
         setNodes(snapshot.nodes || []);
+        setNodesLoaded(true);
       } catch (error) {
         if (error instanceof AdminApiError && error.status === 401) {
           handleLogout({
@@ -1610,7 +1633,13 @@ export default function App() {
       case "dashboard":
         return (
           <Suspense fallback={<SectionLoader label={t("正在加载首页…")} variant="dashboard" />}>
-            <DashboardPage settings={settings} nodes={nodes} onNavigate={navigateToPage} />
+            <DashboardPage
+              settings={settings}
+              liveStatus={socketStatus}
+              nodes={nodes}
+              nodesLoaded={nodesLoaded}
+              onNavigate={navigateToPage}
+            />
           </Suspense>
         );
       case "servers":
@@ -1622,6 +1651,7 @@ export default function App() {
               onCheckAgentUpdate={(nodeID) => fetchAgentUpdateInfo(nodeID)}
               onDeleteNode={handleDeleteNode}
               onDirtyChange={setHasUnsavedPageChanges}
+              onNavigate={navigateToPage}
               onRefresh={handleRefreshNodes}
               onSaveNode={handleSaveNode}
               // F4 节点抽屉「为此节点新增规则」：走 App 现有 updateSettings 通道保存
@@ -1685,9 +1715,11 @@ export default function App() {
     loading,
     navigateToPage,
     nodes,
+    nodesLoaded,
     refreshingNodes,
     savingPage,
     settings,
+    socketStatus,
     t,
     updateSettings,
   ]);
@@ -1698,6 +1730,7 @@ export default function App() {
         return (
           <Suspense fallback={<SectionLoader label={t("正在加载探测设置…")} />}>
             <ProbeSettingsPage
+              nodes={nodes}
               onDirtyChange={setHasUnsavedPageChanges}
               onSave={(testCatalog) => updateSettings("probes", { test_catalog: testCatalog })}
               saving={savingPage === "probes"}
@@ -1757,6 +1790,7 @@ export default function App() {
     handleExport,
     handleImport,
     handleSystemUpdate,
+    nodes,
     refreshingSystemUpdate,
     savingPage,
     settings,
@@ -1929,6 +1963,20 @@ export default function App() {
         id="admin-main-content"
         className="relative flex h-screen min-w-0 flex-1 flex-col overflow-hidden pt-[53px] md:pl-[276px] md:pt-0"
       >
+        {/* 实时连接断开横幅：只在已登录且 socket 非主动关闭时出现；重连成功后自动消失。
+            静态、无渐变/发光/动效，--warn-tint 底 + 底部 hairline。 */}
+        {token && socketStatus === "closed" ? (
+          <div
+            role="status"
+            className="flex shrink-0 items-center gap-2 border-b border-[var(--hairline)] bg-[var(--warn-tint)] px-4 py-2 text-[13px] md:px-10"
+          >
+            <WifiOff aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-[var(--warn)]" />
+            <span className="min-w-0">
+              <span className="font-semibold text-[var(--label-1)]">{t("实时连接已断开：")}</span>{" "}
+              <span className="text-[var(--label-2)]">{t("数据可能已过期，正在自动重连。")}</span>
+            </span>
+          </div>
+        ) : null}
         <ScrollArea className="min-h-0 flex-1">
           <div className="w-full px-4 pb-12 pt-6 md:px-10 md:pb-16 md:pt-8">
             {loading ? (

@@ -33,6 +33,12 @@ const PUBLIC_I18N = {
     emptyWaitingBody: "请启动 Agent 并指向当前管理端地址。",
     emptyGroupTitle: "当前分组暂无节点",
     emptyGroupBody: "请选择其他分组或返回全部查看。",
+    emptyOfflineTitle: "暂无离线服务器",
+    emptyOfflineBody: "所有服务器均在线。",
+    emptyOfflineGroupBody: "当前分组的服务器均在线。",
+    emptyOnlineTitle: "暂无在线服务器",
+    emptyOnlineBody: "所有服务器当前均离线。",
+    emptyOnlineGroupBody: "当前分组的服务器均离线。",
     poweredBy: "Powered by",
     all: "ALL",
     traffic: "流量",
@@ -117,6 +123,12 @@ const PUBLIC_I18N = {
     emptyWaitingBody: "Start the Agent and point it to this control server.",
     emptyGroupTitle: "No nodes in this group",
     emptyGroupBody: "Choose another group or return to All.",
+    emptyOfflineTitle: "No offline servers",
+    emptyOfflineBody: "All servers are online.",
+    emptyOfflineGroupBody: "All servers in this group are online.",
+    emptyOnlineTitle: "No online servers",
+    emptyOnlineBody: "All servers are currently offline.",
+    emptyOnlineGroupBody: "All servers in this group are offline.",
     poweredBy: "Powered by",
     all: "ALL",
     traffic: "Traffic",
@@ -299,6 +311,47 @@ const RENDER_FALLBACK_MS = 1000;
 const PUBLIC_NODE_STALE_GRACE_SECONDS = 12;
 // S5/M-03：动效开关 —— reduce 时不拦截 summary 点击，保留原生瞬时展开 / 收起
 const MOTION_ALLOWED = window.matchMedia("(prefers-reduced-motion: no-preference)");
+
+// 详情区动画的前提是「允许动效」且浏览器支持 WAAPI（Element.prototype.animate）。
+// 每次交互都重新判断：旧浏览器没有方法时不能走动画路径（会抛 TypeError 并留下
+// open=true + is-collapsing + 1px 高度的分歧状态），此时与 reduce 共用原生瞬时切换。
+function detailsMotionEnabled() {
+  return MOTION_ALLOWED.matches && typeof Element.prototype.animate === "function";
+}
+
+// M-03（第 12 轮）：详情区像素高度动画的时长 / 曲线直接取动效令牌，避免与 styles.css 分叉
+let detailsMotionTokens = null;
+
+// 显式指定 startTime：在事件回调里新建的动画，其实例化所在帧不会再推进，点击落在
+// 两帧之间时那一帧依旧看不到几何变化（旧方案的「点了没反应」）。把起点对齐到用户
+// 点击的时刻（原生 <details> 的 toggle 事件晚于 click，所以用点击时间），下一帧就带
+// 着一帧的进度；总时长不变。长任务后最多回退 34ms（两帧），避免首帧直接跳一大段。
+function alignAnimationStart(anim, originMs) {
+  const frameTime = document.timeline?.currentTime;
+  if (typeof frameTime !== "number") return;
+  const now = performance.now();
+  const fresh = Number.isFinite(originMs) && now - originMs >= 0 && now - originMs < 250;
+  anim.startTime = Math.max(fresh ? originMs : now, frameTime - 34);
+}
+
+function resolveDetailsMotion() {
+  if (!detailsMotionTokens) {
+    const rootStyle = getComputedStyle(document.documentElement);
+    const read = (name, fallback) => rootStyle.getPropertyValue(name).trim() || fallback;
+    const ms = (name, fallback) => {
+      const parsed = Number.parseFloat(read(name, ""));
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    };
+    detailsMotionTokens = {
+      collapse: ms("--dur-2", 200),
+      expand: ms("--dur-3", 320),
+      easeOut: read("--ease-out", "cubic-bezier(0.22, 0.61, 0.36, 1)"),
+      easeSpring: read("--ease-spring", "cubic-bezier(0.32, 0.72, 0, 1)"),
+    };
+  }
+  return detailsMotionTokens;
+}
+
 // M-02：入场编排最多覆盖前 12 张（其余直接显示）、每张间隔 40ms
 const NODE_INTRO_MAX = 12;
 const NODE_INTRO_STAGGER_MS = 40;
@@ -413,7 +466,7 @@ function setText(el, value) {
 function setHTML(el, markup) {
   if (el && el.__cmMarkup !== markup) {
     el.__cmMarkup = markup;
-    el.innerHTML = markup;
+    el.replaceChildren(parseMarkup(markup));
   }
 }
 
@@ -1049,6 +1102,32 @@ function resolveNodeStaleSeconds(node) {
   return PUBLIC_NODE_STALE_GRACE_SECONDS;
 }
 
+// 离线时长 = now - last_seen；last_seen 缺失或为 0 时没有可信起点，数字显示 "--"，
+// 否则会算出巨大的假时长。
+function formatOfflineDuration(node) {
+  const lastSeen = Number(node?.last_seen || 0);
+  if (!lastSeen) return "--";
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - lastSeen);
+  return formatUptime(seconds);
+}
+
+// 运行时间展示：在线保持「已运行 <uptime>」；离线时 summary 右列改「离线 <离线时长>」，
+// 详情「运行时间」显示 "--"（最后一次上报的 uptime 不是当前值，直接展示会持续变大）。
+// 每秒的 refreshRealtimeStatus 复用本函数就地更新，避免离线卡片整卡重渲染。
+function applyUptimeFields(fields, node, uptimeText) {
+  if (!fields) return;
+  const offline = resolveNodeStatus(node) === "offline";
+  setText(
+    fields.summaryUptime?.querySelector(".uptime-label"),
+    offline ? `${t("offline")} ` : `${t("runningPrefix")} `
+  );
+  setText(
+    fields.summaryUptime?.querySelector(".num"),
+    offline ? formatOfflineDuration(node) : uptimeText
+  );
+  setDetailText(fields.detailUptime, offline ? "--" : uptimeText);
+}
+
 function syncRealtimeStatus(nodes) {
   const active = new Set();
   (nodes || []).forEach((node) => {
@@ -1075,7 +1154,18 @@ function refreshRealtimeStatus() {
       state.renderedNode.delete(id);
       state.renderedHistorySig.delete(id);
       changed = true;
+      return;
     }
+    // 已渲染且持续离线：就地刷新「离线 <离线时长>」，不必每秒整卡重渲染。
+    // 离线↔在线切换仍走 scheduleRender，回到在线时恢复「已运行」。
+    if (next !== "offline") return;
+    const card = state.nodes.get(id);
+    if (!card?._fields || !card.isConnected) return;
+    applyUptimeFields(
+      card._fields,
+      node,
+      formatUptime(node.stats?.uptime_sec || 0)
+    );
   });
   if (changed) {
     scheduleRender();
@@ -1117,6 +1207,8 @@ function handleSnapshot(payload) {
 }
 
 function handleNodeDelta(payload) {
+  // 保留：服务端已不再广播 node_delta（逐节点 delta 与快照重复，第 3 轮删除），
+  // 但静态托管的新版公开页可能连上旧版服务端，仍需兼容这条帧。
   if (!payload || typeof payload !== "object" || !payload.node) {
     return;
   }
@@ -1162,13 +1254,27 @@ function updateEmptyState(visibleCount, totalCount) {
   if (visibleCount > 0) {
     return;
   }
-  if (totalCount > 0 && state.selectedGroup !== DEFAULT_GROUP) {
-    empty.querySelector("h2").textContent = t("emptyGroupTitle");
-    empty.querySelector("p").textContent = t("emptyGroupBody");
-  } else {
-    empty.querySelector("h2").textContent = t("emptyWaitingTitle");
-    empty.querySelector("p").textContent = t("emptyWaitingBody");
+  const titleNode = empty.querySelector("h2");
+  const bodyNode = empty.querySelector("p");
+  const inGroup = state.selectedGroup !== DEFAULT_GROUP;
+  // 「等待节点接入」只在系统里确实没有任何节点时出现；有节点但当前状态筛选为空，
+  // 说明筛选结果为空而不是没有节点接入。分组内本就没有节点时优先用分组空态。
+  let titleKey = "emptyWaitingTitle";
+  let bodyKey = "emptyWaitingBody";
+  if (state.lastNodes.length > 0) {
+    if (inGroup && totalCount === 0) {
+      titleKey = "emptyGroupTitle";
+      bodyKey = "emptyGroupBody";
+    } else if (state.statusFilter === "offline") {
+      titleKey = "emptyOfflineTitle";
+      bodyKey = inGroup ? "emptyOfflineGroupBody" : "emptyOfflineBody";
+    } else if (state.statusFilter === "online") {
+      titleKey = "emptyOnlineTitle";
+      bodyKey = inGroup ? "emptyOnlineGroupBody" : "emptyOnlineBody";
+    }
   }
+  titleNode.textContent = t(titleKey);
+  bodyNode.textContent = t(bodyKey);
 }
 
 const RANGE_OPTIONS = [
@@ -1966,18 +2072,17 @@ const statTotalCard = statTotal ? statTotal.closest(".stat-card") : null;
 const statOnlineCard = statOnline ? statOnline.closest(".stat-card") : null;
 const statOfflineCard = statOffline ? statOffline.closest(".stat-card") : null;
 
-/* P-04 第 4 条 + P-05（第 4 轮）：当前筛选项的纯展示标记（样式在 CSS）。
-   筛选为「全部」时不显示选中态；仅在线 / 离线选中时对应卡片显示 */
+/* 三张统计卡都是筛选开关，但当前筛选不产生任何选中配色（与「服务器总数」一致）；
+   状态只通过 aria-pressed 暴露给辅助技术，视觉上只有 hover 与 focus-visible 反馈 */
 function syncStatFilterSelection() {
-  if (statTotalCard) {
-    statTotalCard.classList.remove("active");
-  }
-  if (statOnlineCard) {
-    statOnlineCard.classList.toggle("active", state.statusFilter === "online");
-  }
-  if (statOfflineCard) {
-    statOfflineCard.classList.toggle("active", state.statusFilter === "offline");
-  }
+  const pressed = (card, selected) => {
+    if (card) {
+      card.setAttribute("aria-pressed", selected ? "true" : "false");
+    }
+  };
+  pressed(statTotalCard, state.statusFilter === "all");
+  pressed(statOnlineCard, state.statusFilter === "online");
+  pressed(statOfflineCard, state.statusFilter === "offline");
 }
 
 if (statTotalCard) {
@@ -2596,6 +2701,8 @@ function detailInfoRowsHTML() {
         ["arch", "detail-arch"],
         ["os", "detail-os"],
         ["CPU", "detail-cpu", "raw"],
+        // 负载属于主机硬件指标，紧跟 CPU；原先放在网络分组下（只调顺序，data-field 不变）。
+        ["load", "detail-load", "num"],
         ["gpu", "detail-gpu"],
         ["memory", "detail-mem", "num"],
         ["disk", "detail-disk", "num"],
@@ -2605,7 +2712,6 @@ function detailInfoRowsHTML() {
       titleKey: "detailGroupNetwork",
       rows: [
         ["region", "detail-region"],
-        ["load", "detail-load", "num"],
         ["uploadTotal", "detail-upload", "num"],
         ["downloadTotal", "detail-download", "num"],
       ],
@@ -2729,75 +2835,130 @@ function createCard() {
 
   card._fields = fields;
   card._historySignature = "";
+  card._detailsAnim = null;
+  const detailsEl = fields.detailsEl;
+
+  // M-03（第 12 轮）：展开 / 收起改用显式像素高度 + WAAPI。
+  // 旧方案过渡 grid-template-rows 的 0fr→1fr：fr 轨道每帧都要重解整棵详情子树的
+  // max-content，并与 .node-details-inner 的 padding-block 过渡耦合，实测点击后连续
+  // 3 帧（≈46ms）几何完全不变、单帧最跳 184px。像素高度与内容解耦，首帧就开始走。
+  function stopDetailsAnimation() {
+    const anim = card._detailsAnim;
+    if (!anim) return;
+    card._detailsAnim = null;
+    anim.onfinish = null;
+    anim.cancel(); // 释放 fill，高度回落到 CSS（auto / 0）
+  }
+
+  function animateDetailsHeight(from, to, duration, easing, done) {
+    stopDetailsAnimation();
+    // 动画期间高度由动画控制，超出部分必须裁掉
+    detailsEl.style.overflow = "hidden";
+    const anim = detailsEl.animate(
+      [{ height: `${from}px` }, { height: `${to}px` }],
+      { duration, easing, fill: "both" }
+    );
+    card._detailsAnim = anim;
+    alignAnimationStart(anim, card._detailsClickAt);
+    anim.onfinish = () => {
+      card._detailsAnim = null;
+      anim.cancel();
+      detailsEl.style.height = "";
+      detailsEl.style.overflow = "";
+      if (done) done();
+    };
+  }
+
+  function collapseDetails() {
+    const motion = resolveDetailsMotion();
+    const from = detailsEl.getBoundingClientRect().height; // 含正在进行的动画值
+    detailsEl.classList.remove("is-open");
+    detailsEl.classList.add("is-collapsing");
+    animateDetailsHeight(from, 0, motion.collapse, motion.easeOut, () => {
+      detailsEl.classList.remove("is-collapsing");
+      card.open = false; // toggle 监听会照常重置 _historySignature
+    });
+  }
+
+  function expandDetails() {
+    const motion = resolveDetailsMotion();
+    const from = detailsEl.getBoundingClientRect().height; // 收起途中则是当前中间高度
+    stopDetailsAnimation();
+    detailsEl.style.height = "";
+    detailsEl.classList.remove("is-collapsing");
+    detailsEl.classList.add("is-open");
+    const target = detailsEl.getBoundingClientRect().height;
+    animateDetailsHeight(from, target, motion.expand, motion.easeSpring, () => {
+      // 动画期间内容可能变高（探测历史异步到达、节点数据每秒更新）：末端先落到新的
+      // 自然高度再接一段短补间，避免动画结束瞬间直接跳一截
+      const natural = detailsEl.getBoundingClientRect().height;
+      if (Math.abs(natural - target) > 1) {
+        animateDetailsHeight(target, natural, 120, motion.easeOut);
+      }
+    });
+  }
+
+  // 内容先渲染到位再量目标高度：探测图表来自异步历史，先量会把目标算小
+  function prepareDetailsContent() {
+    if (!card._lastNode || !card._nodeId) return;
+    const historySignature = buildCardHistorySignature(card._lastNode, card._nodeId);
+    if (historySignature === card._historySignature) return;
+    renderCardDetails(card, card._lastNode, card._nodeId);
+    card._historySignature = historySignature;
+  }
+
   card.addEventListener("toggle", () => {
     if (!card.open) {
       card._historySignature = "";
-      // M-03 / P-12（第 4 轮）：关闭分支同时清掉两个状态类，
+      // M-03 / P-12（第 4 轮）：关闭分支同时清掉两个状态类与进行中的动画，
       // 避免被中断的展开 / 收起在 details 上留下残留
-      card._fields.detailsEl?.classList.remove("is-open", "is-collapsing");
-      return;
-    }
-    // M-03：展开动画 —— 等一帧让「以 0fr 折叠态渲染」先生效，再切 is-open 触发过渡；
-    // 若此刻已在收起（is-collapsing），不要抢状态
-    requestAnimationFrame(() => {
-      const detailsEl = card._fields.detailsEl;
-      if (detailsEl && !detailsEl.classList.contains("is-collapsing")) {
-        detailsEl.classList.add("is-open");
+      stopDetailsAnimation();
+      if (detailsEl) {
+        detailsEl.classList.remove("is-open", "is-collapsing");
+        detailsEl.style.height = "";
+        detailsEl.style.overflow = "";
       }
-    });
-    if (!card._lastNode || !card._nodeId) {
       return;
     }
-    const historySignature = buildCardHistorySignature(card._lastNode, card._nodeId);
-    if (historySignature === card._historySignature) {
-      return;
-    }
-    renderCardDetails(card, card._lastNode, card._nodeId);
-    card._historySignature = historySignature;
-  });
-  // M-03：收起动画 —— summary 默认点击会让浏览器立即取消子内容渲染，高度无从过渡。
-  // 拦截点击、保持 open=true 播完 0fr 收起（--dur-2）后再真正关闭。
-  // reduce 时（MOTION_ALLOWED 不匹配）不拦截，走原生瞬时切换
-  card.querySelector(".node-summary").addEventListener("click", (event) => {
-    if (!MOTION_ALLOWED.matches) {
-      return;
-    }
-    const detailsEl = card._fields.detailsEl;
-    if (detailsEl.classList.contains("is-collapsing")) {
-      // 收起途中再点：取消收起、恢复展开（open 仍为 true）
-      event.preventDefault();
+    prepareDetailsContent();
+    // 点击路径已在 click 监听里同步启动了展开动画（toggle 事件晚于 click，
+    // 等它才起动画会白等一帧）；只有程序性 card.open=true 才走到这里启动。
+    if (card._detailsAnim) return;
+    // reduce 或不支持 WAAPI 时不拦点击也不做动画，走原生瞬时切换（CSS 也不在
+    // no-preference 外生效）；终态类在这里同步，避免残留 is-collapsing / 内联高度
+    if (!detailsMotionEnabled()) {
+      stopDetailsAnimation();
       detailsEl.classList.remove("is-collapsing");
+      detailsEl.style.height = "";
+      detailsEl.style.overflow = "";
       detailsEl.classList.add("is-open");
       return;
     }
-    if (!card.open) {
-      return; // 原生展开：open=true → toggle 监听里启动 0fr→1fr 过渡
+    expandDetails();
+  });
+  // M-03：收起动画 —— summary 默认点击会让浏览器立即取消子内容渲染，高度无从过渡。
+  // 拦截点击、保持 open=true 播完收起（--dur-2）后再真正关闭。
+  // 展开同理自己置 open，不等 toggle 事件（它比 click 晚一帧）。
+  // reduce 或不支持 WAAPI 时（detailsMotionEnabled 不成立）不拦截，走原生瞬时切换
+  card.querySelector(".node-summary").addEventListener("click", (event) => {
+    card._detailsClickAt = performance.now();
+    if (!detailsMotionEnabled()) {
+      return;
+    }
+    if (detailsEl.classList.contains("is-collapsing")) {
+      // 收起途中再点：取消收起、从当前高度恢复展开（open 仍为 true）
+      event.preventDefault();
+      expandDetails();
+      return;
     }
     event.preventDefault();
-    detailsEl.classList.remove("is-open");
-    detailsEl.classList.add("is-collapsing");
-    const finishCollapse = () => {
-      if (!detailsEl.classList.contains("is-collapsing")) {
-        return; // 已被重新展开取消
-      }
-      detailsEl.classList.remove("is-collapsing");
-      detailsEl.classList.remove("is-open");
-      card.open = false; // toggle 监听会照常重置 _historySignature
-    };
-    detailsEl.addEventListener(
-      "transitionend",
-      (transitionEvent) => {
-        if (
-          transitionEvent.target === detailsEl &&
-          transitionEvent.propertyName === "grid-template-rows"
-        ) {
-          finishCollapse();
-        }
-      },
-      { once: true }
-    );
-    // 兜底：transitionend 因中断以外的原因未触发时也要能关上（--dur-2 = 200ms + 缓冲）
-    window.setTimeout(finishCollapse, 320);
+    if (!card.open) {
+      card.open = true; // 原生 toggle 事件照常异步触发，只负责收尾
+      prepareDetailsContent();
+      expandDetails();
+      return;
+    }
+    collapseDetails();
   });
   return card;
 }
@@ -2883,7 +3044,7 @@ function updateCard(card, node, nodeId) {
   setMetricLevel(fields.netMini, hasNetSpeed ? netPercent : 0);
 
   setText(fields.cpuMeta, "");
-  setText(fields.memMeta, formatBytes(mem.total || 0));
+  setText(fields.memMeta, `${formatBytes(mem.used || 0)} / ${formatBytes(mem.total || 0)}`);
   setText(fields.diskMeta, formatDiskMeta(node, stats, diskAgg));
   // 每个方向内部用不换行空格连接，窄卡换行只发生在「·」处，不把数值与单位拆开
   const nowrap = (text) => text.replace(/ /g, "\u00a0");
@@ -2900,15 +3061,13 @@ function updateCard(card, node, nodeId) {
   // E-06 / Check 2：前缀（本地化文案）与时间拆 span，时间走 .num 等宽，前缀保持 UI 字体
   setText(fields.lastSeen.querySelector(".last-seen-label"), `${t("updatedPrefix")} `);
   setText(fields.lastSeen.querySelector(".num"), formatTime(node.last_seen || 0));
-  setText(fields.summaryUptime.querySelector(".uptime-label"), `${t("runningPrefix")} `);
-  setText(fields.summaryUptime.querySelector(".num"), uptimeText);
+  applyUptimeFields(fields, node, uptimeText);
   setText(
     fields.summaryTests,
     formatRemainingSummary(node.expire_at || 0, node.auto_renew, node.renew_interval_sec || 0)
   );
 
   setDetailText(fields.detailStatus, status);
-  setDetailText(fields.detailUptime, uptimeText);
   setDetailText(fields.detailArch, stats.arch || "--");
   setDetailText(fields.detailOS, stats.os || "--");
   setDetailText(fields.detailCPU, formatCPUModel(cpu));
@@ -4115,7 +4274,8 @@ function buildLinePath(series, stepX, padding, plotWidth, plotHeight, maxValue) 
 
 // P-10 第 3 条：折线下方的渐变填充区域 —— 沿折线闭合到绘图区底边；
 // 与 buildLinePath 同一套坐标换算，单点线段无法构成面积，直接跳过
-function buildAreaPath(series, stepX, padding, plotWidth, plotHeight, maxValue) {
+// （_plotWidth 只为与 buildLinePath 的参数顺序一致而保留，函数体内不使用）
+function buildAreaPath(series, stepX, padding, _plotWidth, plotHeight, maxValue) {
   const baseline = (padding.top + plotHeight).toFixed(1);
   const segments = [];
   let segment = [];
@@ -4157,8 +4317,11 @@ function buildSinglePointLatencySegment(command, stepX, plotStartX, plotEndX, pl
   }
   const x = Number(match[1]);
   const y = Number(match[2]);
-  const halfSpan = Math.max(Math.min(stepX * 0.38, 10), 4);
-  const minVisibleSpan = Math.min(Math.max(stepX * 0.25, 8), plotWidth);
+  // 只有一个样本时 stepX 会退化为整个绘图宽度（maxLen=1 时等于 plotWidth），不限制
+  // 就会把单点画成横跨绘图区的假趋势线；改用固定上限的短虚线表示「只有一个点」。
+  const dashStep = Math.min(stepX, 20);
+  const halfSpan = Math.max(Math.min(dashStep * 0.38, 10), 4);
+  const minVisibleSpan = Math.min(Math.max(dashStep * 0.25, 8), plotWidth);
   let startX = Math.max(plotStartX, x - halfSpan);
   let endX = Math.min(plotEndX, x + halfSpan);
   if (endX - startX < minVisibleSpan) {

@@ -952,10 +952,13 @@ export default function GroupManagement({
           onDragCancel={() => applyDropIndicator(null)}
         >
           <SortableContext items={ledgerRows.map((row) => row.id)} strategy={verticalListSortingStrategy}>
-            {/* A-09 第 1 条同款卡片；不加 overflow-hidden，避免拖拽平移时被卡片裁切。 */}
+            {/* A-09 第 1 条同款卡片；不加 overflow-hidden，避免拖拽平移时被卡片裁切。
+                role="tree" 只在真有分组行时挂上：空态里含按钮（AdminEmptyState），
+                放进 tree 会违反 aria-required-children（tree 的直接子元素必须是 treeitem/group）。 */}
             <div
-              role="tree"
-              aria-label="分组列表"
+              {...(ledgerRows.length > 0
+                ? { role: "tree", "aria-label": "分组列表" }
+                : {})}
               className="rounded-[var(--r-lg)] border border-[var(--hairline)] bg-[var(--surface-raised)] shadow-[var(--shadow-1)]"
             >
               {ledgerRows.length === 0 ? (
@@ -1031,7 +1034,7 @@ export default function GroupManagement({
                 >
                   <Trash2 className="h-4 w-4" aria-hidden="true" />
                 </AlertDialogTrigger>
-                <AlertDialogContent className={adminDialogContentClass}>
+                <AlertDialogContent className={adminDialogContentClass} variant="danger">
                   <AlertDialogHeader className={adminDialogHeaderClass}>
                     <AlertDialogTitle>确认删除分组？</AlertDialogTitle>
                   </AlertDialogHeader>

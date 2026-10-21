@@ -131,7 +131,8 @@ const logTableColumns: ReadonlyArray<AdminDataTableColumn<AdminLogEntry>> = [
     key: "message",
     label: "消息",
     align: "left",
-    width: "auto",
+    // P2：单行省略依赖固定表单宽，列宽交给 AdminDataTable 的 fixed 布局（table-fixed）
+    // 计算——消息列占满剩余宽度，其余列宽不被挤压。
     render: (entry) => (
       <span className="block truncate text-left" title={entry.message}>
         {renderLogMessage(entry.message)}
@@ -145,6 +146,8 @@ export default function AdminLogs() {
   const [detailEntry, setDetailEntry] = useState<AdminLogEntry | null>(null);
   const [entries, setEntries] = useState<AdminLogEntry[]>([]);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  // 轮询失败标记：失败时页头不能继续显示绿色「实时同步」，成功一次即恢复。
+  const [syncFailed, setSyncFailed] = useState(false);
 
   const levelCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -175,6 +178,7 @@ export default function AdminLogs() {
           return;
         }
         errorNotified = false;
+        setSyncFailed(false);
         const nextEntries = data.entries || [];
         const nextSignature = `${nextEntries.length}:${nextEntries[0]?.id ?? ""}:${
           nextEntries[nextEntries.length - 1]?.id ?? ""
@@ -186,9 +190,12 @@ export default function AdminLogs() {
         setEntries(nextEntries);
         setLoadedAt(Date.now());
       } catch (error) {
-        if (active && !errorNotified) {
-          toast.error(getErrorMessage(error, "加载日志失败"));
-          errorNotified = true;
+        if (active) {
+          setSyncFailed(true);
+          if (!errorNotified) {
+            toast.error(getErrorMessage(error, "加载日志失败"));
+            errorNotified = true;
+          }
         }
       } finally {
         inFlight = false;
@@ -240,10 +247,22 @@ export default function AdminLogs() {
         title="日志查看"
         description={
           <span className="inline-flex items-center gap-2">
-            <span aria-hidden="true" className="cm-log-live-dot shrink-0" />
-            {loadedAt
-              ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
-              : "实时同步中"}
+            {syncFailed ? (
+              // 失败态：琥珀静态点（不做呼吸动画），文字说明重试中 / 展示旧数据。
+              <span
+                aria-hidden="true"
+                className="size-1.5 shrink-0 rounded-full bg-[var(--warn)]"
+              />
+            ) : (
+              <span aria-hidden="true" className="cm-log-live-dot shrink-0" />
+            )}
+            {syncFailed
+              ? entries.length > 0
+                ? "同步失败，显示最后一次成功获取的日志"
+                : "同步失败，正在重试"
+              : loadedAt
+                ? `实时同步 ${new Date(loadedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
+                : "实时同步中"}
           </span>
         }
       />
@@ -281,6 +300,9 @@ export default function AdminLogs() {
         <AdminDataTable
           ariaLabel="运行日志"
           columns={logTableColumns}
+          // P2：fixed（table-fixed）把表格宽度约束在卡片内，消息列才能单行省略；
+          // 窄屏下由表格自身的横向滚动容器承接最小宽度（44rem），不撑破页面。
+          fixed
           rows={orderedEntries}
           rowKey={(entry) => String(entry.id)}
           onRowClick={(entry) => setDetailEntry(entry)}

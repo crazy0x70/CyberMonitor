@@ -7,6 +7,7 @@ English · [简体中文](./README_zh-CN.md)
 ## Features
 
 - **Live status page** — online state, CPU, memory, disk, GPU and network for every node, updated every second, plus TCP/ICMP latency and packet loss charts (1 hour / 1 day / 1 week). Light and dark themes, English and Chinese.
+- **AI operations assistant** — ask questions about your fleet in natural language; the snapshot it reasons over includes CPU, memory and network history summaries over the last hour, day and week.
 - **Admin console** — group and tag nodes, track expiry dates, set monthly traffic quotas, and choose which probes each node runs.
 - **Alerts** — rules on CPU, memory, disk, GPU, bandwidth, connections, probe latency/loss, expiry and traffic quota, plus node offline. Notifications go to Telegram, Feishu, DingTalk, WeCom, Slack, Bark or email, with recovery notices.
 - **One-click updates** — update the server and every agent from the admin console.
@@ -51,7 +52,7 @@ A Compose file is available in [server-example.yml](./server-example.yml).
 
 ### 2. Add machines
 
-In the admin console, open **Nodes**. The **Agent quick install** panel shows a command with your server address and token already filled in. Run it on each machine you want to monitor:
+In the admin console, open **Nodes**. The **Quick Agent onboarding** panel shows a command with your server address and token already filled in. Run it on each machine you want to monitor. Once you have nodes the panel collapses to a **Connect new node** button; on a fresh install with no nodes it stays expanded:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/crazy0x70/CyberMonitor/main/scripts/one-click.sh -o one-click.sh
@@ -71,7 +72,7 @@ docker run -d --name cyber-monitor-agent --restart=always \
   ghcr.io/crazy0x70/cyber-monitor-agent:latest
 ```
 
-The node shows up on the status page within a few seconds. A Compose file is available in [agent-example.yml](./agent-example.yml).
+The node shows up on the status page within a few seconds. A Compose file is available in [agent-example.yml](./agent-example.yml). The install script needs root on Linux, so drop `sudo` only if you are already running as root.
 
 ## Upgrade
 
@@ -120,7 +121,7 @@ Running `one-click.sh` or `one-click.ps1` with no arguments opens an interactive
 | Service config | `/etc/cybermonitor/*.conf` | `~/CyberMonitor/etc/*.conf` | Windows service settings |
 | Server log | `data/server.log`, also shown on the admin console's **Logs** page | same | same |
 
-To back up, copy the data directory. It contains settings, nodes and history.
+To back up, copy the data directory. It contains settings, nodes and history. History is split by kind: `data/history/network/` (probe latency and loss), `data/history/offline/` (offline events) and `data/history/resource/` (CPU, memory and network, recorded for the AI operations assistant). Resource history retention is chosen under **Settings → System → Resource history retention** (1 / 7 / 30 days) and applies immediately.
 
 ## Configuration
 
@@ -182,6 +183,14 @@ The new password and the admin path are printed.
 **An agent can't connect over IPv6 to a CDN.** Fix the host's IPv6 route, or pin the server name to IPv4 with `--add-host monitor.example.com:<ipv4>` (Docker) or `/etc/hosts`.
 
 **The status page on a static host.** Upload `internal/server/web/public/` to any static host and set `<meta name="cm-api-base">` in `index.html` to your server URL.
+
+**A notification fails with `目标 … 是内网/保留地址，已被安全策略拒绝` ("target is a private or reserved address, rejected by the security policy").** The server refuses notification targets that resolve to private or reserved addresses. The usual causes are a fake-ip proxy on the server machine (Clash, Surge, OpenClash and similar resolve public domains to `198.18.0.0/15`) and a target that really is an internal service (self-hosted Bark, self-hosted Telegram Bot API, internal SMTP). Turn on **Allow private network addresses** in that channel's settings under **Alerts → Channels**; the switch exists for every channel type, email included.
+
+**How is a rule's duration judged?** The duration is a window statistic, not "continuously over the threshold". A rule fires when the metric stays over the threshold for more than about 70% of the window, and recovers once that share drops below about 30%. The gap in between is a hysteresis band: the rule keeps its current state, so a value hovering around the threshold no longer sends alert/recovery pairs. **Immediately** judges every single sample.
+
+**Moving to a new server.** Copying the data directory is still the recommended way (see [Where things are](#where-things-are)). If you use **Settings → System info → Configuration backup → Export configuration** instead, note that the exported file contains no secrets: webhook URLs, bot tokens, email passwords, chat IDs and recipient lists are cleared. After importing it on the new server, re-enter those values under **Alerts → Channels**; channels that are still missing required fields are marked **Missing required fields** and cannot send alerts.
+
+**The install command says `localhost` or `127.0.0.1`.** When no Agent endpoint is configured, the command uses the address you are currently using to reach the admin console; that address is only used to build the command and is never saved. If agents cannot reach it (you open the console through a reverse proxy or from the machine itself, or the agent-facing address differs), fill in **Agent endpoint** under **Settings → Agent onboarding**. With a separate public port (`-public-listen`) the suggestion uses the status page port.
 
 ## Build from source
 

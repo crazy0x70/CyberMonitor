@@ -14,6 +14,7 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
+  Copy,
   FolderTree,
   Loader2,
   Plus,
@@ -74,6 +75,7 @@ import {
   getErrorMessage,
   normalizeSelectionValues,
   parseDateTimeLocalValue,
+  type AdminPage,
   resolveNodeSelectionValues,
   resolveNodeIdentitySummary,
   parseSelectionValue,
@@ -81,10 +83,12 @@ import {
   resolveNodeName,
   toDateTimeLocalValue,
   upsertSelectionValue,
+  compareNodeDisplayName,
 } from "@/lib/admin-format";
 import {
   buildAgentInstallCommand,
   buildAgentWindowsInstallCommand,
+  isLoopbackAgentHost,
 } from "@/lib/agent-install";
 import {
   adminActionButtonClass,
@@ -110,6 +114,7 @@ import {
   adminSubtleOutlineBadgeClass,
 } from "@/lib/admin-ui";
 import {
+  DEFAULT_ALERT_RULE_RATIO,
   OFFLINE_ALERT_RULE_ID,
   buildRulePayload,
   copyRuleDraft,
@@ -121,6 +126,9 @@ import {
 import { fetchSettings } from "@/lib/admin-api";
 
 const maxTestsPerNode = 128;
+
+// 与 Dashboard 同型：分页 + 分区跳转，页面内部只用到别名 Page。
+type Page = AdminPage;
 
 const REGION_ALIASES: Record<string, string> = {
   新加坡: "SG", 日本: "JP", 香港: "HK", 中国香港: "HK", 台湾: "TW",
@@ -148,6 +156,32 @@ const outlineActionClass = `${adminOutlineButtonClass} h-9 px-4`;
 const agentInstallLinuxId = "server-management-agent-install-linux";
 
 const agentInstallWindowsId = "server-management-agent-install-windows";
+
+// 已有节点时「Agent 快速接入」默认折叠为一行，展开状态记在 localStorage（按
+// 用户偏好保留）。localStorage 不可用（隐私模式等）时退化为本次会话的内存状态。
+const agentInstallExpandedKey = "cm_admin_agent_install_expanded";
+
+function readAgentInstallExpanded(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(agentInstallExpandedKey) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeAgentInstallExpanded(expanded: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(agentInstallExpandedKey, expanded ? "1" : "0");
+  } catch {
+    // 写入失败只影响下次打开的默认展开态，不影响本次操作。
+  }
+}
 
 type RenewPlan = "none" | "month" | "quarter" | "half" | "year";
 
@@ -234,6 +268,8 @@ export interface ServerManagementProps {
   nodes: NodeView[];
   loading?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
+  // 「接入配置」提示里的跳转入口（与 Dashboard 同型，分页 + 分区）。
+  onNavigate: (page: Page, section?: string | null) => void;
   onCheckAgentUpdate: (nodeID: string) => Promise<AgentUpdateInfo>;
   onRefresh: () => Promise<void>;
   onSaveNode: (nodeID: string, payload: NodeProfilePayload) => Promise<void>;
@@ -609,6 +645,24 @@ function escapeSelectorValue(value: string) {
   return value.replace(/"/g, '\\"');
 }
 
+// 批量 Agent 更新的原因分组摘要：按台数降序排列，最多列 3 类，其余合并成
+// 「等 N 类原因」，避免 51 台节点一次性铺满一整段提示。
+const maxUpdateReasonGroups = 3;
+
+function formatUpdateReasonSummary(counts: Map<string, number>): string {
+  const groups = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (groups.length === 0) {
+    return "";
+  }
+  const parts = groups
+    .slice(0, maxUpdateReasonGroups)
+    .map(([reason, count]) => `${reason} ${count} 台`);
+  if (groups.length > maxUpdateReasonGroups) {
+    parts.push(`等 ${groups.length - maxUpdateReasonGroups} 类原因`);
+  }
+  return parts.join("；");
+}
+
 function buildGroupCatalog(
   tree: SettingsView["group_tree"] | undefined,
   nodeListEntries: NodeListEntry[],
@@ -850,6 +904,7 @@ export default function ServerManagement({
   loading = false,
   onDirtyChange,
   onCheckAgentUpdate,
+  onNavigate,
   onRefresh,
   onSaveNode,
   onDeleteNode,
@@ -870,6 +925,9 @@ export default function ServerManagement({
   const [updatingAgent, setUpdatingAgent] = useState(false);
   const [sourceConflict, setSourceConflict] = useState(false);
   const [installPlatform, setInstallPlatform] = useState<"unix" | "windows">("unix");
+  // 已有节点时接入区默认折叠成一行（接入 51 个节点后，完整安装命令区块会把节点
+  // 列表推到首屏以下）；节点数为 0 时（首次使用的主路径）始终完整展开。
+  const [agentInstallExpanded, setAgentInstallExpanded] = useState(readAgentInstallExpanded);
   // A-01 步骤 3（D-08）：节点抽屉的规则草稿（完整列表，AlertRuleDraft 形态）与
   // 打开抽屉时的基线（settings.alert_rules 的原始存储形态）。抽屉内的全部规则
   // 操作只改草稿，随「保存配置」一次提交；「取消」放弃。
@@ -956,13 +1014,39 @@ export default function ServerManagement({
     [nodeListEntries, settings?.group_tree],
   );
 
+  // 「全部更新」的可下发目标与不可下发原因（用户第 24 轮）：可下发 = 非等待
+  // 注册、有 node id、服务端判定 agent_update_supported。离线节点不在这里剔除：
+  // 服务端单节点更新接口（handleAdminPostAgentUpdate）只按远程更新能力把关，
+  // 指令入队后等 Agent 重连拉配置时再执行，因此离线但能力齐备的节点仍算可下发。
+  const agentUpdateDispatch = useMemo(() => {
+    const targets: NodeView[] = [];
+    const blockedReasons = new Map<string, number>();
+    nodes.forEach((node) => {
+      if (
+        node.status !== "waiting_registration" &&
+        resolveNodeId(node) &&
+        node.agent_update_supported
+      ) {
+        targets.push(node);
+        return;
+      }
+      const reason = node.agent_update_message?.trim() || "不支持远程更新";
+      blockedReasons.set(reason, (blockedReasons.get(reason) || 0) + 1);
+    });
+    return {
+      targets,
+      blockedCount: nodes.length - targets.length,
+      blockedSummary: formatUpdateReasonSummary(blockedReasons),
+    };
+  }, [nodes]);
+
   const sortedNodeListEntries = useMemo(
     () =>
       [...nodeListEntries].sort((a, b) => {
         if (a.statusRank !== b.statusRank) {
           return a.statusRank - b.statusRank;
         }
-        return a.nodeName.localeCompare(b.nodeName, "zh-CN");
+        return compareNodeDisplayName(a.nodeName, b.nodeName);
       }),
     [nodeListEntries],
   );
@@ -982,7 +1066,11 @@ export default function ServerManagement({
     return sortedNodeListEntries.filter((entry) => entry.searchText.includes(keyword));
   }, [search, sortedNodeListEntries]);
 
-  const agentEndpoint = settings?.agent_endpoint?.trim() || "";
+  const configuredAgentEndpoint = settings?.agent_endpoint?.trim() || "";
+  const agentEndpointSuggestion = settings?.agent_endpoint_suggestion?.trim() || "";
+  // 推断值只用于生成安装命令，不写回设置。
+  const agentEndpoint = configuredAgentEndpoint || agentEndpointSuggestion;
+  const usingSuggestedEndpoint = !configuredAgentEndpoint && Boolean(agentEndpointSuggestion);
   const agentToken = settings?.agent_token?.trim() || "";
   const linuxInstallCommand = useMemo(
     () => buildAgentInstallCommand(agentEndpoint, agentToken),
@@ -994,6 +1082,14 @@ export default function ServerManagement({
   );
   const installReady = Boolean(linuxInstallCommand && windowsInstallCommand);
   const activeInstallCommand = installPlatform === "windows" ? windowsInstallCommand : linuxInstallCommand;
+  const hasNodes = nodes.length > 0;
+  // 折叠态不隐藏问题：地址缺失或仅本机可达时，把结论压缩成一行提示。
+  const installCollapsedNotice = !installReady
+    ? "对接地址未配置"
+    : isLoopbackAgentHost(agentEndpoint)
+      ? "当前对接地址仅本机可访问"
+      : "";
+  const showAgentInstallBody = !hasNodes || agentInstallExpanded;
 
   const editingNode = useMemo(
     () => nodeLookup.get(editingNodeId) || null,
@@ -1220,14 +1316,17 @@ export default function ServerManagement({
     });
   };
 
-  // 批量下发：逐台调用既有单节点更新接口，各自计结果；等待注册的纯档案
-  // 节点无 Agent 可更新，跳过。已是最新/不支持的平台由接口返回或计入失败。
+  // 批量下发：只对可远程更新的节点逐台调用既有单节点更新接口，各自计结果，
+  // 失败按接口 error 分组汇总。没有可下发节点时只给 info 提示（不弹确认框、
+  // 不发请求）；有失败时不再用成功样式，而是按严重程度给出 warning / error。
   const handleTriggerAllAgentUpdates = async () => {
-    const targets = nodes.filter(
-      (node) => node.status !== "waiting_registration" && resolveNodeId(node),
-    );
+    const targets = agentUpdateDispatch.targets;
     if (targets.length === 0) {
-      toast.info("没有可下发更新的节点");
+      toast.info(
+        agentUpdateDispatch.blockedSummary
+          ? `没有可远程更新的节点；${agentUpdateDispatch.blockedSummary}`
+          : "没有可远程更新的节点",
+      );
       return;
     }
     if (updatingAllAgents) {
@@ -1237,6 +1336,7 @@ export default function ServerManagement({
     let dispatched = 0;
     let upToDate = 0;
     let failed = 0;
+    const failureReasons = new Map<string, number>();
     try {
       for (const node of targets) {
         try {
@@ -1246,8 +1346,10 @@ export default function ServerManagement({
           } else {
             dispatched += 1;
           }
-        } catch {
+        } catch (error) {
           failed += 1;
+          const reason = getErrorMessage(error, "下发失败");
+          failureReasons.set(reason, (failureReasons.get(reason) || 0) + 1);
         }
       }
     } finally {
@@ -1260,8 +1362,19 @@ export default function ServerManagement({
     ]
       .filter(Boolean)
       .join("，");
-    if (summary) {
-      toast.success(`批量更新完成：${summary}`);
+    if (!summary) {
+      return;
+    }
+    const failureSummary = failed ? formatUpdateReasonSummary(failureReasons) : "";
+    const message = failureSummary
+      ? `批量更新完成：${summary}；${failureSummary}`
+      : `批量更新完成：${summary}`;
+    if (!failed) {
+      toast.success(message);
+    } else if (dispatched + upToDate === 0) {
+      toast.error(message);
+    } else {
+      toast.warning(message);
     }
   };
 
@@ -1426,7 +1539,7 @@ export default function ServerManagement({
       trigger,
     };
     // 预设 scope={mode:"include", nodes:[本节点]}；默认形态对齐「告警策略」页的
-    // 新增规则：「CPU > 90% · 持续 5 分钟」。
+    // 新增规则：「CPU > 90%，近 5 分钟内 70% 时间越限」。
     setNodeRuleForm({
       id: generateRuleID(),
       name: "",
@@ -1435,6 +1548,7 @@ export default function ServerManagement({
       op: "gt",
       threshold: "90",
       durationSec: 300,
+      ratio: DEFAULT_ALERT_RULE_RATIO,
       scopeMode: "include",
       scopeNodes: [nodeID],
       scopeGroups: [],
@@ -1637,6 +1751,28 @@ export default function ServerManagement({
               )}
               刷新节点
             </Button>
+            {/* 全部更新：可下发节点为 0 时不弹确认框（否则用户要对明知不可下发的
+                节点点一次确认，再收一串 400），只出 info 提示并附原因分组。 */}
+            <Button
+              type="button"
+              variant="outline"
+              className={outlineActionClass}
+              disabled={updatingAllAgents || loading || nodes.length === 0}
+              onClick={() => {
+                if (agentUpdateDispatch.targets.length === 0) {
+                  void handleTriggerAllAgentUpdates();
+                  return;
+                }
+                setUpdateAllDialogOpen(true);
+              }}
+            >
+              {updatingAllAgents ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Rocket className="mr-2 h-4 w-4" />
+              )}
+              全部更新
+            </Button>
             <AlertDialog
               open={updateAllDialogOpen}
               onOpenChange={(open) => {
@@ -1646,28 +1782,19 @@ export default function ServerManagement({
                 setUpdateAllDialogOpen(open);
               }}
             >
-              <AlertDialogTrigger
-                render={(
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className={outlineActionClass}
-                    disabled={updatingAllAgents || loading || nodes.length === 0}
-                  >
-                    {updatingAllAgents ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <Rocket className="mr-2 h-4 w-4" />
-                    )}
-                    全部更新
-                  </Button>
-                )}
-              />
               <AlertDialogContent className={adminDialogContentClass}>
                 <AlertDialogHeader className={adminDialogHeaderClass}>
                   <AlertDialogTitle>
-                    确认对全部 {nodes.length} 台节点下发 Agent 更新？
+                    {`确认对 ${agentUpdateDispatch.targets.length} 台节点下发 Agent 更新？`}
                   </AlertDialogTitle>
+                  {agentUpdateDispatch.blockedCount > 0 ? (
+                    <p className="text-[13px] leading-relaxed text-[var(--label-2)]">
+                      <span className="block">
+                        {`另有 ${agentUpdateDispatch.blockedCount} 台无法远程更新`}
+                      </span>
+                      <span className="block">{agentUpdateDispatch.blockedSummary}</span>
+                    </p>
+                  ) : null}
                 </AlertDialogHeader>
                 <AlertDialogFooter className={adminDialogFooterClass}>
                   <AlertDialogCancel className={adminDialogCancelClass}>取消</AlertDialogCancel>
@@ -1688,12 +1815,41 @@ export default function ServerManagement({
 
       <AdminMetricStrip ariaLabel="节点统计" items={metricItems} />
 
-      {/* 快速接入在节点列表之上（用户第 17 轮：新建节点时第一眼要能复制命令）。 */}
-      <AdminPanel title="Agent 快速接入">
-        {installReady ? (
+      {/* 快速接入在节点列表之上（用户第 17 轮：新建节点时第一眼要能复制命令）。
+          已有节点时默认折叠成一行：节点多了之后完整安装命令区块会把节点列表推到
+          首屏以下；节点数为 0（首次使用的主路径）始终完整展开。 */}
+      <AdminPanel
+        title="Agent 快速接入"
+        actions={
+          hasNodes ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8"
+              aria-expanded={agentInstallExpanded}
+              onClick={() => {
+                const next = !agentInstallExpanded;
+                setAgentInstallExpanded(next);
+                writeAgentInstallExpanded(next);
+              }}
+            >
+              {agentInstallExpanded ? "收起" : "接入新节点"}
+            </Button>
+          ) : null
+        }
+      >
+        {!showAgentInstallBody ? (
+          installCollapsedNotice ? (
+            <p className="text-[13px] leading-relaxed text-[var(--label-2)]">
+              {installCollapsedNotice}
+            </p>
+          ) : null
+        ) : installReady ? (
           <div className="space-y-4">
             {/* 地址已配置时不再单独展示：命令内已内嵌，重复行只增加噪音（用户第 18 轮）。 */}
             {/* 平台切换：与首页时间范围同款分段控件，两项等宽 */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
             <div role="group" aria-label="安装平台" className={cn(adminSegmentedTrackClass, "w-fit")}>
               <Button
                 type="button"
@@ -1726,6 +1882,37 @@ export default function ServerManagement({
                 Windows
               </Button>
             </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5"
+              onClick={() => copyInstallCommand(activeInstallCommand)}
+            >
+              <Copy aria-hidden="true" className="h-3.5 w-3.5" />
+              复制命令
+            </Button>
+            </div>
+            {usingSuggestedEndpoint ? (
+              // 推断值只用于展示与生成命令：说清实际用了哪个地址，并给出改写入口。
+              <p className="text-[13px] leading-relaxed text-[var(--label-2)]">
+                {"已使用当前访问地址 "}
+                <span className="data-text">{agentEndpoint}</span>
+                {"；如果 Agent 无法访问该地址，请在"}
+                <button
+                  type="button"
+                  onClick={() => onNavigate("settings", "agent")}
+                  className="inline rounded-[var(--r-sm)] font-medium text-[var(--accent-text)] underline decoration-[color-mix(in_srgb,var(--accent-text)_45%,transparent)] underline-offset-2 transition-colors duration-150 hover:text-[var(--accent)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
+                >
+                  接入配置
+                </button>
+                {"中填写。"}
+                {/* 回环地址单独一行：英文模式下与上一句之间需要断句，不靠拼接空格。 */}
+                {isLoopbackAgentHost(agentEndpoint) ? (
+                  <span className="block">该地址仅本机可访问，其他机器无法通过它接入。</span>
+                ) : null}
+              </p>
+            ) : null}
             <code
               id={installPlatform === "windows" ? agentInstallWindowsId : agentInstallLinuxId}
               className={`${adminCodeBlockPanelClass} block w-full cursor-pointer select-text whitespace-pre-wrap break-all transition-colors duration-150 hover:border-[var(--separator-opaque)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]`}
@@ -1752,7 +1939,8 @@ export default function ServerManagement({
           </div>
         ) : (
           // A-19 第 2 条：原虚线提示框改为 A-14 信息横幅的 --accent-tint 版式
-          // （无边框、--r-md、内边距 12px 16px、左 20px 图标圆）。0.1.2：不加「去配置」链接。
+          // （无边框、--r-md、内边距 12px 16px、左 20px 图标圆）。
+          // 0.1.2：分段文案各自独立文本节点，i18n 逐节点精确匹配；带「接入配置」跳转入口。
           <div className="flex items-start gap-4 rounded-[var(--r-md)] bg-[var(--accent-tint)] px-4 py-3">
             <span
               aria-hidden="true"
@@ -1763,7 +1951,15 @@ export default function ServerManagement({
             <p className="text-[13px] leading-relaxed">
               <span className="font-semibold text-[var(--label-1)]">尚未配置 Agent 对接地址：</span>
               <span className="text-[var(--label-2)]">
-                请先在基础设置的接入配置中填写 Agent 对接地址。
+                {"请在"}
+                <button
+                  type="button"
+                  onClick={() => onNavigate("settings", "agent")}
+                  className="inline rounded-[var(--r-sm)] font-medium text-[var(--accent-text)] underline decoration-[color-mix(in_srgb,var(--accent-text)_45%,transparent)] underline-offset-2 transition-colors duration-150 hover:text-[var(--accent)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]"
+                >
+                  接入配置
+                </button>
+                {"中填写。"}
               </span>
             </p>
           </div>
@@ -1829,7 +2025,7 @@ export default function ServerManagement({
                     </Button>
                   )}
                 />
-                <AlertDialogContent className={adminDialogContentClass}>
+                <AlertDialogContent className={adminDialogContentClass} variant="danger">
                   <AlertDialogHeader className={adminDialogHeaderClass}>
                     <AlertDialogTitle>
                       {editingNode
@@ -2036,9 +2232,9 @@ export default function ServerManagement({
                 探测下发策略
               </h3>
               <p className={adminHelpTextClass}>
-                {`已选 ${testDraftState.summary.selected} 个探测节点。${
+                {`已选 ${testDraftState.summary.selected} 个探测目标。${
                   testDraftState.summary.tcpCustom > 0
-                    ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 节点使用了自定义间隔。`
+                    ? ` 其中 ${testDraftState.summary.tcpCustom} 个 TCP 目标使用了自定义间隔。`
                     : ""
                 }`}
               </p>
@@ -2047,7 +2243,7 @@ export default function ServerManagement({
                   设置数据未加载，保存不会改动本节点已下发的探测项，请刷新后重试。
                 </p>
               ) : testCatalog.length === 0 ? (
-                <p className="text-sm text-[var(--label-3)]">请先在“探测设置”页配置探测节点。</p>
+                <p className="text-sm text-[var(--label-3)]">请先在“探测设置”页配置探测目标。</p>
               ) : (
                 <div>
                   {testDraftState.items.map((entry) => {
@@ -2073,7 +2269,7 @@ export default function ServerManagement({
                         />
                         <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2">
                           <span className="text-sm font-medium text-[var(--label-1)]">
-                            {item.name || host || "未命名探测节点"}
+                            {item.name || host || "未命名探测目标"}
                           </span>
                           <span className="data-text truncate text-xs text-[var(--label-3)]">
                             {endpoint}
@@ -2236,7 +2432,7 @@ export default function ServerManagement({
                                   </button>
                                 )}
                               />
-                              <AlertDialogContent className={adminDialogContentClass}>
+                              <AlertDialogContent className={adminDialogContentClass} variant="danger">
                                 <AlertDialogHeader className={adminDialogHeaderClass}>
                                   <AlertDialogTitle>
                                     {`删除规则『${rule.name.trim() || (rule.metric === OFFLINE_ALERT_RULE_ID ? "节点离线" : "未命名规则")}』？此规则只作用于本节点，删除后不可恢复。`}

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { RefreshCw, Server } from "lucide-react";
 import { AdminPageHeader } from "@/components/admin-page-header";
 import { AdminPanel } from "@/components/admin-panel";
 import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
@@ -13,7 +14,11 @@ import {
   adminSegmentedItemInactiveClass,
   adminSegmentedTrackClass,
 } from "@/lib/admin-ui";
-import { fetchProbesOverview, fetchSystemStatus } from "@/lib/admin-api";
+import {
+  fetchProbesOverview,
+  fetchSystemStatus,
+  type AdminSocketStatus,
+} from "@/lib/admin-api";
 import type {
   NodeView,
   ProbeNodeOverview,
@@ -30,6 +35,7 @@ import {
   resolveNodeId,
   resolveNodeName,
   type AdminPage,
+  compareNodeDisplayName,
 } from "@/lib/admin-format";
 import { cn } from "@/lib/utils";
 
@@ -38,7 +44,12 @@ type Page = AdminPage;
 export interface DashboardProps {
   settings: SettingsView | null;
   nodes: NodeView[];
+  // 是否已拿到一次权威节点结果；false 时不显示零节点引导，避免已有节点时闪现。
+  nodesLoaded: boolean;
   onNavigate: (page: Page, section?: string | null) => void;
+  // 实时连接状态由 App 的 connectAdminSocket onStatus 驱动；页头「实时」指示
+  // 与断线时的降级文案都按它渲染，否则断线时会继续显示健康态。
+  liveStatus: AdminSocketStatus;
 }
 
 // F7 刷新策略（evolution_log §5 F7 第 5 条）：system/status 每 10s、probes/overview
@@ -49,6 +60,10 @@ const PROBES_OVERVIEW_POLL_MS = 60_000;
 // F7 首页行距：与 adminPageShellClass 同宽限，行距收紧到 24px（信息密度高于设置页）。
 const dashboardShellClass =
   "mx-auto w-full max-w-[1200px] space-y-6 text-slate-900 dark:text-neutral-100";
+
+// 内联文字链按钮（与设置页同一规格）：用于从表格尾部/空态跳到探测设置页。
+const probeInlineLinkClass =
+  "inline rounded-[var(--r-sm)] font-medium text-[var(--accent-text)] underline decoration-[color-mix(in_srgb,var(--accent-text)_45%,transparent)] underline-offset-2 transition-colors duration-150 hover:text-[var(--accent)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]";
 
 // =====================================================================
 // F7 前端派生（纯函数，evolution_log §5 F7 测试第 3 条）：
@@ -172,26 +187,73 @@ export interface ProbeNodeRow {
   avgLossPct?: number | null;
 }
 
+// nodeHasProbeConfig 判定节点是否配置了探测：手动下发（test_selections）或范围
+// 下发（scoped_test_ids）任一非空。口径与 ProbeSettings 的 countManualProbeNodes /
+// 节点抽屉「探测下发策略」一致。
+export function nodeHasProbeConfig(node: NodeView): boolean {
+  return (node.test_selections?.length ?? 0) > 0 || (node.scoped_test_ids?.length ?? 0) > 0;
+}
+
+// 配置的探测目标数（P3）：手动下发与范围下发的目标去重计数，口径与节点抽屉的
+// 「探测下发策略」一致（同一目录项只算一个，手动选择优先、范围下发项不重复）。
+// 服务端 overview 的 targets 只统计窗口内有采样点的目标，窗口内无数据的节点会
+// 得到 0；这类行改用本函数，避免「已配置探测却显示 0 个目标」的自相矛盾。
+export function countConfiguredProbeTargets(node: NodeView): number {
+  const targets = new Set<string>();
+  for (const selection of node.test_selections || []) {
+    const id = (selection?.test_id || "").trim();
+    if (id) {
+      targets.add(id);
+    }
+  }
+  for (const id of node.scoped_test_ids || []) {
+    const trimmed = (id || "").trim();
+    if (trimmed) {
+      targets.add(trimmed);
+    }
+  }
+  return targets.size;
+}
+
+// deriveProbeNodeRows 生成探测表行。入表条件按配置判定，不按窗口内是否采样：
+// 离线时长 ≥ 所选范围、刚接入或历史查询失败的节点在窗口内没有数据，但它们恰恰
+// 最该被看到。因此：
+// - 配置了探测的节点一律入表（无数据时 targets 取配置的目标数、samples=0，并排到
+//   后面）；
+// - 没配置但窗口内有数据（服务端已聚合出探测目标/样本）的节点防御性保留；
+// - 两者皆无的节点由调用方汇总成「另有 N 个节点未配置探测目标」。
+// includeConfiguredWithoutData 为 false（探测数据尚未就绪）时不补无数据行，避免
+// 把加载中的 0 当成事实显示。
 export function deriveProbeNodeRows(
   overviewNodes: readonly ProbeNodeOverview[],
   nodes: readonly NodeView[],
+  options: { includeConfiguredWithoutData?: boolean } = {},
 ): ProbeNodeRow[] {
+  const overviewById = new Map(overviewNodes.map((item) => [item.node_id, item]));
   const rows: ProbeNodeRow[] = [];
-  for (const overviewNode of overviewNodes) {
-    const node = nodes.find((item) => resolveNodeId(item) === overviewNode.node_id);
-    if (!node) {
+  for (const node of nodes) {
+    const nodeId = resolveNodeId(node);
+    if (!nodeId) {
+      continue;
+    }
+    const overview = overviewById.get(nodeId);
+    const hasWindowData = Boolean(overview && (overview.targets > 0 || overview.samples > 0));
+    const configured = nodeHasProbeConfig(node);
+    if (!hasWindowData && !(configured && options.includeConfiguredWithoutData)) {
       continue;
     }
     rows.push({
-      nodeId: overviewNode.node_id,
+      nodeId,
       nodeName: resolveNodeName(node),
       online: node.status === "online",
-      targets: overviewNode.targets,
-      samples: overviewNode.samples,
-      availabilityPct: overviewNode.availability_pct,
-      avgLatencyMs: overviewNode.avg_latency_ms,
-      p95LatencyMs: overviewNode.p95_latency_ms,
-      avgLossPct: overviewNode.avg_loss_pct,
+      // P3：窗口内无数据时用配置的目标数（去重后），不用服务端的采样口径 targets
+      // （只会统计有采样点的目标），否则「已配置探测」会显示成 0 个目标。
+      targets: hasWindowData ? (overview?.targets ?? 0) : countConfiguredProbeTargets(node),
+      samples: overview?.samples ?? 0,
+      availabilityPct: overview?.availability_pct,
+      avgLatencyMs: overview?.avg_latency_ms,
+      p95LatencyMs: overview?.p95_latency_ms,
+      avgLossPct: overview?.avg_loss_pct,
     });
   }
   return rows.sort((a, b) => {
@@ -212,7 +274,7 @@ export function deriveProbeNodeRows(
     if (latencyDiff !== 0) {
       return latencyDiff;
     }
-    return a.nodeName.localeCompare(b.nodeName);
+    return compareNodeDisplayName(a.nodeName, b.nodeName);
   });
 }
 
@@ -251,10 +313,10 @@ function availabilityToneClass(value: number | undefined) {
     return "text-[var(--label-1)]";
   }
   if (value < 95) {
-    return "text-[var(--danger)]";
+    return "text-[var(--danger-text)]";
   }
   if (value < 99) {
-    return "text-[var(--warn)]";
+    return "text-[var(--warn-text)]";
   }
   return "text-[var(--label-1)]";
 }
@@ -352,7 +414,7 @@ function DashboardKpiCard({
 }: {
   label: string;
   value: string;
-  sub: string;
+  sub: ReactNode;
   barTone?: "ok" | "danger";
   barPct?: number | null;
   // A-10：数字颜色覆盖（如「告警中」数值 > 0 时用 --danger）。
@@ -490,11 +552,18 @@ const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeNodeRow>> = [
   },
 ];
 
-export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
+export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, settings }: DashboardProps) {
   const [clockText, setClockText] = useState(() => formatDashboardClock(new Date()));
   const [systemStatus, setSystemStatus] = useState<SystemStatusView | null>(null);
+  // system/status 失败标记：保留最后一次成功数据的同时标记「可能已过期」；
+  // reloadKey 用于「主控状态」面板的重试按钮触发重新拉取。
+  const [systemStatusError, setSystemStatusError] = useState(false);
+  const [systemStatusReloadKey, setSystemStatusReloadKey] = useState(0);
   const [probeRange, setProbeRange] = useState<ProbeOverviewRange>("1h");
   const [probesOverview, setProbesOverview] = useState<ProbesOverviewResponse | null>(null);
+  // probes/overview 失败标记 + 重试 key：失败时清空数据，避免旧范围数据留在新选择下。
+  const [probesError, setProbesError] = useState(false);
+  const [probesReloadKey, setProbesReloadKey] = useState(0);
 
   // 页头「实时 · HH:mm:ss」时钟，每秒一跳。
   useEffect(() => {
@@ -507,18 +576,26 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
   // system/status：每 10s；document.hidden 时暂停，切回前台补拉。
   useEffect(() => {
     let cancelled = false;
+    // 请求序号：轮询 / visibilitychange / 重试可能重叠，只允许最新请求提交结果，
+    // 避免旧的失败晚到后把刚恢复的界面重新清空或标错。
+    let latestRequest = 0;
     const load = () => {
       if (document.hidden) {
         return;
       }
+      const requestID = ++latestRequest;
       fetchSystemStatus()
         .then((status) => {
-          if (!cancelled) {
+          if (!cancelled && requestID === latestRequest) {
             setSystemStatus(status);
+            setSystemStatusError(false);
           }
         })
         .catch(() => {
-          // 轮询错误静默（下一轮重试）；401 已由 apiFetch 统一登出。
+          // 轮询错误保留上一份数据，但标记为可能已过期（401 已由 apiFetch 统一登出）。
+          if (!cancelled && requestID === latestRequest) {
+            setSystemStatusError(true);
+          }
         });
     };
     load();
@@ -534,23 +611,33 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, []);
+  }, [systemStatusReloadKey]);
 
-  // probes/overview：每 60s，切换分段立即重拉；document.hidden 时同样暂停。
+  // probes/overview：每 60s，切换分段或点「重试」立即重拉；document.hidden 时同样暂停。
+  // effect 开始时先清空上一轮数据：切范围 / 重试都不把旧范围数据显示在新选择下。
   useEffect(() => {
     let cancelled = false;
+    let latestRequest = 0;
+    setProbesOverview(null);
+    setProbesError(false);
     const load = () => {
       if (document.hidden) {
         return;
       }
+      const requestID = ++latestRequest;
       fetchProbesOverview(probeRange)
         .then((overview) => {
-          if (!cancelled) {
+          if (!cancelled && requestID === latestRequest) {
             setProbesOverview(overview);
+            setProbesError(false);
           }
         })
         .catch(() => {
-
+          // 失败时不保留旧数据，改为显式错误态 + 重试入口。
+          if (!cancelled && requestID === latestRequest) {
+            setProbesOverview(null);
+            setProbesError(true);
+          }
         });
     };
     load();
@@ -566,15 +653,41 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [probeRange]);
+  }, [probeRange, probesReloadKey]);
 
   const nodeKpis = useMemo(() => deriveDashboardNodeKpis(nodes), [nodes]);
   const probeKpis = useMemo(() => deriveDashboardProbeKpis(nodes), [nodes]);
-  const hotspots = useMemo(() => deriveDashboardResourceHotspots(nodes), [nodes]);
-  const probeNodeRows = useMemo(
-    () => deriveProbeNodeRows(probesOverview?.nodes || [], nodes),
-    [probesOverview, nodes],
+  // 零节点是“尚未接入”而不是“健康”：确认节点列表为空后显示接入引导；
+  // 节点数据尚未就绪时保持原仪表盘，避免已有节点时闪现引导卡。
+  const isEmptyNodes = nodeKpis.total === 0;
+  const showOnboarding = nodesLoaded && isEmptyNodes;
+  // 推断地址同样算「可接入」：未配置时服务端会按当前访问地址给出合法 URL。
+  const endpointReady = Boolean(
+    settings?.agent_endpoint?.trim() || settings?.agent_endpoint_suggestion?.trim(),
   );
+  const hotspots = useMemo(() => deriveDashboardResourceHotspots(nodes), [nodes]);
+  const probesReady = probesOverview !== null && !probesError;
+  const activeProbeRows = useMemo(
+    () =>
+      deriveProbeNodeRows(probesOverview?.nodes || [], nodes, {
+        includeConfiguredWithoutData: probesReady,
+      }),
+    [probesOverview, nodes, probesReady],
+  );
+  // 入表按节点配置判定（见 deriveProbeNodeRows）：配置了探测但没有窗口数据的节点
+  // 仍保留一行 0 / —；既无配置也无数据的节点不进表，汇总成表下方那一行入口。
+  const probeUnconfiguredCount = useMemo(() => {
+    if (!probesReady) {
+      return 0;
+    }
+    const activeIds = new Set(activeProbeRows.map((row) => row.nodeId));
+    // 无 ID 的节点不进探测表（deriveProbeNodeRows 同样跳过），也不计入「未配置
+    // 探测目标」：它们不是配置缺失，而是无从归属。
+    return nodes.filter((node) => {
+      const nodeId = resolveNodeId(node);
+      return nodeId !== "" && !activeIds.has(nodeId);
+    }).length;
+  }, [activeProbeRows, nodes, probesReady]);
 
   const loadKpiSub = systemStatus
     ? `内存 ${formatBinaryBytes(systemStatus.mem?.alloc)} · 运行 ${formatUptimeZh(
@@ -610,11 +723,37 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
     },
   ];
 
+  // 页头实时指示严格由 WS 连接状态驱动：断线 / 建连中不再显示健康态。
+  const liveIndicator =
+    liveStatus === "open"
+      ? { dotClass: "bg-[var(--ok)] animate-pulse", label: "实时" }
+      : liveStatus === "connecting"
+        ? { dotClass: "bg-[var(--label-4)]", label: "连接中" }
+        : { dotClass: "bg-[var(--warn)]", label: "连接中断" };
+
+  // 「告警中」KPI：无数据时不能显示 0 / 「一切正常」；接口失败时降级为「数据
+  // 可能已过期」。数据来自 system/status 的 REST 轮询（与 WS 无关），WS 断开的
+  // 降级只作用于依赖 WS 快照的数据（顶部断线横幅已覆盖），这里不能跟着误报。
+  const statusStale = systemStatusError;
+  const staleLabel = <span className="text-[var(--warn-text)]">数据可能已过期</span>;
+  const firingCount = systemStatus?.alerts?.firing ?? 0;
+  const alertingValue = systemStatus ? String(firingCount) : "--";
+  const alertingSub: ReactNode = systemStatus
+    ? statusStale
+      ? staleLabel
+      : firingCount > 0
+        ? `涉及 ${systemStatus.alerts?.nodes ?? 0} 台节点`
+        : "一切正常"
+    : statusStale
+      ? <span className="text-[var(--warn-text)]">状态不可用</span>
+      : "加载中…";
+
   return (
     <div className={dashboardShellClass}>
       <style>{DASHBOARD_METER_STYLE}</style>
 
-      {/* F7 页头：h1「首页」+ 右侧「实时 · 时间」（6px 呼吸绿点）。 */}
+      {/* F7 页头：h1「首页」+ 右侧「实时 · 时间」（6px 呼吸绿点）；断线 / 建连中
+          切换为琥珀 / 中性静态点，时钟保留。 */}
       <AdminPageHeader
         as="section"
         title="首页"
@@ -622,16 +761,50 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
           <span className="flex items-center gap-2 text-[13px] text-[var(--label-3)]">
             <span
               aria-hidden="true"
-              className="size-1.5 shrink-0 animate-pulse rounded-full bg-[var(--ok)]"
+              className={cn("size-1.5 shrink-0 rounded-full", liveIndicator.dotClass)}
             />
-            <span>实时</span>
+            <span>{liveIndicator.label}</span>
             <span aria-hidden="true">·</span>
             <span className="data-text tabular-nums">{clockText}</span>
           </span>
         }
       />
 
+      {/* 零节点首次使用：说明当前处于“尚未接入”状态，并给出一条可执行的下一步。 */}
+      {showOnboarding ? (
+        <section
+          aria-label="接入引导"
+          className="flex flex-wrap items-center gap-4 rounded-[var(--r-lg)] border border-[var(--hairline)] bg-[var(--surface-raised)] px-4 py-4 shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-1)] sm:px-5"
+        >
+          <span
+            aria-hidden="true"
+            className="flex size-10 shrink-0 items-center justify-center rounded-full bg-[var(--accent-tint)] text-[var(--accent-text)]"
+          >
+            <Server className="h-5 w-5" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-[var(--label-1)]">还没有节点接入</p>
+            <p className="mt-1 text-[13px] leading-relaxed text-[var(--label-2)]">
+              {endpointReady
+                ? "在「节点管理」复制接入命令，到目标服务器运行即可完成接入。"
+                : "先在「基础设置 → 接入配置」填写 Agent 对接地址，再复制接入命令。"}
+            </p>
+          </div>
+          <Button
+            className="h-11 w-full shrink-0 bg-[#0057e6] hover:bg-[#0048c2] sm:h-9 sm:w-auto dark:bg-[#0057e6] dark:hover:bg-[#0048c2]"
+            onClick={() =>
+              onNavigate(endpointReady ? "servers" : "settings", endpointReady ? null : "agent")
+            }
+          >
+            {endpointReady ? "去接入节点" : "填写对接地址"}
+          </Button>
+        </section>
+      ) : null}
+
+      {/* 零节点时隐藏 KPI / 连通性 / 资源热点：它们此时全是空占位，会把真正的
+          接入引导挤到首屏之外；只保留引导卡与主控状态。 */}
       {/* 第一行：4 张 KPI 卡（12 列网格、每张 3 列；手机单列）。 */}
+      {!showOnboarding ? (
       <section
         aria-label="总览"
         className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12"
@@ -650,15 +823,9 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
         <DashboardKpiCard
           className="lg:col-span-3"
           label="告警中"
-          value={String(systemStatus?.alerts?.firing ?? 0)}
-          sub={
-            (systemStatus?.alerts?.firing ?? 0) > 0
-              ? `涉及 ${systemStatus?.alerts?.nodes ?? 0} 台节点`
-              : "一切正常"
-          }
-          valueClassName={
-            (systemStatus?.alerts?.firing ?? 0) > 0 ? "text-[var(--danger)]" : undefined
-          }
+          value={alertingValue}
+          sub={alertingSub}
+          valueClassName={firingCount > 0 ? "text-[var(--danger-text)]" : undefined}
           onClick={() => onNavigate("alerts", "policy")}
         />
         <DashboardKpiCard
@@ -678,17 +845,19 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
           sub={loadKpiSub}
         />
       </section>
+      ) : null}
 
       {/* 第二行：左 8 列「网络连通性」+ 右 4 列「主控状态」。
           A-05 / M-02：lg 起「网络连通性」lg:absolute 于 col-span-8 外层内
           （不参与行高计算），行高只由「主控状态」决定，两卡等高、表内滚动、
           表头固定；<lg 自然撑开，滚动容器限高 420px。 */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-12 lg:items-stretch">
+        {!showOnboarding ? (
         <div className="relative min-w-0 lg:col-span-8">
         <AdminPanel
           className="flex min-w-0 flex-col lg:absolute lg:inset-0"
-          bodyClassName="min-h-0 flex-1"
-          headerClassName="min-h-[52px] flex-nowrap"
+          bodyClassName="min-h-0 flex-1 flex flex-col"
+          headerClassName="min-h-[52px] flex-wrap gap-y-2"
           title="网络连通性"
           actions={
             <div
@@ -716,27 +885,104 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
             </div>
           }
         >
+          {/* 加载失败时在表格上方给出可见原因 + 重试入口（不再默默显示空表）。
+              错误行 shrink-0、表格改 min-h-0 flex-1，避免行高把卡片顶出溢出。 */}
+          {probesError ? (
+            <div className="flex shrink-0 flex-wrap items-center gap-3 px-4 pb-2 text-[13px] text-[var(--label-2)]">
+              <span role="status">探测数据加载失败，请重试</span>
+              <Button
+                aria-label="重试加载探测数据"
+                className="h-7 px-2.5 text-xs dark:border-[var(--hairline-strong)] dark:bg-[rgba(255,255,255,0.12)]"
+                size="sm"
+                title="重试加载探测数据"
+                variant="outline"
+                onClick={() => setProbesReloadKey((current) => current + 1)}
+              >
+                重试
+              </Button>
+            </div>
+          ) : null}
           <AdminDataTable
             ariaLabel="网络连通性"
-            className="h-full"
+            className="min-h-0 flex-1 flex flex-col"
             columns={probeTableColumns}
-            rows={probeNodeRows}
+            rows={activeProbeRows}
             rowKey={(row) => row.nodeId}
-            emptyLabel="暂无探测数据"
+            emptyLabel={
+              probesError ? (
+                "—"
+              ) : probesOverview === null ? (
+                "加载中…"
+              ) : (
+                // 数据已就绪但仍无行：没有任何节点配置探测（窗口内也没有数据），
+                // 给出可直接行动的入口，而不是一列「—」。
+                <span className="flex flex-col items-center gap-2">
+                  <span>还没有节点在运行探测</span>
+                  <button
+                    type="button"
+                    className={probeInlineLinkClass}
+                    onClick={() => onNavigate("probes")}
+                  >
+                    去探测设置
+                  </button>
+                </span>
+              )
+            }
             showRowChevron={false}
-            scrollClassName="h-full overflow-y-auto overscroll-contain max-lg:max-h-[420px]"
+            scrollClassName="min-h-0 flex-1 overflow-y-auto overscroll-contain max-lg:max-h-[420px]"
             stickyHeader
+            // 既无配置也无数据的节点不占用表格行：在卡片底部汇总成一行入口。
+            // 全部节点都未配置时行列表本身为空（上方空态已给出入口），这里不重复。
+            footer={
+              probesReady && probeUnconfiguredCount > 0 && activeProbeRows.length > 0 ? (
+                <button
+                  type="button"
+                  className={probeInlineLinkClass}
+                  onClick={() => onNavigate("probes")}
+                >
+                  {`另有 ${probeUnconfiguredCount} 个节点未配置探测目标`}
+                </button>
+              ) : null
+            }
           />
         </AdminPanel>
         </div>
+        ) : null}
 
         <AdminPanel
-          className="min-w-0 lg:col-span-4"
-          bodyClassName="flex-1"
+          className={cn("min-w-0", showOnboarding ? "lg:col-span-12" : "lg:col-span-4")}
+          bodyClassName="flex-1 flex flex-col"
           headerClassName="min-h-[52px] flex-nowrap"
           title="主控状态"
+          actions={
+            systemStatusError ? (
+              <Button
+                aria-label="重试加载主控状态"
+                className="h-7 gap-1 px-2 text-xs dark:border-[var(--hairline-strong)] dark:bg-[rgba(255,255,255,0.12)]"
+                size="sm"
+                title="重试加载主控状态"
+                variant="outline"
+                onClick={() => setSystemStatusReloadKey((current) => current + 1)}
+              >
+                <RefreshCw aria-hidden="true" className="h-3.5 w-3.5" />
+                重试
+              </Button>
+            ) : null
+          }
         >
-          <div className={cn(adminGroupedCardClass, "h-full")}>
+          <div className={cn(adminGroupedCardClass, "min-h-0 flex-1")}>
+            {systemStatusError ? (
+              <div
+                role="status"
+                className="flex items-center gap-2 border-b border-[var(--hairline)] px-4 py-2.5 text-[13px] text-[var(--warn-text)]"
+              >
+                <span
+                  aria-hidden="true"
+                  className="size-1.5 shrink-0 rounded-full bg-[var(--warn)]"
+                />
+                数据可能已过期
+              </div>
+            ) : null}
             {statusRows.map((row) => (
               <div
                 key={row.label}
@@ -763,6 +1009,7 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
       </div>
 
       {/* 第三行：「资源热点」（12 列）：CPU / 内存 / 磁盘 ≥80% 的节点，进度条同前台样式。 */}
+      {!showOnboarding ? (
       <AdminPanel title="资源热点" headerClassName="min-h-[52px] flex-nowrap">
         <div className={adminGroupedCardClass}>
           {hotspots.length === 0 ? (
@@ -786,7 +1033,7 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
                     <span
                       className={cn(
                         "shrink-0 text-[13px] font-semibold tabular-nums",
-                        hot ? "text-[var(--danger)]" : "text-[var(--warn)]",
+                        hot ? "text-[var(--danger-text)]" : "text-[var(--warn-text)]",
                       )}
                     >
                       {formatDashboardPercent(hotspot.valuePct)}
@@ -808,6 +1055,7 @@ export default function Dashboard({ nodes, onNavigate }: DashboardProps) {
           )}
         </div>
       </AdminPanel>
+      ) : null}
     </div>
   );
 }

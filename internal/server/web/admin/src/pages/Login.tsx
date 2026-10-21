@@ -277,13 +277,16 @@ export default function Login({
   return (
     // A-20：登录页外壳 —— 后台唯一允许动态背景的地方，流光画布见 index.css .cm-login-shell::before
     <div className="cm-login-shell relative flex min-h-screen items-center justify-center px-4 py-20 sm:py-16">
-      {/* 右上角语言/主题按钮：topControls 由 App.tsx 传入，已按圆形玻璃按钮规格（A-03/A-02）渲染 */}
-      <div className="absolute right-4 top-4 z-20 flex items-center gap-2 sm:right-6 sm:top-4">
+      {/* 右上角语言/主题按钮：topControls 由 App.tsx 传入，已按圆形玻璃按钮规格（A-03/A-02）渲染。
+          地标：登录页不经过 App.tsx 外壳，页内需要自带 header + main 才能满足
+          axe 的 landmark-one-main / region 规则（样式与原来的 div 完全一致）。 */}
+      <header className="absolute right-4 top-4 z-20 flex items-center gap-2 sm:right-6 sm:top-4">
         {topControls}
-      </div>
+      </header>
       {/* A-20 第 2 条：.glass + --mat-sheet-bg + --blur-thick + --shadow-4、--r-2xl、宽 380px、内边距 32px。
-          入场动画（cm-login-card-enter）与失败抖动（cm-login-card-shake）见 index.css */}
-      <div
+          入场动画（cm-login-card-enter）与失败抖动（cm-login-card-shake）见 index.css。
+          用 <main> 而非 <div> 承载登录主体：这是页面唯一的主要内容区。 */}
+      <main
         className={cn(
           "glass cm-login-card w-[380px] max-w-full space-y-8 rounded-[var(--r-2xl)] p-8",
           "[--mat-bg:var(--mat-sheet-bg)] [--mat-blur:var(--blur-thick)] [--mat-shadow:var(--shadow-4)]",
@@ -293,10 +296,11 @@ export default function Login({
       >
         <div className="flex flex-col items-center text-center">
           {/* 56px Logo 方块（同侧栏品牌 Logo 规范，0.1.1：站点图标 <img>），--shadow-2；
-              入场延迟 80ms scale(.8)→1（--ease-bounce），见 index.css .cm-login-logo */}
+              入场延迟 80ms scale(.8)→1（--ease-bounce），见 index.css .cm-login-logo。
+              装饰性图片：站点名已在下方 <h1>，alt 留空避免重复朗读 */}
           <span className="cm-login-logo flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-[16px] shadow-[var(--shadow-2)]">
             <img
-              alt={homeTitle}
+              alt=""
               className="h-full w-full object-cover"
               src={siteIcon || DEFAULT_LOGIN_SITE_ICON}
               width={56}
@@ -447,7 +451,7 @@ export default function Login({
             </form>
           ) : null}
         </div>
-      </div>
+      </main>
     </div>
   );
 }

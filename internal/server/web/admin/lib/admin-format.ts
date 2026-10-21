@@ -78,59 +78,6 @@ export function resolveNodeId(node: NodeView) {
   return node.stats.node_id || node.stats.node_name || "";
 }
 
-function resolveNodeFreshness(node: NodeView) {
-  const statsTimestamp = Number(node.stats?.timestamp || 0);
-  if (Number.isFinite(statsTimestamp) && statsTimestamp > 0) {
-    return statsTimestamp;
-  }
-  const lastSeen = Number(node.last_seen || 0);
-  return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
-}
-
-function shouldReplaceNodeView(existing: NodeView | undefined, candidate: NodeView) {
-  if (!existing) {
-    return true;
-  }
-  const candidateFreshness = resolveNodeFreshness(candidate);
-  const existingFreshness = resolveNodeFreshness(existing);
-  if (candidateFreshness !== existingFreshness) {
-    return candidateFreshness > existingFreshness;
-  }
-  const candidateLastSeen = Number(candidate.last_seen || 0);
-  const existingLastSeen = Number(existing.last_seen || 0);
-  return candidateLastSeen >= existingLastSeen;
-}
-
-// R-03：这些字段只由管理端快照下发，node_delta 推送（公开视图）不含。
-const ADMIN_ONLY_NODE_FIELDS = [
-  "scoped_test_ids",
-  "traffic_used_bytes",
-  "traffic_cycle_start",
-] as const;
-
-export function upsertNodeView(current: NodeView[], node: NodeView) {
-  const nodeID = resolveNodeId(node).trim();
-  if (!nodeID) {
-    return current;
-  }
-  const index = current.findIndex((item) => resolveNodeId(item).trim() === nodeID);
-  if (index < 0) {
-    return [...current, node];
-  }
-  if (!shouldReplaceNodeView(current[index], node)) {
-    return current;
-  }
-  const next = [...current];
-  const merged: NodeView = { ...node };
-  for (const field of ADMIN_ONLY_NODE_FIELDS) {
-    if (merged[field] === undefined) {
-      Object.assign(merged, { [field]: current[index][field] });
-    }
-  }
-  next[index] = merged;
-  return next;
-}
-
 export function resolveNodeName(node: NodeView) {
   return node.alias || node.stats.node_alias || node.stats.node_name || node.stats.node_id;
 }
@@ -221,6 +168,26 @@ export function parseSelectionValue(value: string) {
     return splitSelectionValue(raw, "/");
   }
   return { group: raw, tag: "" };
+}
+
+// 节点展示名排序（节点列表与首页探测表共用）：数字段按数值比较
+// （de-vps-4 < de-vps-14、hk2 < hk10），大小写不敏感，与服务端快照排序一致。
+const nodeDisplayNameCollator = new Intl.Collator("zh-CN", {
+  numeric: true,
+  sensitivity: "base",
+});
+
+export function compareNodeDisplayName(left: string, right: string) {
+  const primary = nodeDisplayNameCollator.compare(
+    String(left || ""),
+    String(right || ""),
+  );
+  if (primary !== 0) return primary;
+  // 自然顺序相等（只差大小写或前导零）时回退到原始字节序，保证顺序可复现。
+  const leftText = String(left || "");
+  const rightText = String(right || "");
+  if (leftText === rightText) return 0;
+  return leftText < rightText ? -1 : 1;
 }
 
 export function normalizeSelectionValues(values: string[]) {

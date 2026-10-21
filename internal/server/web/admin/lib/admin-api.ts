@@ -12,10 +12,8 @@ import type {
   ConfigImportResponse,
   LoginConfigResponse,
   LoginResponse,
-  NodeDelta,
   NodeDeleteResponse,
   NodeProfilePayload,
-  NodeView,
   NotifyChannel,
   ProbeOverviewRange,
   ProbesOverviewResponse,
@@ -60,7 +58,7 @@ export function setStoredAdminToken(token: string) {
     }
     window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
   } catch {
-
+    // sessionStorage 不可用（隐私模式等）时放弃持久化，令牌仅存内存。
   }
 }
 
@@ -84,7 +82,7 @@ async function parseErrorMessage(resp: Response, fallback: string) {
       return payload.error;
     }
   } catch {
-
+    // 响应体不是 JSON 时忽略，由调用方使用 fallback 文案。
   }
   return fallback;
 }
@@ -230,7 +228,7 @@ export function readAdminBootPayload(): AdminBootPayload {
     try {
       return JSON.parse(window.atob(encoded)) as AdminBootPayload;
     } catch {
-
+      // boot payload 解码失败时回落到 window.__CM_ADMIN_BOOT__。
     }
   }
   const payload = window.__CM_ADMIN_BOOT__;
@@ -454,17 +452,21 @@ interface AdminSocketConnection {
   close: () => void;
 }
 
+// 实时连接状态：主动 close()（页面卸载 / 登出）不回调，只有真正的断开才报 closed。
+export type AdminSocketStatus = "connecting" | "open" | "closed";
+
 interface AdminSocketOptions {
   reconnectDelayMs?: number;
   reconnectMaxDelayMs?: number;
   staleTimeoutMs?: number;
+  // 状态回调：connecting（每次尝试建连）/ open / closed（非主动关闭）。
+  onStatus?: (status: AdminSocketStatus) => void;
 }
 
 const DEFAULT_STALE_TIMEOUT_MS = 70000;
 
 export function connectAdminSocket(
   onSnapshot: (snapshot: Snapshot) => void,
-  onNodeDelta?: (node: NodeView) => void,
   options: AdminSocketOptions = {},
 ): AdminSocketConnection {
   const reconnectDelayMs = Math.max(0, Number(options.reconnectDelayMs ?? 1000));
@@ -481,6 +483,15 @@ export function connectAdminSocket(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let staleTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
+
+  // 回调由调用方提供，抛错（例如已卸载组件）不得中断重连。
+  const emitStatus = (status: AdminSocketStatus) => {
+    try {
+      options.onStatus?.(status);
+    } catch {
+      // 状态回调异常不影响建连 / 重连流程，直接忽略。
+    }
+  };
 
   const clearStaleTimer = () => {
     if (staleTimer) {
@@ -501,7 +512,7 @@ export function connectAdminSocket(
       try {
         activeSocket?.close();
       } catch {
-
+        // 关闭已失效的 socket 可能抛错，不影响后续重连。
       }
     }, staleTimeoutMs);
   };
@@ -509,14 +520,12 @@ export function connectAdminSocket(
   const handleMessage = (event: MessageEvent) => {
     armStaleTimer();
     try {
-      const payload = JSON.parse(event.data) as Snapshot | NodeDelta;
+      const payload = JSON.parse(event.data) as Snapshot;
       if (isSnapshotPayload(payload)) {
         onSnapshot(payload);
-      } else if (isNodeDeltaPayload(payload)) {
-        onNodeDelta?.(payload.node);
       }
     } catch {
-
+      // 解析失败的帧直接丢弃，保持连接与重连逻辑不受影响。
     }
   };
 
@@ -535,11 +544,17 @@ export function connectAdminSocket(
     socket.addEventListener("open", () => {
       nextReconnectDelayMs = reconnectDelayMs;
       armStaleTimer();
+      emitStatus("open");
     });
     socket.addEventListener("message", handleMessage);
     socket.addEventListener("close", () => {
       clearStaleTimer();
       socket = null;
+      // 先通知界面断线，再按退避重连；重连期间保持 closed（不切回
+      // connecting），避免断线横幅每次重试闪烁。
+      if (!closed) {
+        emitStatus("closed");
+      }
       if (!closed && !reconnectTimer) {
         const delay = nextReconnectDelayMs;
         nextReconnectDelayMs = reconnectDelayMs === 0
@@ -553,6 +568,7 @@ export function connectAdminSocket(
     });
   };
 
+  emitStatus("connecting");
   connect();
 
   return {
@@ -569,35 +585,4 @@ export function connectAdminSocket(
 
 function isSnapshotPayload(payload: unknown): payload is Snapshot {
   return Boolean(payload && typeof payload === "object" && Array.isArray((payload as Snapshot).nodes));
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function hasStableNodeID(stats: Record<string, unknown>) {
-  return typeof stats.node_id === "string" && stats.node_id.trim() !== "" ||
-    typeof stats.node_name === "string" && stats.node_name.trim() !== "";
-}
-
-function isNodeViewPayload(payload: unknown): payload is NodeView {
-  if (!isObjectRecord(payload)) {
-    return false;
-  }
-  if (!isObjectRecord(payload.stats)) {
-    return false;
-  }
-  return (
-    hasStableNodeID(payload.stats) &&
-    isObjectRecord(payload.stats.cpu) &&
-    isObjectRecord(payload.stats.memory)
-  );
-}
-
-function isNodeDeltaPayload(payload: unknown): payload is NodeDelta {
-  if (!isObjectRecord(payload)) {
-    return false;
-  }
-  const delta = payload as Partial<NodeDelta>;
-  return delta.type === "node_delta" && isNodeViewPayload(delta.node);
 }

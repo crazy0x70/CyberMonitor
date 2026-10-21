@@ -94,7 +94,7 @@ export function AdminSaveBar({
           >
             放弃修改
           </AlertDialogTrigger>
-          <AlertDialogContent className={adminDialogContentClass}>
+          <AlertDialogContent className={adminDialogContentClass} variant="danger">
             <AlertDialogHeader className={adminDialogHeaderClass}>
               <AlertDialogTitle>放弃未保存的修改？</AlertDialogTitle>
               <AlertDialogDescription>

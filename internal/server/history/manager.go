@@ -10,11 +10,12 @@ import (
 )
 
 type Manager struct {
-	network *NetworkStore
-	offline *OfflineStore
+	network  *NetworkStore
+	offline  *OfflineStore
+	resource *ResourceStore
 }
 
-func OpenManager(dataDir string) (*Manager, error) {
+func OpenManager(dataDir string, resourceRetentionDays int) (*Manager, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, errors.New("history data dir required")
 	}
@@ -27,23 +28,24 @@ func OpenManager(dataDir string) (*Manager, error) {
 		_ = network.Close()
 		return nil, err
 	}
+	resource, err := OpenResourceStore(defaultResourceStoreDir(dataDir), resourceRetentionDays)
+	if err != nil {
+		_ = network.Close()
+		_ = offline.Close()
+		return nil, err
+	}
 	return &Manager{
-		network: network,
-		offline: offline,
+		network:  network,
+		offline:  offline,
+		resource: resource,
 	}, nil
 }
 
 func (m *Manager) Close() error {
-	return m.joinStoreOps((*NetworkStore).Close, (*OfflineStore).Close)
-}
-
-func (m *Manager) joinStoreOps(
-	runNetwork func(*NetworkStore) error,
-	runOffline func(*OfflineStore) error,
-) error {
 	return errors.Join(
-		runStoreOp(m.networkStore(), runNetwork),
-		runStoreOp(m.offlineStore(), runOffline),
+		runStoreOp(m.networkStore(), (*NetworkStore).Close),
+		runStoreOp(m.offlineStore(), (*OfflineStore).Close),
+		runStoreOp(m.resourceStore(), (*ResourceStore).Close),
 	)
 }
 
@@ -67,9 +69,10 @@ func (m *Manager) DeleteNode(nodeID string) error {
 	if err != nil || nodeID == "" {
 		return err
 	}
-	return m.joinStoreOps(
-		func(store *NetworkStore) error { return store.DeleteNode(nodeID) },
-		func(store *OfflineStore) error { return store.DeleteNode(nodeID) },
+	return errors.Join(
+		runStoreOp(m.networkStore(), func(store *NetworkStore) error { return store.DeleteNode(nodeID) }),
+		runStoreOp(m.offlineStore(), func(store *OfflineStore) error { return store.DeleteNode(nodeID) }),
+		runStoreOp(m.resourceStore(), func(store *ResourceStore) error { return store.DeleteNode(nodeID) }),
 	)
 }
 
@@ -79,10 +82,15 @@ func (m *Manager) HasNodeHistory(nodeID string) (bool, error) {
 	if err != nil || nodeID == "" {
 		return false, err
 	}
-	if ok, err := hasStoreHistory(m.networkStore(), nodeID); ok || err != nil {
-		return ok, err
+	for _, store := range []historyExistenceStore{m.networkStore(), m.offlineStore(), m.resourceStore()} {
+		if store == nil {
+			continue
+		}
+		if ok, err := hasStoreHistory(store, nodeID); ok || err != nil {
+			return ok, err
+		}
 	}
-	return hasStoreHistory(m.offlineStore(), nodeID)
+	return false, nil
 }
 
 type historyExistenceStore interface {
@@ -97,11 +105,46 @@ func hasStoreHistory(store historyExistenceStore, nodeID string) (bool, error) {
 }
 
 func (m *Manager) ClearNodes() error {
-	return m.joinStoreOps((*NetworkStore).Clear, (*OfflineStore).Clear)
+	return errors.Join(
+		runStoreOp(m.networkStore(), (*NetworkStore).Clear),
+		runStoreOp(m.offlineStore(), (*OfflineStore).Clear),
+		runStoreOp(m.resourceStore(), (*ResourceStore).Clear),
+	)
 }
 
 func (m *Manager) NetworkStore() *NetworkStore {
 	return m.networkStore()
+}
+
+func (m *Manager) ResourceStore() *ResourceStore {
+	return m.resourceStore()
+}
+
+// ObserveResource 计入一次资源采样（30 秒桶内求平均）。
+func (m *Manager) ObserveResource(nodeID string, stats metrics.NodeStats, now time.Time) error {
+	store := m.resourceStore()
+	if store == nil {
+		return nil
+	}
+	return store.Observe(nodeID, stats, now)
+}
+
+// FlushResourceHistory 落盘已结束的桶并清理过期样本，由服务端巡检每秒调用。
+func (m *Manager) FlushResourceHistory(now time.Time) error {
+	store := m.resourceStore()
+	if store == nil {
+		return nil
+	}
+	return store.FlushExpired(now)
+}
+
+// SetResourceRetentionDays 运行时修改资源历史保留天数。
+func (m *Manager) SetResourceRetentionDays(days int) error {
+	store := m.resourceStore()
+	if store == nil {
+		return nil
+	}
+	return store.SetRetentionDays(days)
 }
 
 func (m *Manager) AppendOfflineEvent(nodeID string, recoveredAt time.Time, duration time.Duration) error {
@@ -136,6 +179,13 @@ func (m *Manager) offlineStore() *OfflineStore {
 		return nil
 	}
 	return m.offline
+}
+
+func (m *Manager) resourceStore() *ResourceStore {
+	if m == nil {
+		return nil
+	}
+	return m.resource
 }
 
 func HistoryRootDir(dataDir string) string {

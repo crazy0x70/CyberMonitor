@@ -177,6 +177,9 @@ export interface SettingsView {
 
   turnstile_secret_key?: string;
   agent_endpoint?: string;
+  // 仅未配置 agent_endpoint 时由服务端按请求推断的对接地址，只用于展示；
+  // 不写回设置，也不进任何保存载荷。
+  agent_endpoint_suggestion?: string;
 
   agent_token?: string;
   agent_token_set?: boolean;
@@ -210,6 +213,8 @@ export interface SettingsView {
   groups?: string[];
   group_tree?: GroupNode[];
   test_catalog?: TestCatalogItem[];
+  // 资源历史（CPU / 内存 / 网络）保留天数：1 / 7 / 30。
+  resource_history_days?: number;
 }
 
 export interface SettingsUpdate {
@@ -243,6 +248,7 @@ export interface SettingsUpdate {
   group_tree?: GroupNode[];
   group_moves?: GroupMove[];
   test_catalog?: TestCatalogItem[];
+  resource_history_days?: number;
 }
 
 export interface ConfigImportResponse {
@@ -520,12 +526,6 @@ export interface Snapshot {
   nodes: NodeView[];
   groups?: string[];
   settings?: PublicSettings;
-}
-
-export interface NodeDelta {
-  type: "node_delta";
-  generated_at: number;
-  node: NodeView;
 }
 
 export const DEFAULT_TCP_INTERVAL = 5;

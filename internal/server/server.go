@@ -322,8 +322,6 @@ type Store struct {
 	// alertDeliveryWG 跟踪 tick 循环派生的告警投递 goroutine：关闭时在释放
 	// historyManager/数据目录锁之前做有界等待。
 	alertDeliveryWG sync.WaitGroup
-
-	deltaDigests map[string]uint64
 }
 
 type nodeMutationLock struct {
@@ -436,6 +434,33 @@ type NodeView struct {
 	AgentUpdateMessage       string          `json:"agent_update_message,omitempty"`
 }
 
+// publicNodeView 生成公开受众的 NodeView 投影（红线 4：管理端专属字段不得进入
+// 公开快照与公开 WS 载荷）。返回副本、不改原值；json tag 保持不变（管理端依赖
+// 它们），没有 omitempty 的 bool 清零后序列化为 false 是可接受的。
+func publicNodeView(view NodeView) NodeView {
+	view.ServerID = ""
+	view.AlertEnabled = false
+	view.AgentUpdateSupported = false
+	view.AgentUpdateMode = ""
+	view.AgentUpdateState = ""
+	view.AgentUpdateTargetVersion = ""
+	view.AgentUpdateMessage = ""
+	view.TrafficLimitBytes = 0
+	view.TrafficLimitType = ""
+	view.TrafficResetDay = 0
+	view.Stats.PublicIPv4 = ""
+	view.Stats.PublicIPv6 = ""
+	view.Stats.DeployMode = ""
+	view.Stats.AgentVersion = ""
+	view.Stats.AgentUpdateDisabled = false
+	view.Stats.AgentUpdateInsecure = false
+	// docker_managed_update / agent_remote_update 同属管理端专属语义（公开页不使用，
+	// 它们只用于管理端判断节点的升级方式与远程升级能力），一并清零。
+	view.Stats.DockerManagedUpdate = false
+	view.Stats.AgentRemoteUpdate = false
+	return view
+}
+
 type PublicSettings struct {
 	SiteTitle           string `json:"site_title,omitempty"`
 	SiteIcon            string `json:"site_icon,omitempty"`
@@ -461,12 +486,6 @@ type PublicNodeHistoryResponse struct {
 	From     int64                        `json:"from"`
 	To       int64                        `json:"to"`
 	Tests    map[string]*TestHistoryEntry `json:"tests"`
-}
-
-type NodeDelta struct {
-	Type        string   `json:"type"`
-	GeneratedAt int64    `json:"generated_at"`
-	Node        NodeView `json:"node"`
 }
 
 type Hub struct {
@@ -633,7 +652,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return wrapDataPathError("写入持久化数据失败", dataPath, err)
 	}
 
-	historyManager, err := history.OpenManager(cfg.DataDir)
+	historyManager, err := history.OpenManager(cfg.DataDir, normalizeResourceHistoryDays(settings.ResourceHistoryDays))
 	if err != nil {
 		return wrapDataPathError("初始化历史存储失败", history.HistoryRootDir(cfg.DataDir), err)
 	}
@@ -675,7 +694,6 @@ func Run(ctx context.Context, cfg Config) error {
 		agentIngestRate:   make(map[string]agentRateWindow),
 		agentRegisterRate: make(map[string]agentRateWindow),
 		startedAt:         time.Now(),
-		deltaDigests:      make(map[string]uint64),
 	}
 	if _, err := recoverLegacyHistoryAndPendingCleanup(dataPath, historyPath, historyManager, persistedSnapshot); err != nil {
 		return wrapDataPathError("恢复历史清理任务失败", dataPath, err)
@@ -863,6 +881,10 @@ func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
 		store.sweepExpiredAgentRateWindows(now)
 		t.lastRateSweep = now
 	}
+	// 资源历史：落盘已结束的 30 秒桶（节点离线/停报时也要靠这里收尾）并按节奏
+	// 清理超过保留期的样本；与离线宽限期无关，必须放在它之前。
+	store.FlushResourceHistory(now)
+	store.ReconcileResourceHistoryRetention()
 	if hub.HasVariant(adminVariant) {
 
 		payload, err := json.Marshal(adminStoreSnapshot(store))
@@ -892,8 +914,8 @@ func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
 		return
 	}
 	store.ReconcileOfflineTracker(now)
-	targets, offlineEvents, recoveredEvents := store.CollectAlertEvents(now)
-	logReportEvents(targets.SiteTitle, offlineEvents, recoveredEvents)
+	targets, offlineEvents, recoveredEvents, skippedRecoveredEvents := store.CollectAlertEvents(now)
+	logReportEvents(targets.SiteTitle, len(targets.Channels) > 0, offlineEvents, recoveredEvents, skippedRecoveredEvents)
 	if len(offlineEvents) > 0 || len(recoveredEvents) > 0 {
 		store.alertDeliveryWG.Add(1)
 		go func() {
@@ -904,7 +926,12 @@ func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
 				}
 			}()
 			if len(targets.Channels) == 0 {
+				// 无可用渠道：离线告警保持「待补发」（退避重试，补配渠道后补发）；恢复
+				// 通知同样必须落成 RecoveryPending——CollectAlertEvents 产出恢复事件时
+				// 已删除 alerted 状态，若这里只记录离线事件就返回，恢复通知会被永久
+				// 丢弃：既不投递也不进补发队列，之后补配渠道也永远不会补发。
 				store.RecordAlertDelivery(offlineEvents, nil, true)
+				store.RecordAlertDelivery(recoveredEvents, nil, false)
 				return
 			}
 			if len(offlineEvents) > 0 {
@@ -945,16 +972,7 @@ func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
 					log.Printf("规则告警投递 panic 已恢复: %v\n%s", rec, debug.Stack())
 				}
 			}()
-			for _, batch := range batches {
-				if len(batch.Channels) == 0 {
-					store.RecordRuleDelivery(batch, nil)
-					continue
-				}
-				results := dispatchRuleBatchNotice(batch)
-				if !allChannelNoticesOK(results) {
-					store.RecordRuleDelivery(batch, results)
-				}
-			}
+			deliverRuleBatches(store, batches)
 		}(ruleBatches)
 	}
 }
@@ -1353,6 +1371,12 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 			log.Printf("写入 network TSDB 失败: %v", err)
 		}
 	}
+	// 资源历史：每秒上报在存储层按 30 秒桶求平均后再落盘，这里的调用只是累加。
+	if acceptStats && historyManager != nil {
+		if err := historyManager.ObserveResource(mergedStats.NodeID, mergedStats, now); err != nil {
+			log.Printf("写入资源 TSDB 失败: %v", err)
+		}
+	}
 	return updateReconciled, recoveryCandidate, nil
 }
 
@@ -1433,6 +1457,9 @@ type AlertEvent struct {
 	RetryCount int
 	// Delivered 记录该事件已成功投递的渠道 ID（F5 泛化：只补发失败渠道）。
 	Delivered map[string]bool
+	// Retry 标记该事件来自失败补发（内部字段，不落盘、不对外）：日志只在事件
+	// 首次产生时记录一次，退避补发不再重复记录成新事件。
+	Retry bool
 }
 
 type AlertTargets struct {
@@ -1588,7 +1615,10 @@ func (s *Store) completeOfflineRecoveryProtected(candidate offlineRecoveryCandid
 	}
 }
 
-func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent) {
+// CollectAlertEvents 收集本轮的离线事件与恢复事件。第四个返回值是「跳过恢复通知」
+// 的恢复事件：离线告警一个渠道都没送达时节点恢复，不再单独发「已恢复」，只清状态
+// 并记一行报告日志（该切片仅用于日志，不参与投递）。
+func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, []AlertEvent, []AlertEvent) {
 	s.mu.Lock()
 
 	// B-03：内置 offline 规则接入离线引擎——停用、范围、渠道设置生效。
@@ -1601,6 +1631,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	threshold := s.offlineAlertThreshold()
 	offlineEvents := make([]AlertEvent, 0)
 	recoveredEvents := make([]AlertEvent, 0)
+	skippedRecoveredEvents := make([]AlertEvent, 0)
 	needsPersist := false
 	for nodeID, node := range s.nodes {
 		state, wasAlerted := s.alerted[nodeID]
@@ -1629,7 +1660,11 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 		offlineFor := now.Sub(node.LastSeen)
 		if offlineFor < threshold {
 			if wasAlerted {
-				if !state.NextRetryAt.IsZero() && now.Before(state.NextRetryAt) &&
+				// 退避门槛只服务恢复通知自身的补发（RecoveryPending）：恢复通知投递
+				// 失败后按 NextRetryAt 重试。离线告警阶段的补发退避（RecordAlertDelivery
+				// offline=true 设置的 NextRetryAt）不能推迟恢复处理——否则恢复最多被
+				// 推迟 5 分钟，期间离线告警可能仍未送达，用户只会收到「已恢复」。
+				if state.RecoveryPending && !state.NextRetryAt.IsZero() && now.Before(state.NextRetryAt) &&
 					state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff {
 					continue
 				}
@@ -1639,11 +1674,13 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				if state.OfflineSince.IsZero() {
 					offlineSec = 0
 				}
+				// RecoveryPending 表示这条恢复通知是上一轮投递失败的补发；
+				// 首次恢复（含离线告警尚在补发时恢复）不算补发。
 				var delivered map[string]bool
 				if state.RecoveryPending {
 					delivered = cloneNotifyBoolMap(state.Delivered)
 				}
-				recoveredEvents = append(recoveredEvents, AlertEvent{
+				event := AlertEvent{
 					NodeID:     nodeID,
 					Display:    display,
 					OS:         stats.OS,
@@ -1651,7 +1688,18 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 					OfflineSec: offlineSec,
 					RetryCount: state.RetryCount,
 					Delivered:  delivered,
-				})
+					Retry:      state.RecoveryPending,
+				}
+				// 「至少完成过一次离线告警投递尝试且全部失败」（RetryCount>0 且无任何
+				// 已送达渠道）才跳过恢复：用户从未收到过这条告警，单独一条「已恢复」
+				// 只会制造困惑。RetryCount 只在 RecordAlertDelivery 的失败/无渠道分支
+				// 递增；投递仍在途（goroutine 未回执）或全部渠道一次送达（成功路径不记
+				// 回执，RetryCount 仍为 0）时，离线告警已经发出或正在发送，必须产出恢复。
+				if !state.RecoveryPending && state.RetryCount > 0 && len(state.Delivered) == 0 {
+					skippedRecoveredEvents = append(skippedRecoveredEvents, event)
+				} else {
+					recoveredEvents = append(recoveredEvents, event)
+				}
 				delete(s.alerted, nodeID)
 				needsPersist = true
 			}
@@ -1661,9 +1709,15 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 			if state.NextRetryAt.IsZero() || (now.Before(state.NextRetryAt) && state.NextRetryAt.Sub(now) <= maxAlertRetryBackoff) {
 				continue
 			}
-			if state.OfflineSince.Before(node.LastSeen) {
+			// LastSeen 新于 OfflineSince 说明节点中间上过线，这是新一次离线事件（
+			// 可能紧跟在一次未送达的恢复通知之后），不能当作失败补发而跳过日志。
+			newIncident := state.OfflineSince.Before(node.LastSeen)
+			if newIncident {
+				// 新一次离线事件：回执与重试退避从头开始，不继承上一轮的送达记录和
+				// 退避档位（否则首次失败从上一轮遗留的 5 分钟档起步）。
 				state.OfflineSince = node.LastSeen
 				state.Delivered = nil
+				state.RetryCount = 0
 				state.RecoveryPending = false
 			}
 			stats := node.Stats
@@ -1678,6 +1732,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 				LastSeen:   node.LastSeen.Unix(),
 				OfflineSec: offlineSec,
 				Delivered:  cloneNotifyBoolMap(state.Delivered),
+				Retry:      !newIncident,
 			})
 			state.NextRetryAt = time.Time{}
 			s.alerted[nodeID] = state
@@ -1708,7 +1763,7 @@ func (s *Store) CollectAlertEvents(now time.Time) (AlertTargets, []AlertEvent, [
 	if needsPersist {
 		s.persistLogged()
 	}
-	return targets, offlineEvents, recoveredEvents
+	return targets, offlineEvents, recoveredEvents, skippedRecoveredEvents
 }
 
 const maxAlertRetryBackoff = 5 * time.Minute
@@ -1748,13 +1803,16 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, results map[string]bool
 			if !ok {
 				continue
 			}
+			deliveredChanged := false
 			for channelID, success := range results {
-				if success {
-					if state.Delivered == nil {
-						state.Delivered = make(map[string]bool)
-					}
-					state.Delivered[channelID] = true
+				if !success || state.Delivered[channelID] {
+					continue
 				}
+				if state.Delivered == nil {
+					state.Delivered = make(map[string]bool)
+				}
+				state.Delivered[channelID] = true
+				deliveredChanged = true
 			}
 			// results 为空表示当前没有可用渠道：保持旧语义，安排退避重试，
 			// 管理员补配渠道后仍能把未送达的告警补发出去。
@@ -1766,6 +1824,13 @@ func (s *Store) RecordAlertDelivery(events []AlertEvent, results map[string]bool
 				}
 			}
 			if allDelivered {
+				// 全部送达：没有待补发的离线告警，但 Delivered 要落盘——节点恢复时
+				// 靠它区分「离线告警确实送达过」与「一个渠道都没送到」。重试档位一并
+				// 归零，下次离线事件首次失败从最小退避起步。
+				state.NextRetryAt = time.Time{}
+				state.RetryCount = 0
+				s.alerted[event.NodeID] = state
+				needsPersist = needsPersist || deliveredChanged
 				continue
 			}
 			state.RetryCount++
@@ -1870,9 +1935,17 @@ func buildRecoveryMessage(siteTitle string, events []AlertEvent) string {
 	return buildEventMessage(siteTitle, "服务器恢复在线", "已恢复节点：", "服务已恢复。", events)
 }
 
-func logReportEvents(siteTitle string, offlineEvents, recoveredEvents []AlertEvent) {
+// logReportEvents 输出离线/恢复报告日志。只有首次产生的事件记一行；失败的退避
+// 补发（AlertEvent.Retry）不再重复记录，避免同一事件在日志页被记成多次掉线。
+// hasChannels 为 false 时额外记一条「未发送」，同样只在首次产生时出现。
+func logReportEvents(siteTitle string, hasChannels bool, offlineEvents, recoveredEvents, skippedRecoveredEvents []AlertEvent) {
 	title := normalizeSiteTitle(siteTitle)
+	freshOffline := 0
 	for _, event := range offlineEvents {
+		if event.Retry {
+			continue
+		}
+		freshOffline++
 		reportLogger.Printf("[%s] 离线：%s（node=%s，最后=%s，时长=%s）",
 			title,
 			formatAlertValue(event.Display, "未命名节点"),
@@ -1881,7 +1954,12 @@ func logReportEvents(siteTitle string, offlineEvents, recoveredEvents []AlertEve
 			formatAlertDuration(event.OfflineSec),
 		)
 	}
+	freshRecovered := 0
 	for _, event := range recoveredEvents {
+		if event.Retry {
+			continue
+		}
+		freshRecovered++
 		reportLogger.Printf("[%s] 恢复：%s（node=%s，恢复=%s，时长=%s）",
 			title,
 			formatAlertValue(event.Display, "未命名节点"),
@@ -1890,13 +1968,32 @@ func logReportEvents(siteTitle string, offlineEvents, recoveredEvents []AlertEve
 			formatAlertDuration(event.OfflineSec),
 		)
 	}
+	// 跳过恢复通知（离线告警一个渠道都没送达）：状态已清理，只在清理当轮记一行。
+	for _, event := range skippedRecoveredEvents {
+		reportLogger.Printf("[%s] 恢复：%s（node=%s，恢复=%s，时长=%s，离线告警未送达，跳过恢复通知）",
+			title,
+			formatAlertValue(event.Display, "未命名节点"),
+			formatAlertValue(event.NodeID, "unknown"),
+			formatReportEventTime(event.LastSeen),
+			formatAlertDuration(event.OfflineSec),
+		)
+	}
+	if !hasChannels && freshOffline+freshRecovered > 0 {
+		// 分隔符用逗号而非中文分号：管理端日志页的 i18n 会把「；」当复合句分隔符重组。
+		// 不提「已安排补发」：无渠道时只有离线事件会登记退避补发，恢复通知不会，
+		// 这句话不能扩大到两者。
+		reportLogger.Printf("[%s] 告警未发送：没有可用的通知渠道（离线 %d 个节点，恢复 %d 个节点）",
+			title, freshOffline, freshRecovered)
+	}
 }
 
+// formatReportEventTime 按服务器本地时区格式化（与 log 包的时间戳一致，避免日志行
+// 与事件时间相差一个时区）。
 func formatReportEventTime(unixSeconds int64) string {
 	if unixSeconds <= 0 {
 		return "unknown"
 	}
-	return time.Unix(unixSeconds, 0).UTC().Format(time.DateTime)
+	return time.Unix(unixSeconds, 0).Local().Format(time.DateTime)
 }
 
 func formatAlertDuration(seconds int64) string {
@@ -2383,6 +2480,55 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 	return convertNetworkHistoryToTestHistory(entries), nil
 }
 
+// QueryAINodeResources 查询节点的 CPU / 内存 / 网络资源历史（供 AI 快照使用）。
+func (s *Store) QueryAINodeResources(ctx context.Context, nodeID string, from, to time.Time) (*history.ResourceHistoryEntry, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return history.NewEmptyResourceHistoryEntry(), nil
+	}
+	if s == nil || s.historyManager == nil || s.historyManager.ResourceStore() == nil {
+		return history.NewEmptyResourceHistoryEntry(), nil
+	}
+	return s.historyManager.ResourceStore().QueryPublicRange(ctx, nodeID, from, to)
+}
+
+// ReconcileResourceHistoryRetention 把设置中的资源历史保留天数应用到存储；已经
+// 一致时无动作，由巡检每秒调用作兵底。最新设置在存储的串行锁内重读：调用方读到的
+// 值可能在等锁期间就过期了，用旧值覆盖更新的配置会让内存值与磁盘保留期分叉。
+func (s *Store) ReconcileResourceHistoryRetention() {
+	s.mu.RLock()
+	manager := s.historyManager
+	s.mu.RUnlock()
+	if manager == nil {
+		return
+	}
+	store := manager.ResourceStore()
+	if store == nil {
+		return
+	}
+	latest := func() int {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return normalizeResourceHistoryDays(s.settings.ResourceHistoryDays)
+	}
+	if err := store.SyncRetention(latest); err != nil {
+		log.Printf("应用资源历史保留设置失败: %v", err)
+	}
+}
+
+// FlushResourceHistory 落盘已完成 30 秒桶并清理过期样本（巡检每秒调用）。
+func (s *Store) FlushResourceHistory(now time.Time) {
+	s.mu.RLock()
+	manager := s.historyManager
+	s.mu.RUnlock()
+	if manager == nil {
+		return
+	}
+	if err := manager.FlushResourceHistory(now); err != nil {
+		log.Printf("落盘资源历史失败: %v", err)
+	}
+}
+
 func (s *Store) Snapshot() []NodeView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -2395,7 +2541,9 @@ func (s *Store) Snapshot() []NodeView {
 			view.HiddenFromDisplay, view.HiddenFromCR, view.HiddenFromAll, view.Groups) {
 			continue
 		}
-		visible = append(visible, view)
+		// 可见性过滤后统一做公开投影（红线 4）：storeSnapshot / 公开 REST 快照 /
+		// 公开 WS 初始快照都走这里；AdminSnapshot 走 snapshotLocked(true)，不脱敏。
+		visible = append(visible, publicNodeView(view))
 	}
 	return visible
 }
@@ -2493,18 +2641,28 @@ func (s *Store) snapshotLocked(includeProfileOnly bool) []NodeView {
 			}
 		}
 	}
-	sort.Slice(views, func(i, j int) bool {
-		leftGroup := views[i].Group
-		rightGroup := views[j].Group
-		if leftGroup == rightGroup {
-			if views[i].Alias == views[j].Alias {
-				return views[i].Stats.NodeID < views[j].Stats.NodeID
-			}
-			return views[i].Alias < views[j].Alias
-		}
-		return leftGroup < rightGroup
-	})
+	// 分组名保持字节序（分组顺序由分组树单独表达，这里只保证同一分组内相邻）。
+	sort.Slice(views, func(i, j int) bool { return nodeViewLess(views[i], views[j]) })
 	return views
+}
+
+// nodeViewLess 是快照列表的排序谓词：先按分组名字节序，再按同组展示名的自然
+// 顺序（de-vps-4 < de-vps-14、hk2 < hk10）。自然顺序相等（大小写不同、前导零
+// 不同）时回退到原始字节序，最后用 NodeID 兜底，保证每次序列化顺序稳定。
+func nodeViewLess(left, right NodeView) bool {
+	if left.Group != right.Group {
+		return left.Group < right.Group
+	}
+	if naturalLess(left.Alias, right.Alias) {
+		return true
+	}
+	if naturalLess(right.Alias, left.Alias) {
+		return false
+	}
+	if left.Alias != right.Alias {
+		return left.Alias < right.Alias
+	}
+	return left.Stats.NodeID < right.Stats.NodeID
 }
 
 func (s *Store) reconcileProfiles(now time.Time) bool {
@@ -2580,43 +2738,6 @@ func profileOnlyNodeView(nodeID string, profile *NodeProfile) (NodeView, bool) {
 		AgentUpdateTargetVersion: strings.TrimSpace(profile.AgentUpdateTargetVersion),
 		AgentUpdateMessage:       strings.TrimSpace(profile.AgentUpdateMessage),
 	}, true
-}
-
-func (s *Store) PublicNodeDeltaIfChanged(nodeID string) (NodeDelta, bool) {
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	node, ok := s.nodeViewLocked(nodeID, now)
-	if !ok || !s.nodePublicVisibleLocked(node.HiddenFromDisplay, node.HiddenFromCR, node.HiddenFromAll, node.Groups) {
-		return NodeDelta{}, false
-	}
-	digest := nodeDeltaContentDigest(node)
-	if prev, seen := s.deltaDigests[nodeID]; seen && prev == digest {
-		return NodeDelta{}, false
-	}
-	if s.deltaDigests == nil {
-		s.deltaDigests = make(map[string]uint64)
-	}
-	s.deltaDigests[nodeID] = digest
-	return NodeDelta{
-		Type:        "node_delta",
-		GeneratedAt: now.Unix(),
-		Node:        node,
-	}, true
-}
-
-func nodeDeltaContentDigest(node NodeView) uint64 {
-	node.LastSeen = 0
-	node.Stats.Timestamp = 0
-	node.Stats.UptimeSec = 0
-	data, err := json.Marshal(node)
-	if err != nil {
-		return 0
-	}
-	digest := fnv.New64a()
-	digest.Write(data)
-	return digest.Sum64()
 }
 
 func (s *Store) nodeViewLocked(nodeID string, now time.Time) (NodeView, bool) {
@@ -2837,12 +2958,6 @@ func (h *Hub) BroadcastVariant(payload []byte, variant string) {
 
 func (h *Hub) BroadcastAdmin(payload []byte, tokenSalt string) {
 	h.broadcast(payload, tokenSalt, h.adminClientAllowed)
-}
-
-func (h *Hub) BroadcastAllVariants(payload []byte, tokenSalt string) {
-	h.broadcast(payload, tokenSalt, func(client *hubClient, currentSalt string) bool {
-		return client.variant == publicVariantBalanced || h.adminClientAllowed(client, currentSalt)
-	})
 }
 
 func (h *Hub) prepareBroadcast(payload []byte) *websocket.PreparedMessage {
@@ -3577,6 +3692,13 @@ func (s *Store) PublicSettings() PublicSettings {
 	}
 }
 
+// ResourceHistoryDays 返回生效中的资源历史保留天数。
+func (s *Store) ResourceHistoryDays() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeResourceHistoryDays(s.settings.ResourceHistoryDays)
+}
+
 func (s *Store) settingsViewLocked() SettingsView {
 	loginFailLimit := s.settings.LoginFailLimit
 	if loginFailLimit < 0 {
@@ -3601,6 +3723,7 @@ func (s *Store) settingsViewLocked() SettingsView {
 		HomeSubtitle:          s.settings.HomeSubtitle,
 		Locale:                normalizeLocale(s.settings.Locale),
 		RegionGroupEnabled:    boolPointer(!s.settings.RegionGroupDisabled),
+		ResourceHistoryDays:   normalizeResourceHistoryDays(s.settings.ResourceHistoryDays),
 		AlertOfflineSec:       s.settings.AlertOfflineSec,
 		AlertTelegramUserIDs:  slices.Clone(s.settings.AlertTelegramUserIDs),
 		NotifyChannels:        notifyChannelsForView(s.settings.NotifyChannels),
@@ -3679,6 +3802,8 @@ func redactSettingsViewForExport(view SettingsView) SettingsView {
 	view.TurnstileSiteKey = ""
 	view.TurnstileSecretKey = ""
 	view.AgentToken = ""
+	// 推断的对接地址不属用户配置，导出只带用户实际填写的值。
+	view.AgentEndpointSuggestion = ""
 	view.AlertWebhook = ""
 	view.AlertTelegramToken = ""
 	view.AlertTelegramUserIDs = nil
@@ -3772,6 +3897,117 @@ func requestIsSecure(r *http.Request, trustedProxyHeaders bool) bool {
 	return strings.EqualFold(trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Proto"), "https")
 }
 
+// suggestAgentEndpoint 推断 Agent 对接地址，仅用于展示与生成安装命令：不写回
+// agent_endpoint、不导出。推断值必须能通过 validateAgentEndpoint，构造不出合法
+// 值就返回空串。
+func suggestAgentEndpoint(r *http.Request, splitMode bool, publicAddr string, trustedProxyHeaders bool) string {
+	scheme := "http"
+	if requestIsSecure(r, trustedProxyHeaders) {
+		scheme = "https"
+	}
+	host := requestExternalHost(r, trustedProxyHeaders)
+	if splitMode {
+		host = splitModeAgentHost(r, publicAddr, host)
+	}
+	if host == "" {
+		return ""
+	}
+	candidate := scheme + "://" + host
+	if err := validateAgentEndpoint(candidate); err != nil {
+		return ""
+	}
+	return candidate
+}
+
+// splitModeAgentHost 用 publicAddr 的明确主机名与端口拼出分端口模式的 Agent 接入
+// host：通配地址（空 / 0.0.0.0 / :: / *）退回请求 hostname；publicAddr 解析不出
+// 端口时沿用整个请求 host（含其端口）。
+func splitModeAgentHost(r *http.Request, publicAddr, requestHost string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(publicAddr))
+	if err != nil || strings.TrimSpace(port) == "" {
+		return requestHost
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || isWildcardListenHost(host) {
+		host = requestHostname(requestHost)
+	}
+	if host == "" || !validExternalHost(host) {
+		return ""
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func isWildcardListenHost(host string) bool {
+	switch strings.Trim(host, "[]") {
+	case "", "*", "0.0.0.0", "::":
+		return true
+	}
+	return false
+}
+
+// requestExternalHost 返回请求的外部 host（含端口）。仅当显式开启
+// -trust-proxy-headers 时才采信 X-Forwarded-Host（逗号列表取第一个非空项）。
+func requestExternalHost(r *http.Request, trustedProxyHeaders bool) string {
+	if r == nil {
+		return ""
+	}
+	if raw := trustedForwardedHeader(r, trustedProxyHeaders, "X-Forwarded-Host"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if !validExternalHost(part) {
+				return ""
+			}
+			return part
+		}
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" || !validExternalHost(host) {
+		return ""
+	}
+	return host
+}
+
+// requestHostname 从已校验的请求 host 里取 hostname（去掉端口与 IPv6 方括号）。
+func requestHostname(host string) string {
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return strings.Trim(h, "[]")
+	}
+	return strings.Trim(host, "[]")
+}
+
+// validExternalHost 严格校验来自请求头 / r.Host 的 host：拒绝空白、控制字符、
+// 引号、反斜杠、路径、userinfo 等。
+func validExternalHost(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if value == "" || value != raw {
+		return false
+	}
+	for _, ch := range value {
+		if ch <= ' ' || ch == 0x7f {
+			return false
+		}
+	}
+	if strings.ContainsAny(value, "\"'`\\/<>@,;") {
+		return false
+	}
+	// 裸 IPv6 字面量：url.Parse("http://"+value) 会把它当成 host:port 而报错，
+	// 这里先用 net.ParseIP 单独放行（拼接时由 net.JoinHostPort 补方括号）。
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	parsed, err := url.Parse("http://" + value)
+	if err != nil {
+		return false
+	}
+	return parsed.Host == value && parsed.Hostname() != "" && parsed.User == nil && parsed.Path == ""
+}
+
 func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 	adminPath := strings.TrimSpace(view.AdminPath)
 	adminUser := strings.TrimSpace(view.AdminUser)
@@ -3818,6 +4054,7 @@ func settingsViewToUpdate(view SettingsView) SettingsUpdate {
 		Groups:               &groups,
 		GroupTree:            &groupTree,
 		TestCatalog:          &testCatalog,
+		ResourceHistoryDays:  intPointer(normalizeResourceHistoryDays(view.ResourceHistoryDays)),
 	}
 	if agentToken != "" {
 		update.AgentToken = stringPointer(agentToken)
@@ -4089,8 +4326,6 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 			return fail(err)
 		}
 		s.settings.AlertRules = rules
-		// 规则变更后旧样本环语义失效（阈值/操作符可能已改），整体重建。
-		s.clearRuleSamplesLocked()
 	}
 	if update.AlertTelegramToken != nil {
 		value := strings.TrimSpace(*update.AlertTelegramToken)
@@ -4128,6 +4363,16 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 			return fail(err)
 		}
 		s.settings.NotifyChannels = normalized
+	}
+	// 规则引用的渠道必须存在：删除/替换渠道后规则会静默失去投递目标，等于改写
+	// 规则语义。只在本次请求涉及任一告警表示时校验（用本次请求生效后的渠道列表），
+	// 旧 state.json 可能已带失效引用，不能让无关设置保存失败。
+	if update.AlertRules != nil || update.NotifyChannels != nil ||
+		update.AlertWebhook != nil || update.AlertTelegramToken != nil ||
+		update.AlertTelegramUserIDs != nil {
+		if err := validateAlertRuleChannelRefs(s.settings.AlertRules, s.settings.NotifyChannels); err != nil {
+			return fail(err)
+		}
 	}
 	// 渠道 → 旧字段：本次请求涉及任一告警表示时回填。Telegram Bot 轮询
 	// （TelegramSettings）与旧测试推送回退由此读到第一个启用渠道的取值。
@@ -4229,6 +4474,19 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	if update.Groups != nil || update.GroupTree != nil || update.GroupMoves != nil {
 		s.pruneProfileGroupSelectionsLocked()
 	}
+	if update.ResourceHistoryDays != nil {
+		days := *update.ResourceHistoryDays
+		if !history.ValidResourceRetentionDays(days) {
+			return fail(errors.New("resource_history_days invalid"))
+		}
+		s.settings.ResourceHistoryDays = days
+	}
+	// 规则变更后旧样本环语义失效（阈值/操作符可能已改），整体重建。位置必须在
+	// 所有校验通过之后：fail() 只回滚 s.settings，样本环一旦提前清空无法回滚，
+	// 会让「保存失败、规则实际未变」的全部节点重新预热、漏报一整个窗口。
+	if update.AlertRules != nil {
+		s.clearRuleSamplesLocked()
+	}
 	view = s.settingsViewLocked()
 	s.mu.Unlock()
 
@@ -4240,6 +4498,8 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	if err := s.persist(); err != nil {
 		return view, err
 	}
+	// 保留天数改动无需重启：立即应用到资源历史存储（巡检也会兜底重填）。
+	s.ReconcileResourceHistoryRetention()
 	return view, nil
 }
 
@@ -4286,12 +4546,17 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, error) {
 	now := time.Now()
 	previousAgentConfigs := s.agentConfigProjectionsLocked(now)
 	s.settings = staged.settings
+	// 导入的规则可能与旧规则同 ID 但阈值/持续窗口不同，旧样本的 violated 语义
+	// 已失效；与 UpdateSettings 保存规则一致，提交后清空正式 Store 的样本环，
+	// 让窗口重新预热，避免用旧样本直接判定告警/恢复。
+	s.clearRuleSamplesLocked()
 	s.profiles = normalizedProfiles
 	s.reconcileAgentConfigRefreshLocked(previousAgentConfigs, now)
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return SettingsView{}, err
 	}
+	s.ReconcileResourceHistoryRetention()
 
 	return s.SettingsView(), nil
 }
@@ -5258,7 +5523,6 @@ func (s *Store) deleteNodeMemoryLocked(nodeID string) {
 	delete(s.alerted, nodeID)
 	delete(s.offlineSessions, nodeID)
 	delete(s.configRefresh, nodeID)
-	delete(s.deltaDigests, nodeID)
 }
 
 func (s *Store) clearNodesMemoryLocked() {
@@ -5267,7 +5531,6 @@ func (s *Store) clearNodesMemoryLocked() {
 	s.alerted = make(map[string]AlertedState)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.configRefresh = make(map[string]struct{})
-	s.deltaDigests = make(map[string]uint64)
 }
 
 type AgentUpdateReport struct {
@@ -6154,13 +6417,29 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target interface{}) erro
 	return nil
 }
 
+// validateWebhookURL 是默认的 webhook/端点静态校验：拒绝私网/环回目标。
 func validateWebhookURL(raw string) error {
+	return validateWebhookURLPolicy(raw, false)
+}
+
+// validateWebhookURLAllowPrivate 供通知渠道显式开启“允许内网地址”后使用：
+// 只跳过私网/环回目标判定，其余校验（非空、协议、userinfo、歧义 IPv4 字面量、
+// 百分号 zone）与 validateWebhookURL 完全一致。
+func validateWebhookURLAllowPrivate(raw string) error {
+	return validateWebhookURLPolicy(raw, true)
+}
+
+func validateWebhookURLPolicy(raw string, allowPrivate bool) error {
 	if strings.TrimSpace(raw) == "" {
 		return errors.New("webhook 不能为空")
 	}
-	if err := validateHTTPCallbackURL(raw); err != nil {
+	if err := validateHTTPCallbackURLPolicy(raw, allowPrivate); err != nil {
 		if errors.Is(err, errCallbackURLScheme) {
 			return errors.New("webhook 协议无效")
+		}
+		var privateTarget *privateTargetError
+		if errors.As(err, &privateTarget) {
+			return privateTarget
 		}
 		return errors.New("webhook 无效")
 	}
@@ -6312,6 +6591,42 @@ func validateHTTPBaseURL(raw string) error {
 
 var errCallbackURLScheme = errors.New("callback url scheme invalid")
 
+// privateTargetError 标记“目标解析或字面量是私网/环回/保留地址”这一类确定性拒绝：
+// 携带被拒的 host 与 IP，供通知层拼出带指引的中文文案（errors.As 可识别）。
+// Host 非空而 IP 为 nil 表示 host 本身命中（如 localhost）；两者都不为空表示 host
+// 解析出的地址命中。
+type privateTargetError struct {
+	Host string
+	IP   net.IP
+}
+
+func (e *privateTargetError) Error() string {
+	if e == nil {
+		return "callback private target rejected"
+	}
+	if e.IP != nil {
+		if e.Host != "" && e.Host != e.IP.String() {
+			return fmt.Sprintf("callback private ip rejected: %s (%s)", e.Host, e.IP.String())
+		}
+		return fmt.Sprintf("callback private ip rejected: %s", e.IP.String())
+	}
+	return fmt.Sprintf("callback private host rejected: %s", e.Host)
+}
+
+// target 返回用于提示文案的目标描述（优先 IP，附带主机名）。
+func (e *privateTargetError) target() string {
+	if e == nil {
+		return "未知地址"
+	}
+	if e.IP != nil {
+		if e.Host != "" && e.Host != e.IP.String() {
+			return fmt.Sprintf("%s（%s）", e.Host, e.IP.String())
+		}
+		return e.IP.String()
+	}
+	return e.Host
+}
+
 type callbackResolver interface {
 	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
 }
@@ -6337,12 +6652,38 @@ var sharedWebhookClient = sync.OnceValue(func() *http.Client {
 	}
 })
 
+// sharedWebhookClientAllowPrivate 是通知渠道显式开启“允许内网地址”后的出站客户端：
+// 超时、传输参数与 sharedWebhookClient 一致（不设 Proxy），也不再做地址判定，
+// 让 fake-ip 代理（198.18.0.0/15）与内网自建服务可达。重定向语义不变（最多 10
+// 跳、删 Referer、每跳重新校验），只是校验改用 allow-private 版本。
+var sharedWebhookClientAllowPrivate = sync.OnceValue(func() *http.Client {
+	return &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           defaultCallbackDialer,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 6 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			IdleConnTimeout:       60 * time.Second,
+		},
+		CheckRedirect: webhookRedirectPolicyAllowPrivate,
+	}
+})
+
 func webhookRedirectPolicy(req *http.Request, via []*http.Request) error {
+	return webhookRedirectPolicyUsing(req, via, validateWebhookURL)
+}
+
+func webhookRedirectPolicyAllowPrivate(req *http.Request, via []*http.Request) error {
+	return webhookRedirectPolicyUsing(req, via, validateWebhookURLAllowPrivate)
+}
+
+func webhookRedirectPolicyUsing(req *http.Request, via []*http.Request, validate func(string) error) error {
 	if len(via) >= 10 {
 		return errors.New("webhook redirect limit exceeded")
 	}
 	req.Header.Del("Referer")
-	return validateWebhookURL(req.URL.String())
+	return validate(req.URL.String())
 }
 
 func noRedirectHTTPClient(timeout time.Duration) *http.Client {
@@ -6399,13 +6740,21 @@ func validateResolvedCallbackHost(ctx context.Context, resolver callbackResolver
 			return nil, errors.New("callback host resolved empty ip")
 		}
 		if isPrivateCallbackIP(ip.IP) {
-			return nil, errors.New("callback private ip rejected")
+			return nil, &privateTargetError{Host: host, IP: ip.IP}
 		}
 	}
 	return ips, nil
 }
 
+// validateHTTPCallbackURL 是默认的 callback URL 静态校验：拒绝私网/环回目标。
 func validateHTTPCallbackURL(raw string) error {
+	return validateHTTPCallbackURLPolicy(raw, false)
+}
+
+// validateHTTPCallbackURLPolicy 按 allowPrivate 决定是否放行字面量私网 IP 与
+// localhost；其余校验（空/非法 host、非 http(s)、userinfo、百分号 zone、歧义 IPv4
+// 字面量）在两种模式下都保留。
+func validateHTTPCallbackURLPolicy(raw string, allowPrivate bool) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Host == "" {
 		return errors.New("callback url invalid")
@@ -6420,17 +6769,25 @@ func validateHTTPCallbackURL(raw string) error {
 	if host == "" {
 		return errors.New("callback host invalid")
 	}
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return errors.New("callback private host rejected")
-	}
+	// 结构性非法 host（百分号 zone、歧义 IPv4 字面量）先判，避免被下面的
+	// localhost 放行分支绕过。
 	if strings.Contains(host, "%") {
 		return errors.New("callback host invalid")
 	}
 	if isAmbiguousIPv4LiteralHost(host) {
 		return errors.New("callback host invalid")
 	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		if allowPrivate {
+			return nil
+		}
+		return &privateTargetError{Host: host}
+	}
 	if ip := net.ParseIP(host); ip != nil && isPrivateCallbackIP(ip) {
-		return errors.New("callback private ip rejected")
+		if allowPrivate {
+			return nil
+		}
+		return &privateTargetError{Host: host, IP: ip}
 	}
 	return nil
 }

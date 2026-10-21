@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AdminDrawer } from "@/components/admin-drawer";
 import { adminStatusBadgeClass } from "@/components/admin-data-table";
 import {
@@ -53,8 +53,10 @@ import {
   buildRulePayload,
   copyRuleDraft,
   formatRulePreviewValue,
+  ruleAlertRatioPct,
   ruleDurationChoices,
   ruleDurationLabel,
+  ruleRecoverRatioPct,
   validateRuleDraft,
   type AlertRuleDraft,
 } from "@/lib/alert-rules";
@@ -112,7 +114,7 @@ export function RuleMultiSelect({
   id: string;
   summary: string;
   emptyText: string;
-  options: Array<{ value: string; label: string; indent?: boolean }>;
+  options: Array<{ value: string; label: ReactNode; indent?: boolean }>;
   selected: string[];
   onToggle: (value: string, checked: boolean) => void;
   disabled?: boolean;
@@ -164,7 +166,7 @@ export function RuleMultiSelect({
 // F4 规则抽屉「删除」危险文字按钮：规格对齐 adminTextButtonClass，仅换 danger 色
 // （admin-ui.ts 不在本批文件范围内，类内联在本组件）。
 const adminRuleDangerTextButtonClass =
-  "inline-flex h-9 items-center gap-1 rounded-full px-2 text-sm font-medium text-[var(--danger)] outline-none [transition:transform_var(--dur-1),scale_var(--dur-1),background-color_var(--dur-2)] hover:bg-[var(--danger-tint)] active:scale-[0.97] focus-visible:ring-[3px] focus-visible:ring-[var(--primary-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-9 items-center gap-1 rounded-full px-2 text-sm font-medium text-[var(--danger-text)] outline-none [transition:transform_var(--dur-1),scale_var(--dur-1),background-color_var(--dur-2)] hover:bg-[var(--danger-tint)] active:scale-[0.97] focus-visible:ring-[3px] focus-visible:ring-[var(--primary-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:pointer-events-none disabled:opacity-50";
 
 export function AlertRuleDrawer({
   open,
@@ -250,7 +252,13 @@ export function AlertRuleDrawer({
           scopeExclude: [],
         }
       : form;
-    if (!applyFormErrors(validateRuleDraft(draft))) {
+    const nextErrors = validateRuleDraft(draft);
+    // 已删除渠道必须显式取消勾选：保存时后端会拒绝失效引用，不拦在这里只会
+    // 到保存才失败。字段错误显示在渠道选择器下方。
+    if (missingChannelIds.length > 0) {
+      nextErrors.channels = "有渠道已删除，请取消勾选后再保存。";
+    }
+    if (!applyFormErrors(nextErrors)) {
       return;
     }
     onDone(copyRuleDraft(draft));
@@ -291,6 +299,7 @@ export function AlertRuleDrawer({
     threshold: errors.threshold || "",
     probe: errors.probe || "",
     scope: errors.scope || "",
+    channels: errors.channels || "",
   };
   const showOpControl = spec?.kind === "threshold";
   const showThresholdControl =
@@ -310,13 +319,53 @@ export function AlertRuleDrawer({
       indent: true,
     })),
   ]);
-  const channelOptions = channels
-    .filter((channel) => channel.enabled)
-    .map((channel) => ({
-      value: channel.id || "",
-      label: `${channelDisplayName(channel)}（${CHANNEL_TYPE_LABELS[channel.type || ""] || channel.type || ""}）`,
-    }))
-    .filter((option) => option.value);
+  const selectedChannelIds = Array.from(new Set(form.channelIds));
+  const missingChannelIds = selectedChannelIds.filter(
+    (id) => !channels.some((channel) => channel.id === id),
+  );
+  // 停用渠道不参与投递，但已被规则选中的停用渠道必须出现在选项里，否则用户
+  // 无法取消勾选（也无法从这里看出它已停用）。
+  const selectedDisabledChannels = channels.filter(
+    (channel) => !channel.enabled && selectedChannelIds.includes(channel.id || ""),
+  );
+  const selectableChannels = [
+    ...channels.filter((channel) => channel.enabled),
+    ...selectedDisabledChannels,
+  ];
+  const channelOptions: Array<{ value: string; label: ReactNode }> = [
+    ...selectableChannels
+      .map((channel) => {
+        const typeLabel = CHANNEL_TYPE_LABELS[channel.type || ""] || channel.type || "";
+        // 自定义名称不参与 DOM 翻译：若整段是字符串，名称里恰好出现
+        // “已删除的渠道 · xxx” 会被 i18n 模式误译成缺失渠道。只把名称节点
+        // 标记为跳过翻译，类型标签与停用状态仍可翻译。
+        return {
+          value: channel.id || "",
+          label: (
+            <>
+              <span data-admin-i18n-skip={channel.name?.trim() ? true : undefined}>
+                {channelDisplayName(channel)}
+              </span>
+              {` (`}
+              <span>{typeLabel}</span>
+              {`)`}
+              {channel.enabled ? null : (
+                <>
+                  <span>{` · `}</span>
+                  <span className="text-[var(--warn-text)]">已停用</span>
+                </>
+              )}
+            </>
+          ),
+        };
+      })
+      .filter((option) => option.value),
+    // 已删除的渠道仍作为可取消勾选的选项出现，否则用户无法从规则里移除失效引用。
+    ...missingChannelIds.map((id) => ({
+      value: id,
+      label: `已删除的渠道 · ${id}`,
+    })),
+  ];
   const probeOptions = (probes || [])
     .map((item) => item.name)
     .filter(Boolean)
@@ -464,7 +513,7 @@ export function AlertRuleDrawer({
             <div className="w-full space-y-1.5">
               {probeOptions.length === 0 ? (
                 <p className="text-xs leading-relaxed text-[var(--label-3)]">
-                  请先在“探测设置”页配置探测节点。
+                  请先在“探测设置”页配置探测目标。
                 </p>
               ) : (
                 <Select
@@ -552,32 +601,41 @@ export function AlertRuleDrawer({
           </AdminGroupedFieldRow>
         ) : null}
         {showDurationControl ? (
-          <AdminGroupedFieldRow label="持续时间" htmlFor="alert-rule-duration">
-            <Select
-              value={String(form.durationSec)}
-              onValueChange={(next) =>
-                patchForm({ durationSec: Number(next) || 0 })
-              }
-            >
-              <SelectTrigger
-                id="alert-rule-duration"
-                size="sm"
-                disabled={busy}
-                className={`${adminSelectTriggerClass} w-full`}
+          <>
+            <AdminGroupedFieldRow label="持续时间" htmlFor="alert-rule-duration">
+              <Select
+                value={String(form.durationSec)}
+                onValueChange={(next) =>
+                  patchForm({ durationSec: Number(next) || 0 })
+                }
               >
-                <SelectValue>
-                  {ruleDurationLabel(form.durationSec)}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent className={adminSelectContentClass}>
-                {ruleDurationChoices().map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </AdminGroupedFieldRow>
+                <SelectTrigger
+                  id="alert-rule-duration"
+                  size="sm"
+                  disabled={busy}
+                  className={`${adminSelectTriggerClass} w-full`}
+                >
+                  <SelectValue>
+                    {ruleDurationLabel(form.durationSec)}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent className={adminSelectContentClass}>
+                  {ruleDurationChoices().map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </AdminGroupedFieldRow>
+            {/* 判定口径说明（P2）：「持续时间」不是“连续越限多久”而是窗口统计，
+                告警/恢复用两个不同门槛（滞回），不写清楚会被当成误报或重复通知。 */}
+            <p className="mt-1.5 px-4 text-xs leading-relaxed text-[var(--label-3)]">
+              {form.durationSec > 0
+                ? `窗口内超过 ${ruleAlertRatioPct(form)}% 的时间越限才告警，越限时间降到 ${ruleRecoverRatioPct(form)}% 以下才恢复，避免偶发波动反复通知。`
+                : "每次采样即判定"}
+            </p>
+          </>
         ) : null}
         {isOfflineRule ? (
           <p className="text-xs leading-relaxed text-[var(--label-3)]">
@@ -683,17 +741,28 @@ export function AlertRuleDrawer({
         >
           <RuleMultiSelect
             id="alert-rule-channels"
-            summary={`已选 ${form.channelIds.length} 项`}
+            summary={`已选 ${selectedChannelIds.length} 项`}
             emptyText="全部已启用渠道"
             options={channelOptions}
             selected={form.channelIds}
             disabled={busy}
-            onToggle={(value, checked) =>
+            onToggle={(value, checked) => {
               patchForm({
                 channelIds: toggleListValue(form.channelIds, value, checked),
-              })
-            }
+              });
+              clearErrorField("channels");
+            }}
           />
+          {ruleErrors.channels ? (
+            <p className={adminFieldErrorClass} aria-live="polite">
+              {ruleErrors.channels}
+            </p>
+          ) : null}
+          {selectedDisabledChannels.length > 0 ? (
+            <p className="mt-1.5 text-[12px] leading-relaxed text-[var(--label-3)]" role="status">
+              已停用的渠道不会收到通知。
+            </p>
+          ) : null}
         </AdminGroupedFieldRow>
         <AdminGroupedSwitchRow
           label="恢复时通知"
