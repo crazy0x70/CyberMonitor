@@ -25,6 +25,14 @@ type agentRunner struct {
 	runtimeCfg          *runtimeConfig
 	testCache           map[string]cachedTest
 	lastTestConfigSig   string
+	probeMu             sync.Mutex
+	probeRunning        bool
+	probeLastConfigSig  string
+	probeNextDue        time.Time
+	probeSnapshot       []metrics.NetworkTestResult
+	probeDirty          bool
+	probeSeq            uint64
+	probeWG             sync.WaitGroup
 	agentToken          string
 	agentTokenDurable   bool
 	nextRegisterAttempt time.Time
@@ -262,8 +270,13 @@ func (r *agentRunner) applyRemoteConfig(ctx context.Context, remote RemoteConfig
 		return
 	}
 	if !r.agentTokenDurable {
-		r.logControlPlaneError("拒绝执行远程更新", "token-not-durable",
-			fmt.Errorf("Agent 专属凭据尚未可靠写入 %s", strings.TrimSpace(r.cfg.TokenFile)))
+		msg := fmt.Sprintf("Agent 专属凭据尚未可靠写入 %s，无法执行远程更新", strings.TrimSpace(r.cfg.TokenFile))
+		r.logControlPlaneError("拒绝执行远程更新", "token-not-durable", errors.New(msg))
+		reportCtx, cancel := context.WithTimeout(ctx, updateReportTimeout)
+		if err := r.reportUpdateWithToken(reportCtx, r.agentToken, remote.Update.ID, "failed", strings.TrimSpace(remote.Update.Version), msg); err != nil {
+			log.Printf("上报 Agent 远程更新失败状态失败: %v", err)
+		}
+		cancel()
 		return
 	}
 	r.logControlPlaneError("拒绝执行远程更新", "", nil)
@@ -352,21 +365,96 @@ func (r *agentRunner) collectAndReport(ctx context.Context) {
 	if group != "" {
 		sample.NodeGroup = group
 	}
-	configChanged := false
-	if configSig := networkTestConfigSignature(tests); configSig != r.lastTestConfigSig {
-		r.lastTestConfigSig = configSig
-		configChanged = true
-	}
-	if testsSnapshot, resultsChanged := runNetworkTestsWithCache(ctx, tests, interval, r.testCache, configChanged); configChanged || resultsChanged {
+	// 异步触发网络探测，避免不可达目标的 DNS/ICMP 超时（最高 12s+）阻塞 1s 心跳导致节点误离线。
+	r.triggerProbeSweepIfNeeded(ctx, tests, interval)
+	probeSnapshot, probeSeq, hasProbeUpdate := r.peekPendingProbeResults()
+	if hasProbeUpdate {
 		sample.NetworkTestsChanged = true
-		sample.NetworkTests = testsSnapshot
+		sample.NetworkTests = probeSnapshot
 	}
 
 	if err := r.reportStats(ctx, sample); err != nil {
 		r.logControlPlaneError("上报失败", err.Error(), err)
 		return
 	}
+	if hasProbeUpdate {
+		r.ackPendingProbeResults(probeSeq)
+	}
 	r.logControlPlaneError("上报失败", "", nil)
+}
+
+func (r *agentRunner) triggerProbeSweepIfNeeded(ctx context.Context, tests []metrics.NetworkTestConfig, interval time.Duration) {
+	configSig := networkTestConfigSignature(tests)
+	now := time.Now()
+
+	r.probeMu.Lock()
+	configChanged := configSig != r.probeLastConfigSig
+	if r.probeRunning {
+		r.probeMu.Unlock()
+		return
+	}
+	if !configChanged {
+		if len(tests) == 0 {
+			r.probeMu.Unlock()
+			return
+		}
+		if !r.probeNextDue.IsZero() && now.Before(r.probeNextDue) {
+			r.probeMu.Unlock()
+			return
+		}
+	}
+	r.probeRunning = true
+	testsCopy := append([]metrics.NetworkTestConfig(nil), tests...)
+	r.probeWG.Add(1)
+	r.probeMu.Unlock()
+
+	go func() {
+		defer r.probeWG.Done()
+		var (
+			snapshot       []metrics.NetworkTestResult
+			resultsChanged bool
+			nextDue        time.Time
+		)
+		runRecovered("网络探测", func() {
+			snapshot, resultsChanged = runNetworkTestsWithCache(ctx, testsCopy, interval, r.testCache, configChanged)
+			nextDue = nextProbeDueTime(testsCopy, interval, r.testCache)
+		})
+		r.probeMu.Lock()
+		r.probeRunning = false
+		r.probeLastConfigSig = configSig
+		r.probeNextDue = nextDue
+		if configChanged || resultsChanged {
+			r.probeSnapshot = snapshot
+			r.probeDirty = true
+			r.probeSeq++
+		}
+		r.probeMu.Unlock()
+	}()
+}
+
+func (r *agentRunner) peekPendingProbeResults() ([]metrics.NetworkTestResult, uint64, bool) {
+	r.probeMu.Lock()
+	defer r.probeMu.Unlock()
+	if !r.probeDirty {
+		return nil, 0, false
+	}
+	copied := make([]metrics.NetworkTestResult, len(r.probeSnapshot))
+	for i, item := range r.probeSnapshot {
+		if item.LatencyMs != nil {
+			v := *item.LatencyMs
+			item.LatencyMs = &v
+		}
+		copied[i] = item
+	}
+	return copied, r.probeSeq, true
+}
+
+func (r *agentRunner) ackPendingProbeResults(seq uint64) {
+	r.probeMu.Lock()
+	if r.probeSeq == seq {
+		r.probeDirty = false
+	}
+	r.probeMu.Unlock()
 }
 
 func (r *agentRunner) reportStats(ctx context.Context, sample metrics.NodeStats) error {

@@ -69,9 +69,9 @@ export function AdminSaveBar({
   return (
     <div
       className={cn(
-        "sticky bottom-4 z-30 mx-auto flex h-[52px] w-fit items-center justify-between gap-4 rounded-[var(--r-full)] border border-[var(--hairline)] bg-[var(--mat-bar-bg)] pl-5 pr-2 shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-3)] [-webkit-backdrop-filter:var(--blur-regular)] [backdrop-filter:var(--blur-regular)]",
+        "sticky bottom-4 z-30 mx-auto flex min-h-[52px] w-fit max-w-full flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-[var(--r-full)] border border-[var(--hairline)] bg-[var(--mat-bar-bg)] py-2 pl-5 pr-2 shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-3)] [-webkit-backdrop-filter:var(--blur-regular)] [backdrop-filter:var(--blur-regular)]",
         "animate-in fade-in slide-in-from-bottom-6 [animation-duration:var(--dur-4)] [animation-timing-function:var(--ease-spring)]",
-        "max-sm:w-[calc(100%-24px)] max-sm:bottom-[calc(12px+env(safe-area-inset-bottom))]",
+        "max-sm:w-[calc(100%-24px)] max-sm:rounded-[var(--r-lg)] max-sm:px-3.5 max-sm:bottom-[calc(12px+env(safe-area-inset-bottom))]",
         className,
       )}
     >

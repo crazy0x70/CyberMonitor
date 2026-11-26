@@ -137,11 +137,15 @@ function saveThemeMode(mode) {
   }
 }
 
-function closeChoiceMenus(except = null) {
+function closeChoiceMenus(except = null, restoreFocus = false) {
   menuControllers.forEach((controller) => {
     if (controller === except) return;
+    const wasOpen = !controller.panel.hidden;
     controller.toggle.setAttribute("aria-expanded", "false");
     controller.panel.hidden = true;
+    if (restoreFocus && wasOpen) {
+      controller.toggle.focus();
+    }
   });
 }
 
@@ -156,6 +160,14 @@ function setupChoiceMenu(toggle, panel) {
     closeChoiceMenus(willOpen ? controller : null);
     panel.hidden = !willOpen;
     toggle.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    if (willOpen) {
+      const target =
+        panel.querySelector('[aria-checked="true"]:not([disabled])') ||
+        panel.querySelector("button:not([disabled])");
+      if (target) {
+        target.focus();
+      }
+    }
   });
 
   panel.addEventListener("click", (event) => {
@@ -199,7 +211,7 @@ function setupThemeControls() {
       saveThemeMode(mode);
       resolved = applyTheme(mode);
       updateThemeToggle(mode, resolved);
-      closeChoiceMenus();
+      closeChoiceMenus(null, true);
     });
   });
 
@@ -260,7 +272,7 @@ function setupLanguageControls() {
   document.querySelectorAll("[data-locale-option]").forEach((item) => {
     item.addEventListener("click", () => {
       requestLocale(item.getAttribute("data-locale-option"));
-      closeChoiceMenus();
+      closeChoiceMenus(null, true);
     });
   });
 
@@ -278,7 +290,7 @@ function setupGlobalMenuDismiss() {
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      closeChoiceMenus();
+      closeChoiceMenus(null, true);
       return;
     }
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;

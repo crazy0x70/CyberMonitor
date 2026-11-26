@@ -933,13 +933,15 @@ func (s *Store) evaluateThresholdRuleLocked(rule AlertRule, nodeIDs []string, no
 	for _, nodeID := range nodeIDs {
 		node := s.nodes[nodeID]
 		profile := s.profiles[nodeID]
-		if !isAlertEnabled(profile) {
-			continue
-		}
-		if !ruleScopeMatches(rule.Scope, nodeID, profile) {
-			continue
-		}
 		key := ruleStateKey(nodeID, rule.ID)
+		if !isAlertEnabled(profile) || !ruleScopeMatches(rule.Scope, nodeID, profile) {
+			if _, exists := s.alertStates[key]; exists {
+				delete(s.alertStates, key)
+				changed = true
+			}
+			delete(s.ruleSamples, key)
+			continue
+		}
 		state, hasState := s.alertStates[key]
 
 		// 待恢复补发：OK 状态但上一轮恢复通知未送达全部渠道。恢复素材只读恢复瞬间
@@ -1274,12 +1276,13 @@ func (s *Store) collectExpiryEventsLocked(rule AlertRule, now time.Time) ([]Rule
 	return events, changed
 }
 
-// alertCalendarDaysUntil 计算本地日历日差（now → expireAt）。
+// alertCalendarDaysUntil 计算与 now 同处一个时区的日历日差（now → expireAt）。
+// 转为 UTC 零点后再相减，避免夏令时 23h/25h 切换日导致按 24 小时整除时跳过提醒点。
 func alertCalendarDaysUntil(now time.Time, expireAt int64) int {
-	expire := time.Unix(expireAt, 0)
-	nowDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	expireDay := time.Date(expire.Year(), expire.Month(), expire.Day(), 0, 0, 0, 0, expire.Location())
-	return int(expireDay.Sub(nowDay).Hours() / 24)
+	expire := time.Unix(expireAt, 0).In(now.Location())
+	nowDayUTC := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	expireDayUTC := time.Date(expire.Year(), expire.Month(), expire.Day(), 0, 0, 0, 0, time.UTC)
+	return int(expireDayUTC.Sub(nowDayUTC) / (24 * time.Hour))
 }
 
 // collectTrafficQuotaEventsLocked 评估流量配额（每分钟）：从 threshold（默认 80）起
@@ -1412,6 +1415,18 @@ func normalizeTrafficResetDay(day int) int {
 	return day
 }
 
+// clearNodeRuleStatesLocked 清理单节点的全部规则评估状态与样本环（禁用告警或删除节点时调用，
+// 防止残留 FIRING 状态永久污染首页告警计数）。
+func (s *Store) clearNodeRuleStatesLocked(nodeID string) {
+	deleteRuleAlertStatesForNode(s.alertStates, nodeID)
+	prefix := nodeID + "|"
+	for key := range s.ruleSamples {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.ruleSamples, key)
+		}
+	}
+}
+
 // clearRuleSamplesLocked 清空全部阈值类样本环（规则列表变更后调用：旧样本的
 // violated 语义基于旧阈值，继续使用会造成误判；环在后续 tick 内自然重建）。
 func (s *Store) clearRuleSamplesLocked() {
@@ -1477,6 +1492,12 @@ func (s *Store) applyTrafficCounterLocked(nodeID string, profile *NodeProfile, s
 			LastRecv:   recv,
 		}
 		return true, true
+	}
+	// 保护：在线上报节点的收发总字节不可能同时跌回 0（瞬时 net.IOCounters 失败会导致
+	// Agent 上报 0/0）；忽略该帧避免 LastSent/LastRecv 归零后在下一秒把整机开机以来
+	// 的历史总流量一次性累加进月度配额。
+	if sent == 0 && recv == 0 && (counter.LastSent > 0 || counter.LastRecv > 0) {
+		return false, false
 	}
 	if counter.CycleStart <= 0 || cycleStart.Unix() > counter.CycleStart {
 		// 新周期：清零累计，Last 基线切换为当前上报值。
@@ -1697,33 +1718,38 @@ func logRuleNoticeEvents(batches []RuleNoticeBatch) {
 
 // ===== 消息泛化（buildEventMessage 四类示例格式） =====
 
-// buildRuleNoticeMessage 组装一个批次的完整消息：单节点时保持文档示例的单行格式，
-// 多节点时标题行 + 项目符号行（沿用离线告警的合并做法）。
+// buildRuleNoticeMessage 组装一个批次的完整消息：首行作为各渠道推送标题/邮件主题，
+// 后续行展示精炼结构化详情；多节点事件合并为标题 + 项目符号列表。
 func buildRuleNoticeMessage(batch RuleNoticeBatch, events []RuleAlertEvent) string {
 	siteTitle := normalizeSiteTitle(batch.SiteTitle)
 	rule := batch.Rule
 	switch rule.Metric {
 	case alertMetricExpiry:
 		if len(events) == 1 {
-			return fmt.Sprintf("⏳ %s 将于 %d 天后到期（%s）", events[0].Display, events[0].Days, events[0].ExpireDate)
+			return strings.Join([]string{
+				fmt.Sprintf("【%s】⏳ 到期提醒 · %s", siteTitle, events[0].Display),
+				fmt.Sprintf("剩余时间：%d 天（%s 到期）", events[0].Days, events[0].ExpireDate),
+			}, "\n")
 		}
-		lines := []string{"⏳ 节点到期提醒"}
+		lines := []string{fmt.Sprintf("【%s】⏳ 节点到期提醒（%d 台）", siteTitle, len(events))}
 		for _, event := range events {
-			lines = append(lines, fmt.Sprintf("• %s 将于 %d 天后到期（%s）", event.Display, event.Days, event.ExpireDate))
+			lines = append(lines, fmt.Sprintf("• %s · 剩余 %d 天（%s 到期）", event.Display, event.Days, event.ExpireDate))
 		}
 		return strings.Join(lines, "\n")
 	case alertMetricTrafficQuota:
 		if len(events) == 1 {
-			return fmt.Sprintf("📶 %s 本月流量已用 %s（%s / %s）",
-				events[0].Display,
-				formatTrafficPercent(events[0].Value),
-				formatTrafficBytes(events[0].UsedBytes),
-				formatTrafficBytes(events[0].QuotaBytes),
-			)
+			return strings.Join([]string{
+				fmt.Sprintf("【%s】📶 流量提醒 · %s", siteTitle, events[0].Display),
+				fmt.Sprintf("本月已用：%s（%s / %s）",
+					formatTrafficPercent(events[0].Value),
+					formatTrafficBytes(events[0].UsedBytes),
+					formatTrafficBytes(events[0].QuotaBytes),
+				),
+			}, "\n")
 		}
-		lines := []string{"📶 节点流量提醒"}
+		lines := []string{fmt.Sprintf("【%s】📶 节点流量提醒（%d 台）", siteTitle, len(events))}
 		for _, event := range events {
-			lines = append(lines, fmt.Sprintf("• %s 本月流量已用 %s（%s / %s）",
+			lines = append(lines, fmt.Sprintf("• %s · 本月已用 %s（%s / %s）",
 				event.Display,
 				formatTrafficPercent(event.Value),
 				formatTrafficBytes(event.UsedBytes),
@@ -1736,70 +1762,54 @@ func buildRuleNoticeMessage(batch RuleNoticeBatch, events []RuleAlertEvent) stri
 	meta := alertRuleMetricTable[rule.Metric]
 	condition := ruleConditionText(rule)
 	// 窗口类阈值规则（duration_sec>0）：告警主信息是判定依据（窗口内越限时间占比），
-	// 瞬时值降为括号里的次要信息。否则用户会把低于阈值的瞬时值当成“告警值”，
-	// 也会把“持续 1 分钟”读成“连续 1 分钟越限”。
+	// 瞬时值降为括号里的次要信息。
 	windowAlert := rule.DurationSec > 0
 	if batch.Kind == ruleNoticeRecovery {
-		if len(events) == 1 {
-			if events[0].RecoverySnapshotMissing {
-				// 旧 state.json 的待补发状态没有恢复快照：不拿当前值/时刻伪造。
-				return fmt.Sprintf("【%s】✅ 已恢复 · %s · %s 恢复时数值未知，持续时长未知",
-					siteTitle, rule.Name, events[0].Display)
-			}
-			return fmt.Sprintf("【%s】✅ 已恢复 · %s · %s 当前 %s，持续 %s%s",
-				siteTitle, rule.Name, events[0].Display,
-				formatRuleMetricValue(rule.Metric, meta, events[0].Value),
-				formatAlertDuration(events[0].DurationSec),
-				ruleRecoveredRatioText(rule, events[0].ViolatedRatio),
-			)
-		}
-		lines := []string{fmt.Sprintf("【%s】✅ 已恢复 · %s", siteTitle, rule.Name)}
-		for _, event := range events {
+		formatRecoverDetail := func(event RuleAlertEvent) string {
 			if event.RecoverySnapshotMissing {
-				lines = append(lines, fmt.Sprintf("• %s 恢复时数值未知，持续时长未知", event.Display))
-				continue
+				return "恢复时数值未知，持续时长未知"
 			}
-			lines = append(lines, fmt.Sprintf("• %s 当前 %s，持续 %s%s",
-				event.Display,
+			return fmt.Sprintf("当前 %s，持续 %s%s",
 				formatRuleMetricValue(rule.Metric, meta, event.Value),
 				formatAlertDuration(event.DurationSec),
 				ruleRecoveredRatioText(rule, event.ViolatedRatio),
-			))
-		}
-		return strings.Join(lines, "\n")
-	}
-	if windowAlert {
-		if len(events) == 1 {
-			return fmt.Sprintf("【%s】⚠️ %s · %s %s（%s）",
-				siteTitle, rule.Name, events[0].Display,
-				ruleWindowAlertText(rule, events[0].ViolatedRatio),
-				ruleAlertValueText(rule, meta, events[0]),
 			)
 		}
-		lines := []string{fmt.Sprintf("【%s】⚠️ %s", siteTitle, rule.Name)}
+		if len(events) == 1 {
+			return strings.Join([]string{
+				fmt.Sprintf("【%s】✅ 告警恢复 · %s", siteTitle, rule.Name),
+				fmt.Sprintf("节点：%s", events[0].Display),
+				fmt.Sprintf("详情：%s", formatRecoverDetail(events[0])),
+			}, "\n")
+		}
+		lines := []string{fmt.Sprintf("【%s】✅ 告警恢复 · %s（%d 台）", siteTitle, rule.Name, len(events))}
 		for _, event := range events {
-			lines = append(lines, fmt.Sprintf("• %s %s（%s）",
-				event.Display,
-				ruleWindowAlertText(rule, event.ViolatedRatio),
-				ruleAlertValueText(rule, meta, event),
-			))
+			lines = append(lines, fmt.Sprintf("• %s · %s", event.Display, formatRecoverDetail(event)))
 		}
 		return strings.Join(lines, "\n")
 	}
-	if len(events) == 1 {
-		return fmt.Sprintf("【%s】⚠️ %s · %s %s（%s）",
-			siteTitle, rule.Name, events[0].Display,
-			ruleAlertValueText(rule, meta, events[0]),
+	formatAlertDetail := func(event RuleAlertEvent) string {
+		if windowAlert {
+			return fmt.Sprintf("%s（%s）",
+				ruleWindowAlertText(rule, event.ViolatedRatio),
+				ruleAlertValueText(rule, meta, event),
+			)
+		}
+		return fmt.Sprintf("%s（%s）",
+			ruleAlertValueText(rule, meta, event),
 			condition,
 		)
 	}
-	lines := []string{fmt.Sprintf("【%s】⚠️ %s", siteTitle, rule.Name)}
+	if len(events) == 1 {
+		return strings.Join([]string{
+			fmt.Sprintf("【%s】⚠️ 告警触发 · %s", siteTitle, rule.Name),
+			fmt.Sprintf("节点：%s", events[0].Display),
+			fmt.Sprintf("详情：%s", formatAlertDetail(events[0])),
+		}, "\n")
+	}
+	lines := []string{fmt.Sprintf("【%s】⚠️ 告警触发 · %s（%d 台）", siteTitle, rule.Name, len(events))}
 	for _, event := range events {
-		lines = append(lines, fmt.Sprintf("• %s %s（%s）",
-			event.Display,
-			ruleAlertValueText(rule, meta, event),
-			condition,
-		))
+		lines = append(lines, fmt.Sprintf("• %s · %s", event.Display, formatAlertDetail(event)))
 	}
 	return strings.Join(lines, "\n")
 }

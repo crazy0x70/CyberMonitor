@@ -464,10 +464,11 @@ function formDraftSignature(form: FormState) {
   });
 }
 
-function formSourceSignature(form: FormState, catalogSignature: string) {
+function formSourceSignature(form: FormState, catalogSignature: string, alertRulesSignature: string) {
   return JSON.stringify({
     draft: formDraftSignature(form),
     testCatalog: catalogSignature,
+    alertRules: alertRulesSignature,
   });
 }
 
@@ -634,7 +635,7 @@ const nodeTableColumns: ReadonlyArray<AdminDataTableColumn<NodeListEntry>> = [
     key: "renew",
     label: "续期",
     width: "180px",
-    render: (entry) => formatNodeRenewal(entry.node),
+    render: (entry) => <span className="tabular-nums">{formatNodeRenewal(entry.node)}</span>,
   },
 ];
 
@@ -1143,7 +1144,8 @@ export default function ServerManagement({
     const nextKey = editingNodeId;
     const nextForm = buildFormState(editingNode, testCatalog);
     const nextDraftSignature = formDraftSignature(nextForm);
-    const nextSourceSignature = formSourceSignature(nextForm, testCatalogSignature);
+    const alertRulesSignature = JSON.stringify(settings?.alert_rules ?? []);
+    const nextSourceSignature = formSourceSignature(nextForm, testCatalogSignature, alertRulesSignature);
     const currentDraftMatchesIncoming = currentFormSignature === nextDraftSignature;
     if (formInitializationKeyRef.current !== nextKey) {
       setForm(nextForm);
@@ -1162,9 +1164,11 @@ export default function ServerManagement({
       return;
     }
     if (isEditingDraftDirty) {
-      if (currentDraftMatchesIncoming) {
+      if (currentDraftMatchesIncoming && !nodeRulesDirty) {
         formBaselineSignatureRef.current = nextDraftSignature;
         formSourceSignatureRef.current = nextSourceSignature;
+        setNodeRules((settings?.alert_rules ?? []).map(makeRuleDraft));
+        nodeRulesBaselineRef.current = settings?.alert_rules ?? [];
         setSourceConflict(false);
         return;
       }
@@ -1174,10 +1178,12 @@ export default function ServerManagement({
       return;
     }
     setForm(nextForm);
+    setNodeRules((settings?.alert_rules ?? []).map(makeRuleDraft));
+    nodeRulesBaselineRef.current = settings?.alert_rules ?? [];
     setSourceConflict(false);
     formBaselineSignatureRef.current = nextDraftSignature;
     formSourceSignatureRef.current = nextSourceSignature;
-  }, [currentFormSignature, deleting, editingNode, editingNodeId, isEditingDraftDirty, saving, settings?.alert_rules, testCatalog, testCatalogSignature]);
+  }, [currentFormSignature, deleting, editingNode, editingNodeId, isEditingDraftDirty, nodeRulesDirty, saving, settings?.alert_rules, testCatalog, testCatalogSignature]);
 
   const patchForm = (updater: (current: FormState) => FormState) => {
     if (editorInputDisabled) {
@@ -1484,6 +1490,10 @@ export default function ServerManagement({
           if (!saved) {
             return;
           }
+          // 告警规则已成功提交，立即推进本地规则基线，避免后续节点设置保存失败导致基线陈旧。
+          const committedRules = saved.alert_rules ?? merged;
+          nodeRulesBaselineRef.current = committedRules;
+          setNodeRules(committedRules.map(makeRuleDraft));
         }
         let profileSaved = false;
         await runAction({
@@ -2255,26 +2265,34 @@ export default function ServerManagement({
                     //（编辑即写入手动选择，active 变 true 后复选框恢复可操作）。
                     const scoped = itemId ? scopedTestIdSet.has(itemId) : false;
                     const scopedOnly = scoped && !active;
+                    const checkboxId = `node-probe-check-${itemId || endpoint}`;
+                    const probeName = item.name || host || "未命名探测目标";
                     return (
-                      <label
+                      <div
                         key={item.id || endpoint}
                         className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-[var(--separator)] py-2.5 last:border-b-0"
                       >
-                        <input
-                          type="checkbox"
-                          className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-[var(--primary-ring)] dark:border-neutral-700 dark:bg-[var(--surface-2)]"
-                          checked={active || scoped}
-                          disabled={!itemId || editorInputDisabled || scopedOnly}
-                          onChange={() => handleToggleTest(entry)}
-                        />
-                        <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2">
-                          <span className="text-sm font-medium text-[var(--label-1)]">
-                            {item.name || host || "未命名探测目标"}
+                        <label
+                          htmlFor={checkboxId}
+                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-3"
+                        >
+                          <input
+                            id={checkboxId}
+                            type="checkbox"
+                            className="h-4 w-4 shrink-0 rounded border-slate-300 text-primary focus:ring-[var(--primary-ring)] dark:border-neutral-700 dark:bg-[var(--surface-2)]"
+                            checked={active || scoped}
+                            disabled={!itemId || editorInputDisabled || scopedOnly}
+                            onChange={() => handleToggleTest(entry)}
+                          />
+                          <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2">
+                            <span className="text-sm font-medium text-[var(--label-1)]">
+                              {probeName}
+                            </span>
+                            <span className="data-text truncate text-xs text-[var(--label-3)]">
+                              {endpoint}
+                            </span>
                           </span>
-                          <span className="data-text truncate text-xs text-[var(--label-3)]">
-                            {endpoint}
-                          </span>
-                        </span>
+                        </label>
                         <span className="text-xs text-[var(--label-3)]">{isTCP ? "TCP" : "ICMP"}</span>
                         {scopedOnly ? (
                           <span className="text-xs text-[var(--label-3)]">来自探测设置</span>
@@ -2283,7 +2301,8 @@ export default function ServerManagement({
                         <span className="flex items-center gap-1.5">
                           <Input
                             name={itemId ? `probe-interval-${itemId}` : "probe-interval"}
-                            className="h-9 w-20 rounded-lg border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] text-sm"
+                            aria-label={`${probeName} 探测间隔（秒）`}
+                            className="h-9 w-20 rounded-lg border-[var(--cm-control-border)] bg-[var(--cm-control-bg)] text-sm tabular-nums"
                             type="number"
                             min={0}
                             max={MAX_TCP_INTERVAL}
@@ -2301,7 +2320,7 @@ export default function ServerManagement({
                           />
                           <span className="text-xs text-[var(--label-3)]">秒</span>
                         </span>
-                      </label>
+                      </div>
                     );
                   })}
                 </div>

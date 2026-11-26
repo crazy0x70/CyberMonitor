@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { RefreshCw, Server } from "lucide-react";
+import { Server } from "lucide-react";
 import { AdminPageHeader } from "@/components/admin-page-header";
 import { AdminPanel } from "@/components/admin-panel";
 import { AdminDataTable, type AdminDataTableColumn } from "@/components/admin-data-table";
@@ -30,7 +30,6 @@ import type {
 import {
   formatBinaryBytes,
   formatUptimeZh,
-  formatVersionLabel,
   nodeDiskPercent,
   resolveNodeId,
   resolveNodeName,
@@ -61,10 +60,6 @@ const PROBES_OVERVIEW_POLL_MS = 60_000;
 const dashboardShellClass =
   "mx-auto w-full max-w-[1200px] space-y-6 text-slate-900 dark:text-neutral-100";
 
-// 内联文字链按钮（与设置页同一规格）：用于从表格尾部/空态跳到探测设置页。
-const probeInlineLinkClass =
-  "inline rounded-[var(--r-sm)] font-medium text-[var(--accent-text)] underline decoration-[color-mix(in_srgb,var(--accent-text)_45%,transparent)] underline-offset-2 transition-colors duration-150 hover:text-[var(--accent)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)]";
-
 // =====================================================================
 // F7 前端派生（纯函数，evolution_log §5 F7 测试第 3 条）：
 // 全部不触碰组件状态，输入 nodes / targets 快照即可复算。
@@ -88,44 +83,34 @@ export function deriveDashboardNodeKpis(nodes: readonly NodeView[]): DashboardNo
   };
 }
 
-export interface DashboardProbeKpis {
-  samples: number;
-  okSamples: number;
-  availabilityPct: number | null;
-  avgLatencyMs: number | null;
+export interface DashboardTrafficKpis {
+  txBytesPerSec: number;
+  rxBytesPerSec: number;
+  totalBytesPerSec: number;
 }
 
-// 探测可用率：所有节点 × 探测目标中 status=="ok" 的占比；平均延迟取有效样本均值。
-export function deriveDashboardProbeKpis(nodes: readonly NodeView[]): DashboardProbeKpis {
-  let samples = 0;
-  let okSamples = 0;
-  let latencySum = 0;
-  let latencyCount = 0;
+// 流量概览：汇总当前所有在线节点的实时上行 / 下行字节速率。
+export function deriveDashboardTrafficKpis(nodes: readonly NodeView[]): DashboardTrafficKpis {
+  let txBytesPerSec = 0;
+  let rxBytesPerSec = 0;
   for (const node of nodes) {
-    const tests = node.stats?.network_tests;
-    if (!Array.isArray(tests)) {
+    if (node.status !== "online") {
       continue;
     }
-    for (const test of tests) {
-      if (!test) {
-        continue;
-      }
-      samples += 1;
-      if (test.status === "ok") {
-        okSamples += 1;
-      }
-      const latency = test.latency_ms;
-      if (typeof latency === "number" && Number.isFinite(latency) && latency >= 0) {
-        latencySum += latency;
-        latencyCount += 1;
-      }
+    const net = node.stats?.network;
+    const tx = Number(net?.tx_bytes_per_sec);
+    const rx = Number(net?.rx_bytes_per_sec);
+    if (Number.isFinite(tx) && tx > 0) {
+      txBytesPerSec += tx;
+    }
+    if (Number.isFinite(rx) && rx > 0) {
+      rxBytesPerSec += rx;
     }
   }
   return {
-    samples,
-    okSamples,
-    availabilityPct: samples > 0 ? (okSamples / samples) * 100 : null,
-    avgLatencyMs: latencyCount > 0 ? latencySum / latencyCount : null,
+    txBytesPerSec,
+    rxBytesPerSec,
+    totalBytesPerSec: txBytesPerSec + rxBytesPerSec,
   };
 }
 
@@ -175,104 +160,70 @@ export function deriveDashboardResourceHotspots(
   );
 }
 
-export interface ProbeNodeRow {
+export interface NodeHealthRow {
   nodeId: string;
   nodeName: string;
   online: boolean;
-  targets: number;
+  cpuPct: number | null;
+  memPct: number | null;
+  diskPct: number | null;
+  txBytesPerSec: number;
+  rxBytesPerSec: number;
+  uptimeSec: number;
   samples: number;
   availabilityPct?: number;
-  avgLatencyMs?: number | null;
-  p95LatencyMs?: number | null;
-  avgLossPct?: number | null;
 }
 
-// nodeHasProbeConfig 判定节点是否配置了探测：手动下发（test_selections）或范围
-// 下发（scoped_test_ids）任一非空。口径与 ProbeSettings 的 countManualProbeNodes /
-// 节点抽屉「探测下发策略」一致。
-export function nodeHasProbeConfig(node: NodeView): boolean {
-  return (node.test_selections?.length ?? 0) > 0 || (node.scoped_test_ids?.length ?? 0) > 0;
-}
-
-// 配置的探测目标数（P3）：手动下发与范围下发的目标去重计数，口径与节点抽屉的
-// 「探测下发策略」一致（同一目录项只算一个，手动选择优先、范围下发项不重复）。
-// 服务端 overview 的 targets 只统计窗口内有采样点的目标，窗口内无数据的节点会
-// 得到 0；这类行改用本函数，避免「已配置探测却显示 0 个目标」的自相矛盾。
-export function countConfiguredProbeTargets(node: NodeView): number {
-  const targets = new Set<string>();
-  for (const selection of node.test_selections || []) {
-    const id = (selection?.test_id || "").trim();
-    if (id) {
-      targets.add(id);
-    }
-  }
-  for (const id of node.scoped_test_ids || []) {
-    const trimmed = (id || "").trim();
-    if (trimmed) {
-      targets.add(trimmed);
-    }
-  }
-  return targets.size;
-}
-
-// deriveProbeNodeRows 生成探测表行。入表条件按配置判定，不按窗口内是否采样：
-// 离线时长 ≥ 所选范围、刚接入或历史查询失败的节点在窗口内没有数据，但它们恰恰
-// 最该被看到。因此：
-// - 配置了探测的节点一律入表（无数据时 targets 取配置的目标数、samples=0，并排到
-//   后面）；
-// - 没配置但窗口内有数据（服务端已聚合出探测目标/样本）的节点防御性保留；
-// - 两者皆无的节点由调用方汇总成「另有 N 个节点未配置探测目标」。
-// includeConfiguredWithoutData 为 false（探测数据尚未就绪）时不补无数据行，避免
-// 把加载中的 0 当成事实显示。
-export function deriveProbeNodeRows(
+// deriveNodeHealthRows 生成全宽「节点健康度」表行：
+// 覆盖所有节点（含离线及未配置探测目标的节点），将主机资源健康（CPU / 内存 / 磁盘 /
+// 实时带宽 / 运行时长）与探测可用率合为一张总览表。
+// 排序：离线节点优先 -> 探测可用率异常优先 -> 资源最高占用率降序 -> 节点名称自然序。
+export function deriveNodeHealthRows(
   overviewNodes: readonly ProbeNodeOverview[],
   nodes: readonly NodeView[],
-  options: { includeConfiguredWithoutData?: boolean } = {},
-): ProbeNodeRow[] {
+): NodeHealthRow[] {
   const overviewById = new Map(overviewNodes.map((item) => [item.node_id, item]));
-  const rows: ProbeNodeRow[] = [];
+  const rows: NodeHealthRow[] = [];
   for (const node of nodes) {
     const nodeId = resolveNodeId(node);
     if (!nodeId) {
       continue;
     }
+    const stats = node.stats;
     const overview = overviewById.get(nodeId);
-    const hasWindowData = Boolean(overview && (overview.targets > 0 || overview.samples > 0));
-    const configured = nodeHasProbeConfig(node);
-    if (!hasWindowData && !(configured && options.includeConfiguredWithoutData)) {
-      continue;
-    }
+    const online = node.status === "online";
+    const cpuRaw = Number(stats?.cpu?.usage_percent);
+    const memRaw = Number(stats?.memory?.used_percent);
+    const diskPct = stats ? nodeDiskPercent(stats) : null;
+    const txRaw = Number(stats?.network?.tx_bytes_per_sec);
+    const rxRaw = Number(stats?.network?.rx_bytes_per_sec);
     rows.push({
       nodeId,
       nodeName: resolveNodeName(node),
-      online: node.status === "online",
-      // P3：窗口内无数据时用配置的目标数（去重后），不用服务端的采样口径 targets
-      // （只会统计有采样点的目标），否则「已配置探测」会显示成 0 个目标。
-      targets: hasWindowData ? (overview?.targets ?? 0) : countConfiguredProbeTargets(node),
+      online,
+      cpuPct: online && Number.isFinite(cpuRaw) ? cpuRaw : null,
+      memPct: online && Number.isFinite(memRaw) ? memRaw : null,
+      diskPct: online && diskPct != null && Number.isFinite(diskPct) ? diskPct : null,
+      txBytesPerSec: online && Number.isFinite(txRaw) && txRaw > 0 ? txRaw : 0,
+      rxBytesPerSec: online && Number.isFinite(rxRaw) && rxRaw > 0 ? rxRaw : 0,
+      uptimeSec: Number(stats?.uptime_sec || 0),
       samples: overview?.samples ?? 0,
       availabilityPct: overview?.availability_pct,
-      avgLatencyMs: overview?.avg_latency_ms,
-      p95LatencyMs: overview?.p95_latency_ms,
-      avgLossPct: overview?.avg_loss_pct,
     });
   }
   return rows.sort((a, b) => {
-    const aEmpty = a.samples === 0;
-    const bEmpty = b.samples === 0;
-    if (aEmpty !== bEmpty) {
-      return aEmpty ? 1 : -1;
+    if (a.online !== b.online) {
+      return a.online ? 1 : -1;
     }
-    const availabilityDiff = (a.availabilityPct ?? 0) - (b.availabilityPct ?? 0);
-    if (availabilityDiff !== 0) {
-      return availabilityDiff;
+    const aAvail = a.samples > 0 && a.availabilityPct != null ? a.availabilityPct : 100;
+    const bAvail = b.samples > 0 && b.availabilityPct != null ? b.availabilityPct : 100;
+    if (aAvail !== bAvail) {
+      return aAvail - bAvail;
     }
-    const lossDiff = (b.avgLossPct ?? 0) - (a.avgLossPct ?? 0);
-    if (lossDiff !== 0) {
-      return lossDiff;
-    }
-    const latencyDiff = (b.avgLatencyMs ?? 0) - (a.avgLatencyMs ?? 0);
-    if (latencyDiff !== 0) {
-      return latencyDiff;
+    const aPeak = Math.max(a.cpuPct ?? 0, a.memPct ?? 0, a.diskPct ?? 0);
+    const bPeak = Math.max(b.cpuPct ?? 0, b.memPct ?? 0, b.diskPct ?? 0);
+    if (aPeak !== bPeak) {
+      return bPeak - aPeak;
     }
     return compareNodeDisplayName(a.nodeName, b.nodeName);
   });
@@ -295,16 +246,25 @@ function formatDashboardClock(date: Date) {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function formatProbeMs(value: number | null | undefined) {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${Math.round(value)} ms`
-    : "—";
+function formatByteRate(bytesPerSec: number | null | undefined) {
+  const value = Number(bytesPerSec || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B/s";
+  }
+  return `${formatBinaryBytes(value)}/s`;
 }
 
-function formatProbeLoss(value: number | null | undefined) {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${Number(value.toFixed(1))}%`
-    : "—";
+function resourceUsageToneClass(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) {
+    return "text-[var(--label-3)]";
+  }
+  if (value >= 85) {
+    return "text-[var(--danger-text)] font-semibold";
+  }
+  if (value >= 60) {
+    return "text-[var(--warn-text)] font-medium";
+  }
+  return "text-[var(--label-1)]";
 }
 
 // 可用率配色（F7：<95% danger，<99% warn，≥99% 常规）。
@@ -337,46 +297,11 @@ const DASHBOARD_METER_STYLE = `
 }
 .cm-dashboard-meter-fill {
   position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  border-radius: 999px 2px 2px 999px;
-  transition: width var(--dur-5) var(--ease-spring);
-}
-.cm-dashboard-meter-fill::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  right: -12px;
-  width: 12px;
-  border-radius: 0 999px 999px 0;
-  background: linear-gradient(90deg, color-mix(in srgb, currentColor 50%, transparent), transparent);
-  pointer-events: none;
-}
-.cm-dashboard-meter-fill::before {
-  content: "";
-  position: absolute;
   inset: 0;
-  border-radius: inherit;
-  background: linear-gradient(100deg, transparent 0%, transparent 38%, rgba(255, 255, 255, 0.42) 50%, transparent 62%, transparent 100%);
-  background-size: 250% 100%;
-  background-position: 100% 0;
-  opacity: 0;
-  pointer-events: none;
-}
-@media (prefers-reduced-motion: no-preference) {
-  .cm-dashboard-meter-fill::before {
-    opacity: 1;
-    animation: cm-dashboard-ribbon-sheen 3.2s var(--ease-in-out, cubic-bezier(0.4, 0, 0.2, 1)) infinite;
-  }
-}
-@keyframes cm-dashboard-ribbon-sheen {
-  from { background-position: 100% 0; }
-  to { background-position: 0% 0; }
-}
-.dark .cm-dashboard-meter-fill::before {
-  background: linear-gradient(100deg, transparent 0%, transparent 38%, rgba(255, 255, 255, 0.22) 50%, transparent 62%, transparent 100%);
+  width: 100%;
+  border-radius: 999px;
+  transform-origin: left center;
+  transition: transform var(--dur-3) var(--ease-out);
 }
 `;
 
@@ -462,9 +387,9 @@ function DashboardKpiCard({
       {barTone ? (
         <span className="h-[3px] w-full overflow-hidden rounded-full bg-[var(--meter-track)]">
           <span
-            className="block h-full rounded-full [transition:width_var(--dur-2)]"
+            className="block h-full w-full origin-left rounded-full [transition:transform_var(--dur-2)_var(--ease-out)]"
             style={{
-              width: `${Math.min(100, Math.max(0, barPct ?? 0))}%`,
+              transform: `scaleX(${Math.min(100, Math.max(0, barPct ?? 0)) / 100})`,
               background: barTone === "ok" ? "var(--ok)" : "var(--danger)",
             }}
           />
@@ -475,93 +400,147 @@ function DashboardKpiCard({
   );
 }
 
+// 估算节点名展示宽度（px）：用于将列标题「节点名称」在左对齐的最长节点名宽度内居中。
+function estimateNodeNameBlockWidthPx(rows: readonly NodeHealthRow[]): number {
+  let maxTextPx = 0;
+  for (const row of rows) {
+    let px = 0;
+    for (const ch of row.nodeName) {
+      const code = ch.codePointAt(0) ?? 0;
+      if (code > 0x2e80) {
+        px += 14;
+      } else if (ch === " " || ch === "-" || ch === "." || ch === "i" || ch === "l" || ch === "1") {
+        px += 5.5;
+      } else if (code >= 65 && code <= 90) {
+        px += 9.5;
+      } else {
+        px += 8;
+      }
+    }
+    if (px > maxTextPx) {
+      maxTextPx = px;
+    }
+  }
+  // 含 6px 状态圆点 + 8px 间距 + 轻微余量，上限 260px 避免超长名挤压其它列。
+  return Math.round(Math.min(260, Math.max(84, maxTextPx + 22)));
+}
+
 // =====================================================================
-// 网络连通性表（F7 第二行左，M-01 D-05）：节点 | 探测目标 | 可用率 | 平均延迟
-// | P95 | 丢包。samples=0 的行后四列显示「—」。
+// 节点概览表（全宽 12 列，无内部纵向滚动条）：
+// 节点名称 | CPU | 内存 | 磁盘 | 实时带宽 | 运行时长 | 在线率
 // =====================================================================
 
-const probeTableColumns: ReadonlyArray<AdminDataTableColumn<ProbeNodeRow>> = [
-  {
-    key: "node",
-    label: "节点",
-    render: (row) => (
-      <span className="flex min-w-0 items-center gap-2 text-sm font-medium text-[var(--label-1)]">
+function buildNodeOverviewColumns(
+  nodeBlockWidthPx: number,
+): ReadonlyArray<AdminDataTableColumn<NodeHealthRow>> {
+  return [
+    {
+      key: "node",
+      label: (
         <span
-          aria-hidden="true"
+          className="inline-block text-center"
+          style={{ width: `${nodeBlockWidthPx}px`, maxWidth: "100%" }}
+        >
+          节点名称
+        </span>
+      ),
+      align: "left",
+      render: (row) => (
+        <span
+          className="flex items-center gap-2 text-left text-sm font-medium text-[var(--label-1)]"
+          style={{ maxWidth: `${nodeBlockWidthPx}px` }}
+          title={row.nodeName}
+        >
+          <span
+            aria-hidden="true"
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              row.online ? "bg-[var(--ok)]" : "bg-[var(--label-4)]",
+            )}
+          />
+          <span className="truncate">{row.nodeName}</span>
+        </span>
+      ),
+    },
+    {
+      key: "cpu",
+      label: "CPU",
+      align: "center",
+      render: (row) => (
+        <span className={cn("text-[13px] tabular-nums", resourceUsageToneClass(row.cpuPct))}>
+          {row.cpuPct == null ? "—" : formatDashboardPercent(row.cpuPct)}
+        </span>
+      ),
+    },
+    {
+      key: "mem",
+      label: "内存",
+      align: "center",
+      render: (row) => (
+        <span className={cn("text-[13px] tabular-nums", resourceUsageToneClass(row.memPct))}>
+          {row.memPct == null ? "—" : formatDashboardPercent(row.memPct)}
+        </span>
+      ),
+    },
+    {
+      key: "disk",
+      label: "磁盘",
+      align: "center",
+      render: (row) => (
+        <span className={cn("text-[13px] tabular-nums", resourceUsageToneClass(row.diskPct))}>
+          {row.diskPct == null ? "—" : formatDashboardPercent(row.diskPct)}
+        </span>
+      ),
+    },
+    {
+      key: "bandwidth",
+      label: "实时带宽",
+      align: "center",
+      render: (row) => (
+        <span className="text-[13px] tabular-nums text-[var(--label-2)]">
+          {row.online
+            ? `↑ ${formatByteRate(row.txBytesPerSec)} · ↓ ${formatByteRate(row.rxBytesPerSec)}`
+            : "—"}
+        </span>
+      ),
+    },
+    {
+      key: "uptime",
+      label: "运行时长",
+      align: "center",
+      render: (row) =>
+        row.online ? (
+          <span className="text-[13px] tabular-nums text-[var(--label-2)]">
+            {formatUptimeZh(row.uptimeSec)}
+          </span>
+        ) : (
+          <span className="text-[13px] font-medium text-[var(--danger-text)]">离线</span>
+        ),
+    },
+    {
+      key: "availability",
+      label: "在线率",
+      align: "center",
+      render: (row) => (
+        <span
           className={cn(
-            "size-1.5 shrink-0 rounded-full",
-            row.online ? "bg-[var(--ok)]" : "bg-[var(--label-4)]",
+            "text-[13px] font-semibold tabular-nums",
+            availabilityToneClass(row.samples === 0 ? undefined : row.availabilityPct),
           )}
-        />
-        <span className="truncate">{row.nodeName}</span>
-      </span>
-    ),
-  },
-  {
-    key: "targets",
-    label: "探测目标",
-    align: "right",
-    render: (row) => (
-      <span className="text-[13px] tabular-nums text-[var(--label-2)]">{row.targets}</span>
-    ),
-  },
-  {
-    key: "availability",
-    label: "可用率",
-    align: "right",
-    render: (row) => (
-      <span
-        className={cn(
-          "text-[13px] font-semibold tabular-nums",
-          availabilityToneClass(row.samples === 0 ? undefined : row.availabilityPct),
-        )}
-      >
-        {row.samples === 0 ? "—" : formatDashboardPercent(row.availabilityPct)}
-      </span>
-    ),
-  },
-  {
-    key: "avg_latency",
-    label: "平均延迟",
-    align: "right",
-    render: (row) => (
-      <span className="text-[13px] tabular-nums text-[var(--label-2)]">
-        {formatProbeMs(row.avgLatencyMs)}
-      </span>
-    ),
-  },
-  {
-    key: "p95_latency",
-    label: "P95",
-    align: "right",
-    render: (row) => (
-      <span className="text-[13px] tabular-nums text-[var(--label-2)]">
-        {formatProbeMs(row.p95LatencyMs)}
-      </span>
-    ),
-  },
-  {
-    key: "loss",
-    label: "丢包",
-    align: "right",
-    render: (row) => (
-      <span className="text-[13px] tabular-nums text-[var(--label-2)]">
-        {formatProbeLoss(row.avgLossPct)}
-      </span>
-    ),
-  },
-];
+        >
+          {row.samples === 0 ? "—" : formatDashboardPercent(row.availabilityPct)}
+        </span>
+      ),
+    },
+  ];
+}
 
 export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, settings }: DashboardProps) {
   const [clockText, setClockText] = useState(() => formatDashboardClock(new Date()));
   const [systemStatus, setSystemStatus] = useState<SystemStatusView | null>(null);
-  // system/status 失败标记：保留最后一次成功数据的同时标记「可能已过期」；
-  // reloadKey 用于「主控状态」面板的重试按钮触发重新拉取。
   const [systemStatusError, setSystemStatusError] = useState(false);
-  const [systemStatusReloadKey, setSystemStatusReloadKey] = useState(0);
   const [probeRange, setProbeRange] = useState<ProbeOverviewRange>("1h");
   const [probesOverview, setProbesOverview] = useState<ProbesOverviewResponse | null>(null);
-  // probes/overview 失败标记 + 重试 key：失败时清空数据，避免旧范围数据留在新选择下。
   const [probesError, setProbesError] = useState(false);
   const [probesReloadKey, setProbesReloadKey] = useState(0);
 
@@ -611,7 +590,7 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [systemStatusReloadKey]);
+  }, []);
 
   // probes/overview：每 60s，切换分段或点「重试」立即重拉；document.hidden 时同样暂停。
   // effect 开始时先清空上一轮数据：切范围 / 重试都不把旧范围数据显示在新选择下。
@@ -656,7 +635,7 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
   }, [probeRange, probesReloadKey]);
 
   const nodeKpis = useMemo(() => deriveDashboardNodeKpis(nodes), [nodes]);
-  const probeKpis = useMemo(() => deriveDashboardProbeKpis(nodes), [nodes]);
+  const trafficKpis = useMemo(() => deriveDashboardTrafficKpis(nodes), [nodes]);
   // 零节点是“尚未接入”而不是“健康”：确认节点列表为空后显示接入引导；
   // 节点数据尚未就绪时保持原仪表盘，避免已有节点时闪现引导卡。
   const isEmptyNodes = nodeKpis.total === 0;
@@ -666,62 +645,31 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
     settings?.agent_endpoint?.trim() || settings?.agent_endpoint_suggestion?.trim(),
   );
   const hotspots = useMemo(() => deriveDashboardResourceHotspots(nodes), [nodes]);
-  const probesReady = probesOverview !== null && !probesError;
-  const activeProbeRows = useMemo(
-    () =>
-      deriveProbeNodeRows(probesOverview?.nodes || [], nodes, {
-        includeConfiguredWithoutData: probesReady,
-      }),
-    [probesOverview, nodes, probesReady],
+  const nodeHealthRows = useMemo(
+    () => deriveNodeHealthRows(probesOverview?.nodes || [], nodes),
+    [probesOverview, nodes],
   );
-  // 入表按节点配置判定（见 deriveProbeNodeRows）：配置了探测但没有窗口数据的节点
-  // 仍保留一行 0 / —；既无配置也无数据的节点不进表，汇总成表下方那一行入口。
-  const probeUnconfiguredCount = useMemo(() => {
-    if (!probesReady) {
-      return 0;
-    }
-    const activeIds = new Set(activeProbeRows.map((row) => row.nodeId));
-    // 无 ID 的节点不进探测表（deriveProbeNodeRows 同样跳过），也不计入「未配置
-    // 探测目标」：它们不是配置缺失，而是无从归属。
-    return nodes.filter((node) => {
-      const nodeId = resolveNodeId(node);
-      return nodeId !== "" && !activeIds.has(nodeId);
-    }).length;
-  }, [activeProbeRows, nodes, probesReady]);
+  const nodeBlockWidthPx = useMemo(
+    () => estimateNodeNameBlockWidthPx(nodeHealthRows),
+    [nodeHealthRows],
+  );
+  const nodeOverviewColumns = useMemo(
+    () => buildNodeOverviewColumns(nodeBlockWidthPx),
+    [nodeBlockWidthPx],
+  );
 
-  const loadKpiSub = systemStatus
-    ? `内存 ${formatBinaryBytes(systemStatus.mem?.alloc)} · 运行 ${formatUptimeZh(
-        systemStatus.uptime_sec,
-      )}`
-    : "--";
-
-  // 主控状态行式列表（F7 第二行右）：版本 / 运行时长 / Goroutines / 内存 /
-  // WS 连接（后台 / 前台）/ 数据目录占用。版本号为机器字符串用 data-text，
-  // 计数与时长按 A-08 用 UI 字体 tabular-nums。
-  const statusRows: ReadonlyArray<{ label: string; value: string; mono?: boolean }> = [
-    { label: "版本", value: formatVersionLabel(systemStatus?.version), mono: true },
-    { label: "运行时长", value: formatUptimeZh(systemStatus?.uptime_sec) },
-    {
-      label: "Goroutines",
-      value: systemStatus ? String(systemStatus.goroutines ?? 0) : "--",
-    },
-    {
-      label: "内存",
-      value: formatBinaryBytes(systemStatus?.mem?.alloc),
-    },
-    {
-      label: "WS 连接（后台 / 前台）",
-      value: systemStatus
-        ? `${systemStatus.ws_clients?.admin ?? 0} / ${systemStatus.ws_clients?.public ?? 0}`
-        : "--",
-    },
-    {
-      label: "数据目录占用",
-      value: formatBinaryBytes(
-        (systemStatus?.data_dir?.state_bytes || 0) + (systemStatus?.data_dir?.tsdb_bytes || 0),
-      ),
-    },
-  ];
+  // 「告警中」与「主控负载」状态降级文案
+  const statusStale = systemStatusError;
+  const staleLabel = <span className="text-[var(--warn-text)]">数据可能已过期</span>;
+  const loadKpiSub: ReactNode = systemStatus
+    ? statusStale
+      ? staleLabel
+      : `内存 ${formatBinaryBytes(systemStatus.mem?.alloc)} · 运行 ${formatUptimeZh(
+          systemStatus.uptime_sec,
+        )}`
+    : statusStale
+      ? <span className="text-[var(--warn-text)]">状态不可用</span>
+      : "--";
 
   // 页头实时指示严格由 WS 连接状态驱动：断线 / 建连中不再显示健康态。
   const liveIndicator =
@@ -731,11 +679,6 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
         ? { dotClass: "bg-[var(--label-4)]", label: "连接中" }
         : { dotClass: "bg-[var(--warn)]", label: "连接中断" };
 
-  // 「告警中」KPI：无数据时不能显示 0 / 「一切正常」；接口失败时降级为「数据
-  // 可能已过期」。数据来自 system/status 的 REST 轮询（与 WS 无关），WS 断开的
-  // 降级只作用于依赖 WS 快照的数据（顶部断线横幅已覆盖），这里不能跟着误报。
-  const statusStale = systemStatusError;
-  const staleLabel = <span className="text-[var(--warn-text)]">数据可能已过期</span>;
   const firingCount = systemStatus?.alerts?.firing ?? 0;
   const alertingValue = systemStatus ? String(firingCount) : "--";
   const alertingSub: ReactNode = systemStatus
@@ -830,12 +773,12 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
         />
         <DashboardKpiCard
           className="lg:col-span-3"
-          label="探测可用率"
-          value={formatDashboardPercent(probeKpis.availabilityPct)}
+          label="网络概览"
+          value={nodesLoaded ? formatByteRate(trafficKpis.totalBytesPerSec) : "--"}
           sub={
-            probeKpis.avgLatencyMs != null
-              ? `平均延迟 ${Math.round(probeKpis.avgLatencyMs)} ms`
-              : "暂无探测数据"
+            nodesLoaded
+              ? `↑ ${formatByteRate(trafficKpis.txBytesPerSec)} · ↓ ${formatByteRate(trafficKpis.rxBytesPerSec)}`
+              : "--"
           }
         />
         <DashboardKpiCard
@@ -847,18 +790,12 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
       </section>
       ) : null}
 
-      {/* 第二行：左 8 列「网络连通性」+ 右 4 列「主控状态」。
-          A-05 / M-02：lg 起「网络连通性」lg:absolute 于 col-span-8 外层内
-          （不参与行高计算），行高只由「主控状态」决定，两卡等高、表内滚动、
-          表头固定；<lg 自然撑开，滚动容器限高 420px。 */}
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-12 lg:items-stretch">
-        {!showOnboarding ? (
-        <div className="relative min-w-0 lg:col-span-8">
+      {/* 第二行：全宽 12 列「节点概览」（自然撑开、无内部纵向滚动条）。 */}
+      {!showOnboarding ? (
         <AdminPanel
-          className="flex min-w-0 flex-col lg:absolute lg:inset-0"
-          bodyClassName="min-h-0 flex-1 flex flex-col"
+          className="min-w-0"
           headerClassName="min-h-[52px] flex-wrap gap-y-2"
-          title="网络连通性"
+          title="节点概览"
           actions={
             <div
               role="group"
@@ -885,10 +822,8 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
             </div>
           }
         >
-          {/* 加载失败时在表格上方给出可见原因 + 重试入口（不再默默显示空表）。
-              错误行 shrink-0、表格改 min-h-0 flex-1，避免行高把卡片顶出溢出。 */}
           {probesError ? (
-            <div className="flex shrink-0 flex-wrap items-center gap-3 px-4 pb-2 text-[13px] text-[var(--label-2)]">
+            <div className="flex flex-wrap items-center gap-3 px-4 pb-2 text-[13px] text-[var(--label-2)]">
               <span role="status">探测数据加载失败，请重试</span>
               <Button
                 aria-label="重试加载探测数据"
@@ -903,110 +838,15 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
             </div>
           ) : null}
           <AdminDataTable
-            ariaLabel="网络连通性"
-            className="min-h-0 flex-1 flex flex-col"
-            columns={probeTableColumns}
-            rows={activeProbeRows}
+            ariaLabel="节点概览"
+            columns={nodeOverviewColumns}
+            rows={nodeHealthRows}
             rowKey={(row) => row.nodeId}
-            emptyLabel={
-              probesError ? (
-                "—"
-              ) : probesOverview === null ? (
-                "加载中…"
-              ) : (
-                // 数据已就绪但仍无行：没有任何节点配置探测（窗口内也没有数据），
-                // 给出可直接行动的入口，而不是一列「—」。
-                <span className="flex flex-col items-center gap-2">
-                  <span>还没有节点在运行探测</span>
-                  <button
-                    type="button"
-                    className={probeInlineLinkClass}
-                    onClick={() => onNavigate("probes")}
-                  >
-                    去探测设置
-                  </button>
-                </span>
-              )
-            }
+            emptyLabel={nodesLoaded ? "暂无节点数据" : "加载中…"}
             showRowChevron={false}
-            scrollClassName="min-h-0 flex-1 overflow-y-auto overscroll-contain max-lg:max-h-[420px]"
-            stickyHeader
-            // 既无配置也无数据的节点不占用表格行：在卡片底部汇总成一行入口。
-            // 全部节点都未配置时行列表本身为空（上方空态已给出入口），这里不重复。
-            footer={
-              probesReady && probeUnconfiguredCount > 0 && activeProbeRows.length > 0 ? (
-                <button
-                  type="button"
-                  className={probeInlineLinkClass}
-                  onClick={() => onNavigate("probes")}
-                >
-                  {`另有 ${probeUnconfiguredCount} 个节点未配置探测目标`}
-                </button>
-              ) : null
-            }
           />
         </AdminPanel>
-        </div>
-        ) : null}
-
-        <AdminPanel
-          className={cn("min-w-0", showOnboarding ? "lg:col-span-12" : "lg:col-span-4")}
-          bodyClassName="flex-1 flex flex-col"
-          headerClassName="min-h-[52px] flex-nowrap"
-          title="主控状态"
-          actions={
-            systemStatusError ? (
-              <Button
-                aria-label="重试加载主控状态"
-                className="h-7 gap-1 px-2 text-xs dark:border-[var(--hairline-strong)] dark:bg-[rgba(255,255,255,0.12)]"
-                size="sm"
-                title="重试加载主控状态"
-                variant="outline"
-                onClick={() => setSystemStatusReloadKey((current) => current + 1)}
-              >
-                <RefreshCw aria-hidden="true" className="h-3.5 w-3.5" />
-                重试
-              </Button>
-            ) : null
-          }
-        >
-          <div className={cn(adminGroupedCardClass, "min-h-0 flex-1")}>
-            {systemStatusError ? (
-              <div
-                role="status"
-                className="flex items-center gap-2 border-b border-[var(--hairline)] px-4 py-2.5 text-[13px] text-[var(--warn-text)]"
-              >
-                <span
-                  aria-hidden="true"
-                  className="size-1.5 shrink-0 rounded-full bg-[var(--warn)]"
-                />
-                数据可能已过期
-              </div>
-            ) : null}
-            {statusRows.map((row) => (
-              <div
-                key={row.label}
-                className={cn(
-                  adminGroupedCardRowClass,
-                  "flex items-center justify-between gap-x-6 py-3",
-                )}
-              >
-                <span className="shrink-0 text-[13px] font-medium leading-5 text-[var(--label-1)]">
-                  {row.label}
-                </span>
-                <span
-                  className={cn(
-                    "min-w-0 truncate text-right text-[13px] leading-5 tabular-nums text-[var(--label-1)]",
-                    row.mono && "data-text",
-                  )}
-                >
-                  {row.value}
-                </span>
-              </div>
-            ))}
-          </div>
-        </AdminPanel>
-      </div>
+      ) : null}
 
       {/* 第三行：「资源热点」（12 列）：CPU / 内存 / 磁盘 ≥80% 的节点，进度条同前台样式。 */}
       {!showOnboarding ? (
@@ -1043,7 +883,7 @@ export default function Dashboard({ liveStatus, nodes, nodesLoaded, onNavigate, 
                     <div
                       className="cm-dashboard-meter-fill"
                       style={{
-                        width: `${Math.min(100, Math.max(0, hotspot.valuePct))}%`,
+                        transform: `scaleX(${Math.min(100, Math.max(0, hotspot.valuePct)) / 100})`,
                         background: hot ? "var(--meter-hot)" : meta.meter,
                         color: hot ? "#e5383b" : meta.endColor,
                       }}

@@ -462,14 +462,19 @@ export default function AIProvider({
         return { ...current, name: value };
       }
       if (field === "apiKey") {
+        if (value === current.apiKey) {
+          return current;
+        }
         return {
           ...current,
           apiKey: value,
-
           status: value ? "unverified" : current.keyConfigured ? current.status : "unconfigured",
         };
       }
-
+      // 仅在端点或模型实际变更时回退为 unverified，避免重开已验证服务商直接点「完成」丢失验证态。
+      if (value === current[field]) {
+        return current;
+      }
       const configured = Boolean(current.apiKey.trim()) || current.keyConfigured;
       const next = {
         ...current,
@@ -571,14 +576,15 @@ export default function AIProvider({
       toast.warning("端点或模型有未保存修改，请先保存后再获取模型。");
       return;
     }
+    const sessionAtStart = dialogSessionRef.current;
     void runAction({
       action: () => onFetchModels(toProviderRequestKey(item), toTestConfig(item)),
       fallbackError: "获取模型列表失败",
       successToast: `${item.name} 模型列表已刷新`,
       onSuccess: (models) => {
-
         updateProviderDraft(item.id, (current) => ({ ...current, models }));
-        const shouldFillModel = models.length > 0 && !item.model;
+        const shouldFillModel =
+          dialogSessionRef.current === sessionAtStart && models.length > 0 && !item.model;
         if (shouldFillModel) {
           setProviderForm((current) => ({ ...current, model: models[0] }));
         }
@@ -745,7 +751,7 @@ export default function AIProvider({
       <AdminDrawer
         open={isDialogOpen && editingItem !== null}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !isBusy) {
             closeProviderDialog();
           }
         }}

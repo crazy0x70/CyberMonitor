@@ -568,6 +568,16 @@ func applyAIProviderDefaults(provider string, cfg AIProviderConfig) AIProviderCo
 }
 
 func resolveAIProviderSelection(settings AISettings, selector string, override *AIProviderConfig) (aiProviderSelection, error) {
+	return resolveAIProviderSelectionWithOptions(settings, selector, override, true)
+}
+
+// resolveAIProviderSelectionForModels 供 /api/v1/admin/ai/models 使用：拉取模型列表
+// 只需要 BaseURL 与 APIKey，尚未选择模型时不应因为 model 为空而拒绝。
+func resolveAIProviderSelectionForModels(settings AISettings, selector string, override *AIProviderConfig) (aiProviderSelection, error) {
+	return resolveAIProviderSelectionWithOptions(settings, selector, override, false)
+}
+
+func resolveAIProviderSelectionWithOptions(settings AISettings, selector string, override *AIProviderConfig, requireModel bool) (aiProviderSelection, error) {
 	selector = normalizeAIProviderSelector(selector)
 	if selector == "" {
 		selector = settings.CommandProvider
@@ -598,7 +608,7 @@ func resolveAIProviderSelection(settings AISettings, selector string, override *
 	if override != nil {
 		selection.Config = normalizeAIProviderConfig(*override)
 	}
-	return finalizeAIProviderSelection(selection)
+	return finalizeAIProviderSelectionWithOptions(selection, requireModel)
 }
 
 func aiCompatibleSelection(provider AIProviderProfile) aiProviderSelection {
@@ -630,14 +640,18 @@ func findAICompatibleProvider(settings AISettings, providerID string) (AIProvide
 }
 
 func finalizeAIProviderSelection(selection aiProviderSelection) (aiProviderSelection, error) {
+	return finalizeAIProviderSelectionWithOptions(selection, true)
+}
+
+func finalizeAIProviderSelectionWithOptions(selection aiProviderSelection, requireModel bool) (aiProviderSelection, error) {
 	selection.Config = applyAIProviderDefaults(selection.Provider, selection.Config)
-	if err := validateResolvedAISelection(selection); err != nil {
+	if err := validateResolvedAISelection(selection, requireModel); err != nil {
 		return aiProviderSelection{}, err
 	}
 	return selection, nil
 }
 
-func validateResolvedAISelection(selection aiProviderSelection) error {
+func validateResolvedAISelection(selection aiProviderSelection, requireModel bool) error {
 	if err := validateAIBaseURL(selection.Config.BaseURL); err != nil {
 		return err
 	}
@@ -650,7 +664,7 @@ func validateResolvedAISelection(selection aiProviderSelection) error {
 	if selection.Config.BaseURL == "" {
 		return errors.New("OpenAI 兼容服务商需填写 Base URL")
 	}
-	if selection.Config.Model == "" {
+	if requireModel && selection.Config.Model == "" {
 		return errors.New("OpenAI 兼容服务商需填写模型")
 	}
 	return nil

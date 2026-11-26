@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cyber_monitor/internal/agentrpc"
@@ -291,8 +292,9 @@ type Store struct {
 	agentMutationMu   sync.RWMutex
 	nodeMutationMu    sync.Mutex
 	nodeMutationLocks map[string]*nodeMutationLock
-	persistMu         sync.Mutex
-	persistPending    bool // 持久化失败后置位（persistMu 内维护），成功后清除
+	persistMu               sync.Mutex
+	persistPending          bool        // 持久化失败后置位（persistMu 内维护），成功后清除
+	periodicPersistInFlight atomic.Bool // 周期落盘去重，防止多节点同秒上报形成 fsync 惊群
 	nodes             map[string]NodeState
 	profiles          map[string]*NodeProfile
 	settings          Settings
@@ -936,9 +938,9 @@ func (t *tickRunner) runOnce(store *Store, hub *Hub, now time.Time) {
 			}
 			if len(offlineEvents) > 0 {
 				results := dispatchChannelNotices(targets.Channels, targets.SiteTitle, offlineEvents, buildAlertMessage, "告警")
-				if !allChannelNoticesOK(results) {
-					store.RecordAlertDelivery(offlineEvents, results, true)
-				}
+				// 始终回写投递结果：首次或补发全部送达时必须把 Delivered 落盘并归零
+				// RetryCount，否则恢复判定会误认为「从未送达任何渠道」而静默跳过恢复通知。
+				store.RecordAlertDelivery(offlineEvents, results, true)
 			}
 			if len(recoveredEvents) > 0 {
 				results := dispatchChannelNotices(targets.Channels, targets.SiteTitle, recoveredEvents, buildRecoveryMessage, "恢复通知")
@@ -1355,13 +1357,13 @@ func (s *Store) updateNodeStats(stats metrics.NodeStats) (bool, *offlineRecovery
 		}
 	}
 
-	if s.shouldPersistLocked(now) {
-		persist = true
-	}
+	periodicPersist := !persist && s.shouldPersistLocked(now)
 	s.mu.Unlock()
 
 	if persist {
 		s.persistLogged()
+	} else if periodicPersist {
+		s.persistPeriodicLogged()
 	}
 	s.mu.RLock()
 	historyManager := s.historyManager
@@ -1913,26 +1915,90 @@ func sendFeishuTest(webhook, siteTitle string) error {
 	return notifier.Send(ctx, NotifyMessage{Text: message})
 }
 
-func buildEventMessage(siteTitle, title, lead, footer string, events []AlertEvent) string {
-	lines := []string{fmt.Sprintf("【%s】%s", normalizeSiteTitle(siteTitle), title), "", lead}
-	for _, event := range events {
-		label := formatAlertValue(event.Display, "未命名节点")
-		detail := ""
-		if event.OfflineSec > 0 {
-			detail = fmt.Sprintf("（离线 %s）", formatAlertDuration(event.OfflineSec))
-		}
-		lines = append(lines, fmt.Sprintf("• %s%s", label, detail))
+func formatAlertShortTime(unixSeconds int64) string {
+	if unixSeconds <= 0 {
+		return ""
 	}
-	lines = append(lines, "", footer)
-	return strings.Join(lines, "\n")
+	return time.Unix(unixSeconds, 0).Local().Format("15:04:05")
+}
+
+func formatAlertFullTime(unixSeconds int64) string {
+	if unixSeconds <= 0 {
+		return ""
+	}
+	return time.Unix(unixSeconds, 0).Local().Format(time.DateTime)
 }
 
 func buildAlertMessage(siteTitle string, events []AlertEvent) string {
-	return buildEventMessage(siteTitle, "服务器离线告警", "离线节点：", "请及时检查服务器状态。", events)
+	site := normalizeSiteTitle(siteTitle)
+	if len(events) == 1 {
+		event := events[0]
+		label := formatAlertValue(event.Display, "未命名节点")
+		lines := []string{fmt.Sprintf("【%s】🔴 节点离线 · %s", site, label)}
+		if event.OfflineSec > 0 {
+			lines = append(lines, fmt.Sprintf("已离线：%s", formatAlertDuration(event.OfflineSec)))
+		}
+		if ts := formatAlertFullTime(event.LastSeen); ts != "" {
+			lines = append(lines, fmt.Sprintf("最后在线：%s", ts))
+		}
+		if len(lines) == 1 {
+			lines = append(lines, "节点已停止上报，请检查网络或服务状态。")
+		}
+		return strings.Join(lines, "\n")
+	}
+	lines := []string{fmt.Sprintf("【%s】🔴 节点离线（%d 台）", site, len(events))}
+	for _, event := range events {
+		label := formatAlertValue(event.Display, "未命名节点")
+		parts := make([]string, 0, 2)
+		if event.OfflineSec > 0 {
+			parts = append(parts, fmt.Sprintf("已离线 %s", formatAlertDuration(event.OfflineSec)))
+		}
+		if ts := formatAlertShortTime(event.LastSeen); ts != "" {
+			parts = append(parts, fmt.Sprintf("最后在线 %s", ts))
+		}
+		if len(parts) > 0 {
+			lines = append(lines, fmt.Sprintf("• %s · %s", label, strings.Join(parts, "，")))
+		} else {
+			lines = append(lines, fmt.Sprintf("• %s", label))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func buildRecoveryMessage(siteTitle string, events []AlertEvent) string {
-	return buildEventMessage(siteTitle, "服务器恢复在线", "已恢复节点：", "服务已恢复。", events)
+	site := normalizeSiteTitle(siteTitle)
+	if len(events) == 1 {
+		event := events[0]
+		label := formatAlertValue(event.Display, "未命名节点")
+		lines := []string{fmt.Sprintf("【%s】🟢 节点恢复 · %s", site, label)}
+		if event.OfflineSec > 0 {
+			lines = append(lines, fmt.Sprintf("中断时长：%s", formatAlertDuration(event.OfflineSec)))
+		}
+		if ts := formatAlertFullTime(event.LastSeen); ts != "" {
+			lines = append(lines, fmt.Sprintf("恢复时间：%s", ts))
+		}
+		if len(lines) == 1 {
+			lines = append(lines, "节点已重新上线并恢复上报。")
+		}
+		return strings.Join(lines, "\n")
+	}
+	lines := []string{fmt.Sprintf("【%s】🟢 节点恢复（%d 台）", site, len(events))}
+	for _, event := range events {
+		label := formatAlertValue(event.Display, "未命名节点")
+		parts := make([]string, 0, 2)
+		if event.OfflineSec > 0 {
+			parts = append(parts, fmt.Sprintf("中断 %s", formatAlertDuration(event.OfflineSec)))
+		}
+		if ts := formatAlertShortTime(event.LastSeen); ts != "" {
+			parts = append(parts, fmt.Sprintf("恢复于 %s", ts))
+		}
+		if len(parts) > 0 {
+			lines = append(lines, fmt.Sprintf("• %s · %s", label, strings.Join(parts, "，")))
+		} else {
+			lines = append(lines, fmt.Sprintf("• %s", label))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // logReportEvents 输出离线/恢复报告日志。只有首次产生的事件记一行；失败的退避
@@ -2478,6 +2544,19 @@ func (s *Store) QueryPublicNodeHistory(ctx context.Context, nodeID string, from,
 		return nil, err
 	}
 	return convertNetworkHistoryToTestHistory(entries), nil
+}
+
+// QueryNodeProbeOverviewStats 按原始未降采样样本流式聚合单个节点在 [from, to] 内的
+// 探测统计（供 /api/v1/admin/probes/overview 使用，避免 24h 降采样桶拉高可用率与抹平 P95）。
+func (s *Store) QueryNodeProbeOverviewStats(ctx context.Context, nodeID string, from, to time.Time) (map[string]*history.NetworkOverviewStats, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return map[string]*history.NetworkOverviewStats{}, nil
+	}
+	if s == nil || s.historyManager == nil || s.historyManager.NetworkStore() == nil {
+		return map[string]*history.NetworkOverviewStats{}, nil
+	}
+	return s.historyManager.NetworkStore().QueryOverviewStats(ctx, nodeID, from, to)
 }
 
 // QueryAINodeResources 查询节点的 CPU / 内存 / 网络资源历史（供 AI 快照使用）。
@@ -4443,6 +4522,23 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 		}
 		s.settings.AISettings = normalized
 	}
+	// 所有字段校验必须在任何 s.profiles / s.configRefresh 变更之前完成：fail() 只回滚
+	// s.settings，提前变更 profiles 会在返回 400 时留下半修改状态。
+	var normalizedCatalog []TestCatalogItem
+	if update.TestCatalog != nil {
+		catalog, err := normalizeTestCatalog(*update.TestCatalog)
+		if err != nil {
+			return fail(err)
+		}
+		normalizedCatalog = catalog
+	}
+	if update.ResourceHistoryDays != nil {
+		days := *update.ResourceHistoryDays
+		if !history.ValidResourceRetentionDays(days) {
+			return fail(errors.New("resource_history_days invalid"))
+		}
+		s.settings.ResourceHistoryDays = days
+	}
 	// F1：group_moves 必须在写入新树之前执行——先把节点归属从 From 迁到 To，
 	// 新树落地后再由 pruneProfileGroupSelectionsLocked 清掉映射到无效目标的条目。
 	if update.GroupMoves != nil {
@@ -4460,26 +4556,15 @@ func (s *Store) UpdateSettings(update SettingsUpdate) (SettingsView, error) {
 	}
 	if update.TestCatalog != nil {
 		previousCatalog := slices.Clone(s.settings.TestCatalog)
-		catalog, err := normalizeTestCatalog(*update.TestCatalog)
-		if err != nil {
-			return fail(err)
-		}
-		s.settings.TestCatalog = catalog
-		s.markAgentConfigRefreshForCatalogChangeLocked(previousCatalog, catalog)
+		s.settings.TestCatalog = normalizedCatalog
+		s.markAgentConfigRefreshForCatalogChangeLocked(previousCatalog, normalizedCatalog)
 		// O-01：任一目录项的 Scope 变化 → 对所有节点标记 agent 配置刷新（范围
 		// 会影响没有手动选择的节点，含新接入节点）。
-		s.markAgentConfigRefreshForScopeChangeLocked(previousCatalog, catalog)
+		s.markAgentConfigRefreshForScopeChangeLocked(previousCatalog, normalizedCatalog)
 		s.pruneProfileTestSelectionsLocked()
 	}
 	if update.Groups != nil || update.GroupTree != nil || update.GroupMoves != nil {
 		s.pruneProfileGroupSelectionsLocked()
-	}
-	if update.ResourceHistoryDays != nil {
-		days := *update.ResourceHistoryDays
-		if !history.ValidResourceRetentionDays(days) {
-			return fail(errors.New("resource_history_days invalid"))
-		}
-		s.settings.ResourceHistoryDays = days
 	}
 	// 规则变更后旧样本环语义失效（阈值/操作符可能已改），整体重建。位置必须在
 	// 所有校验通过之后：fail() 只回滚 s.settings，样本环一旦提前清空无法回滚，
@@ -4535,12 +4620,11 @@ func (s *Store) ImportConfig(payload ConfigTransferData) (SettingsView, error) {
 		return SettingsView{}, err
 	}
 	staged.mu.Lock()
-	normalizedProfiles, err := staged.normalizeProfilesForImportLocked(configTransferProfilesToNodeProfiles(payload.Profiles))
+	normalizedProfiles, err := staged.normalizeProfilesForImportLocked(configTransferProfilesToNodeProfiles(payload.Profiles), staged.profiles)
 	staged.mu.Unlock()
 	if err != nil {
 		return SettingsView{}, err
 	}
-	preserveRedactedProfileRuntimeForImport(normalizedProfiles, staged.profiles)
 
 	s.mu.Lock()
 	now := time.Now()
@@ -4570,6 +4654,13 @@ func preserveRedactedProfileRuntimeForImport(profiles map[string]*NodeProfile, e
 		if existingProfile == nil {
 			redactProfileRuntimeForTransfer(profile)
 			continue
+		}
+		if strings.TrimSpace(profile.ServerID) == "" {
+			profile.ServerID = strings.TrimSpace(existingProfile.ServerID)
+		}
+		if profile.TrafficCounter == nil && existingProfile.TrafficCounter != nil {
+			copied := *existingProfile.TrafficCounter
+			profile.TrafficCounter = &copied
 		}
 		profile.AgentAuthToken = strings.TrimSpace(existingProfile.AgentAuthToken)
 		profile.AgentUpdate = cloneAgentUpdateInstruction(existingProfile.AgentUpdate)
@@ -4644,10 +4735,10 @@ func normalizePersistedProfiles(settings Settings, nodes map[string]NodeState, p
 		settings: cloneSettings(settings),
 		nodes:    nodes,
 	}
-	return store.normalizeProfilesForImportLocked(profiles)
+	return store.normalizeProfilesForImportLocked(profiles, nil)
 }
 
-func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfile) (map[string]*NodeProfile, error) {
+func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfile, existing map[string]*NodeProfile) (map[string]*NodeProfile, error) {
 	if profiles == nil {
 		return map[string]*NodeProfile{}, nil
 	}
@@ -4672,7 +4763,6 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 			*profile = *rawProfile
 		}
 
-		profile.HideFromDisplay = false
 		profile.Alias = strings.TrimSpace(profile.Alias)
 		profile.Group = strings.TrimSpace(profile.Group)
 		profile.Tags = normalizeGroups(profile.Tags)
@@ -4714,6 +4804,9 @@ func (s *Store) normalizeProfilesForImportLocked(profiles map[string]*NodeProfil
 			profile.UpdatedAt = now
 		}
 		normalized[nodeID] = profile
+	}
+	if existing != nil {
+		preserveRedactedProfileRuntimeForImport(normalized, existing)
 	}
 	if err := ensureServerIDsForProfiles(normalized, s.nodes); err != nil {
 		return nil, err
@@ -5108,6 +5201,10 @@ func (s *Store) UpdateProfile(nodeID string, update NodeProfileUpdate) (NodeProf
 	if update.AlertEnabled != nil {
 		value := *update.AlertEnabled
 		profile.AlertEnabled = &value
+		if !value {
+			delete(s.alerted, nodeID)
+			s.clearNodeRuleStatesLocked(nodeID)
+		}
 	}
 	if configChanged {
 		s.markAgentConfigRefreshLocked(nodeID)
@@ -5158,6 +5255,7 @@ func (s *Store) UpdateAlertEnabledByServerID(serverID string, enabled bool) (str
 	profile.AlertEnabled = &value
 	if !enabled {
 		delete(s.alerted, nodeID)
+		s.clearNodeRuleStatesLocked(nodeID)
 	}
 	if node, ok := s.nodes[nodeID]; ok {
 		display = resolveAlertDisplay(profile, node.Stats, nodeID)
@@ -5521,6 +5619,7 @@ func (s *Store) deleteNodeMemoryLocked(nodeID string) {
 	delete(s.nodes, nodeID)
 	delete(s.profiles, nodeID)
 	delete(s.alerted, nodeID)
+	s.clearNodeRuleStatesLocked(nodeID)
 	delete(s.offlineSessions, nodeID)
 	delete(s.configRefresh, nodeID)
 }
@@ -5529,6 +5628,8 @@ func (s *Store) clearNodesMemoryLocked() {
 	s.nodes = make(map[string]NodeState)
 	s.profiles = make(map[string]*NodeProfile)
 	s.alerted = make(map[string]AlertedState)
+	s.alertStates = make(map[string]RuleAlertState)
+	s.ruleSamples = make(map[string][]ruleSample)
 	s.offlineSessions = make(map[string]OfflineSessionState)
 	s.configRefresh = make(map[string]struct{})
 }
@@ -5925,6 +6026,36 @@ func (s *Store) hasPersistPending() bool {
 
 func (s *Store) persistLogged() {
 	if err := s.persist(); err != nil {
+		log.Printf("%v", err)
+	}
+}
+
+// persistPeriodicLogged 供 1 秒节点上报路径的 10 秒周期落盘使用：通过原子标志确保同一
+// 窗口内最多一个请求进入持锁落盘，其余并发上报直接返回，避免 N 个节点同时触发 N 次
+// 连续全量 JSON 序列化 + fsync。
+func (s *Store) persistPeriodicLogged() {
+	if s.dataPath == "" {
+		return
+	}
+	if !s.periodicPersistInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.periodicPersistInFlight.Store(false)
+
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	s.mu.RLock()
+	due := s.shouldPersistLocked(time.Now())
+	var data PersistedData
+	if due {
+		data = s.snapshotPersistedLocked()
+	}
+	s.mu.RUnlock()
+	if !due {
+		return
+	}
+	if err := s.writePersistedSnapshotLocked(data); err != nil {
 		log.Printf("%v", err)
 	}
 }

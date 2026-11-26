@@ -35,9 +35,20 @@ if [ "${CM_ENABLE_DOCKER_UPDATE:-0}" = "1" ] && [ -S "${socket}" ]; then
 	group="$(awk -F: -v gid="${gid}" '$3 == gid { print $1; exit }' /etc/group)"
 	if [ -z "${group}" ]; then
 		group="dockerhost"
-		addgroup -g "${gid}" -S "${group}"
+		if command -v groupadd >/dev/null 2>&1; then
+			groupadd --gid "${gid}" --system "${group}"
+		else
+			addgroup -g "${gid}" -S "${group}"
+		fi
 	fi
-	addgroup "${RUNTIME_USER}" "${group}" 2>/dev/null || true
+	if command -v usermod >/dev/null 2>&1; then
+		usermod -aG "${group}" "${RUNTIME_USER}" 2>/dev/null || true
+	else
+		addgroup "${RUNTIME_USER}" "${group}" 2>/dev/null || true
+	fi
 fi
 
+if command -v gosu >/dev/null 2>&1; then
+	exec gosu "${RUNTIME_USER}" "${BINARY_PATH}" "$@"
+fi
 exec su-exec "${RUNTIME_USER}" "${BINARY_PATH}" "$@"

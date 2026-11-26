@@ -81,6 +81,7 @@ func Run(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ctx.Done():
+			waitForGoroutines(&runner.probeWG, 5*time.Second)
 			waitForGoroutines(&runner.updateWG, agentShutdownWait)
 			return ctx.Err()
 		case <-ticker.C:
@@ -465,6 +466,37 @@ func buildOrderedResults(configs []metrics.NetworkTestConfig, keys []string, cac
 		}
 	}
 	return ordered
+}
+
+// nextProbeDueTime 计算下一轮最早需要执行探测的时间点，用于空闲周期零开销跳过后台扫描。
+func nextProbeDueTime(configs []metrics.NetworkTestConfig, defaultInterval time.Duration, cache map[string]cachedTest) time.Time {
+	if len(configs) == 0 {
+		return time.Time{}
+	}
+	if defaultInterval <= 0 {
+		defaultInterval = DefaultTestInterval
+	}
+	var earliest time.Time
+	for _, cfg := range configs {
+		key := testKey(cfg)
+		if key == "" {
+			continue
+		}
+		cached, ok := cache[key]
+		if !ok {
+			// 尚有未跑过的目标（如本轮超 maxNetTestWorkers 被截断），下一 tick 即可继续补跑。
+			return time.Time{}
+		}
+		interval := defaultInterval
+		if cfg.IntervalSec > 0 {
+			interval = time.Duration(cfg.IntervalSec) * time.Second
+		}
+		dueAt := cached.lastRun.Add(interval)
+		if earliest.IsZero() || dueAt.Before(earliest) {
+			earliest = dueAt
+		}
+	}
+	return earliest
 }
 
 func testKey(cfg metrics.NetworkTestConfig) string {

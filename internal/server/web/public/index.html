@@ -21,6 +21,27 @@
     <link rel="icon" id="site-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <link rel="preload" as="font" type="font/woff2" href="./assets/inter-latin.woff2" crossorigin />
     <link rel="preload" as="font" type="font/woff2" href="./assets/geist-mono-latin.woff2" crossorigin />
+    <script>
+      (function () {
+        try {
+          var mode = String(localStorage.getItem("cm_theme_mode") || "auto").trim().toLowerCase();
+          var resolved =
+            mode === "dark"
+              ? "dark"
+              : mode === "light"
+                ? "light"
+                : window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+                  ? "dark"
+                  : "light";
+          document.documentElement.setAttribute("data-theme", resolved);
+          var color = resolved === "dark" ? "#0c0d10" : "#f4f5f8";
+          var metas = document.querySelectorAll('meta[name="theme-color"]');
+          for (var i = 0; i < metas.length; i++) metas[i].setAttribute("content", color);
+          var loc = String(localStorage.getItem("cm_public_locale") || "").trim().toLowerCase().replace("_", "-");
+          if (loc === "en-us") document.documentElement.lang = "en-US";
+        } catch (e) {}
+      })();
+    </script>
     <link rel="stylesheet" href="./assets/styles.css" />
   </head>
   <body>
@@ -34,7 +55,7 @@
           </h1>
           <p class="subtitle" id="brand-subtitle" data-i18n="brandSubtitle">主机监控</p>
         </div>
-        <div class="topbar-actions" role="group" aria-label="展示偏好">
+        <div class="topbar-actions" role="group" aria-label="展示偏好" data-i18n-attr="aria-label:displayPreferences">
             <div class="control-menu">
               <button
                 class="control-toggle language-toggle"
@@ -117,8 +138,29 @@
         </div>
       </section>
 
-      <div class="group-tabs-wrap">
-        <nav id="group-tabs" class="group-tabs" aria-label="节点分组导航" data-i18n-attr="aria-label:groupTabsLabel"></nav>
+      <div class="toolbar-row">
+        <div class="group-tabs-wrap">
+          <nav id="group-tabs" class="group-tabs" aria-label="节点分组导航" data-i18n-attr="aria-label:groupTabsLabel"></nav>
+        </div>
+        <div class="fleet-controls">
+          <label class="fleet-search">
+            <svg class="fleet-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.3-4.3"></path>
+            </svg>
+            <input
+              id="node-search"
+              class="fleet-search-input"
+              type="search"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="搜索节点..."
+              aria-label="搜索节点"
+              data-i18n-attr="placeholder:searchPlaceholder,aria-label:searchLabel"
+            />
+            <kbd class="fleet-search-kbd" aria-hidden="true">/</kbd>
+          </label>
+        </div>
       </div>
 
       <section id="list" class="node-list"></section>
@@ -133,8 +175,9 @@
             <line x1="6" x2="6.01" y1="18" y2="18"></line>
           </svg>
         </div>
-        <h2 data-i18n="emptyWaitingTitle">等待节点接入</h2>
-        <p data-i18n="emptyWaitingBody">请启动 Agent 并指向当前管理端地址。</p>
+        <h2 data-i18n="emptyLoadingTitle">正在加载节点数据</h2>
+        <p data-i18n="emptyLoadingBody">正在连接监控服务端获取实时状态…</p>
+        <button id="empty-retry" class="state-retry-btn" type="button" hidden data-i18n="retry">重试</button>
       </div>
 
       <footer class="site-footer">

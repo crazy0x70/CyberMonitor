@@ -80,6 +80,7 @@ export type AlertRuleDrawerProps = {
   onDelete?: () => void; // 不传则不显示删除（offline 规则不传）
   onClose: () => void;
   lockedNodeId?: string; // 传入时表示「节点抽屉内编辑仅此节点规则」
+  initialErrors?: Record<string, string>; // 页面级保存校验失败自动打开抽屉时注入错误文案
 };
 
 // 渠道类型中文标签（与 NotificationAlert 的 CHANNEL_TYPE_META.label 同一份）。
@@ -180,24 +181,24 @@ export function AlertRuleDrawer({
   onDelete,
   onClose,
   lockedNodeId,
+  initialErrors,
 }: AlertRuleDrawerProps) {
   // 抽屉内的独立编辑副本：「完成」才通过 onDone 写回页面草稿。
   const [form, setForm] = useState<AlertRuleDraft>(() => copyRuleDraft(rule));
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string>>(() => ({ ...(initialErrors || {}) }));
   const [preview, setPreview] = useState<AlertRulePreviewItem[] | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const busy = previewing;
   const runAction = useAsyncAction();
 
-  // 打开（或外部换入新规则）时重建编辑副本，与「以列表草稿为准重建表单」的
-  // 原行为一致。
+  // 打开（或外部换入新规则）时重建编辑副本，同时承接页面级校验传入的错误提示。
   useEffect(() => {
     if (open) {
       setForm(copyRuleDraft(rule));
-      setErrors({});
+      setErrors({ ...(initialErrors || {}) });
       setPreview(null);
     }
-  }, [open, rule]);
+  }, [open, rule, initialErrors]);
 
   const patchForm = (patch: Partial<AlertRuleDraft>) => {
     setForm((current) => (current ? { ...current, ...patch } : current));

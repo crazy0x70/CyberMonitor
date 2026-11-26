@@ -1,10 +1,9 @@
 # syntax=docker/dockerfile:1.7
-ARG GO_IMAGE_VERSION=1.27.1
-ARG NODE_IMAGE_VERSION=26.10.0
+ARG GO_IMAGE=golang:latest
+ARG RUNTIME_IMAGE=debian:stable-slim
 
-FROM --platform=$BUILDPLATFORM golang:${GO_IMAGE_VERSION}-alpine AS build-base
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build-base
 
-ARG GO_IMAGE_VERSION
 ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -12,17 +11,7 @@ ARG TARGETVARIANT
 WORKDIR /src
 COPY go.mod ./
 COPY go.sum ./
-RUN set -eu; \
-    go_version="$(awk '/^go / { print $2; exit }' go.mod)"; \
-    if [ -z "${go_version}" ]; then \
-      echo "Unable to resolve Go version from go.mod" >&2; \
-      exit 1; \
-    fi; \
-    if [ "${go_version}" != "${GO_IMAGE_VERSION}" ]; then \
-      echo "Go version drift detected: go.mod=${go_version}, Dockerfile GO_IMAGE_VERSION=${GO_IMAGE_VERSION}" >&2; \
-      exit 1; \
-    fi; \
-    go mod download
+RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
@@ -71,22 +60,28 @@ RUN set -eux; \
     -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILD_TIME}" \
     ./cmd/agent
 
-FROM alpine:3.24 AS runtime-base
+FROM ${RUNTIME_IMAGE} AS runtime-base
 WORKDIR /app
 # GOMEMLIMIT 是 Go GC 软上限：实测 30 agent 满负载工作集 <60MiB，
 # 300MiB 留足余量，同时阻止堆水位在分配波动下无限抬升容器 RSS。
-ENV GOMEMLIMIT=300MiB
+ENV GOMEMLIMIT=300MiB \
+    DEBIAN_FRONTEND=noninteractive
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN apk add --no-cache su-exec tzdata && \
-    addgroup -S cm && \
-    adduser -S -G cm cm && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates gosu tzdata && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --system cm && \
+    useradd --system --gid cm --home-dir /app --shell /usr/sbin/nologin cm && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \
     chown -R cm:cm /app
 
 FROM runtime-base AS release-server
 ARG VERSION=dev
 ARG COMMIT=none
-RUN mkdir -p /data && chown -R cm:cm /data
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /data && chown -R cm:cm /data
 ENV CM_DATA_DIR=/data \
     CM_DEPLOY_MODE=docker \
     CM_VERSION=${VERSION} \
@@ -95,19 +90,18 @@ COPY --from=build-server /out/cyber-monitor /app/cyber-monitor
 EXPOSE 25012
 EXPOSE 25013
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget -q -O - http://127.0.0.1:25012/api/v1/health || exit 1
+  CMD curl -fsS http://127.0.0.1:25012/api/v1/health >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 FROM runtime-base AS release-agent
 ARG VERSION=dev
 ARG COMMIT=none
 COPY --from=build-agent /out/cyber-monitor /app/cyber-monitor
-RUN apk add --no-cache iputils libcap-utils && \
-    setcap cap_net_raw+ep /bin/ping && \
-    ping6_path="$(command -v ping6 || true)" && \
-    if [ -n "$ping6_path" ] && [ ! -L "$ping6_path" ] && [ "$ping6_path" != "/bin/ping" ]; then \
-      setcap cap_net_raw+ep "$ping6_path"; \
-    fi
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends iputils-ping libcap2-bin && \
+    rm -rf /var/lib/apt/lists/* && \
+    ping_path="$(readlink -f "$(command -v ping)")" && \
+    setcap cap_net_raw+ep "$ping_path"
 ENV CM_DEPLOY_MODE=docker \
     CM_VERSION=${VERSION} \
     CM_COMMIT=${COMMIT}
@@ -117,7 +111,10 @@ FROM runtime-base AS release-server-prebuilt
 ARG VERSION=dev
 ARG COMMIT=none
 ARG TARGETARCH
-RUN mkdir -p /data && chown -R cm:cm /data
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /data && chown -R cm:cm /data
 RUN --mount=type=bind,source=docker-release,target=/release,readonly \
     set -eu; \
     case "${TARGETARCH}" in \
@@ -136,7 +133,7 @@ ENV CM_DATA_DIR=/data \
 EXPOSE 25012
 EXPOSE 25013
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget -q -O - http://127.0.0.1:25012/api/v1/health || exit 1
+  CMD curl -fsS http://127.0.0.1:25012/api/v1/health >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 FROM runtime-base AS release-agent-prebuilt
@@ -154,12 +151,11 @@ RUN --mount=type=bind,source=docker-release,target=/release,readonly \
     cp "$binary" /app/cyber-monitor; \
     chmod 0755 /app/cyber-monitor; \
     chown cm:cm /app/cyber-monitor
-RUN apk add --no-cache iputils libcap-utils && \
-    setcap cap_net_raw+ep /bin/ping && \
-    ping6_path="$(command -v ping6 || true)" && \
-    if [ -n "$ping6_path" ] && [ ! -L "$ping6_path" ] && [ "$ping6_path" != "/bin/ping" ]; then \
-      setcap cap_net_raw+ep "$ping6_path"; \
-    fi
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends iputils-ping libcap2-bin && \
+    rm -rf /var/lib/apt/lists/* && \
+    ping_path="$(readlink -f "$(command -v ping)")" && \
+    setcap cap_net_raw+ep "$ping_path"
 ENV CM_DEPLOY_MODE=docker \
     CM_VERSION=${VERSION} \
     CM_COMMIT=${COMMIT}

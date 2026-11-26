@@ -127,7 +127,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			return
 		}
 		if turnstileConfigured(creds.TurnstileSiteKey, creds.TurnstileSecretKey) {
-			if err := verifyTurnstileToken(r.Context(), creds.TurnstileSecretKey, req.TurnstileToken, clientIPFromRemoteAddr(r.RemoteAddr)); err != nil {
+			if err := verifyTurnstileToken(r.Context(), creds.TurnstileSecretKey, req.TurnstileToken, clientIP); err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 				return
 			}
@@ -681,7 +681,7 @@ func newRouteMuxes(deps routeDeps) (publicMux *http.ServeMux, adminMux *http.Ser
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		selection, err := resolveAIProviderSelection(settings, req.Provider, req.Config)
+		selection, err := resolveAIProviderSelectionForModels(settings, req.Provider, req.Config)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return

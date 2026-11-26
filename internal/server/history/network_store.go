@@ -192,6 +192,106 @@ func (s *NetworkStore) QueryRangeRaw(ctx context.Context, nodeID string, from, t
 	return s.queryRangeWithOptions(ctx, nodeID, from, to, true, 0)
 }
 
+// NetworkOverviewStats 是单个节点单个探测目标在窗口内的原始样本统计（流式聚合，不经过
+// 面向图表的降采样桶，也不物化完整时间序列 map）。
+type NetworkOverviewStats struct {
+	AvailSamples int
+	AvailOK      int
+	Latencies    []float64
+	LossSum      float64
+	LossCount    int
+}
+
+// QueryOverviewStats 流式扫描 TSDB 原始样本并返回每个探测目标的精确窗口统计。
+func (s *NetworkStore) QueryOverviewStats(ctx context.Context, nodeID string, from, to time.Time) (map[string]*NetworkOverviewStats, error) {
+	if s == nil || s.db == nil {
+		return nil, errNilNetworkStore
+	}
+	nodeID = normalizeNodeID(nodeID)
+	if nodeID == "" || to.Before(from) {
+		return map[string]*NetworkOverviewStats{}, nil
+	}
+	mint := from.UnixMilli()
+	maxt := to.UnixMilli()
+	querier, err := s.db.Querier(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	defer querier.Close()
+
+	nameMatcher, err := newMetricNameMatcher(networkMetricNames(true))
+	if err != nil {
+		return nil, err
+	}
+	nodeMatcher, err := labels.NewMatcher(labels.MatchEqual, "node_id", nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	seriesSet := querier.Select(ctx, false, &storage.SelectHints{
+		Start: mint,
+		End:   maxt,
+	}, nameMatcher, nodeMatcher)
+
+	result := make(map[string]*NetworkOverviewStats)
+	dropped := 0
+	for seriesSet.Next() {
+		series := seriesSet.At()
+		seriesLabels := series.Labels()
+		metricName := strings.TrimSpace(seriesLabels.Get(labels.MetricName))
+		_, key := normalizeNetworkSeriesKey(networkIdentityFromLabels(seriesLabels))
+		if key == "" {
+			continue
+		}
+		stats := result[key]
+		if stats == nil {
+			if len(result) >= maxSeriesPerQuery {
+				dropped++
+				continue
+			}
+			stats = &NetworkOverviewStats{}
+			result[key] = stats
+		}
+
+		iterator := series.Iterator(nil)
+		for valueType := iterator.Next(); valueType != chunkenc.ValNone; valueType = iterator.Next() {
+			if valueType != chunkenc.ValFloat {
+				continue
+			}
+			_, value := iterator.At()
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				continue
+			}
+			switch metricName {
+			case networkAvailabilityMetric:
+				stats.AvailSamples++
+				if value >= 0.5 {
+					stats.AvailOK++
+				}
+			case networkLatencyMetric:
+				if value >= 0 {
+					stats.Latencies = append(stats.Latencies, value)
+				}
+			case networkLossMetric:
+				if value >= 0 {
+					stats.LossSum += value
+					stats.LossCount++
+				}
+			}
+		}
+		if err := iterator.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if err := seriesSet.Err(); err != nil {
+		return nil, err
+	}
+	if dropped > 0 && s.allowCapLog(time.Now()) {
+		log.Printf("history 概览查询丢弃 %d 个超出基数上限（%d）的序列 node=%s", dropped, maxSeriesPerQuery, nodeID)
+	}
+	return result, nil
+}
+
 func (s *NetworkStore) HasNodeHistory(nodeID string) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, errNilNetworkStore

@@ -313,7 +313,13 @@ func (c *Collector) Collect() NodeStats {
 	netFilter := c.resolveNetFilterAt(now)
 	netCounters, err := gnet.IOCounters(true)
 	c.warnOnce("net.IOCounters", err)
-	netStat := sumNetCounters(netCounters, netFilter)
+	var netStat gnet.IOCountersStat
+	if err != nil && c.prevNet != nil {
+		// 网卡计数器瞬时读取失败时沿用上次累计值，避免上报 0/0 触发服务端流量回绕误算。
+		netStat = *c.prevNet
+	} else {
+		netStat = sumNetCounters(netCounters, netFilter)
+	}
 
 	hostname, uptime, processCount := c.sampleHostIdentityAt(now)
 	if hostName := c.readHostHostnameAt(now); hostName != "" {

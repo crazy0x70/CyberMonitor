@@ -13,6 +13,8 @@ const siteIcon = document.getElementById("site-icon");
 const DEFAULT_SITE_ICON =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231f5dff'/%3E%3Cpath d='M18 40L28 24l8 10 10-14' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E";
 const footerYear = document.getElementById("footer-year");
+const nodeSearchInput = document.getElementById("node-search");
+const emptyRetryBtn = document.getElementById("empty-retry");
 const PUBLIC_LOCALE_STORAGE_KEY = "cm_public_locale";
 let publicLocale = "zh-CN";
 let currentPublicSettings = {};
@@ -106,6 +108,17 @@ const PUBLIC_I18N = {
     totalSuffix: "总计",
     networkCardFocus: "点击仅显示该探测曲线",
     networkCardReset: "点击恢复全部曲线",
+    displayPreferences: "展示偏好",
+    latencyRawFormat: (clipped, raw) => `${clipped}（原始 ${raw}）`,
+    searchPlaceholder: "搜索节点...",
+    searchLabel: "搜索节点",
+    emptyLoadingTitle: "正在加载节点数据",
+    emptyLoadingBody: "正在连接监控服务端获取实时状态…",
+    emptyErrorTitle: "无法连接到监控服务",
+    emptyErrorBody: "请检查服务状态、网络连通性或跨站 API 地址配置。",
+    emptySearchTitle: "没有匹配的节点",
+    emptySearchBody: "尝试调整搜索关键词或切换筛选条件。",
+    retry: "重试",
   },
   "en-US": {
     brandSubtitle: "Host monitoring",
@@ -195,13 +208,34 @@ const PUBLIC_I18N = {
     totalSuffix: "total",
     networkCardFocus: "Click to show only this probe",
     networkCardReset: "Click to show all curves",
+    displayPreferences: "Display preferences",
+    latencyRawFormat: (clipped, raw) => `${clipped} (raw ${raw})`,
+    searchPlaceholder: "Search nodes...",
+    searchLabel: "Search nodes",
+    emptyLoadingTitle: "Loading nodes",
+    emptyLoadingBody: "Connecting to monitor server for live metrics…",
+    emptyErrorTitle: "Unable to reach monitor server",
+    emptyErrorBody: "Check server availability, network connectivity, or cm-api-base settings.",
+    emptySearchTitle: "No matching nodes",
+    emptySearchBody: "Try another search keyword or adjust active filters.",
+    retry: "Retry",
   },
 };
-const timeFormatter = new Intl.DateTimeFormat(undefined, {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
+const timeFormatterCache = new Map();
+function getTimeFormatter(locale) {
+  const key = locale || "zh-CN";
+  if (!timeFormatterCache.has(key)) {
+    timeFormatterCache.set(
+      key,
+      new Intl.DateTimeFormat(key, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    );
+  }
+  return timeFormatterCache.get(key);
+}
 const regionDisplayNamesCache = new Map();
 function regionDisplayNamesFor(locale) {
   if (typeof Intl === "undefined" || !Intl.DisplayNames) return null;
@@ -293,6 +327,9 @@ const state = {
   // F1（第 4 轮）：分组树里每个分组的标签顺序（Map<group, string[]>），
   // 来自快照 group_tree；标签分区按树内顺序展示，树外标签按字母序排后。
   groupTagOrder: new Map(),
+  hasReceivedSnapshot: false,
+  initialLoadFailed: false,
+  searchQuery: "",
 };
 
 const HISTORY_CACHE_KEY = "cm_test_history_v1";
@@ -434,14 +471,38 @@ window.CyberMonitorPublic = Object.assign(window.CyberMonitorPublic || {}, {
   setLocale: (locale) => setPublicLocale(locale, { persist: true }),
 });
 
+function resolvePublicAssetURL(value) {
+  const normalized = normalizePublicImageURL(value);
+  if (!normalized) return "";
+  if (/^https?:\/\//i.test(normalized)) {
+    return normalized;
+  }
+  // 静态托管配置 cm-api-base 时，以 '/' 开头的服务端资源路径相对 apiBase 解析；
+  // 相对路径（如 ./assets/...）继续相对当前静态页面解析。
+  if (normalized.startsWith("/")) {
+    const target = resolveOriginTarget();
+    if (target.apiBase) {
+      try {
+        return new URL(normalized, `${target.apiBase}/`).toString();
+      } catch {
+        // fallback below
+      }
+    }
+  }
+  try {
+    return new URL(normalized, window.location.href).toString();
+  } catch {
+    return "";
+  }
+}
+
 function applySiteBackground(image) {
-  const value = normalizePublicImageURL(image);
-  if (!value) {
+  const resolved = resolvePublicAssetURL(image);
+  if (!resolved) {
     document.documentElement.removeAttribute("data-site-background");
     document.documentElement.style.removeProperty("--site-background-image");
     return;
   }
-  const resolved = new URL(value, window.location.href).toString();
   document.documentElement.setAttribute("data-site-background", "custom");
   document.documentElement.style.setProperty("--site-background-image", `url(${JSON.stringify(resolved)})`);
 }
@@ -547,6 +608,8 @@ function shouldHandleLocalNavigation(event) {
 }
 
 function scheduleRender() {
+  // 后台标签页不执行 DOM 渲染，避免每秒刷新的常驻页浪费 CPU；切回前台由 visibilitychange 立刻补绘。
+  if (document.hidden) return;
   if (state.renderFrame || state.renderTimer) return;
   let flushed = false;
   const flush = () => {
@@ -560,12 +623,10 @@ function scheduleRender() {
       window.clearTimeout(state.renderTimer);
       state.renderTimer = null;
     }
+    if (document.hidden) return;
     render();
   };
   state.renderFrame = window.requestAnimationFrame(flush);
-  // rAF 在隐藏文档里会被挂起，导致 DOM（以及 card._lastNode）停止更新；若回调被丢弃
-  // 还会让 renderFrame 永远非 0，scheduleRender 从此变成永久空操作——只能靠刷新恢复。
-  // 因此始终挂一个 timeout 兜底，谁先到谁生效。
   state.renderTimer = window.setTimeout(flush, RENDER_FALLBACK_MS);
 }
 
@@ -675,7 +736,7 @@ function resolveAPIBaseOverride() {
     return null;
   }
   try {
-    const parsed = new URL(raw);
+    const parsed = new URL(raw, window.location.href);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return null;
     }
@@ -724,15 +785,25 @@ async function fetchPublicSnapshot() {
         cache: "no-store",
       });
       if (!resp.ok) {
+        if (!state.hasReceivedSnapshot) {
+          state.initialLoadFailed = true;
+          scheduleRender();
+        }
         return false;
       }
       const payload = await resp.json();
       if (payload && payload.type === "snapshot") {
         state.wsLastMessageAt = Date.now();
+        state.hasReceivedSnapshot = true;
+        state.initialLoadFailed = false;
         handleSnapshot(payload);
         return true;
       }
     } catch {
+      if (!state.hasReceivedSnapshot) {
+        state.initialLoadFailed = true;
+        scheduleRender();
+      }
       return false;
     }
     return false;
@@ -875,12 +946,35 @@ function resolveNodeFreshness(node) {
   return Number.isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0;
 }
 
+// 轻量签名替代全量 JSON.stringify：仅提取影响渲染与流量累计的关键标量，降低每秒 N 节点 CPU 开销。
 function nodeSignature(node) {
-  try {
-    return JSON.stringify(node);
-  } catch {
-    return "";
-  }
+  if (!node || typeof node !== "object") return "";
+  const s = node.stats || {};
+  const net = s.network || {};
+  const cpu = s.cpu || {};
+  const mem = s.memory || {};
+  const tests = Array.isArray(s.network_tests) ? s.network_tests : [];
+  const lastTestAt = tests.length ? Number(tests[tests.length - 1]?.checked_at || 0) : 0;
+  return [
+    node.last_seen || 0,
+    node.status || "",
+    node.alias || "",
+    node.region || "",
+    node.expire_at || 0,
+    node.hidden_from_all ? 1 : 0,
+    node.hidden_from_cr ? 1 : 0,
+    Array.isArray(node.groups) ? node.groups.join(",") : node.group || "",
+    s.timestamp || 0,
+    s.uptime_sec || 0,
+    Math.round((cpu.usage_percent || 0) * 10),
+    Math.round((mem.used_percent || 0) * 10),
+    net.bytes_sent || 0,
+    net.bytes_recv || 0,
+    Math.round(net.tx_bytes_per_sec || 0),
+    Math.round(net.rx_bytes_per_sec || 0),
+    tests.length,
+    lastTestAt,
+  ].join("|");
 }
 
 function shouldReplaceNode(existing, candidate) {
@@ -1118,11 +1212,11 @@ function applyUptimeFields(fields, node, uptimeText) {
   if (!fields) return;
   const offline = resolveNodeStatus(node) === "offline";
   setText(
-    fields.summaryUptime?.querySelector(".uptime-label"),
+    fields.summaryUptimeLabel,
     offline ? `${t("offline")} ` : `${t("runningPrefix")} `
   );
   setText(
-    fields.summaryUptime?.querySelector(".num"),
+    fields.summaryUptimeNum,
     offline ? formatOfflineDuration(node) : uptimeText
   );
   setDetailText(fields.detailUptime, offline ? "--" : uptimeText);
@@ -1144,6 +1238,7 @@ function syncRealtimeStatus(nodes) {
 }
 
 function refreshRealtimeStatus() {
+  if (document.hidden) return;
   let changed = false;
   state.lastNodes.forEach((node) => {
     const id = resolveDisplayNodeId(node, "").trim();
@@ -1193,6 +1288,8 @@ function handleSnapshot(payload) {
   if (!payload || typeof payload !== "object") {
     return;
   }
+  state.hasReceivedSnapshot = true;
+  state.initialLoadFailed = false;
 
   const generatedAt = Number(payload.generated_at || 0);
   const currentAt = Number((state.snapshot && state.snapshot.generated_at) || 0);
@@ -1227,15 +1324,39 @@ function handleNodeDelta(payload) {
   rebuildMergedSnapshotState();
 }
 
+function filterNodesBySearch(nodes, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return nodes;
+  return nodes.filter((node) => {
+    const stats = node?.stats || {};
+    const haystack = [
+      resolveDisplayName(node, stats),
+      node?.alias,
+      stats.node_name,
+      stats.hostname,
+      stats.os,
+      stats.arch,
+      node?.region,
+      formatRegion(node?.region),
+      ...(Array.isArray(node?.groups) ? node.groups : []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+}
+
 function render() {
   const groups = collectGroupNames(state.lastNodes, state.settingsGroups);
   renderGroupTabs(groups);
   const groupNodes = filterNodesByGroup(state.lastNodes, state.selectedGroup);
-  const visibleNodes = filterNodesByStatus(groupNodes, state.statusFilter);
+  const statusNodes = filterNodesByStatus(groupNodes, state.statusFilter);
+  const visibleNodes = filterNodesBySearch(statusNodes, state.searchQuery);
 
   updateStats(state.lastNodes);
   syncStatFilterSelection();
-  updateEmptyState(visibleNodes.length, groupNodes.length);
+  updateEmptyState(visibleNodes.length, groupNodes.length, statusNodes.length);
   const mode = state.selectedGroup === DEFAULT_GROUP ? "flat" : "tag";
   if (state.renderMode !== mode) {
     resetRenderMode(mode);
@@ -1247,7 +1368,7 @@ function render() {
   }
 }
 
-function updateEmptyState(visibleCount, totalCount) {
+function updateEmptyState(visibleCount, totalCount, statusCount = totalCount) {
   // P-08（第 4 轮）：用 hidden 属性控制显隐，不写内联 display，
   // 避免 display: block 覆盖 .empty 的 grid + justify-items: center
   empty.hidden = visibleCount > 0;
@@ -1256,13 +1377,29 @@ function updateEmptyState(visibleCount, totalCount) {
   }
   const titleNode = empty.querySelector("h2");
   const bodyNode = empty.querySelector("p");
+  const iconBlock = empty.querySelector(".state-icon-block");
   const inGroup = state.selectedGroup !== DEFAULT_GROUP;
-  // 「等待节点接入」只在系统里确实没有任何节点时出现；有节点但当前状态筛选为空，
-  // 说明筛选结果为空而不是没有节点接入。分组内本就没有节点时优先用分组空态。
+  const hasSearch = Boolean(String(state.searchQuery || "").trim());
   let titleKey = "emptyWaitingTitle";
   let bodyKey = "emptyWaitingBody";
-  if (state.lastNodes.length > 0) {
-    if (inGroup && totalCount === 0) {
+  let showRetry = false;
+  let isError = false;
+
+  if (!state.hasReceivedSnapshot) {
+    if (state.initialLoadFailed) {
+      titleKey = "emptyErrorTitle";
+      bodyKey = "emptyErrorBody";
+      showRetry = true;
+      isError = true;
+    } else {
+      titleKey = "emptyLoadingTitle";
+      bodyKey = "emptyLoadingBody";
+    }
+  } else if (state.lastNodes.length > 0) {
+    if (hasSearch && statusCount > 0) {
+      titleKey = "emptySearchTitle";
+      bodyKey = "emptySearchBody";
+    } else if (inGroup && totalCount === 0) {
       titleKey = "emptyGroupTitle";
       bodyKey = "emptyGroupBody";
     } else if (state.statusFilter === "offline") {
@@ -1272,6 +1409,13 @@ function updateEmptyState(visibleCount, totalCount) {
       titleKey = "emptyOnlineTitle";
       bodyKey = inGroup ? "emptyOnlineGroupBody" : "emptyOnlineBody";
     }
+  }
+  if (iconBlock) {
+    iconBlock.classList.toggle("is-error", isError);
+  }
+  if (emptyRetryBtn) {
+    emptyRetryBtn.hidden = !showRetry;
+    emptyRetryBtn.textContent = t("retry");
   }
   titleNode.textContent = t(titleKey);
   bodyNode.textContent = t(bodyKey);
@@ -1319,8 +1463,9 @@ function applyPublicIdentitySettings(settings) {
     brandSubtitle.textContent = resolvedSubtitle;
   }
   if (siteIcon) {
-    if (icon) {
-      siteIcon.setAttribute("href", icon);
+    const resolvedIcon = resolvePublicAssetURL(icon);
+    if (resolvedIcon) {
+      siteIcon.setAttribute("href", resolvedIcon);
     } else {
       siteIcon.setAttribute("href", DEFAULT_SITE_ICON);
     }
@@ -2107,6 +2252,59 @@ window.addEventListener("popstate", () => {
 
 // P-03（第 4 轮）：窗口尺寸变化时重算分组栏溢出态
 window.addEventListener("resize", updateGroupTabsOverflow);
+if (groupTabs) {
+  groupTabs.addEventListener("scroll", updateGroupTabsOverflow, { passive: true });
+}
+if (nodeSearchInput) {
+  nodeSearchInput.addEventListener("input", () => {
+    state.searchQuery = nodeSearchInput.value || "";
+    scheduleRender();
+  });
+  nodeSearchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      if (nodeSearchInput.value) {
+        nodeSearchInput.value = "";
+        state.searchQuery = "";
+        scheduleRender();
+      } else {
+        nodeSearchInput.blur();
+      }
+    }
+  });
+}
+if (emptyRetryBtn) {
+  emptyRetryBtn.addEventListener("click", () => {
+    state.initialLoadFailed = false;
+    scheduleRender();
+    fetchPublicSnapshot().finally(() => {
+      connectWS();
+    });
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (
+    event.key !== "/" ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.altKey ||
+    !nodeSearchInput
+  ) {
+    return;
+  }
+  const active = document.activeElement;
+  if (
+    active &&
+    (active.tagName === "INPUT" ||
+      active.tagName === "TEXTAREA" ||
+      active.tagName === "SELECT" ||
+      active.isContentEditable)
+  ) {
+    return;
+  }
+  event.preventDefault();
+  nodeSearchInput.focus();
+  nodeSearchInput.select();
+});
 
 function rangeSeconds(key) {
   const match = RANGE_OPTIONS.find((item) => item.key === key);
@@ -2295,7 +2493,8 @@ function renderGroupTabs(groups) {
       { history: "replace", render: false }
     );
   }
-  if (state.groupTabSignature !== signature) {
+  const tabsChanged = state.groupTabSignature !== signature;
+  if (tabsChanged) {
     state.groupTabSignature = signature;
     groupTabs.innerHTML = "";
     allGroups.forEach((group) => {
@@ -2318,25 +2517,40 @@ function renderGroupTabs(groups) {
   if (hrefChanged) {
     state.groupTabHrefSignature = state.statusFilter;
   }
+  let activeChanged = false;
+  let activeButton = null;
   Array.from(groupTabs.querySelectorAll(".group-tab")).forEach((button) => {
-    button.classList.toggle("active", button.dataset.group === state.selectedGroup);
+    const isActive = button.dataset.group === state.selectedGroup;
+    if (button.classList.contains("active") !== isActive) {
+      activeChanged = true;
+    }
+    button.classList.toggle("active", isActive);
+    if (isActive) {
+      button.setAttribute("aria-current", "page");
+      activeButton = button;
+    } else {
+      button.removeAttribute("aria-current");
+    }
     if (hrefChanged && button.tagName === "A") {
       button.setAttribute("href", buildViewURL(button.dataset.group || DEFAULT_GROUP, state.statusFilter));
     }
   });
-  updateGroupTabsOverflow();
+  if (activeChanged && activeButton && typeof activeButton.scrollIntoView === "function") {
+    activeButton.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+  if (tabsChanged || activeChanged) {
+    updateGroupTabsOverflow();
+  }
 }
 
-// P-03（第 4 轮）：分组栏只在真正溢出（scrollWidth > clientWidth）时加 .is-overflowing，
-// CSS 借此切换两端渐隐遮罩；渲染后与窗口 resize 时各判断一次
+// 独立维护左右溢出态，避免 scrollLeft === 0 时左侧淡化 ALL 标签
 function updateGroupTabsOverflow() {
   if (!groupTabs) {
     return;
   }
-  groupTabs.classList.toggle(
-    "is-overflowing",
-    groupTabs.scrollWidth > groupTabs.clientWidth
-  );
+  const maxScroll = Math.max(0, groupTabs.scrollWidth - groupTabs.clientWidth);
+  groupTabs.classList.toggle("can-scroll-left", groupTabs.scrollLeft > 2);
+  groupTabs.classList.toggle("can-scroll-right", maxScroll - groupTabs.scrollLeft > 2);
 }
 
 function filterNodesByGroup(nodes, group) {
@@ -2417,6 +2631,58 @@ function netStatBlockMarkup(label, upText, downText) {
   );
 }
 
+function ensureNetStatNodes(container) {
+  if (!container) return null;
+  if (container.__cmNetNodes) {
+    return container.__cmNetNodes;
+  }
+  container.replaceChildren(
+    parseMarkup(netStatBlockMarkup("", "--", "--"))
+  );
+  const labelEl = container.querySelector(".stat-net-label");
+  const items = container.querySelectorAll(".stat-net-item");
+  const bindItem = (item) => {
+    if (!item) return null;
+    let unitEl = item.querySelector(".stat-net-unit");
+    if (!unitEl) {
+      unitEl = document.createElement("span");
+      unitEl.className = "stat-net-unit";
+      item.appendChild(unitEl);
+    }
+    return {
+      root: item,
+      num: item.querySelector(".num"),
+      unit: unitEl,
+    };
+  };
+  const nodes = {
+    label: labelEl,
+    up: bindItem(items[0]),
+    down: bindItem(items[1]),
+  };
+  container.__cmNetNodes = nodes;
+  return nodes;
+}
+
+function patchNetStatBlock(container, label, upText, downText) {
+  const nodes = ensureNetStatNodes(container);
+  if (!nodes) return;
+  setText(nodes.label, label);
+  const patchSide = (side, arrowText, value) => {
+    if (!side) return;
+    const { num, unit } = splitNetValueText(value);
+    setText(side.num, num);
+    setText(side.unit, unit);
+    side.unit.hidden = !unit;
+    const title = `${arrowText} ${value}`;
+    if (side.root.title !== title) {
+      side.root.title = title;
+    }
+  };
+  patchSide(nodes.up, "↑", upText);
+  patchSide(nodes.down, "↓", downText);
+}
+
 function updateStats(nodes) {
   let online = 0;
   let totalUpRate = 0;
@@ -2445,21 +2711,14 @@ function updateStats(nodes) {
   }
 
   // S6（0.1.1 裁定）：健康度色温 —— 存在离线即 degraded。
-  // CSS 按 html[data-health] 切换 --canvas-tint-b（淡琥珀，过渡 --dur-5），不做数值插值
   const health = offline > 0 ? "degraded" : "ok";
   if (document.documentElement.dataset.health !== health) {
     document.documentElement.dataset.health = health;
   }
 
-  // P-04 第 5 条：两个小指标块（累计 / 实时），展示层拆 span，数值与格式不变
-  setHTML(
-    statNetUsage,
-    netStatBlockMarkup(t("netTotal"), formatBytes(totalUp), formatBytes(totalDown))
-  );
-  setHTML(
-    statNetRate,
-    netStatBlockMarkup(t("netRate"), formatRate(totalUpRate), formatRate(totalDownRate))
-  );
+  // 就地更新文本节点，消除每秒两次 DOMParser 解析与 SVG 重建
+  patchNetStatBlock(statNetUsage, t("netTotal"), formatBytes(totalUp), formatBytes(totalDown));
+  patchNetStatBlock(statNetRate, t("netRate"), formatRate(totalUpRate), formatRate(totalDownRate));
 }
 
 function upsertRenderedCard(container, node, id, animationIndex) {
@@ -2585,6 +2844,10 @@ function cleanupTagSections(activeTags) {
 
 function releaseCardResources(card) {
   card?._fields?.testChart?.__latencyHoverCleanup?.();
+  if (card?._chartResizeObserver) {
+    card._chartResizeObserver.disconnect();
+    card._chartResizeObserver = null;
+  }
 }
 
 function cleanupInactive(activeIds) {
@@ -2649,7 +2912,7 @@ function tagSectionOrderComparator(group) {
         return aInTree ? -1 : 1;
       }
     }
-    return a.tag.localeCompare(b.tag, "zh-Hans-CN");
+    return a.tag.localeCompare(b.tag, publicLocale === "en-US" ? "en" : "zh-Hans-CN");
   };
 }
 
@@ -2747,7 +3010,6 @@ function createCard() {
       <div class="node-summary-left">
         <div class="node-title">
           <span class="node-name" data-field="name"></span>
-          <span class="status-dot" data-field="status-dot" role="img"></span>
         </div>
         <div class="node-meta">
           <span class="node-meta-text" data-field="meta"></span>
@@ -2771,6 +3033,8 @@ function createCard() {
                 <span class="clip-control-label">${t("clip")}</span>
                 <button
                   type="button"
+                  role="switch"
+                  aria-checked="false"
                   class="clip-toggle"
                   data-field="test-clip"
                   aria-label="${t("clipToggle")}"
@@ -2815,6 +3079,10 @@ function createCard() {
   fields.networkSection = card.querySelector(".network-section");
   fields.gpuMetaBadge = card.querySelector(".gpu-badge");
   fields.detailsEl = card.querySelector(".node-details");
+  fields.lastSeenLabel = fields.lastSeen?.querySelector(".last-seen-label") || null;
+  fields.lastSeenNum = fields.lastSeen?.querySelector(".num") || null;
+  fields.summaryUptimeLabel = fields.summaryUptime?.querySelector(".uptime-label") || null;
+  fields.summaryUptimeNum = fields.summaryUptime?.querySelector(".num") || null;
 
   fields.rangeButtons = new Map();
   RANGE_OPTIONS.forEach((item) => {
@@ -2836,6 +3104,26 @@ function createCard() {
   card._fields = fields;
   card._historySignature = "";
   card._detailsAnim = null;
+  if (typeof ResizeObserver === "function" && fields.testChart) {
+    let lastChartWidth = 0;
+    let resizeRaf = 0;
+    const ro = new ResizeObserver((entries) => {
+      const nextWidth = Math.round(entries[0]?.contentRect?.width || 0);
+      if (!card.open || nextWidth <= 0 || Math.abs(nextWidth - lastChartWidth) < 4) {
+        return;
+      }
+      lastChartWidth = nextWidth;
+      if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
+      resizeRaf = window.requestAnimationFrame(() => {
+        resizeRaf = 0;
+        if (card.open && card._nodeId && card._fields) {
+          renderNetworkSection(card._fields, card._nodeId);
+        }
+      });
+    });
+    ro.observe(fields.testChart);
+    card._chartResizeObserver = ro;
+  }
   const detailsEl = fields.detailsEl;
 
   // M-03（第 12 轮）：展开 / 收起改用显式像素高度 + WAAPI。
@@ -2901,6 +3189,10 @@ function createCard() {
   // 内容先渲染到位再量目标高度：探测图表来自异步历史，先量会把目标算小
   function prepareDetailsContent() {
     if (!card._lastNode || !card._nodeId) return;
+    if (card._detailsDirty) {
+      updateCardDetailFields(card, card._lastNode);
+      card._detailsDirty = false;
+    }
     const historySignature = buildCardHistorySignature(card._lastNode, card._nodeId);
     if (historySignature === card._historySignature) return;
     renderCardDetails(card, card._lastNode, card._nodeId);
@@ -3002,33 +3294,23 @@ function updateCard(card, node, nodeId) {
   fields.gpuMeta.hidden = !gpuMetaText;
 
   const statusValue = resolveNodeStatus(node);
-  const status = statusValue === "offline" ? t("offline") : t("online");
-  fields.statusDot.classList.toggle("offline", statusValue === "offline");
-  // 仅视觉钩子：离线卡片整体弱化；状态点带可读标签，不只依赖颜色区分
   card.classList.toggle("is-offline", statusValue === "offline");
-  fields.statusDot.setAttribute("aria-label", status);
-  fields.statusDot.title = status;
+  card.dataset.status = statusValue;
 
   const cpuPercent = clamp(cpu.usage_percent || 0);
   setText(fields.cpuSummary, `${cpuPercent.toFixed(0)}%`);
-  if (fields.cpuMini) {
-    fields.cpuMini.style.width = `${cpuPercent}%`;
-  }
+  setBarPercent(fields.cpuMini, cpuPercent);
   setMetricLevel(fields.cpuMini, cpuPercent);
 
   const memPercent = clamp(mem.used_percent || 0);
   setText(fields.memSummary, `${memPercent.toFixed(0)}%`);
-  if (fields.memMini) {
-    fields.memMini.style.width = `${memPercent}%`;
-  }
+  setBarPercent(fields.memMini, memPercent);
   setMetricLevel(fields.memMini, memPercent);
 
   const diskAgg = aggregateDisk(diskList);
   const diskPercent = clamp(diskAgg.percent);
   setText(fields.diskSummary, `${diskPercent.toFixed(0)}%`);
-  if (fields.diskMini) {
-    fields.diskMini.style.width = `${diskPercent}%`;
-  }
+  setBarPercent(fields.diskMini, diskPercent);
   setMetricLevel(fields.diskMini, diskPercent);
 
   const netSpeed =
@@ -3038,9 +3320,7 @@ function updateCard(card, node, nodeId) {
   const hasNetSpeed = Number.isFinite(netSpeed) && netSpeed > 0;
   const netPercent = hasNetSpeed ? calcNetPercent(net, netSpeed) : 0;
   setText(fields.netSummary, hasNetSpeed ? `${netPercent.toFixed(0)}%` : "");
-  if (fields.netMini) {
-    fields.netMini.style.width = `${hasNetSpeed ? netPercent : 0}%`;
-  }
+  setBarPercent(fields.netMini, hasNetSpeed ? netPercent : 0);
   setMetricLevel(fields.netMini, hasNetSpeed ? netPercent : 0);
 
   setText(fields.cpuMeta, "");
@@ -3057,26 +3337,59 @@ function updateCard(card, node, nodeId) {
   card._lastNode = node;
 
   const uptimeText = formatUptime(stats.uptime_sec || 0);
-  // P-04（第 5 轮）：卡片底部「已运行」已删除，运行时间只在详情与 summary 右列显示
-  // E-06 / Check 2：前缀（本地化文案）与时间拆 span，时间走 .num 等宽，前缀保持 UI 字体
-  setText(fields.lastSeen.querySelector(".last-seen-label"), `${t("updatedPrefix")} `);
-  setText(fields.lastSeen.querySelector(".num"), formatTime(node.last_seen || 0));
   applyUptimeFields(fields, node, uptimeText);
   setText(
     fields.summaryTests,
     formatRemainingSummary(node.expire_at || 0, node.auto_renew, node.renew_interval_sec || 0)
   );
 
+  // 折叠卡片跳过 14 项隐藏详情字段的每秒 DOM 写入，展开时再一次性补齐
+  if (card.open) {
+    updateCardDetailFields(card, node);
+    card._detailsDirty = false;
+  } else {
+    card._detailsDirty = true;
+  }
+  updateTestHistory(nodeId, tests);
+
+  const historySignature = buildCardHistorySignature(node, nodeId);
+  if (card.open && card._historySignature !== historySignature) {
+    renderCardDetails(card, node, nodeId);
+    card._historySignature = historySignature;
+  }
+}
+
+function setBarPercent(el, percent) {
+  if (!el) return;
+  const clamped = clamp(percent);
+  const ratio = (clamped / 100).toFixed(4);
+  if (el.__cmPct !== ratio) {
+    el.__cmPct = ratio;
+    el.style.setProperty("--pct", ratio);
+    el.classList.toggle("is-zero", clamped <= 0);
+  }
+}
+
+function updateCardDetailFields(card, node) {
+  const fields = card._fields;
+  const stats = node.stats || {};
+  const cpu = stats.cpu || {};
+  const mem = stats.memory || {};
+  const diskList = stats.disk || [];
+  const net = stats.network || {};
+  const diskAgg = aggregateDisk(diskList);
+  const statusValue = resolveNodeStatus(node);
+  const status = statusValue === "offline" ? t("offline") : t("online");
+
+  setText(fields.lastSeenLabel, `${t("updatedPrefix")} `);
+  setText(fields.lastSeenNum, formatTime(node.last_seen || 0));
   setDetailText(fields.detailStatus, status);
   setDetailText(fields.detailArch, stats.arch || "--");
   setDetailText(fields.detailOS, stats.os || "--");
   setDetailText(fields.detailCPU, formatCPUModel(cpu));
   setDetailText(fields.detailGPU, formatGPUDetails(stats.gpu));
   setDetailText(fields.detailLoad, formatLoad(cpu));
-  setDetailText(fields.detailMem, `${formatBytes(mem.used)} / ${formatBytes(
-    mem.total
-  )}`);
-  // P-05（第 5 轮）：类型未填时不再追加「未知」占位，只显示「已用 / 总量」
+  setDetailText(fields.detailMem, `${formatBytes(mem.used)} / ${formatBytes(mem.total)}`);
   const diskTypeLabel = formatDiskType(node, stats);
   setDetailText(
     fields.detailDisk,
@@ -3085,7 +3398,6 @@ function updateCard(card, node, nodeId) {
     }`
   );
   setDetailText(fields.detailRegion, formatRegion(node.region));
-  // P-04（第 5 轮）：地区未设置（原显示「—」）时整行隐藏
   setDetailRowHidden(fields.detailRegion, !String(node.region || "").trim());
   const remainingText = formatRemaining(
     node.expire_at || 0,
@@ -3093,22 +3405,12 @@ function updateCard(card, node, nodeId) {
     node.renew_interval_sec || 0
   );
   setDetailText(fields.detailRemaining, remainingText);
-  // P-04（第 5 轮）：剩余时间未设置（原显示「未设置」）时整行隐藏
   setDetailRowHidden(fields.detailRemaining, remainingText === t("unset"));
-  // 0.1.2 E-06：剩余时间只在为数值（时长，数字开头）时用 .num；
-  // 未设置 / 已到期 / 续费中 这类状态文案回落 UI 字体
   fields.detailRemaining.classList.toggle("num", /^[0-9]/.test(remainingText));
   setDetailText(fields.detailUpload, formatBytes(net.bytes_sent));
   setDetailText(fields.detailDownload, formatBytes(net.bytes_recv));
   setDetailText(fields.detailFirst, formatTimeFull(node.first_seen || 0));
   setDetailText(fields.detailLast, formatTimeFull(node.last_seen || 0));
-  updateTestHistory(nodeId, tests);
-
-  const historySignature = buildCardHistorySignature(node, nodeId);
-  if (card.open && card._historySignature !== historySignature) {
-    renderCardDetails(card, node, nodeId);
-    card._historySignature = historySignature;
-  }
 }
 
 function renderCardDetails(card, node, nodeId) {
@@ -3158,7 +3460,7 @@ function renderNetworkLoadingState(fields) {
 
 function resetNetworkChartInteractions(fields) {
   if (fields.testChart) {
-
+    fields.testChart.__latencyLastPointer = null;
     if (typeof fields.testChart.__latencyHoverCleanup === "function") {
       fields.testChart.__latencyHoverCleanup();
     }
@@ -3167,19 +3469,20 @@ function resetNetworkChartInteractions(fields) {
   if (fields.testClip) {
     fields.testClip.disabled = true;
     fields.testClip.classList.remove("active");
-    fields.testClip.setAttribute("aria-pressed", "false");
+    fields.testClip.setAttribute("aria-checked", "false");
   }
   if (fields.testTooltip) {
     fields.testTooltip.classList.remove("visible");
+    fields.testTooltip.style.transform = "";
   }
   if (fields.testCrosshair) {
     fields.testCrosshair.classList.remove("visible");
+    fields.testCrosshair.style.transform = "";
   }
 }
 
-function renderNetworkHistoryErrorChart(fields) {
+function renderNetworkHistoryErrorChart(fields, nodeId, activeRange) {
   resetNetworkChartInteractions(fields);
-  // P-12 错误态：--danger-tint 图标方块 + 标题 + 说明（0.1.2：不做重试按钮）
   fields.testChart.replaceChildren(parseMarkup(`
     <div class="network-empty-state" role="status" aria-live="polite" aria-label="${t("historyErrorLabel")}">
       <span class="state-icon-block is-error" aria-hidden="true">
@@ -3191,13 +3494,28 @@ function renderNetworkHistoryErrorChart(fields) {
       </span>
       <strong>${t("historyErrorTitle")}</strong>
       <span class="state-sub">${t("historyErrorBody")}</span>
+      <button type="button" class="state-retry-btn" data-action="retry-history">${t("retry")}</button>
     </div>
   `));
+  const retryBtn = fields.testChart.querySelector('[data-action="retry-history"]');
+  if (retryBtn && nodeId) {
+    retryBtn.addEventListener("click", () => {
+      const key = historyRequestKey(nodeId, activeRange || DEFAULT_TEST_RANGE_KEY);
+      state.testHistoryFailures.delete(key);
+      const timer = state.testHistoryRetryTimers.get(key);
+      if (timer) {
+        window.clearTimeout(timer);
+        state.testHistoryRetryTimers.delete(key);
+      }
+      renderNetworkLoadingState(fields, activeRange || DEFAULT_TEST_RANGE_KEY);
+      void fetchNodeHistory(nodeId, activeRange || DEFAULT_TEST_RANGE_KEY);
+    });
+  }
 }
 
-function renderNetworkHistoryErrorState(fields, activeRange) {
+function renderNetworkHistoryErrorState(fields, activeRange, nodeId) {
   renderRangeTabs(fields, activeRange);
-  renderNetworkHistoryErrorChart(fields);
+  renderNetworkHistoryErrorChart(fields, nodeId, activeRange);
   fields.testCards.innerHTML = "";
 }
 
@@ -3226,11 +3544,11 @@ function updateNetworkTests(fields, node, tests, nodeId) {
   const hasHistory = hasActiveRangeHistory || hasAnyHistoryForNode(nodeId);
   if (activeRangeFailed) {
     if (!tests.length && !hasActiveRangeHistory) {
-      renderNetworkHistoryErrorState(fields, activeRange);
+      renderNetworkHistoryErrorState(fields, activeRange, nodeId);
       return;
     }
     renderNetworkSection(fields, nodeId);
-    renderNetworkHistoryErrorChart(fields);
+    renderNetworkHistoryErrorChart(fields, nodeId, activeRange);
     return;
   }
   if (!tests.length && !hasHistory) {
@@ -3376,16 +3694,17 @@ function renderNetworkSection(fields, nodeId) {
       labels.push(entry.label);
     }
 
-    const card = document.createElement("div");
+    const card = document.createElement("button");
+    card.type = "button";
     card.className = "network-card";
+    card.dataset.testKey = entry.key;
     if (!entry.focused) {
       card.classList.add("muted");
     }
     if (entry.selected) {
       card.classList.add("selected");
     }
-    card.setAttribute("role", "button");
-    card.setAttribute("tabindex", "0");
+    card.setAttribute("aria-pressed", entry.selected ? "true" : "false");
     card.title = entry.selected
       ? t("networkCardReset")
       : t("networkCardFocus");
@@ -3421,20 +3740,15 @@ function renderNetworkSection(fields, nodeId) {
     card.addEventListener("click", () => {
       toggleTestFocus(fields, nodeId, entry.key);
     });
-    card.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        toggleTestFocus(fields, nodeId, entry.key);
-      }
-    });
     fields.testCards.appendChild(card);
   });
 
+  const rawChartWidth = fields.testChart ? Math.round(fields.testChart.clientWidth) : 0;
   const chart = buildLatencyChart(
     seriesList,
     colors,
     timeSeries,
-    fields.testChart ? Math.max(320, Math.round(fields.testChart.clientWidth)) : 680,
+    rawChartWidth > 0 ? Math.max(320, rawChartWidth) : 680,
     seriesRawValues,
   );
   fields.testChart.replaceChildren(parseMarkup(chart.svg));
@@ -3442,12 +3756,21 @@ function renderNetworkSection(fields, nodeId) {
 }
 
 function toggleTestFocus(fields, nodeId, key) {
+  const restoreKey = document.activeElement?.closest?.(".network-card")?.dataset?.testKey || "";
   if (state.selectedTests.get(nodeId) === key) {
     state.selectedTests.delete(nodeId);
   } else {
     state.selectedTests.set(nodeId, key);
   }
   renderNetworkSection(fields, nodeId);
+  if (restoreKey && fields.testCards) {
+    const match = Array.from(fields.testCards.querySelectorAll(".network-card")).find(
+      (btn) => btn.dataset.testKey === restoreKey
+    );
+    if (match) {
+      match.focus();
+    }
+  }
 }
 
 function buildRenderedTestGrid(rangeKey, rangeSec, rangeEndSec, testEntries) {
@@ -3464,7 +3787,7 @@ function renderClipToggle(fields, nodeId, enabled) {
   if (!button) return;
   button.disabled = false;
   button.classList.toggle("active", enabled);
-  button.setAttribute("aria-pressed", enabled ? "true" : "false");
+  button.setAttribute("aria-checked", enabled ? "true" : "false");
   button.onclick = () => {
     const next = !Boolean(state.testClip.get(nodeId));
     if (next) {
@@ -3479,7 +3802,9 @@ function renderClipToggle(fields, nodeId, enabled) {
 function renderRangeTabs(fields, active) {
   if (!fields.rangeButtons) return;
   fields.rangeButtons.forEach((button, key) => {
-    button.classList.toggle("active", key === active);
+    const isActive = key === active;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
   });
 }
 
@@ -3866,10 +4191,8 @@ function latencyEmptyStateHTML() {
 }
 
 function buildLatencyChart(seriesList, colors, times, chartWidth, rawValues) {
-
   const width = chartWidth > 0 ? chartWidth : 680;
   const height = 220;
-  const padding = { top: 20, right: 18, bottom: 18, left: 52 };
   const normalized = seriesList
     .map((series) => (Array.isArray(series) ? series : []))
     .filter((series) => series.length > 0);
@@ -3892,7 +4215,15 @@ function buildLatencyChart(seriesList, colors, times, chartWidth, rawValues) {
   }
   const { ticks: yTicks, maxValue } = yScale;
 
-  const plotWidth = width - padding.left - padding.right;
+  // 根据纵轴最大刻度文本长度动态扩展左侧留白，防止 1000ms 以上刻度被 SVG 裁切遮挡
+  const maxYLabelLen = yTicks.reduce(
+    (max, value) => Math.max(max, `${value}\u00a0ms`.length),
+    0
+  );
+  const leftPadding = Math.max(52, Math.ceil(maxYLabelLen * 7.4) + 16);
+  const padding = { top: 20, right: 18, bottom: 18, left: leftPadding };
+
+  const plotWidth = Math.max(80, width - padding.left - padding.right);
   const plotHeight = height - padding.top - padding.bottom;
   const stepX = plotWidth / Math.max(maxLen - 1, 1);
 
@@ -3998,74 +4329,78 @@ function setupLatencyHover(fields, meta, labels) {
   const crosshair = fields.testCrosshair;
   if (!container || !tooltip || !crosshair) return;
   const host = fields.testChart.parentElement;
+  const preservedPointer = container.__latencyLastPointer || null;
   if (typeof container.__latencyHoverCleanup === "function") {
-    container.__latencyHoverCleanup();
+    container.__latencyHoverCleanup(true);
   }
   if (!meta || !meta.maxLen || !meta.paddedTimes.length) {
+    container.__latencyLastPointer = null;
     tooltip.classList.remove("visible");
+    tooltip.style.transform = "";
     crosshair.classList.remove("visible");
+    crosshair.style.transform = "";
     return;
   }
   const svg = container.querySelector("svg");
   if (!svg) return;
 
-  const hide = () => {
+  let pendingClientX = 0;
+  let pendingClientY = 0;
+  let hoverRaf = 0;
+
+  const hide = (preservePointer = false) => {
+    if (hoverRaf) {
+      window.cancelAnimationFrame(hoverRaf);
+      hoverRaf = 0;
+    }
+    if (!preservePointer) {
+      container.__latencyLastPointer = null;
+    }
     tooltip.classList.remove("visible");
+    tooltip.style.transform = "";
     crosshair.classList.remove("visible");
+    crosshair.style.transform = "";
     tooltip.__latencyTooltipSignature = "";
-    tooltip.__latencyTooltipSize = null;
   };
 
-  const handleLeave = () => hide();
+  const handleLeave = () => hide(false);
   const handleGlobalPointerMove = (event) => {
     if (!tooltip.classList.contains("visible") && !crosshair.classList.contains("visible")) {
       return;
     }
-    const hostRect = host ? host.getBoundingClientRect() : svg.getBoundingClientRect();
+    const hostRect = (host || container).getBoundingClientRect();
     if (
+      !hostRect.width ||
       event.clientX < hostRect.left ||
       event.clientX > hostRect.right ||
       event.clientY < hostRect.top ||
       event.clientY > hostRect.bottom
     ) {
-      hide();
+      hide(false);
     }
   };
-  const handleScrollOrBlur = () => hide();
+  const handleScrollOrBlur = () => hide(false);
 
-  container.addEventListener("mouseleave", handleLeave);
-  container.addEventListener("pointerleave", handleLeave);
-  if (host) {
-    host.addEventListener("mouseleave", handleLeave);
-    host.addEventListener("pointerleave", handleLeave);
-  }
-  window.addEventListener("pointermove", handleGlobalPointerMove, true);
-  window.addEventListener("scroll", handleScrollOrBlur, true);
-  window.addEventListener("blur", handleScrollOrBlur);
-  container.__latencyHoverCleanup = () => {
-    container.removeEventListener("mouseleave", handleLeave);
-    container.removeEventListener("pointerleave", handleLeave);
-    if (host) {
-      host.removeEventListener("mouseleave", handleLeave);
-      host.removeEventListener("pointerleave", handleLeave);
-    }
-    window.removeEventListener("pointermove", handleGlobalPointerMove, true);
-    window.removeEventListener("scroll", handleScrollOrBlur, true);
-    window.removeEventListener("blur", handleScrollOrBlur);
-    container.onmousemove = null;
-  };
-
-  container.onmousemove = (event) => {
+  const renderAtPointer = () => {
+    hoverRaf = 0;
     const rect = svg.getBoundingClientRect();
-    const hostRect = (host || fields.testChart).getBoundingClientRect();
+    const hostRect = (host || container).getBoundingClientRect();
+    if (!rect.width || !hostRect.width) {
+      hide(true);
+      return;
+    }
     const offsetX = rect.left - hostRect.left;
     const scaleX = rect.width / (meta.width || 680);
     const paddingLeft = meta.padding.left * scaleX;
     const paddingRight = meta.padding.right * scaleX;
     const plotWidth = rect.width - paddingLeft - paddingRight;
-    const x = event.clientX - rect.left;
+    if (plotWidth <= 0) {
+      hide(true);
+      return;
+    }
+    const x = pendingClientX - rect.left;
     if (x < paddingLeft || x > rect.width - paddingRight) {
-      hide();
+      hide(true);
       return;
     }
     const stepX = plotWidth / Math.max(meta.maxLen - 1, 1);
@@ -4082,44 +4417,88 @@ function setupLatencyHover(fields, meta, labels) {
     }
     const time = meta.paddedTimes[activeIndex] || meta.paddedTimes[hoverIndex];
     if (!time || rows.length === 0) {
-      hide();
+      hide(true);
       return;
     }
 
     const tooltipSignature = `${activeIndex}|${time}|${rows
       .map((row) => `${row.name}:${row.color}:${row.value}`)
       .join("|")}`;
-    let tooltipSize = tooltip.__latencyTooltipSize;
     if (tooltip.__latencyTooltipSignature !== tooltipSignature) {
       renderLatencyTooltip(tooltip, formatTimeFull(time), rows);
       tooltip.__latencyTooltipSignature = tooltipSignature;
-      const tooltipRect = tooltip.getBoundingClientRect();
-      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
-      tooltip.__latencyTooltipSize = tooltipSize;
     }
     tooltip.classList.add("visible");
-    if (!tooltipSize) {
-      const tooltipRect = tooltip.getBoundingClientRect();
-      tooltipSize = { width: tooltipRect.width, height: tooltipRect.height };
-      tooltip.__latencyTooltipSize = tooltipSize;
-    }
 
-    const containerRect = hostRect;
-    let left = event.clientX - containerRect.left + 12;
-    let top = event.clientY - containerRect.top + 12;
-    if (left + tooltipSize.width > containerRect.width) {
-      left = containerRect.width - tooltipSize.width - 12;
+    const tooltipWidth = tooltip.offsetWidth || 160;
+    const tooltipHeight = tooltip.offsetHeight || 56;
+    let left = pendingClientX - hostRect.left + 12;
+    let top = pendingClientY - hostRect.top + 12;
+    if (left + tooltipWidth > hostRect.width - 8) {
+      left = pendingClientX - hostRect.left - tooltipWidth - 12;
     }
-    if (top + tooltipSize.height > containerRect.height) {
-      top = containerRect.height - tooltipSize.height - 12;
+    if (left < 8) {
+      left = Math.max(8, hostRect.width - tooltipWidth - 8);
     }
-    tooltip.style.left = `${Math.max(left, 8)}px`;
-    tooltip.style.top = `${Math.max(top, 8)}px`;
+    if (top + tooltipHeight > hostRect.height - 8) {
+      top = hostRect.height - tooltipHeight - 8;
+    }
+    tooltip.style.transform = `translate(${Math.round(Math.max(left, 8))}px, ${Math.round(Math.max(top, 8))}px)`;
 
     const crossX = offsetX + paddingLeft + activeIndex * stepX;
-    crosshair.style.left = `${crossX}px`;
+    crosshair.style.transform = `translate(${Math.round(crossX)}px, 0px)`;
     crosshair.classList.add("visible");
   };
+
+  const scheduleRenderAt = (clientX, clientY) => {
+    pendingClientX = clientX;
+    pendingClientY = clientY;
+    container.__latencyLastPointer = { clientX, clientY };
+    if (!hoverRaf) {
+      hoverRaf = window.requestAnimationFrame(renderAtPointer);
+    }
+  };
+
+  const handlePointer = (event) => {
+    scheduleRenderAt(event.clientX, event.clientY);
+  };
+
+  container.addEventListener("pointerenter", handlePointer);
+  container.addEventListener("pointerdown", handlePointer);
+  container.addEventListener("pointermove", handlePointer);
+  container.addEventListener("mouseleave", handleLeave);
+  container.addEventListener("pointerleave", handleLeave);
+  container.addEventListener("pointercancel", handleLeave);
+  if (host) {
+    host.addEventListener("mouseleave", handleLeave);
+    host.addEventListener("pointerleave", handleLeave);
+  }
+  window.addEventListener("pointermove", handleGlobalPointerMove, true);
+  window.addEventListener("scroll", handleScrollOrBlur, true);
+  window.addEventListener("resize", handleScrollOrBlur);
+  window.addEventListener("blur", handleScrollOrBlur);
+  container.__latencyHoverCleanup = (preservePointer = false) => {
+    hide(preservePointer);
+    container.removeEventListener("pointerenter", handlePointer);
+    container.removeEventListener("pointerdown", handlePointer);
+    container.removeEventListener("pointermove", handlePointer);
+    container.removeEventListener("mouseleave", handleLeave);
+    container.removeEventListener("pointerleave", handleLeave);
+    container.removeEventListener("pointercancel", handleLeave);
+    if (host) {
+      host.removeEventListener("mouseleave", handleLeave);
+      host.removeEventListener("pointerleave", handleLeave);
+    }
+    window.removeEventListener("pointermove", handleGlobalPointerMove, true);
+    window.removeEventListener("scroll", handleScrollOrBlur, true);
+    window.removeEventListener("resize", handleScrollOrBlur);
+    window.removeEventListener("blur", handleScrollOrBlur);
+    container.onmousemove = null;
+  };
+
+  if (preservedPointer) {
+    scheduleRenderAt(preservedPointer.clientX, preservedPointer.clientY);
+  }
 }
 
 function buildLatencyTooltipRows(meta, labels, hoverIndex) {
@@ -4141,7 +4520,7 @@ function buildLatencyTooltipRows(meta, labels, hoverIndex) {
       const valueText =
         rawValue === undefined
           ? formatLatency(value)
-          : `${formatLatency(value)}（原始 ${formatLatency(rawValue)}）`;
+          : t("latencyRawFormat", formatLatency(value), formatLatency(rawValue));
       return { color, name, value: valueText };
     })
     .filter(Boolean)
@@ -4481,14 +4860,14 @@ function formatCPUModel(cpu) {
   return parts.length ? parts.join(" · ") : "--";
 }
 
-// P-08 第 3 条（0.1.2 裁定）：阈值只用于样式 —— 写宽度的同时维护所属指标块的
-// dataset.level（≥90 为 hot、≥80 为 warn、否则删除），CSS 按 [data-level] 着色
+// 占用率阈值只用于样式 —— 写宽度的同时维护所属指标块的
+// dataset.level（≥85 为 hot 红色、≥60 为 warn 橙黄色、否则默认绿色），CSS 按 [data-level] 着色
 function setMetricLevel(miniEl, percent) {
   const block = miniEl?.closest(".summary-metric");
   if (!block) return;
-  if (percent >= 90) {
+  if (percent >= 85) {
     block.dataset.level = "hot";
-  } else if (percent >= 80) {
+  } else if (percent >= 60) {
     block.dataset.level = "warn";
   } else {
     delete block.dataset.level;
@@ -4757,7 +5136,7 @@ function formatRate(bytes = 0) {
 
 function formatTime(timestamp) {
   if (!timestamp) return "--";
-  return timeFormatter.format(new Date(timestamp * 1000));
+  return getTimeFormatter(publicLocale).format(new Date(timestamp * 1000));
 }
 
 function formatUptime(seconds = 0) {
@@ -4780,6 +5159,9 @@ function aggregateDisk(list) {
   return { total, used, percent };
 }
 
+// 启动时同步读取本地语言偏好并立即翻译静态节点，消除 en-US 首屏中文闪烁
+publicLocale = loadPublicLocalePreference("zh-CN");
+applyStaticTranslations();
 updateFooter();
 loadTestHistoryCache();
 window.setInterval(refreshRealtimeStatus, 1000);

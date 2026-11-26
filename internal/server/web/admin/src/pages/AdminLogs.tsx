@@ -219,28 +219,13 @@ export default function AdminLogs() {
 
   return (
     <div className={adminPageShellClass}>
-      {/* M-05 呼吸绿点（A-18 第 2 条）：box-shadow 由 0 扩散到 6px、透明度 .35→0、2.4s 无限循环；
-          prefers-reduced-motion 下为静态点（第 7 节通用约束）。任务只允许改本文件，样式随组件内联。 */}
       <style>{`
-@keyframes cm-log-live-dot-breath {
-  from {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 35%, transparent);
-  }
-  to {
-    box-shadow: 0 0 0 6px transparent;
-  }
-}
 .cm-log-live-dot {
   display: inline-block;
   width: 6px;
   height: 6px;
   border-radius: var(--r-full, 9999px);
   background: var(--ok);
-}
-@media (prefers-reduced-motion: no-preference) {
-  .cm-log-live-dot {
-    animation: cm-log-live-dot-breath 2.4s ease-out infinite;
-  }
 }
 `}</style>
       <AdminPageHeader

@@ -65,11 +65,9 @@
   --danger-text: #b02225;
   --danger-tint: rgba(229, 56, 59, 0.10);
 
-  /* 数据条专用（指标语义色，比状态色更柔） */
-  --meter-cpu: linear-gradient(90deg, #4f8bff, #0a64ff);
-  --meter-mem: linear-gradient(90deg, #44d39b, #1fa855);
-  --meter-disk: linear-gradient(90deg, #ffb35c, #ff8a1f);
-  --meter-net: linear-gradient(90deg, #8e8cff, #5b57f0);
+  /* 数据条专用：按占用率分级着色（默认绿色 -> 预警橙黄 -> 高载红色） */
+  --meter-ok: linear-gradient(90deg, #44d39b, #1fa855);
+  --meter-warn: linear-gradient(90deg, #ffb35c, #f08c00);
   --meter-hot: linear-gradient(90deg, #ff8a6a, #e5383b);
   --meter-track: rgba(118, 118, 128, 0.14);
 
@@ -245,6 +243,9 @@ html[data-theme="dark"] {
   --warn-text: var(--warn);
   --danger: #ff5d5f;
   --danger-text: var(--danger);
+  --meter-ok: linear-gradient(90deg, #2ec971, #34d27b);
+  --meter-warn: linear-gradient(90deg, #ffc46b, #ff9f0a);
+  --meter-hot: linear-gradient(90deg, #ff7b6b, #ff4d4f);
   --meter-track: rgba(118, 118, 128, 0.24);
 
   /* 4.2 材质 · 深色 */
@@ -369,77 +370,46 @@ body {
   isolation: isolate;
 }
 
-/* P-01 白釉流光画布：三层叠加（纯色 + 三个径向色团 + feTurbulence 噪点）。
-   inset 向四周外扩 6vmax，配合 ≤6vmax 的漂移幅度，平移后不会露出画布边缘 */
+/* 静态克制画布：移除无限漂移动画与 SVG feTurbulence 滤镜，常驻标签页零持续 GPU 占用 */
 body::before {
   content: "";
   position: fixed;
-  inset: -6vmax;
+  inset: 0;
   z-index: -1;
   pointer-events: none;
   background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E"),
-    radial-gradient(60vmax 60vmax at 10% 0%, var(--canvas-tint-a), transparent 70%),
-    radial-gradient(60vmax 60vmax at 90% 10%, var(--canvas-tint-b), transparent 70%),
-    radial-gradient(60vmax 60vmax at 50% 100%, var(--canvas-tint-c), transparent 70%),
+    radial-gradient(56vmax 48vmax at 12% -6%, var(--canvas-tint-a), transparent 68%),
+    radial-gradient(52vmax 46vmax at 90% 4%, var(--canvas-tint-b), transparent 68%),
     var(--canvas);
 }
 
-/* 第 7 节通用约束：漂移动画包进 no-preference（P-01：reduce 时停止漂移）。
-   P-12（第 4 轮）：will-change 一并移入 no-preference，reduce 时不驻留合成层 */
-@media (prefers-reduced-motion: no-preference) {
-  body::before {
-    animation: canvas-drift 48s var(--ease-in-out) infinite;
-    will-change: transform;
-  }
-}
-
-@keyframes canvas-drift {
-  0% {
-    transform: translate3d(0, 0, 0);
-  }
-  25% {
-    transform: translate3d(3vmax, -2vmax, 0);
-  }
-  50% {
-    transform: translate3d(-2vmax, 3vmax, 0);
-  }
-  75% {
-    transform: translate3d(-3vmax, -1vmax, 0);
-  }
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-/* P-01 第 4 条：自定义站点背景图共存 —— 图片已在 body 背景最底层，
-   色团不透明度降 50%（color-mix 减半），噪点保留，去掉纯色打底 */
-html[data-site-background="custom"] body::before {
-  background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E"),
-    radial-gradient(
-      60vmax 60vmax at 10% 0%,
-      color-mix(in srgb, var(--canvas-tint-a) 50%, transparent),
-      transparent 70%
-    ),
-    radial-gradient(
-      60vmax 60vmax at 90% 10%,
-      color-mix(in srgb, var(--canvas-tint-b) 50%, transparent),
-      transparent 70%
-    ),
-    radial-gradient(
-      60vmax 60vmax at 50% 100%,
-      color-mix(in srgb, var(--canvas-tint-c) 50%, transparent),
-      transparent 70%
-    );
-}
-
-html[data-site-background="custom"] body {
+/* 自定义站点背景图：拆到 fixed 伪元素（避免 iOS background-attachment: fixed 抖动）
+   并在 body::before 叠加主题自适应可读遮罩，保障标题、分组栏与页脚对比度 */
+html[data-site-background="custom"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
   background-color: var(--bg-1);
   background-image: var(--site-background-image, none);
   background-position: center;
   background-size: cover;
-  background-attachment: fixed;
+  background-repeat: no-repeat;
+}
+
+html[data-site-background="custom"] body::before {
+  background: rgba(244, 245, 248, 0.72);
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-site-background="custom"]:not([data-theme="light"]) body::before {
+    background: rgba(12, 13, 16, 0.74);
+  }
+}
+
+html[data-site-background="custom"][data-theme="dark"] body::before {
+  background: rgba(12, 13, 16, 0.74);
 }
 
 button,
@@ -723,10 +693,15 @@ html[data-theme="dark"] .control-menu-item:hover {
 
 .stats-grid {
   display: grid;
-  /* 0.1.1：保持 4 等分，不做 3+2 bento */
   gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: var(--space-4);
+}
+
+@media (max-width: 1080px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 /* 第 7 节通用约束：入场位移包进 no-preference，reduce 时直接显示（M-02） */
@@ -769,24 +744,26 @@ html[data-theme="dark"] .control-menu-item:hover {
   -webkit-tap-highlight-color: transparent;
 }
 
+.stat-filter-button:focus {
+  outline: none;
+}
+
 .stat-filter-button:focus-visible {
-  outline: 2px solid var(--ring);
+  outline: 2px solid var(--hairline-strong);
   outline-offset: 2px;
 }
 
 .stat-filter-button:hover {
   border-color: var(--hairline-strong);
-  background-color: color-mix(in srgb, var(--label-1) 3%, var(--surface-raised));
 }
 
-/* P-01（第 5 轮）：标题 15px / 600 / --label-1，是卡片中字号最大的文字；
-   不再含圆点（圆点随数字移到 .stat-value 内）。行高 1.2 控制卡高 ≤ 80px */
+/* 精密仪表盘层级：标签弱化为 12px / 500 / --label-2，让 22px 指标数字成为绝对视觉焦点 */
 .stat-label {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 500;
   line-height: 1.2;
-  letter-spacing: 0; /* P-05（第 4 轮）：中文标签不加字距 */
-  color: var(--label-1);
+  letter-spacing: 0;
+  color: var(--label-2);
 }
 
 /* P-01（第 5 轮）：数字降为 13px / 600 / --label-2，圆点在数字左侧 */
@@ -920,10 +897,111 @@ html[data-theme="dark"] .control-menu-item:hover {
    P-03（第 4 轮）：轨道外层新增 .group-tabs-wrap（padding-block 2px 给滑块投影留范围），
    轨道本身 inline-flex 只包住按钮宽度；无条件 mask 已删除，改为 .is-overflowing
    （monitor.js 按 scrollWidth > clientWidth 切换）时才渐隐 */
-.group-tabs-wrap {
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.group-tabs-wrap {
   padding-block: 2px;
   max-width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.fleet-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.fleet-search {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 36px;
+  background: var(--surface-raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-full);
+  padding: 0 10px;
+  gap: 6px;
+  transition: border-color var(--dur-2) var(--ease-out);
+}
+
+.fleet-search:focus-within {
+  border-color: var(--accent);
+}
+
+.fleet-search-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--label-3);
+  flex: 0 0 auto;
+}
+
+.fleet-search-input {
+  width: 156px;
+  border: 0;
+  background: transparent;
+  color: var(--label-1);
+  font-size: var(--fs-sm);
+  outline: none;
+  min-width: 0;
+}
+
+.fleet-search-input::placeholder {
+  color: var(--label-3);
+}
+
+.fleet-search-kbd {
+  font-family: var(--font-data);
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--hairline);
+  color: var(--label-3);
+  background: var(--surface-sunken);
+  flex: 0 0 auto;
+}
+
+.fleet-search:focus-within .fleet-search-kbd {
+  opacity: 0;
+}
+
+.state-retry-btn {
+  margin-top: 8px;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-raised);
+  color: var(--label-1);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
+}
+
+.state-retry-btn:hover {
+  background: var(--surface-sunken);
+}
+
+.state-retry-btn:active {
+  transform: scale(0.97);
+}
+
+.state-retry-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 
 .group-tabs {
@@ -939,25 +1017,22 @@ html[data-theme="dark"] .control-menu-item:hover {
   overflow-x: auto;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
-  /* 超出宽度横向滚动；不显示滚动条（避免重现 U1） */
 }
 
-/* 仅在真正溢出时两端渐隐（起点 #000 12px），首尾按钮与轨道圆头不再被无条件淡化 */
-.group-tabs.is-overflowing {
-  -webkit-mask-image: linear-gradient(
-    90deg,
-    transparent 0,
-    #000 12px,
-    #000 calc(100% - 12px),
-    transparent 100%
-  );
-  mask-image: linear-gradient(
-    90deg,
-    transparent 0,
-    #000 12px,
-    #000 calc(100% - 12px),
-    transparent 100%
-  );
+/* 独立左右溢出渐隐：scrollLeft === 0 时左侧不淡化 ALL 标签 */
+.group-tabs.can-scroll-right:not(.can-scroll-left) {
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 16px), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 16px), transparent 100%);
+}
+
+.group-tabs.can-scroll-left:not(.can-scroll-right) {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 100%);
+}
+
+.group-tabs.can-scroll-left.can-scroll-right {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
 }
 
 .group-tabs::-webkit-scrollbar {
@@ -1083,11 +1158,10 @@ html[data-theme="dark"] .group-tab.active {
   border-color: var(--hairline-strong);
 }
 
-.node-card[open] {
-  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
-  box-shadow:
-    inset 0 1px 0 var(--glass-edge),
-    var(--shadow-2);
+.node-card[open],
+.node-card:active {
+  border-color: var(--hairline-strong);
+  box-shadow: none;
 }
 
 /* M-08 + P-09（第 4 轮）：按压反馈只作用于收起态卡片的 summary ——
@@ -1098,19 +1172,24 @@ html[data-theme="dark"] .group-tab.active {
 
 .node-summary {
   display: grid;
-  /* 右列按内容收缩：运行时间只占实际所需宽度，余量让给指标区 */
-  grid-template-columns: minmax(0, 248px) minmax(0, 1fr) minmax(88px, max-content);
+  /* 固定右列宽度，保证所有节点行的 4 项指标列垂直精准对齐，便于 1 秒级快速扫视 */
+  grid-template-columns: minmax(0, 248px) minmax(0, 1fr) 128px;
   align-items: center;
-  gap: var(--space-3) 28px;
-  padding: var(--space-3) 24px var(--space-3) 20px;
+  gap: var(--space-3) 24px;
+  padding: var(--space-3) 20px;
   cursor: pointer;
   list-style: none;
   position: relative;
   border-radius: inherit;
+  outline: none;
+}
+
+.node-summary:focus {
+  outline: none;
 }
 
 .node-summary:focus-visible {
-  outline: 2px solid var(--ring);
+  outline: 2px solid var(--hairline-strong);
   outline-offset: -2px;
 }
 
@@ -1144,50 +1223,6 @@ html[data-theme="dark"] .group-tab.active {
   text-overflow: ellipsis;
   white-space: nowrap;
   word-break: normal;
-}
-
-.node-title .status-dot {
-  flex-shrink: 0;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--status-ok);
-}
-
-.status-dot.offline {
-  background: var(--status-danger);
-}
-
-/* P-06 第 6 条：离线徽标 —— --danger-tint 底、--danger 字、--r-full 胶囊，前接 6px 实心点 */
-.node-card.is-offline .status-dot.offline {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  width: auto;
-  height: 18px;
-  padding: 0 8px;
-  border-radius: var(--r-full);
-  background: var(--danger-tint);
-  color: var(--danger-text);
-  font-size: var(--fs-2xs);
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.node-card.is-offline .status-dot.offline::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: currentColor;
-}
-
-.node-card.is-offline .status-dot.offline::after {
-  content: attr(aria-label);
 }
 
 .node-meta {
@@ -1285,10 +1320,12 @@ html[data-theme="dark"] .group-tab.active {
   color: var(--label-1);
 }
 
-/* 百分比：13px / 600，.num 等宽由上方字体分组提供 */
+/* 百分比：13px / 600，固定最小宽右对齐避免 9%→10%→100% 刷新抖动 */
 .summary-value {
   margin-left: auto;
   flex: 0 0 auto;
+  min-width: 3.4ch;
+  text-align: right;
   font-size: var(--fs-md);
   font-weight: 600;
   color: var(--label-1);
@@ -1324,100 +1361,33 @@ html[data-theme="dark"] .group-tab.active {
   overflow: hidden;
 }
 
-/* P-08：填充按指标语义色使用 --meter-* 渐变。
-   P-04（第 4 轮）：左端圆、右端近似平切（999px 2px 2px 999px），删内描边；
-   color 取各指标渐变的末端色，供 ::after 丝带拖尾经 currentColor 同色渐隐 */
+/* 仅驱动合成层 transform: scaleX()，避免每秒 4×N 条进度条 width 动画触发重排与重绘；
+   CPU / 内存 / 硬盘 / 网络四项默认均为绿色，按实时占用率切换至橙黄 / 红色 */
 .summary-fill {
   position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 0%;
-  border-radius: 999px 2px 2px 999px;
-  background: var(--meter-cpu);
-  color: #0a64ff;
-  /* P-08 第 4 条（0.1.2：不改 scaleX）：宽度过渡 --dur-5 --ease-spring */
-  transition: width var(--dur-5) var(--ease-spring);
-}
-
-.summary-fill::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  right: -12px;
-  width: 12px;
-  border-radius: 0 999px 999px 0;
-  background: linear-gradient(90deg, color-mix(in srgb, currentColor 50%, transparent), transparent);
-  pointer-events: none;
-}
-
-.summary-fill::before {
-  content: "";
-  position: absolute;
   inset: 0;
-  border-radius: inherit;
-  background: linear-gradient(100deg, transparent 0%, transparent 38%, rgba(255, 255, 255, 0.42) 50%, transparent 62%, transparent 100%);
-  background-size: 250% 100%;
-  background-position: 100% 0;
+  width: 100%;
+  border-radius: var(--r-full);
+  background: var(--meter-ok);
+  color: var(--ok);
+  transform-origin: left center;
+  transform: scaleX(var(--pct, 0));
+  transition: transform var(--dur-3) var(--ease-out);
+}
+
+.summary-fill.is-zero {
   opacity: 0;
-  pointer-events: none;
-}
-@media (prefers-reduced-motion: no-preference) {
-  .summary-fill::before {
-    opacity: 1;
-    animation: ribbon-sheen 3.2s var(--ease-in-out) infinite;
-  }
-}
-@keyframes ribbon-sheen {
-  from { background-position: 100% 0; }
-  to { background-position: 0% 0; }
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .summary-fill::before {
-    background: linear-gradient(100deg, transparent 0%, transparent 38%, rgba(255, 255, 255, 0.22) 50%, transparent 62%, transparent 100%);
-  }
-}
-
-[data-theme="dark"] .summary-fill::before {
-  background: linear-gradient(100deg, transparent 0%, transparent 38%, rgba(255, 255, 255, 0.22) 50%, transparent 62%, transparent 100%);
-}
-
-/* 进度为 0 时不显示拖尾与高光 */
-.summary-fill[style*="width: 0"]::before,
-.summary-fill[style*="width: 0"]::after {
-  display: none;
-}
-
-.summary-fill.mem {
-  background: var(--meter-mem);
-  color: #1fa855;
-}
-
-.summary-fill.disk {
-  background: var(--meter-disk);
-  color: #ff8a1f;
-}
-
-.summary-fill.net {
-  background: var(--meter-net);
-  color: #5b57f0;
-}
-
-/* P-08 第 3 条（0.1.2 裁定做）：阈值色只作用于样式。
-   monitor.js 在写宽度处同步维护 .summary-metric 的 data-level（≥90 hot / ≥80 warn） */
-.summary-metric[data-level="warn"] .summary-value {
-  color: var(--warn-text);
-}
-
-.summary-metric[data-level="hot"] .summary-value {
-  color: var(--danger-text);
+/* 占用率阈值着色：仅作用于进度条（<60 默认绿 / ≥60 warn 橙黄 / ≥85 hot 红），百分比数字保持默认文字色 */
+.summary-metric[data-level="warn"] .summary-fill {
+  background: var(--meter-warn);
+  color: var(--warn);
 }
 
 .summary-metric[data-level="hot"] .summary-fill {
   background: var(--meter-hot);
-  color: #e5383b;
+  color: var(--danger);
 }
 
 /* P-06 第 5 条：右列两行右对齐 —— 上行「已运行」--t-caption，下行时长 15px .num */
@@ -1477,21 +1447,19 @@ html[data-theme="dark"] .group-tab.active {
     var(--shadow-1);
 }
 
-.node-card.is-offline[open] {
-  box-shadow:
-    inset 3px 0 0 var(--danger),
-    inset 0 1px 0 var(--glass-edge),
-    var(--shadow-2);
+.node-card.is-offline[open],
+.node-card.is-offline:active {
+  box-shadow: inset 3px 0 0 var(--danger);
 }
 
 .node-card.is-offline .node-summary-metrics {
-  opacity: 0.55;
-  filter: grayscale(1);
+  opacity: 0.72;
+  filter: grayscale(0.85);
 }
 
-.node-card.is-offline .summary-fill {
+.node-card.is-offline .summary-metric .summary-fill {
   background: var(--label-3);
-  color: var(--label-3); /* P-04（第 4 轮）：拖尾随整卡灰度去色 */
+  color: var(--label-3);
 }
 
 .summary-right-line:empty {
@@ -1662,7 +1630,7 @@ html[data-theme="dark"] .group-tab.active {
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
   overflow: hidden;
-  font-weight: 300;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1934,7 +1902,15 @@ html[data-theme="dark"] .range-btn.active {
   gap: var(--space-3);
 }
 
+.network-canvas {
+  touch-action: pan-y;
+}
+
 .network-card {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  text-align: center;
   min-width: 180px;
   padding: var(--space-3);
   border-radius: var(--radius-detail);
@@ -1958,11 +1934,11 @@ html[data-theme="dark"] .range-btn.active {
 }
 
 .network-card.muted {
-  opacity: 0.45;
+  opacity: 0.62;
 }
 
 .network-card.muted:hover {
-  opacity: 0.7;
+  opacity: 0.85;
 }
 
 .network-card-dot {
@@ -1980,7 +1956,7 @@ html[data-theme="dark"] .range-btn.active {
 }
 
 .network-card-name {
-  font-weight: 300;
+  font-weight: 500;
   font-size: var(--fs-sm);
   color: var(--text);
   margin-bottom: var(--space-2);
@@ -2038,9 +2014,10 @@ html[data-theme="dark"] .range-btn.active {
   color: var(--muted);
 }
 
-/* P-10 第 4 条：十字线 1px --label-4 */
+/* P-10 第 4 条：十字线 1px --label-4，使用 2D translate 定位避免重排与合成层闪烁 */
 .network-crosshair {
   position: absolute;
+  left: 0;
   top: 56px;
   bottom: 16px;
   width: 1px;
@@ -2054,30 +2031,31 @@ html[data-theme="dark"] .range-btn.active {
   opacity: 1;
 }
 
-/* P-10 第 4 条：悬停 tooltip。P-12（第 4 轮）：不再挂 .glass，
-   默认 backdrop-filter: none，只在 .visible 时开启模糊，避免每张展开卡常驻合成层 */
+/* 悬停 tooltip：实底高对比浮层，不使用动态 backdrop-filter，避免与 overflow:hidden + SVG 叠加引发白屏 */
 .network-tooltip {
   position: absolute;
+  left: 0;
+  top: 0;
+  width: max-content;
   min-width: 160px;
+  max-width: min(320px, calc(100% - 16px));
   padding: var(--space-2) var(--space-3);
   border-radius: var(--r-md);
-  background: var(--mat-popover-bg);
-  border: 1px solid var(--hairline);
-  box-shadow: var(--shadow-3);
+  background: var(--surface-solid);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: var(--shadow-2);
   color: var(--label-1);
   font-size: var(--fs-2xs);
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
   transition: opacity var(--dur-fast) var(--ease-out);
   z-index: 2;
 }
 
 .network-tooltip.visible {
   opacity: 1;
-  -webkit-backdrop-filter: var(--blur-thick);
-  backdrop-filter: var(--blur-thick);
+  visibility: visible;
 }
 
 .latency-tooltip-time {
@@ -2098,7 +2076,7 @@ html[data-theme="dark"] .range-btn.active {
 
 .latency-tooltip-row strong {
   font-variant-numeric: tabular-nums;
-  font-weight: 300;
+  font-weight: 600;
 }
 
 .latency-tooltip-dot {
@@ -2419,12 +2397,6 @@ html[data-theme="dark"] .range-btn.active {
     transition: opacity var(--dur-2) var(--ease-out) 60ms;
   }
 
-  /* M-05：在线状态点呼吸 —— box-shadow 扩散 0→6px、透明度 .35→0，2.4s 循环；
-     离线（.offline 徽标）不呼吸 */
-  .node-card .status-dot:not(.offline) {
-    animation: status-breathe 2.4s var(--ease-out) infinite;
-  }
-
   /* M-06：图表加载态扫光动画（骨架块底色与高光带在上方静态规则里） */
   .network-loading-state span {
     animation: skeleton-sweep 1.2s linear infinite;
@@ -2441,15 +2413,6 @@ html[data-theme="dark"] .range-btn.active {
     opacity: 1;
     transform: translateY(0);
     filter: blur(0);
-  }
-}
-
-@keyframes status-breathe {
-  from {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 35%, transparent);
-  }
-  to {
-    box-shadow: 0 0 0 6px transparent;
   }
 }
 
@@ -2497,12 +2460,25 @@ html[data-theme="dark"] .range-btn.active {
   .node-summary-right {
     grid-auto-flow: column;
     justify-content: start;
+    justify-items: start;
+    text-align: left;
     gap: var(--space-3);
   }
 
-  .node-summary-right {
-    justify-items: start;
-    text-align: left;
+  .fleet-controls {
+    width: 100%;
+  }
+
+  .fleet-search {
+    flex: 1 1 auto;
+  }
+
+  .fleet-search-input {
+    width: 100%;
+  }
+
+  .fleet-search-kbd {
+    display: none;
   }
 
   /* P-09：分组后网格容器是 .detail-group-grid，移动端保持 2 列 */

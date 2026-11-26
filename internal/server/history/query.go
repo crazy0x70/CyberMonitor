@@ -140,7 +140,9 @@ func buildNetworkSeriesKey(identity networkTestIdentity) string {
 }
 
 func ParseNetworkSeriesKey(key string) (networkTestIdentity, error) {
-	parts := strings.Split(key, "|")
+	// type / host / port 均不含 '|'，探测名称允许包含 '|'（如 "US | Cloudflare"），
+	// 使用 SplitN(..., 4) 避免名称中的竖线导致解析失败并被静默丢弃。
+	parts := strings.SplitN(key, "|", 4)
 	if len(parts) != 4 {
 		return networkTestIdentity{}, fmt.Errorf("invalid network history key %q", key)
 	}

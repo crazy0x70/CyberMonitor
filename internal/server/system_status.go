@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +25,10 @@ import (
 )
 
 // systemStatusSampleInterval 是 CPU 百分比的后台采样周期（F7 定稿 5s）。
-const systemStatusSampleInterval = 5 * time.Second
+const (
+	systemStatusSampleInterval = 5 * time.Second
+	tsdbDirSizeCacheTTL        = 30 * time.Second
+)
 
 // SystemStatus 是 GET /api/v1/admin/system/status 的响应（字段与文档 JSON 一致）。
 type SystemStatus struct {
@@ -84,6 +88,14 @@ type SystemStatusDataDir struct {
 type systemStatusMonitor struct {
 	processCPUPercent float64AsAtomic
 	hostCPUPercent    float64AsAtomic
+
+	sampleMu sync.Mutex
+	selfProc *process.Process
+
+	dirSizeMu    sync.Mutex
+	dirSizeRoot  string
+	dirSizeBytes int64
+	dirSizeAt    time.Time
 }
 
 func newSystemStatusMonitor() *systemStatusMonitor {
@@ -114,14 +126,47 @@ func (m *systemStatusMonitor) start(ctx context.Context) {
 }
 
 func (m *systemStatusMonitor) sample() {
-	if proc, err := process.NewProcess(int32(os.Getpid())); err == nil {
-		if percent, err := proc.Percent(0); err == nil && percent >= 0 {
+	m.sampleMu.Lock()
+	// 复用同一个 *process.Process 实例：gopsutil 的 Percent(0) 依赖实例内部保存的
+	// lastCPUTimes 计算两次调用之间的增量，每次重建会永远返回 0。
+	if m.selfProc == nil {
+		if proc, err := process.NewProcess(int32(os.Getpid())); err == nil {
+			m.selfProc = proc
+		}
+	}
+	if m.selfProc != nil {
+		if percent, err := m.selfProc.Percent(0); err == nil && percent >= 0 {
 			m.processCPUPercent.Store(percent)
 		}
 	}
+	m.sampleMu.Unlock()
 	if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 && percents[0] >= 0 {
 		m.hostCPUPercent.Store(percents[0])
 	}
+}
+
+func (m *systemStatusMonitor) cachedDirSizeBytes(root string, now time.Time) int64 {
+	if root == "" {
+		return 0
+	}
+	if m == nil {
+		return dirSizeBytes(root)
+	}
+	m.dirSizeMu.Lock()
+	if m.dirSizeRoot == root && !m.dirSizeAt.IsZero() && now.Sub(m.dirSizeAt) < tsdbDirSizeCacheTTL {
+		cached := m.dirSizeBytes
+		m.dirSizeMu.Unlock()
+		return cached
+	}
+	m.dirSizeMu.Unlock()
+
+	size := dirSizeBytes(root)
+	m.dirSizeMu.Lock()
+	m.dirSizeRoot = root
+	m.dirSizeBytes = size
+	m.dirSizeAt = now
+	m.dirSizeMu.Unlock()
+	return size
 }
 
 // float64AsAtomic 是 float64 的原子包装：统一以 float64 动态类型写入
@@ -198,7 +243,7 @@ func buildSystemStatus(store *Store, hub *Hub, monitor *systemStatusMonitor, now
 	if store != nil {
 		status.Alerts = store.alertStatusCounts()
 	}
-	status.DataDir = systemStatusDataDir(store)
+	status.DataDir = systemStatusDataDir(store, monitor, now)
 	return status
 }
 
@@ -255,7 +300,7 @@ func (s *Store) alertStatusCounts() SystemStatusAlerts {
 // systemStatusDataDir 统计数据目录占用：state.json 单文件大小、history 目录
 // （network + offline 两个 TSDB）总大小、以及所在文件系统的剩余空间。任一统计
 // 失败（如测试中的裸 Store 没有数据目录）保持 0。
-func systemStatusDataDir(store *Store) SystemStatusDataDir {
+func systemStatusDataDir(store *Store, monitor *systemStatusMonitor, now time.Time) SystemStatusDataDir {
 	var result SystemStatusDataDir
 	if store == nil {
 		return result
@@ -267,7 +312,12 @@ func systemStatusDataDir(store *Store) SystemStatusDataDir {
 	if info, err := os.Stat(statePath); err == nil && !info.IsDir() {
 		result.StateBytes = info.Size()
 	}
-	result.TSDBBytes = dirSizeBytes(history.HistoryRootDir(filepath.Dir(statePath)))
+	historyDir := history.HistoryRootDir(filepath.Dir(statePath))
+	if monitor != nil {
+		result.TSDBBytes = monitor.cachedDirSizeBytes(historyDir, now)
+	} else {
+		result.TSDBBytes = dirSizeBytes(historyDir)
+	}
 	if usage, err := disk.Usage(filepath.Dir(statePath)); err == nil && usage != nil && usage.Free >= 0 {
 		result.FreeBytes = int64(usage.Free)
 	}

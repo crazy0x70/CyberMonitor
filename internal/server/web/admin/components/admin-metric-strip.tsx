@@ -40,7 +40,7 @@ export function AdminMetricStrip({ items, ariaLabel = "统计摘要", className 
           className={cn(
             // 卡片：--surface-raised 实底（内容层，不开 backdrop）+ --r-lg + 内边距 14px 16px + 最小宽 160px；
             // 1px --hairline 边 + 上沿内高光 + --shadow-1（P-04 第 2 条卡片配方）
-            "flex min-w-[160px] flex-col gap-2 rounded-[var(--r-lg)] border border-[var(--hairline)] bg-[var(--surface-raised)] px-4 py-[14px] shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-1)]",
+            "flex min-w-0 flex-col gap-2 rounded-[var(--r-lg)] border border-[var(--hairline)] bg-[var(--surface-raised)] px-4 py-[14px] shadow-[inset_0_1px_0_var(--glass-edge),var(--shadow-1)]",
           )}
         >
           <span className="flex min-w-0 items-center gap-1.5 text-[var(--label-3)] [font:var(--t-caption)] tracking-[var(--t-caption-ls)]">

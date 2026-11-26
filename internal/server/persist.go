@@ -444,6 +444,9 @@ type ConfigTransferProfile struct {
 	Tags             []string `json:"tags,omitempty"`
 	Groups           []string `json:"groups,omitempty"`
 	Region           string   `json:"region,omitempty"`
+	HideFromCR       bool     `json:"hide_from_cr,omitempty"`
+	HideFromAll      bool     `json:"hide_from_all,omitempty"`
+	HideFromDisplay  bool     `json:"hide_from_display,omitempty"`
 	DiskType         string   `json:"disk_type,omitempty"`
 	NetSpeedMbps     int      `json:"net_speed_mbps,omitempty"`
 	ExpireAt         int64    `json:"expire_at,omitempty"`
@@ -1027,6 +1030,9 @@ func configTransferProfilesFromNodeProfiles(profiles map[string]*NodeProfile) ma
 			Tags:              slices.Clone(profile.Tags),
 			Groups:            slices.Clone(profile.Groups),
 			Region:            profile.Region,
+			HideFromCR:        profile.HideFromCR,
+			HideFromAll:       profile.HideFromAll,
+			HideFromDisplay:   profile.HideFromDisplay,
 			DiskType:          profile.DiskType,
 			NetSpeedMbps:      profile.NetSpeedMbps,
 			ExpireAt:          profile.ExpireAt,
@@ -1063,6 +1069,9 @@ func configTransferProfilesToNodeProfiles(profiles map[string]*ConfigTransferPro
 			Tags:              slices.Clone(transfer.Tags),
 			Groups:            slices.Clone(transfer.Groups),
 			Region:            transfer.Region,
+			HideFromCR:        transfer.HideFromCR,
+			HideFromAll:       transfer.HideFromAll,
+			HideFromDisplay:   transfer.HideFromDisplay,
 			DiskType:          transfer.DiskType,
 			NetSpeedMbps:      transfer.NetSpeedMbps,
 			ExpireAt:          transfer.ExpireAt,

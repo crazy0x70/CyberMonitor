@@ -155,7 +155,7 @@ export function AdminDataTable<Row>({
             }
           : {})}
         className={cn(
-          "w-full max-md:overflow-x-auto",
+          "cm-thin-scroll w-full max-md:overflow-x-auto",
           "[&.is-scrollable]:[mask-image:linear-gradient(to_bottom,black_calc(100%-16px),transparent)]",
           tailHidden && "is-scrollable",
           // 可滚动时可用键盘聚焦，沿用现有焦点环（--primary-ring），内缩避免被卡片圆角裁切

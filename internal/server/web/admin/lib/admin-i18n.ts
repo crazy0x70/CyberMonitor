@@ -51,8 +51,37 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["正在加载数据…", "Loading data..."],
   ["离开当前页面前先处理未保存内容？", "Handle unsaved changes before leaving this page?"],
   ["继续编辑", "Keep editing"],
-  ["Close", "关闭"],
+  ["关闭", "Close"],
   ["放弃未保存修改", "Discard changes"],
+  ["保存后清除", "Will clear on save"],
+  ["撤销", "Undo"],
+  ["清除", "Clear"],
+  ["导出配置失败", "Failed to export configuration"],
+  ["允许访问内网 / 环回地址", "Allow private / loopback addresses"],
+  [
+    "默认禁止指向私网、环回、链路本地等地址，以防借 API Key 探测内网。自建内网 LLM 网关（如 10.x 上的 vLLM / ollama）需显式开启。",
+    "Private, loopback, and link-local targets are blocked by default to prevent SSRF with your API key. Enable explicitly for self-hosted internal LLM gateways (e.g. vLLM or Ollama on 10.x).",
+  ],
+  [
+    "新增一个 OpenAI 兼容服务商后，可在对话指令中调用它分析节点状态。",
+    "Add an OpenAI-compatible provider to query and analyze fleet status via chat commands.",
+  ],
+  [
+    "创建分组后，可在节点管理中为节点指定分组归属，展示页将按分组筛选节点。",
+    "Create groups to organize nodes in Nodes management and filter them on the status page.",
+  ],
+  [
+    "添加探测目标后，展示页节点详情中将显示到各目标的延迟图表。",
+    "Add probe targets to display latency charts for each target in the status page node details.",
+  ],
+  [
+    "配额需为大于或等于 0 的数字，最多两位小数。",
+    "Quota must be a number ≥ 0 with at most two decimal places.",
+  ],
+  [
+    "设置数据未加载，保存不会改动本节点已下发的探测项，请刷新后重试。",
+    "Settings are not loaded yet. Saving will keep this node's assigned probes unchanged; refresh and try again.",
+  ],
   ["放弃修改", "Discard modifications"],
   ["有未保存的修改", "Unsaved changes"],
   ["保存中…", "Saving..."],
@@ -750,8 +779,15 @@ const ADMIN_ZH_TO_EN_ENTRIES = [
   ["在线率", "Online rate"],
   ["离线率", "Offline rate"],
   ["探测可用率", "Probe availability"],
+  ["网络概览", "Network overview"],
+  ["实时带宽", "Live bandwidth"],
+  ["暂无节点数据", "No node data yet"],
   ["主控负载", "Server load"],
   ["网络连通性", "Network connectivity"],
+  ["节点概览", "Node overview"],
+  ["节点名称", "Node name"],
+  ["节点健康度", "Node health"],
+  ["已接入 Agent", "Connected agents"],
   ["主控状态", "Server status"],
   ["资源热点", "Resource hotspots"],
   ["资源使用正常", "Resource usage is normal"],
@@ -1516,6 +1552,35 @@ const ADMIN_TEXT_PATTERNS: Array<{
       } missing required fields; alerts cannot be sent through ${match[1] === "1" ? "it" : "them"}.`,
     en: /^(\d+)\s+channels? (?:is|are) missing required fields; alerts cannot be sent through (?:it|them)\.$/,
     toZh: (match) => `${match[1]} 个渠道缺少必填项，告警无法通过它们发出。`,
+  },
+  // 节点续期摘要（日期 + 周期缩写）与探测间隔输入框 aria-label。
+  {
+    zh: /^(\d{4}\/\d{1,2}\/\d{1,2})\s+·\s+(月|季|半年|年)$/,
+    toEn: (match) => {
+      const map: Record<string, string> = {
+        月: "Monthly",
+        季: "Quarterly",
+        半年: "Semi-annual",
+        年: "Yearly",
+      };
+      return `${match[1]} · ${map[match[2]] || match[2]}`;
+    },
+    en: /^(\d{4}\/\d{1,2}\/\d{1,2})\s+·\s+(Monthly|Quarterly|Semi-annual|Yearly)$/,
+    toZh: (match) => {
+      const map: Record<string, string> = {
+        Monthly: "月",
+        Quarterly: "季",
+        "Semi-annual": "半年",
+        Yearly: "年",
+      };
+      return `${match[1]} · ${map[match[2]] || match[2]}`;
+    },
+  },
+  {
+    zh: /^(.+)\s+探测间隔（秒）$/,
+    toEn: (match) => `${match[1]} probe interval (seconds)`,
+    en: /^(.+)\s+probe interval \(seconds\)$/,
+    toZh: (match) => `${match[1]} 探测间隔（秒）`,
   },
 ];
 

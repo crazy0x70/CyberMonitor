@@ -84,7 +84,7 @@ func handleAdminProbesOverview(store *Store, sem chan struct{}) http.HandlerFunc
 		// 总预算含排队时间（与公开历史接口同策略）：先起截止再等 semaphore，
 		// 避免「排队 + 查询」叠加超过 WriteTimeout。
 		queryCtx, cancelQuery := context.WithTimeout(r.Context(), publicHistoryQueryTimeout)
-		nodeHistories := make(map[string]map[string]*TestHistoryEntry, len(nodeIDs))
+		nodeStats := make(map[string]map[string]*history.NetworkOverviewStats, len(nodeIDs))
 		failed := 0
 		var mu sync.Mutex
 		var wg sync.WaitGroup
@@ -97,7 +97,7 @@ func handleAdminProbesOverview(store *Store, sem chan struct{}) http.HandlerFunc
 				case <-queryCtx.Done():
 					return
 				}
-				tests, err := store.QueryPublicNodeHistory(queryCtx, nodeID, from, to)
+				stats, err := store.QueryNodeProbeOverviewStats(queryCtx, nodeID, from, to)
 				<-sem
 				if err != nil {
 					// 单节点失败不整体失败：记录后跳过该节点，聚合其余节点。
@@ -108,7 +108,7 @@ func handleAdminProbesOverview(store *Store, sem chan struct{}) http.HandlerFunc
 					return
 				}
 				mu.Lock()
-				nodeHistories[nodeID] = tests
+				nodeStats[nodeID] = stats
 				mu.Unlock()
 			}(nodeID)
 		}
@@ -125,12 +125,13 @@ func handleAdminProbesOverview(store *Store, sem chan struct{}) http.HandlerFunc
 			return
 		}
 
-		response.Targets = aggregateProbeTargetOverviews(nodeHistories)
+		catalog := store.settingsTestCatalog()
+		response.Targets = aggregateProbeTargetOverviewStats(nodeStats)
 		// M-01（D-05）：按节点聚合，3a 目录过滤只作用于 nodes；targets 行为不变。
-		response.Nodes = aggregateProbeNodeOverviews(nodeHistories, store.settingsTestCatalog())
+		response.Nodes = aggregateProbeNodeOverviewStats(nodeStats, catalog)
 		// B-07：序列键中的 Name 已被规范化为小写，展示名用当前 TestCatalog 的
 		// 原始名称覆盖；目录中已删除的目标保持聚合名不变。
-		applyProbeCatalogDisplayNames(response.Targets, store.settingsTestCatalog())
+		applyProbeCatalogDisplayNames(response.Targets, catalog)
 		writeJSON(w, http.StatusOK, response)
 	}
 }
@@ -225,6 +226,185 @@ func collectProbeEntrySamples(entry *TestHistoryEntry) (probeEntrySamples, bool)
 		}
 	}
 	return samples, true
+}
+
+// collectProbeOverviewSamples 从原始未降采样统计提取样本数、可用数、延迟切片与丢包合计。
+func collectProbeOverviewSamples(stats *history.NetworkOverviewStats) (probeEntrySamples, bool) {
+	if stats == nil {
+		return probeEntrySamples{}, false
+	}
+	totalSamples := stats.AvailSamples
+	okSamples := stats.AvailOK
+	if totalSamples == 0 {
+		totalSamples = max(stats.LossCount, len(stats.Latencies))
+		okSamples = len(stats.Latencies)
+	}
+	if totalSamples == 0 {
+		return probeEntrySamples{}, false
+	}
+	return probeEntrySamples{
+		samples:   totalSamples,
+		okSamples: okSamples,
+		latencies: stats.Latencies,
+		lossSum:   stats.LossSum,
+		lossCount: stats.LossCount,
+	}, true
+}
+
+// aggregateProbeTargetOverviewStats 按目标聚合原始探测统计（无 24h 降采样失真）。
+func aggregateProbeTargetOverviewStats(nodeStats map[string]map[string]*history.NetworkOverviewStats) []ProbeTargetOverview {
+	type targetAccumulator struct {
+		identity  probeTargetIdentity
+		nodes     map[string]struct{}
+		samples   int
+		okSamples int
+		latencies []float64
+		lossSum   float64
+		lossCount int
+	}
+
+	targets := make(map[string]*targetAccumulator)
+	for nodeID, series := range nodeStats {
+		for key, entry := range series {
+			if key == "" || entry == nil {
+				continue
+			}
+			parsed, err := history.ParseNetworkSeriesKey(key)
+			if err != nil {
+				log.Printf("probes overview 跳过非法序列键 %q: %v", key, err)
+				continue
+			}
+			samples, ok := collectProbeOverviewSamples(entry)
+			if !ok {
+				continue
+			}
+			acc := targets[key]
+			if acc == nil {
+				acc = &targetAccumulator{
+					identity: probeTargetIdentity{
+						Type: parsed.Type,
+						Host: parsed.Host,
+						Port: parsed.Port,
+						Name: parsed.Name,
+					},
+					nodes: make(map[string]struct{}),
+				}
+				targets[key] = acc
+			}
+			acc.nodes[nodeID] = struct{}{}
+			acc.samples += samples.samples
+			acc.okSamples += samples.okSamples
+			acc.latencies = append(acc.latencies, samples.latencies...)
+			acc.lossSum += samples.lossSum
+			acc.lossCount += samples.lossCount
+		}
+	}
+
+	keys := make([]string, 0, len(targets))
+	for key := range targets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	overviews := make([]ProbeTargetOverview, 0, len(keys))
+	for _, key := range keys {
+		acc := targets[key]
+		overview := ProbeTargetOverview{
+			Name:    acc.identity.Name,
+			Type:    acc.identity.Type,
+			Host:    acc.identity.Host,
+			Port:    acc.identity.Port,
+			Nodes:   len(acc.nodes),
+			Samples: acc.samples,
+		}
+		if acc.samples > 0 {
+			overview.AvailabilityPct = float64(acc.okSamples) / float64(acc.samples) * 100
+		}
+		if len(acc.latencies) > 0 {
+			avgLatency := averageFloatValues(acc.latencies)
+			overview.AvgLatencyMs = &avgLatency
+			p95Latency := percentileFloatValues(acc.latencies, 0.95)
+			overview.P95LatencyMs = &p95Latency
+		}
+		if acc.lossCount > 0 {
+			avgLoss := acc.lossSum / float64(acc.lossCount)
+			overview.AvgLossPct = &avgLoss
+		}
+		overviews = append(overviews, overview)
+	}
+	return overviews
+}
+
+// aggregateProbeNodeOverviewStats 按节点聚合原始探测统计（仅计入当前目录中的目标）。
+func aggregateProbeNodeOverviewStats(
+	nodeStats map[string]map[string]*history.NetworkOverviewStats,
+	catalog []TestCatalogItem,
+) []ProbeNodeOverview {
+	catalogIndex := make(map[probeCatalogKey]struct{}, len(catalog))
+	for _, item := range catalog {
+		key := probeCatalogKey{
+			Type: strings.ToLower(strings.TrimSpace(item.Type)),
+			Host: strings.ToLower(strings.TrimSpace(item.Host)),
+			Port: item.Port,
+		}
+		if key.Host == "" {
+			continue
+		}
+		catalogIndex[key] = struct{}{}
+	}
+
+	overviews := make([]ProbeNodeOverview, 0, len(nodeStats))
+	for nodeID, series := range nodeStats {
+		acc := probeEntrySamples{}
+		targets := 0
+		for key, entry := range series {
+			if key == "" || entry == nil {
+				continue
+			}
+			parsed, err := history.ParseNetworkSeriesKey(key)
+			if err != nil {
+				continue
+			}
+			if _, ok := catalogIndex[probeCatalogKey{
+				Type: strings.ToLower(strings.TrimSpace(parsed.Type)),
+				Host: strings.ToLower(strings.TrimSpace(parsed.Host)),
+				Port: parsed.Port,
+			}]; !ok {
+				continue
+			}
+			samples, ok := collectProbeOverviewSamples(entry)
+			if !ok {
+				continue
+			}
+			targets++
+			acc.samples += samples.samples
+			acc.okSamples += samples.okSamples
+			acc.latencies = append(acc.latencies, samples.latencies...)
+			acc.lossSum += samples.lossSum
+			acc.lossCount += samples.lossCount
+		}
+		overview := ProbeNodeOverview{
+			NodeID:  nodeID,
+			Targets: targets,
+			Samples: acc.samples,
+		}
+		if acc.samples > 0 {
+			overview.AvailabilityPct = float64(acc.okSamples) / float64(acc.samples) * 100
+		}
+		if len(acc.latencies) > 0 {
+			avgLatency := averageFloatValues(acc.latencies)
+			overview.AvgLatencyMs = &avgLatency
+			p95Latency := percentileFloatValues(acc.latencies, 0.95)
+			overview.P95LatencyMs = &p95Latency
+		}
+		if acc.lossCount > 0 {
+			avgLoss := acc.lossSum / float64(acc.lossCount)
+			overview.AvgLossPct = &avgLoss
+		}
+		overviews = append(overviews, overview)
+	}
+	sort.Slice(overviews, func(i, j int) bool { return overviews[i].NodeID < overviews[j].NodeID })
+	return overviews
 }
 
 // aggregateProbeTargetOverviews 把「节点 → 序列键 → 历史」聚合成按目标分组的

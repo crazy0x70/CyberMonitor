@@ -48,10 +48,17 @@ const (
 	adminOAuthUnavailableMessage = "OAuth 提供方暂不可用"
 	// adminOAuthDiscoveryFailureTTL 是 OIDC 发现失败结果的负缓存时长，避免失败路径反复发起对外请求。
 	adminOAuthDiscoveryFailureTTL = 30 * time.Second
+	// adminOAuthProviderCacheTTL 是 OIDC 发现成功结果的缓存时长：允许元数据/端点变更在无需重启下生效。
+	adminOAuthProviderCacheTTL = time.Hour
 	// adminOAuthStartRateWindow / adminOAuthStartRateLimit 是 /oauth/start 的按客户端 IP 准入限流参数。
 	adminOAuthStartRateWindow = time.Minute
 	adminOAuthStartRateLimit  = 30
 )
+
+type cachedOIDCProvider struct {
+	provider  *oidc.Provider
+	expiresAt time.Time
+}
 
 type adminOAuthStatePayload struct {
 	Provider     string `json:"provider"`
@@ -286,8 +293,9 @@ func handleAdminOAuthStart(store *Store, jwtSecret string, trustedProxyHeaders b
 			return
 		}
 		// 准入限流：/oauth/start 直挂 adminMux，无 requireAdminJWT，未认证方可触发 OIDC 发现，
-		// 故按客户端 IP 分桶限流，避免被反复用来探测外部/内网目标。
-		if !store.allowAgentRate("admin-oauth-start:"+clientIPFromRemoteAddr(r.RemoteAddr), adminOAuthStartRateWindow, adminOAuthStartRateLimit, time.Now(), true) {
+		// 故按真实客户端 IP（反代开启 -trust-proxy-headers 时读取可信代理头）分桶限流。
+		clientIP := clientIPFromRequest(r, trustedProxyHeaders)
+		if !store.allowAgentRate("admin-oauth-start:"+clientIP, adminOAuthStartRateWindow, adminOAuthStartRateLimit, time.Now(), true) {
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "请求过于频繁，请稍后再试"})
 			return
 		}
@@ -356,23 +364,28 @@ func handleAdminOAuthCallback(store *Store, jwtSecret string, trustedProxyHeader
 		}
 
 		settings := normalizeAdminAuthSettings(store.Credentials().AdminAuth)
+		clientIP := clientIPFromRequest(r, trustedProxyHeaders)
 		oauthConfig, provider, _, err := adminOAuthConfigForProvider(r.Context(), payload.Provider, settings, adminOAuthRedirectURI(r, trustedProxyHeaders))
 		if err != nil {
+			log.Printf("管理员 OAuth 回调失败（提供方不可用）: provider=%s client=%s err=%v", payload.Provider, clientIP, err)
 			http.Error(w, "OAuth provider disabled", http.StatusUnauthorized)
 			return
 		}
 		ctx := adminOAuthContext(r.Context())
 		token, err := oauthConfig.Exchange(ctx, code, oauth2.VerifierOption(payload.CodeVerifier))
 		if err != nil {
+			log.Printf("管理员 OAuth 回调失败（令牌交换失败）: provider=%s client=%s err=%v", payload.Provider, clientIP, err)
 			http.Error(w, "OAuth exchange failed", http.StatusUnauthorized)
 			return
 		}
 		identity, err := adminOAuthIdentityForProvider(ctx, payload.Provider, settings, provider, token, payload.Nonce)
 		if err != nil {
+			log.Printf("管理员 OAuth 回调失败（身份校验失败）: provider=%s client=%s err=%v", payload.Provider, clientIP, err)
 			http.Error(w, "OAuth identity rejected", http.StatusUnauthorized)
 			return
 		}
 		if err := matchAdminOAuthIdentity(payload.Provider, settings, identity); err != nil {
+			log.Printf("管理员 OAuth 回调拒绝（不在白名单）: provider=%s login=%s email=%s client=%s err=%v", payload.Provider, identity.Login, identity.Email, clientIP, err)
 			http.Error(w, "OAuth identity not allowed", http.StatusUnauthorized)
 			return
 		}
@@ -380,7 +393,7 @@ func handleAdminOAuthCallback(store *Store, jwtSecret string, trustedProxyHeader
 			http.Error(w, "session error", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("管理员 OAuth 登录: provider=%s login=%s email=%s remote=%s", payload.Provider, identity.Login, identity.Email, r.RemoteAddr)
+		log.Printf("管理员 OAuth 登录: provider=%s login=%s email=%s client=%s", payload.Provider, identity.Login, identity.Email, clientIP)
 		http.Redirect(w, r, forwardedPrefixedPath(r, payload.ReturnTo, trustedProxyHeaders), http.StatusFound)
 	}
 }
@@ -407,19 +420,29 @@ func adminOAuthConfigForProvider(ctx context.Context, providerID string, setting
 			return oauth2.Config{}, nil, "", err
 		}
 		var provider *oidc.Provider
+		now := time.Now()
 		if cached, ok := oidcProviderCache.Load(settings.OIDC.IssuerURL); ok {
-			provider = cached.(*oidc.Provider)
-		} else if until, ok := oidcDiscoveryFailureCachedUntil(settings.OIDC.IssuerURL, time.Now()); ok {
-			// 短时负缓存：失败的发现结果在 TTL 内直接拒绝，不再重复发起对外请求。
-			// 返回不含拓扑细节的通用错误（对外仍会被 handler 脱敏）。
-			return oauth2.Config{}, nil, "", fmt.Errorf("oidc discovery failed, retry after %s", until.Format(time.RFC3339))
-		} else {
+			if entry, ok := cached.(cachedOIDCProvider); ok && entry.provider != nil && now.Before(entry.expiresAt) {
+				provider = entry.provider
+			} else {
+				oidcProviderCache.Delete(settings.OIDC.IssuerURL)
+			}
+		}
+		if provider == nil {
+			if until, ok := oidcDiscoveryFailureCachedUntil(settings.OIDC.IssuerURL, now); ok {
+				// 短时负缓存：失败的发现结果在 TTL 内直接拒绝，不再重复发起对外请求。
+				// 返回不含拓扑细节的通用错误（对外仍会被 handler 脱敏）。
+				return oauth2.Config{}, nil, "", fmt.Errorf("oidc discovery failed, retry after %s", until.Format(time.RFC3339))
+			}
 			provider, err = oidc.NewProvider(adminOAuthContext(ctx), settings.OIDC.IssuerURL)
 			if err != nil {
 				oidcDiscoveryFailureCache.Store(settings.OIDC.IssuerURL, time.Now().Add(adminOAuthDiscoveryFailureTTL))
 				return oauth2.Config{}, nil, "", err
 			}
-			oidcProviderCache.Store(settings.OIDC.IssuerURL, provider)
+			oidcProviderCache.Store(settings.OIDC.IssuerURL, cachedOIDCProvider{
+				provider:  provider,
+				expiresAt: time.Now().Add(adminOAuthProviderCacheTTL),
+			})
 		}
 		return oauth2.Config{
 			ClientID:     settings.OIDC.ClientID,

@@ -35,7 +35,7 @@ jobs:
       stable: ${{ steps.version.outputs.stable }}
     steps:
       - name: Checkout release ref
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -96,18 +96,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: 'stable'
+          check-latest: true
 
       - name: Restore admin assets cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@v6
         with:
           path: admin-web-sync.tar.gz
           key: admin-web-sync-${{ github.run_id }}-${{ github.run_attempt }}
@@ -176,19 +177,20 @@ jobs:
             output: cyber-monitor-server-freebsd-arm64
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: 'stable'
+          check-latest: true
 
       - name: Restore admin assets cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@v6
         with:
           path: admin-web-sync.tar.gz
           key: admin-web-sync-${{ github.run_id }}-${{ github.run_attempt }}
@@ -216,7 +218,7 @@ jobs:
             "${{ matrix.cmd_path }}"
 
       - name: Upload ${{ matrix.output }}
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
@@ -281,16 +283,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: 'stable'
+          check-latest: true
 
       - name: Build ${{ matrix.output }}
         run: |
@@ -308,7 +311,7 @@ jobs:
             "${{ matrix.cmd_path }}"
 
       - name: Upload ${{ matrix.output }}
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
@@ -323,30 +326,16 @@ jobs:
       actions: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
 
       - name: Verify build inputs
-        id: build-inputs
         run: |
-          GO_VERSION="$(awk '/^go / { print $2; exit }' go.mod)"
-          DOCKER_GO_VERSION="$(awk -F= '/^ARG GO_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
-          NODE_VERSION="$(awk -F= '/^ARG NODE_IMAGE_VERSION=/ { print $2; exit }' Dockerfile)"
-          if [ -z "$GO_VERSION" ] || [ -z "$DOCKER_GO_VERSION" ] || [ -z "$NODE_VERSION" ]; then
-            echo "Unable to resolve Go or Node build version" >&2
-            exit 1
-          fi
-          if ! printf '%s' "$NODE_VERSION" | grep -Eq '^[0-9]+([.][0-9]+){0,2}$'; then
-            echo "Node version must be numeric, got: $NODE_VERSION" >&2
-            exit 1
-          fi
-          if [ "$GO_VERSION" != "$DOCKER_GO_VERSION" ]; then
-            echo "Go version drift detected: go.mod=$GO_VERSION, Dockerfile GO_IMAGE_VERSION=$DOCKER_GO_VERSION" >&2
-            exit 1
-          fi
           for path in \
+            go.mod \
+            Dockerfile \
             internal/server/web/admin/package.json \
             internal/server/web/admin/package-lock.json \
             internal/server/web/admin/src/App.tsx \
@@ -361,7 +350,6 @@ jobs:
           do
             test -e "$path"
           done
-          echo "node_version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify install scripts
         run: |
@@ -382,9 +370,10 @@ jobs:
           }
 
       - name: Set up Node
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7
         with:
-          node-version: ${{ steps.build-inputs.outputs.node_version }}
+          node-version: 'lts/*'
+          check-latest: true
           cache: 'npm'
           cache-dependency-path: internal/server/web/admin/package-lock.json
 
@@ -401,7 +390,7 @@ jobs:
           tar -tzf admin-web-sync.tar.gz | grep -qx 'dist/admin/index.html'
 
       - name: Save synced admin assets cache
-        uses: actions/cache/save@v6.1.0
+        uses: actions/cache/save@v6
         with:
           path: admin-web-sync.tar.gz
           key: admin-web-sync-${{ github.run_id }}-${{ github.run_attempt }}
@@ -411,7 +400,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
@@ -452,13 +441,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           persist-credentials: false
 
       - name: Download release binaries for image
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           pattern: cyber-monitor-${{ matrix.suffix }}-linux-*
           path: docker-release
@@ -471,13 +460,13 @@ jobs:
           chmod +x docker-release/cyber-monitor-${{ matrix.suffix }}-linux-*
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4.4.0
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.4.1
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
@@ -496,7 +485,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
-        uses: docker/build-push-action@v7.4.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -520,7 +509,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag_sha }}
           fetch-depth: 0
@@ -543,7 +532,7 @@ jobs:
           echo "compare_url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Restore admin assets cache
-        uses: actions/cache/restore@v6.1.0
+        uses: actions/cache/restore@v6
         with:
           path: admin-web-sync.tar.gz
           key: admin-web-sync-${{ github.run_id }}-${{ github.run_attempt }}
@@ -556,7 +545,7 @@ jobs:
           test -f internal/server/web/dist/admin/index.html
 
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8
         with:
           pattern: cyber-monitor-*
           path: release

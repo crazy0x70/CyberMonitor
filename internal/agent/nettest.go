@@ -516,15 +516,20 @@ func newPingCommand(ctx context.Context, pingPath string, host string) *exec.Cmd
 }
 
 func parsePingOutput(output string) (*float64, float64, string, string) {
-	packetLoss := parsePacketLoss(output)
+	packetLoss, lossParsed := parsePacketLoss(output)
 	latency := parsePingLatency(output)
-	status, loss := resolvePingStatus(output, packetLoss, latency)
+	status, loss := resolvePingStatus(output, packetLoss, lossParsed, latency)
 	return latency, loss, status, ""
 }
 
-func resolvePingStatus(output string, packetLoss float64, latency *float64) (string, float64) {
-	if strings.Contains(output, "100%") || strings.Contains(strings.ToLower(output), "timeout") {
-		packetLoss = 100
+func resolvePingStatus(output string, packetLoss float64, lossParsed bool, latency *float64) (string, float64) {
+	// 仅在未解析到统计丢包且无延迟样本时，才从文本中的 "100%" / "timeout" 推断全超时，
+	// 避免 macOS 局部丢包（输出单包 "Request timeout"）或主机名含 "timeout" 被误判为 100% 丢包。
+	if !lossParsed && latency == nil {
+		lower := strings.ToLower(output)
+		if strings.Contains(output, "100%") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") {
+			packetLoss = 100
+		}
 	}
 	switch {
 	case packetLoss >= 100:
@@ -536,20 +541,20 @@ func resolvePingStatus(output string, packetLoss float64, latency *float64) (str
 	}
 }
 
-func parsePacketLoss(output string) float64 {
+func parsePacketLoss(output string) (float64, bool) {
 	loss, ok := parsePacketLossPercent(output)
 	if ok && loss != 0 {
-		return loss
+		return loss, true
 	}
 	for _, pattern := range pingCountRegexes {
 		if countLoss, matched := parsePacketLossCounts(output, pattern); matched {
-			return countLoss
+			return countLoss, true
 		}
 	}
 	if ok {
-		return loss
+		return loss, true
 	}
-	return 0
+	return 0, false
 }
 
 func parsePacketLossPercent(output string) (float64, bool) {

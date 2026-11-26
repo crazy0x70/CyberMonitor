@@ -1286,7 +1286,7 @@ export default function NotificationAlert({
                     // F4：状态来自 SettingsView.alert_rule_status（运行时聚合，只读）。
                     const firing = settings?.alert_rule_status?.[rule.id]?.firing || 0;
                     return firing > 0 ? (
-                      <span className={cn(adminStatusBadgeClass("danger"), "whitespace-nowrap")}>
+                      <span className={cn(adminStatusBadgeClass("danger"), "whitespace-nowrap tabular-nums")}>
                         告警中 {firing} 台
                       </span>
                     ) : (
@@ -1485,7 +1485,7 @@ export default function NotificationAlert({
       <AdminDrawer
         open={editingChannel !== null}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !isBusy) {
             closeChannelDrawer();
           }
         }}
@@ -1799,6 +1799,11 @@ export default function NotificationAlert({
           groupTree={settings?.group_tree || []}
           channels={channels}
           probes={settings?.test_catalog || []}
+          initialErrors={Object.fromEntries(
+            Object.entries(fieldErrors)
+              .filter(([key, message]) => key.startsWith(`rule:${ruleForm.id}:`) && Boolean(message))
+              .map(([key, message]) => [key.slice(`rule:${ruleForm.id}:`.length), message]),
+          )}
           onDone={handleRuleDone}
           onDelete={ruleForm.metric === OFFLINE_ALERT_RULE_ID ? undefined : () => removeRule(ruleForm.id)}
           onClose={closeRuleDrawer}

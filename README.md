@@ -1,15 +1,16 @@
-# CyberMonitor
-
-Lightweight, self-hosted server monitoring. One server binary with the status page and admin console built in, plus a small agent on each machine you want to watch. No database to set up — everything lives in one data directory.
-
-English · [简体中文](./README_zh-CN.md)
+<div align="center">
+  <img src="./docs/icon.svg" width="72" height="72" alt="CyberMonitor" />
+  <h1>CyberMonitor</h1>
+  <p>Lightweight, self-hosted server monitoring. One server binary with the status page and admin console built in, plus a small agent on each machine you want to watch. No database to set up — everything lives in one data directory.</p>
+  <p><strong>English</strong> · <a href="./README_zh-CN.md">简体中文</a></p>
+</div>
 
 ## Features
 
-- **Live status page** — online state, CPU, memory, disk, GPU and network for every node, updated every second, plus TCP/ICMP latency and packet loss charts (1 hour / 1 day / 1 week). Light and dark themes, English and Chinese.
+- **Live status page** — online state, CPU, memory, disk, GPU and network for every node updated every second, with usage-based progress bar coloring, instant node search (`/`), and TCP/ICMP latency & packet loss charts (1 hour / 1 day / 1 week, with optional spike clipping). Light and dark themes, English and Chinese.
 - **AI operations assistant** — ask questions about your fleet in natural language; the snapshot it reasons over includes CPU, memory and network history summaries over the last hour, day and week.
-- **Admin console** — group and tag nodes, track expiry dates, set monthly traffic quotas, and choose which probes each node runs.
-- **Alerts** — rules on CPU, memory, disk, GPU, bandwidth, connections, probe latency/loss, expiry and traffic quota, plus node offline. Notifications go to Telegram, Feishu, DingTalk, WeCom, Slack, Bark or email, with recovery notices.
+- **Admin console** — unified dashboard (online rate, active alerts, live network throughput, server load, full-width node overview and resource hotspots), plus node groups and tags, expiry tracking, monthly traffic quotas and per-node probe assignment.
+- **Alerts** — rules on CPU, memory, disk, GPU, bandwidth, connections, probe latency/loss, expiry and traffic quota, plus node offline. Clean, structured alert and recovery notices are delivered to Telegram, Feishu, DingTalk, WeCom, Slack, Bark or email.
 - **One-click updates** — update the server and every agent from the admin console.
 - **Small footprint** — the server idles at about 35 MB of memory; agents read system counters directly and send one small report per second.
 - **Secure sign-in** — random admin path, GitHub / OIDC login, Cloudflare Turnstile and brute-force lockout.
@@ -194,7 +195,7 @@ The new password and the admin path are printed.
 
 ## Build from source
 
-Requires Go (version in `go.mod`) and Node.js (version in the `Dockerfile`). The admin console is embedded into the server binary, so build it first:
+Requires Go (version in `go.mod` or newer) and Node.js (current LTS). The admin console is embedded into the server binary, so build it first:
 
 ```bash
 npm --prefix internal/server/web/admin ci

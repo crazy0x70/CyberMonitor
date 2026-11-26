@@ -648,7 +648,7 @@ export default function BasicSettings({
     if (systemAlreadyLatest) {
       return { text: "已是最新", tone: "default" as const };
     }
-    return { text: "检查失败", tone: "danger" as const };
+    return { text: "未检查", tone: "default" as const };
   })();
   const systemVersionStatusToneClass =
     systemVersionStatus.tone === "accent"
@@ -1289,8 +1289,12 @@ export default function BasicSettings({
                 <button
                   type="button"
                   className={adminTextButtonClass}
+                  disabled={isBusy}
                   onClick={() => {
-                    void onExport();
+                    void runAction({
+                      action: () => onExport(),
+                      fallbackError: "导出配置失败",
+                    });
                   }}
                 >
                   导出

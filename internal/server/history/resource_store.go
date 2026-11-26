@@ -473,10 +473,11 @@ func (s *ResourceStore) DeleteNode(nodeID string) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.accumulators, nodeID)
 	delete(s.pending, nodeID)
 	delete(s.committed, nodeID)
+	s.mu.Unlock()
+	// 不持有 s.mu 执行 DB.Delete：TSDB 删除会等待压缩锁，持锁会阻塞全部节点的 Observe。
 	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher)
 }
 
@@ -484,15 +485,15 @@ func (s *ResourceStore) Clear() error {
 	if s == nil || s.db == nil {
 		return errNilResourceStore
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.accumulators = make(map[string]*resourceBucket)
-	s.pending = make(map[string][]*resourceBucket)
-	s.committed = make(map[string]int64)
 	matcher, err := newMetricNameMatcher(resourceMetricNames)
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.accumulators = make(map[string]*resourceBucket)
+	s.pending = make(map[string][]*resourceBucket)
+	s.committed = make(map[string]int64)
+	s.mu.Unlock()
 	return s.db.Delete(context.Background(), math.MinInt64, math.MaxInt64, matcher)
 }
 

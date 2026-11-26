@@ -814,7 +814,11 @@ export default function App() {
   const [savingPage, setSavingPage] = useState<Page | null>(null);
   const [loginState, setLoginState] = useState<LoginState>(() => createLoginState());
   const [hasUnsavedPageChanges, setHasUnsavedPageChanges] = useState(false);
-  const [pendingPageNavigation, setPendingPageNavigation] = useState<Page | null>(null);
+  const [pendingPageNavigation, setPendingPageNavigation] = useState<{
+    page: Page;
+    section?: string | null;
+    replace?: boolean;
+  } | null>(null);
   const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
   // 通知告警 / 基础设置页上报的“存在校验错误的分区”，供侧栏子项红点展示（U1-b 第 3 条、F3 第 4 条）。
   const [sectionValidationErrors, setSectionValidationErrors] = useState<AdminSectionErrors>({});
@@ -938,8 +942,9 @@ export default function App() {
         return;
       }
       if (hasUnsavedPageChanges) {
+        const nextSection = resolveInitialSection(nextPage);
         syncPageToURL(currentPage, currentSection, true);
-        setPendingPageNavigation(nextPage);
+        setPendingPageNavigation({ page: nextPage, section: nextSection, replace: true });
         setUnsavedDialogOpen(true);
         return;
       }
@@ -998,10 +1003,10 @@ export default function App() {
     }
   }
 
-  function proceedToPage(page: Page, section?: string | null) {
+  function proceedToPage(page: Page, section?: string | null, replace = false) {
     // 跨页导航不带分区时进入目标页第一个分区（U1-b 第 1 条，取“第一分区”方案）。
     const nextSection = resolveAdminSection(page, section ?? null);
-    syncPageToURL(page, nextSection);
+    syncPageToURL(page, nextSection, replace);
     setCurrentPage(page);
     setCurrentSection(nextSection);
     setHasUnsavedPageChanges(false);
@@ -1026,7 +1031,7 @@ export default function App() {
         return;
       }
       if (hasUnsavedPageChanges) {
-        setPendingPageNavigation(page);
+        setPendingPageNavigation({ page, section });
         setUnsavedDialogOpen(true);
         setIsMobileMenuOpen(false);
         return;
@@ -2024,7 +2029,11 @@ export default function App() {
               className={adminPrimaryButtonClass}
               onClick={() => {
                 if (pendingPageNavigation) {
-                  proceedToPage(pendingPageNavigation);
+                  proceedToPage(
+                    pendingPageNavigation.page,
+                    pendingPageNavigation.section,
+                    pendingPageNavigation.replace ?? false,
+                  );
                 } else {
                   setUnsavedDialogOpen(false);
                 }
